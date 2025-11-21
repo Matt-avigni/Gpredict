@@ -1628,7 +1628,6 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         ctrl->client.thread = NULL;
     }
 
-    g_mutex_clear(&ctrl->client.mutex);
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }
