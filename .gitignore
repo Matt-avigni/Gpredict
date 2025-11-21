@@ -37,3 +37,9 @@ m4/
 GTAGS
 GRTAGS
 GPATH
+.DS_Store
+*.o
+*.lo
+*.la
+.libs/
+src/*/.DS_Store

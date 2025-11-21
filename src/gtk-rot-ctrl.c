@@ -1134,6 +1134,95 @@ static void rot_monitor_cb(GtkCheckButton * button, gpointer data)
 }
 
 /**
+ * Ensure rotctld is running.
+ *
+ * This helper will first try to connect to the configured rotctld
+ * endpoint. If the connection succeeds, it assumes rotctld is already
+ * running and immediately closes the temporary socket.
+ *
+ * If the connection fails, it will try to spawn rotctld using the
+ * GPREDICT_ROTCTLD_CMD environment variable (if set). If the variable
+ * is not set, we log an error and return FALSE instead of guessing a
+ * command line.
+ */
+static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
+{
+    gint tmp_sock;
+
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return FALSE;
+
+    /* First: probe whether rotctld is already running */
+    tmp_sock = rotctld_socket_open(ctrl->conf->host, ctrl->conf->port);
+    if (tmp_sock != -1)
+    {
+        /* rotctld already accepting connections; close probe socket */
+#ifndef WIN32
+        shutdown(tmp_sock, SHUT_RDWR);
+        close(tmp_sock);
+#else
+        shutdown(tmp_sock, SD_BOTH);
+        closesocket(tmp_sock);
+#endif
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rotctld already running at %s:%d"),
+                    __func__, ctrl->conf->host, ctrl->conf->port);
+        return TRUE;
+    }
+
+    /* If we get here, the connection failed: try to spawn rotctld. */
+    const gchar *cmd = g_getenv("GPREDICT_ROTCTLD_CMD");
+    if (cmd == NULL || *cmd == '\0')
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rotctld is not running and GPREDICT_ROTCTLD_CMD "
+                      "is not set; cannot auto-start rotctld."),
+                    __func__);
+        return FALSE;
+    }
+
+    GError *error = NULL;
+    if (!g_spawn_command_line_async(cmd, &error))
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: failed to start rotctld using '%s': %s"),
+                    __func__, cmd, error->message);
+        g_error_free(error);
+        return FALSE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: started rotctld using '%s'"),
+                __func__, cmd);
+
+    /* Give rotctld a short time to come up, then re-probe. */
+    g_usleep(500000); /* 500 ms */
+
+    tmp_sock = rotctld_socket_open(ctrl->conf->host, ctrl->conf->port);
+    if (tmp_sock == -1)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rotctld did not become reachable at %s:%d"),
+                    __func__, ctrl->conf->host, ctrl->conf->port);
+        return FALSE;
+    }
+
+#ifndef WIN32
+    shutdown(tmp_sock, SHUT_RDWR);
+    close(tmp_sock);
+#else
+    shutdown(tmp_sock, SD_BOTH);
+    closesocket(tmp_sock);
+#endif
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: rotctld is now reachable at %s:%d"),
+                __func__, ctrl->conf->host, ctrl->conf->port);
+
+    return TRUE;
+}
+
+/**
  * Rotor locked.
  *
  * \param button Pointer to the "Engage" button.
@@ -1148,6 +1237,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
     gchar           buffback[128];
     gboolean        retcode;
     gint            retval;
+    GtkWidget      *status_label =
+        g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
 
     if (!gtk_toggle_button_get_active(button))
     {
@@ -1157,8 +1248,12 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         gtk_label_set_text(GTK_LABEL(ctrl->ElRead), "---");
 
         if (!ctrl->client.running)
+        {
             /* client thread is not running; nothing to do */
+            if (status_label)
+                gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
             return;
+        }
 
         /* stop moving rotor */
         /** FIXME: should use high level func */
@@ -1197,6 +1292,20 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         /* ensure we are not in monitor mode when engaging by default */
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->MonitorCheckBox), FALSE);
         ctrl->monitor = FALSE;
+
+        /* ensure rotctld daemon is running (start it if needed) */
+        if (!rotctld_ensure_running(ctrl))
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: failed to connect to or start rotctld"),
+                        __func__);
+
+            /* Reset engage button and show error to the user */
+            gtk_toggle_button_set_active(button, FALSE);
+            if (status_label)
+                gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+            return;
+        }
 
         ctrl->client.thread =
             g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
