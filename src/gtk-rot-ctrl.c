@@ -160,6 +160,7 @@ static gboolean rotctld_socket_rw(gint sock, gchar * buff, gchar * buffout,
     gint            written;
     gint            size;
 
+    g_print("rotctld_socket_rw: sending command '%s'\n", buff);
     size = strlen(buff);
 
     /* send command */
@@ -171,6 +172,7 @@ static gboolean rotctld_socket_rw(gint sock, gchar * buff, gchar * buffout,
     }
     if (written == -1)
     {
+        g_print("rotctld_socket_rw: send() failed for command '%s'\n", buff);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld Socket Down"), __func__);
         return FALSE;
@@ -367,6 +369,8 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gboolean        retcode;
     gint            retval;
 
+    g_print("set_pos: az=%.2f el=%.2f\n", az, el);
+
     /* send command */
     buff = g_strdup_printf("P %.2f %.2f\x0a", az, el);
     retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
@@ -387,7 +391,7 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
         }
     }
 
-    return (retcode);
+    return retcode;
 }
 
 /* Rotctl client thread */
@@ -396,11 +400,10 @@ static gpointer rotctld_client_thread(gpointer data)
     gdouble         elapsed_time;
     gdouble         azi = 0.0;
     gdouble         ele = 0.0;
-    gboolean        new_trg = FALSE;
     gboolean        io_error = FALSE;
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
 
-    g_print("Starting rotctld client thread\n");
+    g_print("IUT_ROT_DEBUG: rotctld_client_thread started\n");
 
     ctrl->client.socket = rotctld_socket_open(ctrl->conf->host,
                                               ctrl->conf->port);
@@ -417,24 +420,28 @@ static gpointer rotctld_client_thread(gpointer data)
         g_timer_start(ctrl->client.timer);
         io_error = FALSE;
 
+        /* get latest commanded position from controller */
         g_mutex_lock(&ctrl->client.mutex);
-        if (ctrl->client.new_trg)
-        {
-            azi = ctrl->client.azi_out;
-            ele = ctrl->client.ele_out;
-            new_trg = ctrl->client.new_trg;
-        }
+        azi = ctrl->client.azi_out;
+        ele = ctrl->client.ele_out;
         g_mutex_unlock(&ctrl->client.mutex);
 
-        if (new_trg && !ctrl->monitor)
+        g_print("MATTEO_DEBUG: forcing set_pos call (engaged=%d monitor=%d az=%.2f el=%.2f)\n",
+                ctrl->engaged ? 1 : 0,
+                ctrl->monitor ? 1 : 0,
+                azi, ele);
+
+        if (!set_pos(ctrl, azi, ele))
         {
-            if (set_pos(ctrl, azi, ele))
-                new_trg = FALSE;
-            else
-                io_error = TRUE;
+            io_error = TRUE;
+            g_print("MATTEO_DEBUG: set_pos FAILED\n");
+        }
+        else
+        {
+            g_print("MATTEO_DEBUG: set_pos SUCCESS\n");
         }
 
-        /* wait 100 ms before sending new command */
+        /* wait 100 ms before reading back position */
         g_usleep(100000);
         if (!get_pos(ctrl, &azi, &ele))
             io_error = TRUE;
@@ -442,7 +449,6 @@ static gpointer rotctld_client_thread(gpointer data)
         g_mutex_lock(&ctrl->client.mutex);
         ctrl->client.azi_in = azi;
         ctrl->client.ele_in = ele;
-        ctrl->client.new_trg = new_trg;
         ctrl->client.io_error = io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
@@ -729,27 +735,29 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
  */
 static gboolean rot_ctrl_timeout_cb(gpointer data)
 {
-    GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
-    gdouble         rotaz = 0.0, rotel = 0.0;
-    gdouble         setaz = 0.0, setel = 45.0;
-    gchar          *text;
-    gboolean        error = FALSE;
-    sat_t           sat_working, *sat;
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gdouble rotaz = 0.0, rotel = 0.0;
+    gdouble setaz = 0.0, setel = 45.0;
+    gchar *text;
+    gboolean error = FALSE;
+    sat_t sat_working, *sat;
+    GtkWidget *status_label =
+        g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
 
     /* parameters for path predictions */
-    gdouble         time_delta;
-    gdouble         step_size;
+    gdouble time_delta;
+    gdouble step_size;
 
 #define SAFE_AZI(azi) CLAMP(azi, ctrl->conf->minaz, ctrl->conf->maxaz)
 #define SAFE_ELE(ele) CLAMP(ele, ctrl->conf->minel, ctrl->conf->maxel)
 
-    /* If we are tracking and the target satellite is within
-       range, set the rotor position controller knob values to
-       the target values. If the target satellite is out of range
-       set the rotor controller to 0 deg El and to the Az where the
-       target sat is expected to come up or where it last went down
+    /* If we are tracking and the target satellite is within range, set the
+     * rotor position controller knob values to the target values. If the
+     * target satellite is out of range set the rotor controller to 0 deg El
+     * and to the Az where the target sat is expected to come up or where it
+     * last went down.
      */
-    if (ctrl->tracking && ctrl->target)
+    if (ctrl->tracking && ctrl->target && ctrl->conf)
     {
         if (ctrl->target->el < 0.0)
         {
@@ -772,8 +780,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             setaz = SAFE_AZI(ctrl->target->az);
             setel = SAFE_ELE(ctrl->target->el);
         }
+
         /* if this is a flipped pass and the rotor supports it */
-        if ((ctrl->flipped) && (ctrl->conf->maxel >= 180.0))
+        if (ctrl->flipped && ctrl->conf->maxel >= 180.0)
         {
             setel = 180 - setel;
             if (setaz > 180)
@@ -783,31 +792,29 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
             while (setaz > ctrl->conf->maxaz)
                 setaz -= 360;
-
             while (setaz < ctrl->conf->minaz)
                 setaz += 360;
         }
 
-        if ((ctrl->conf->aztype == ROT_AZ_TYPE_180) && (setaz > 180.0))
-            setaz = setaz - 360.0;
+        if (ctrl->conf->aztype == ROT_AZ_TYPE_180 && setaz > 180.0)
+            setaz -= 360.0;
 
-        if (!(ctrl->engaged))
+        if (!ctrl->engaged)
         {
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), setaz);
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), setel);
         }
-
     }
     else
     {
-        /* the control ranges have already been limited by conf */
+        /* Not tracking: use current knob values */
         setaz = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
         setel = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
     }
 
-    if ((ctrl->engaged) && (ctrl->conf != NULL))
+    /* Handle I/O with rotctld client if running and not in monitor mode */
+    if (ctrl->client.running && !ctrl->monitor)
     {
-
         if (g_mutex_trylock(&ctrl->client.mutex))
         {
             error = ctrl->client.io_error;
@@ -838,7 +845,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 gtk_label_set_text(GTK_LABEL(ctrl->ElRead), text);
                 g_free(text);
 
-                if ((ctrl->conf->aztype == ROT_AZ_TYPE_180) && (rotaz < 0.0))
+                if (ctrl->conf->aztype == ROT_AZ_TYPE_180 && rotaz < 0.0)
                 {
                     gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
                                                  rotaz + 360.0, rotel);
@@ -852,56 +859,43 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
 
         /* if tolerance exceeded */
-        if ((fabs(setaz - rotaz) > ctrl->threshold) ||
-            (fabs(setel - rotel) > ctrl->threshold))
+        if (fabs(setaz - rotaz) > ctrl->threshold ||
+            fabs(setel - rotel) > ctrl->threshold)
         {
-            if (ctrl->tracking)
+            if (ctrl->tracking && ctrl->target && ctrl->conf)
             {
-                /* if we are in a pass try to lead the satellite 
-                   some so we are not always chasing it */
-                if (ctrl->target && ctrl->target->el > 0.0)
+                /* if we are in a pass try to lead the satellite some
+                 * so we are not always chasing it
+                 */
+                if (ctrl->target->el > 0.0)
                 {
-                    /* starting the rotator moving while we do some computation
-                     * can lead to errors later */
-                    /* compute a time in the future when the position is 
-                       within tolerance so and send the rotor there.
-                     */
-
                     /* use a working copy so data does not get corrupted */
-                    sat = memcpy(&(sat_working), ctrl->target, sizeof(sat_t));
+                    sat = memcpy(&sat_working, ctrl->target, sizeof(sat_t));
 
-                    /* compute az/el in the future that is past end of pass 
-                       or exceeds tolerance
+                    /* compute az/el in the future that is past end of pass
+                     * or exceeds tolerance
                      */
                     if (ctrl->pass)
-                    {
-                        /* the next point is before the end of the pass 
-                           if there is one. */
                         time_delta = ctrl->pass->los - ctrl->t;
-                    }
                     else
-                    {
-                        /* otherwise look 20 minutes into the future */
-                        time_delta = 1.0 / 72.0;
-                    }
+                        time_delta = 1.0 / 72.0; /* ~20 minutes */
 
                     /* have a minimum time delta */
                     step_size = time_delta / 2.0;
-                    if (step_size < ctrl->delay / 1000.0 / (secday))
-                    {
-                        step_size = ctrl->delay / 1000.0 / (secday);
-                    }
-                    /* find a time when satellite is above horizon and at the 
-                       edge of tolerance. the final step size needs to be smaller
-                       than delay. otherwise the az/el could be further away than
-                       tolerance the next time we enter the loop and we end up 
-                       pushing ourselves away from the satellite.
+                    if (step_size < ctrl->delay / 1000.0 / secday)
+                        step_size = ctrl->delay / 1000.0 / secday;
+
+                    /* search for a time when satellite is above horizon
+                     * and at the edge of tolerance
                      */
-                    while (step_size > (ctrl->delay / 1000.0 / 4.0 / (secday)))
+                    while (step_size > (ctrl->delay / 1000.0 / 4.0 / secday))
                     {
                         predict_calc(sat, ctrl->qth, ctrl->t + time_delta);
-                        /*update sat->az and sat->el to account for flips and az range */
-                        if ((ctrl->flipped) && (ctrl->conf->maxel >= 180.0))
+
+                        /* update sat->az and sat->el to account for flips
+                         * and az range
+                         */
+                        if (ctrl->flipped && ctrl->conf->maxel >= 180.0)
                         {
                             sat->el = 180.0 - sat->el;
                             if (sat->az > 180.0)
@@ -909,14 +903,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                             else
                                 sat->az += 180.0;
                         }
-                        if ((ctrl->conf->aztype == ROT_AZ_TYPE_180) &&
-                            (sat->az > 180.0))
-                        {
-                            sat->az = sat->az - 360.0;
-                        }
-                        if ((sat->el < 0.0) || (sat->el > 180.0) ||
-                            (fabs(setaz - sat->az) > (ctrl->threshold)) ||
-                            (fabs(setel - sat->el) > (ctrl->threshold)))
+
+                        if (ctrl->conf->aztype == ROT_AZ_TYPE_180 &&
+                            sat->az > 180.0)
+                            sat->az -= 360.0;
+
+                        if (sat->el < 0.0 || sat->el > 180.0 ||
+                            fabs(setaz - sat->az) > ctrl->threshold ||
+                            fabs(setel - sat->el) > ctrl->threshold)
                         {
                             time_delta -= step_size;
                         }
@@ -924,15 +918,16 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         {
                             time_delta += step_size;
                         }
+
                         step_size /= 2.0;
                     }
+
                     setel = SAFE_ELE(sat->el);
                     setaz = SAFE_AZI(sat->az);
                 }
             }
 
-            /* send controller values to rotator device */
-            /* this is the newly computed value which should be ahead of the current position */
+            /* send controller values to rotator device (via client thread) */
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), setaz);
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), setel);
             if (g_mutex_trylock(&ctrl->client.mutex))
@@ -942,13 +937,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 ctrl->client.new_trg = TRUE;
                 g_mutex_unlock(&ctrl->client.mutex);
             }
-
         }
 
         /* check error status */
         if (!error)
         {
-            /* reset error counter */
             ctrl->errcnt = 0;
         }
         else
@@ -960,23 +953,39 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                              FALSE);
                 ctrl->engaged = FALSE;
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _
-                            ("%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
+                            _("%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
                             __func__, MAX_ERROR_COUNT);
                 ctrl->errcnt = 0;
-                //g_print ("ERROR. WROPS: %d   RDOPS: %d\n", ctrl->wrops, ctrl->rdops);
             }
             else
             {
-                /* increment error counter */
                 ctrl->errcnt++;
             }
+        }
+
+        /* update status label if present, based on real data */
+        if (status_label)
+        {
+            const gchar *status_text = NULL;
+
+            if (error)
+                status_text = _("ERROR: link/rotator");
+            else if (fabs(setaz - rotaz) > ctrl->threshold ||
+                     fabs(setel - rotel) > ctrl->threshold)
+                status_text = _("MOVING");
+            else
+                status_text = _("ON TARGET");
+
+            gtk_label_set_text(GTK_LABEL(status_label), status_text);
         }
     }
     else
     {
-        /* ensure rotor pos is not visible on plot */
+        /* client not running or monitor mode: ensure rotor pos is not visible */
         gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot), -10.0, -10.0);
+
+        if (status_label)
+            gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
     }
 
     /* update target object on polar plot */
@@ -989,29 +998,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     /* update controller circle on polar plot */
     if (ctrl->conf != NULL)
     {
-        if ((ctrl->conf->aztype == ROT_AZ_TYPE_180) && (setaz < 0.0))
-        {
-            gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                        gtk_rot_knob_get_value(GTK_ROT_KNOB
-                                                               (ctrl->AzSet)) +
-                                        360.0,
-                                        gtk_rot_knob_get_value(GTK_ROT_KNOB
-                                                               (ctrl->ElSet)));
-        }
-        else
-        {
-            gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                        gtk_rot_knob_get_value(GTK_ROT_KNOB
-                                                               (ctrl->AzSet)),
-                                        gtk_rot_knob_get_value(GTK_ROT_KNOB
-                                                               (ctrl->ElSet)));
-        }
+        gdouble dispaz = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+        gdouble dispel = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+
+        if (ctrl->conf->aztype == ROT_AZ_TYPE_180 && dispaz < 0.0)
+            dispaz += 360.0;
+
+        gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot), dispaz, dispel);
         gtk_widget_queue_draw(ctrl->plot);
     }
 
     return TRUE;
 }
-
 /**
  * Manage cycle delay changes.
  *
@@ -1195,6 +1193,10 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
                         __func__);
             return;
         }
+
+        /* ensure we are not in monitor mode when engaging by default */
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->MonitorCheckBox), FALSE);
+        ctrl->monitor = FALSE;
 
         ctrl->client.thread =
             g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
@@ -1396,7 +1398,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     }
 
     g_free(dirname);
-    g_dir_close(dir);
+    if (dir)
+        g_dir_close(dir);
 
     gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->DevSel), 0);
     g_signal_connect(ctrl->DevSel, "changed", G_CALLBACK(rot_selected_cb),
@@ -1459,11 +1462,47 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 2, 3, 1, 1);
 
+    /* Status line */
+    label = gtk_label_new(_("Status:"));
+    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+
+    GtkWidget *status = gtk_label_new(_("DISENGAGED"));
+    g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), status, 1, 4, 2, 1);
+
+    /* store pointer on the controller object for later updates */
+    g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
+
     /* load initial rotator configuration */
     rot_selected_cb(GTK_COMBO_BOX(ctrl->DevSel), ctrl);
 
     frame = gtk_frame_new(_("Settings"));
     gtk_container_add(GTK_CONTAINER(frame), table);
+
+    return frame;
+}
+
+/* Create calibration widgets */
+static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
+{
+    GtkWidget *frame, *grid, *label, *button;
+
+    frame = gtk_frame_new(_("Calibration"));
+
+    grid = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 5);
+    gtk_container_add(GTK_CONTAINER(frame), grid);
+
+    label = gtk_label_new(_("Auto-calibration (coming soon)"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
+
+    button = gtk_button_new_with_label(_("Start"));
+    gtk_widget_set_sensitive(button, FALSE);
+    gtk_grid_attach(GTK_GRID(grid), button, 1, 0, 1, 1);
 
     return frame;
 }
@@ -1528,7 +1567,8 @@ static gboolean have_conf()
     }
 
     g_free(dirname);
-    g_dir_close(dir);
+    if (dir)
+        g_dir_close(dir);
 
     return (i > 0) ? TRUE : FALSE;
 }
@@ -1545,11 +1585,13 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->plot = NULL;
 
     ctrl->tracking = FALSE;
+    ctrl->monitor  = FALSE;
     ctrl->engaged = FALSE;
     ctrl->delay = 1000;
     ctrl->timerid = 0;
     ctrl->threshold = 5.0;
     ctrl->errcnt = 0;
+    ctrl->conf = NULL;
 
     g_mutex_init(&ctrl->client.mutex);
     ctrl->client.thread = NULL;
@@ -1578,10 +1620,12 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     }
 
     /* stop client thread */
-    if (ctrl->client.running)
+    if (ctrl->client.thread)
     {
+        /* Signal the thread to stop, then wait for it */
         ctrl->client.running = FALSE;
         g_thread_join(ctrl->client.thread);
+        ctrl->client.thread = NULL;
     }
 
     g_mutex_clear(&ctrl->client.mutex);
@@ -1677,6 +1721,7 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
                     0, 1, 1, 1);
     gtk_grid_attach(GTK_GRID(table), create_conf_widgets(rot_ctrl),
                     1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), create_cal_widgets(rot_ctrl), 0, 2, 2, 1);
 
     gtk_box_pack_start(GTK_BOX(rot_ctrl), create_plot_widget(rot_ctrl),
                        TRUE, TRUE, 5);
@@ -1685,6 +1730,13 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 
     if (module->target > 0)
         gtk_rot_ctrl_select_sat(rot_ctrl, module->target);
+
+    /* start the control loop timer so we actually send commands */
+    if (rot_ctrl->timerid == 0) {
+        rot_ctrl->timerid = g_timeout_add(rot_ctrl->delay,
+                                          rot_ctrl_timeout_cb,
+                                          rot_ctrl);
+    }
 
     return GTK_WIDGET(rot_ctrl);
 }
