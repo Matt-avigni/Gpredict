@@ -372,7 +372,15 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     g_print("set_pos: az=%.2f el=%.2f\n", az, el);
 
     /* send command */
-    buff = g_strdup_printf("P %.2f %.2f\x0a", az, el);
+    {
+        gchar azbuf[G_ASCII_DTOSTR_BUF_SIZE];
+        gchar elbuf[G_ASCII_DTOSTR_BUF_SIZE];
+
+        g_ascii_dtostr(azbuf, sizeof(azbuf), az);
+        g_ascii_dtostr(elbuf, sizeof(elbuf), el);
+
+        buff = g_strdup_printf("P %s %s\x0a", azbuf, elbuf);
+    }
     retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
     g_free(buff);
 
@@ -1276,6 +1284,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 
         ctrl->client.running = FALSE;
         g_thread_join(ctrl->client.thread);
+        ctrl->client.thread = NULL;
     }
     else
     {
