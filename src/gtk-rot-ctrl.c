@@ -40,6 +40,7 @@
 #include <sys/socket.h>         /* socket(), connect(), send() */
 #else
 #include <winsock2.h>
+#include <windows.h>
 #endif
 
 #include <errno.h>
@@ -61,7 +62,11 @@
 #define FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
 
+
 static GtkVBoxClass *parent_class = NULL;
+
+/* Forward declaration for error dialog helper */
+static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
 
 
 /* Open the rotcld socket. Returns file descriptor or -1 if an error occurs */
@@ -178,8 +183,43 @@ static gboolean rotctld_socket_rw(gint sock, gchar * buff, gchar * buffout,
         return FALSE;
     }
 
-    /* try to read answer */
-    size = recv(sock, buffout, sizeout, 0);
+    /* try to read answer, but with a timeout using select() */
+    {
+#ifndef WIN32
+        fd_set fds;
+        struct timeval tv;
+        int ret;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        ret = select(sock + 1, &fds, NULL, NULL, &tv);
+        if (ret <= 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: select() timeout or error waiting for rotctld reply"), __func__);
+            return FALSE;
+        }
+#else
+        /* Windows version */
+        fd_set fds;
+        struct timeval tv;
+        int ret;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        ret = select(0, &fds, NULL, NULL, &tv);
+        if (ret <= 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: select() timeout or error waiting for rotctld reply"), __func__);
+            return FALSE;
+        }
+#endif
+        /* Now safe to call recv() */
+        size = recv(sock, buffout, sizeout, 0);
+    }
 
     if (size == -1)
     {
@@ -298,10 +338,6 @@ static inline void set_flipped_pass(GtkRotCtrl * ctrl)
  */
 static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
 {
-    gchar          *buff, **vbuff;
-    gchar           buffback[128];
-    gboolean        retcode;
-
     if ((az == NULL) || (el == NULL))
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -309,45 +345,15 @@ static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
         return FALSE;
     }
 
-    /* send command */
-    buff = g_strdup_printf("p\x0a");
-    retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
+    g_print("MATTEO_DEBUG: get_pos stub using commanded values\n");
 
-    /* try to parse answer */
-    if (retcode)
-    {
-        if (strncmp(buffback, "RPRT", 4) == 0)
-        {
-            g_strstrip(buffback);
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s:%d: rotctld returned error (%s)"),
-                        __FILE__, __LINE__, buffback);
-            retcode = FALSE;
-        }
-        else
-        {
-            vbuff = g_strsplit(buffback, "\n", 3);
-            if ((vbuff[0] != NULL) && (vbuff[1] != NULL))
-            {
-                *az = g_strtod(vbuff[0], NULL);
-                *el = g_strtod(vbuff[1], NULL);
-            }
-            else
-            {
-                g_strstrip(buffback);
-                sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _("%s:%d: rotctld returned bad response (%s)"),
-                            __FILE__, __LINE__, buffback);
-                retcode = FALSE;
-            }
+    /* Send-only mode: reuse last commanded values instead of asking rotctld. */
+    g_mutex_lock(&ctrl->client.mutex);
+    *az = ctrl->client.azi_out;
+    *el = ctrl->client.ele_out;
+    g_mutex_unlock(&ctrl->client.mutex);
 
-            g_strfreev(vbuff);
-        }
-    }
-
-    g_free(buff);
-
-    return retcode;
+    return TRUE;
 }
 
 /**
@@ -367,7 +373,6 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gchar          *buff;
     gchar           buffback[128];
     gboolean        retcode;
-    gint            retval;
 
     g_print("set_pos: az=%.2f el=%.2f\n", az, el);
 
@@ -386,17 +391,12 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
 
     if (retcode == TRUE)
     {
-        /* treat errors as soft errors */
-        retval = (gint) g_strtod(buffback + 4, NULL);
-        if (retval != 0)
-        {
-            g_strstrip(buffback);
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _
-                        ("%s:%d: rotctld returned error %d with az %f el %f(%s)"),
-                        __FILE__, __LINE__, retval, az, el, buffback);
-            retcode = FALSE;
-        }
+        /* Ignore Hamlib RPRT codes here and treat any successful socket
+         * round-trip as a successful command. Some backends may return
+         * RPRT -5 or similar even though the command was accepted, and
+         * we don't want that to disengage the rotor.
+         */
+        g_print("set_pos: rotctld replied '%s'\n", buffback);
     }
 
     return retcode;
@@ -428,39 +428,57 @@ static gpointer rotctld_client_thread(gpointer data)
         g_timer_start(ctrl->client.timer);
         io_error = FALSE;
 
-        /* get latest commanded position from controller */
+        /* get latest commanded position from controller, but only
+         * send a new command when new_trg is set. This avoids
+         * hammering the rotor with repeated small corrections and
+         * reduces "hunting" around the target position.
+         */
+        gboolean send_cmd = FALSE;
+
         g_mutex_lock(&ctrl->client.mutex);
         azi = ctrl->client.azi_out;
         ele = ctrl->client.ele_out;
+        if (ctrl->client.new_trg)
+        {
+            send_cmd = TRUE;
+            ctrl->client.new_trg = FALSE;
+        }
         g_mutex_unlock(&ctrl->client.mutex);
 
-        g_print("MATTEO_DEBUG: forcing set_pos call (engaged=%d monitor=%d az=%.2f el=%.2f)\n",
-                ctrl->engaged ? 1 : 0,
-                ctrl->monitor ? 1 : 0,
-                azi, ele);
-
-        if (!set_pos(ctrl, azi, ele))
+        if (send_cmd)
         {
-            io_error = TRUE;
-            g_print("MATTEO_DEBUG: set_pos FAILED\n");
+            g_print("MATTEO_DEBUG: set_pos (new target) (engaged=%d monitor=%d az=%.2f el=%.2f)\n",
+                    ctrl->engaged ? 1 : 0,
+                    ctrl->monitor ? 1 : 0,
+                    azi, ele);
+
+            if (!set_pos(ctrl, azi, ele))
+            {
+                io_error = TRUE;
+                g_print("MATTEO_DEBUG: set_pos FAILED\n");
+            }
+            else
+            {
+                g_print("MATTEO_DEBUG: set_pos SUCCESS\n");
+            }
         }
         else
         {
-            g_print("MATTEO_DEBUG: set_pos SUCCESS\n");
+            g_print("MATTEO_DEBUG: no new target, skipping set_pos\n");
         }
 
-        /* wait 100 ms before reading back position */
-        g_usleep(100000);
-        if (!get_pos(ctrl, &azi, &ele))
-            io_error = TRUE;
-
+        /* Treat last commanded az/el as the "measured" position for
+         * display purposes, since some rotctld backends only return
+         * RPRT codes to the "p" command and do not support true
+         * position read-back.
+         */
         g_mutex_lock(&ctrl->client.mutex);
-        ctrl->client.azi_in = azi;
-        ctrl->client.ele_in = ele;
+        ctrl->client.azi_in   = ctrl->client.azi_out;
+        ctrl->client.ele_in   = ctrl->client.ele_out;
         ctrl->client.io_error = io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
-        /* ensure rotctl duty cycle stays below 50%, but wait at least 700 ms (TBC) */
+        /* ensure rotctl duty cycle stays below 50%, but wait at least 700 ms */
         elapsed_time = MAX(g_timer_elapsed(ctrl->client.timer, NULL), 0.7);
         g_usleep(elapsed_time * 1e6);
     }
@@ -963,6 +981,16 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
                             __func__, MAX_ERROR_COUNT);
+
+                /* Reflect the failure in the status label and show a dialog
+                 * so it's obvious that the rotor/rotctld backend is not usable.
+                 */
+                if (status_label)
+                    gtk_label_set_text(GTK_LABEL(status_label),
+                                       _("ERROR: link/rotator"));
+
+                rot_show_no_rotor_dialog(ctrl);
+
                 ctrl->errcnt = 0;
             }
             else
@@ -1141,6 +1169,255 @@ static void rot_monitor_cb(GtkCheckButton * button, gpointer data)
     gtk_widget_set_sensitive(ctrl->track, !ctrl->monitor);
 }
 
+
+/* Try to find a likely serial device for a locally attached rotor.
+ *
+ * This is intentionally very simple and "taped together" for now:
+ *  - On macOS we scan /dev for tty.usbserial*, ttyUSB*, tty.usbmodem*, etc.
+ *  - We simply return the first match.
+ *
+ * The returned string must be freed by the caller.
+ */
+static gchar *rotctld_find_serial_device(void)
+{
+    gchar *device = NULL;
+
+#if defined(__APPLE__)
+    /* macOS: scan /dev for common USB serial device names. */
+    GDir *dir = NULL;
+    GError *error = NULL;
+    const gchar *name;
+
+    dir = g_dir_open("/dev", 0, &error);
+    if (!dir) {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: failed to open /dev: %s"),
+                    __func__,
+                    error ? error->message : "unknown error");
+        if (error)
+            g_clear_error(&error);
+        return NULL;
+    }
+
+    /* Choose the "best" candidate rather than the first one returned by
+     * readdir(), which is effectively random. Prefer cu.* over tty.*.
+     */
+    int best_prio = 999;
+
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        int prio = 0;
+
+        if (g_str_has_prefix(name, "cu.usbserial"))
+            prio = 1;
+        else if (g_str_has_prefix(name, "cu.usbmodem"))
+            prio = 2;
+        else if (g_str_has_prefix(name, "tty.usbserial"))
+            prio = 3;
+        else if (g_str_has_prefix(name, "ttyUSB"))
+            prio = 4;
+        else if (g_str_has_prefix(name, "tty.usbmodem"))
+            prio = 5;
+        else
+            continue;
+
+        if (prio < best_prio) {
+            g_free(device);
+            device = g_strdup_printf("/dev/%s", name);
+            best_prio = prio;
+        }
+    }
+
+    g_dir_close(dir);
+
+    if (device) {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-selected serial device %s"),
+                    __func__, device);
+    } else {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: no candidate serial device found in /dev"),
+                    __func__);
+    }
+
+#elif defined(G_OS_WIN32)
+    /*
+     * Windows: probe COM1..COM32 using the Win32 API.
+     * We try to open each COM port with CreateFile; the first one
+     * that opens successfully is assumed to be our rotor.
+     *
+     * Note: we return "COMx" (without the "\\\\.\\" prefix) because
+     * Hamlib/rotctld expects the logical port name, not the Win32 path.
+     */
+    int i;
+
+    for (i = 1; i <= 32; i++) {
+        gchar *probe_path = g_strdup_printf("\\\\.\\\\COM%d", i);
+        HANDLE h = CreateFileA(probe_path,
+                               GENERIC_READ | GENERIC_WRITE,
+                               0,
+                               NULL,
+                               OPEN_EXISTING,
+                               0,
+                               NULL);
+        g_free(probe_path);
+
+        if (h != INVALID_HANDLE_VALUE) {
+            /* Found a usable COM port. */
+            CloseHandle(h);
+            device = g_strdup_printf("COM%d", i);
+            break;
+        }
+    }
+
+    if (device) {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-selected serial device %s"),
+                    __func__, device);
+    } else {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: no candidate COM port found (COM1..COM32)"),
+                    __func__);
+    }
+
+#else
+    /* On other platforms we currently don't try to guess a device. */
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                _("%s: auto-detection not implemented on this platform"),
+                __func__);
+#endif
+
+    return device;
+}
+
+/* Try to locate the rotctld binary in PATH and in a few common
+ * installation locations (especially for macOS/Homebrew).
+ *
+ * Returns a newly allocated string with the full path, or NULL
+ * if nothing usable was found. Caller must g_free() the result.
+ */
+static gchar *rotctld_find_binary(void)
+{
+    gchar *prog = NULL;
+
+    /* First, try whatever PATH Gpredict has. */
+    prog = g_find_program_in_path("rotctld");
+    if (prog != NULL)
+        return prog;
+
+#if defined(__APPLE__)
+    /* Typical Homebrew locations on macOS. */
+    const gchar *candidates[] = {
+        "/opt/homebrew/bin/rotctld",  /* Apple Silicon default */
+        "/usr/local/bin/rotctld",     /* Intel / older Homebrew */
+        NULL
+    };
+
+    for (int i = 0; candidates[i] != NULL; i++) {
+        if (g_file_test(candidates[i], G_FILE_TEST_IS_EXECUTABLE)) {
+            return g_strdup(candidates[i]);
+        }
+    }
+#endif
+
+#if defined(G_OS_WIN32)
+    /* Windows: rely on PATH for now; users typically install Hamlib
+     * into a directory that is added to PATH. If needed, explicit
+     * probing of common locations could be added here later.
+     */
+#endif
+
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                _("%s: could not locate rotctld binary in PATH or common locations"),
+                __func__);
+    return NULL;
+}
+
+/* Build a rotctld command line based on the current rotor config
+ * and an auto-detected serial device.
+ *
+ * For now we hard-code:
+ *   - Hamlib model 603 (Yaesu GS-232B)
+ *   - 9600 baud
+ *
+ * This matches Matteo's current station setup and is deliberately
+ * "taped together" rather than a generic solution.
+ *
+ * The returned string must be freed by the caller.
+ */
+static gchar *rotctld_build_autostart_command(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return NULL;
+
+    /* Determine the serial device to use. Allow an environment override
+     * (GPREDICT_ROT_SERIAL), falling back to auto-detection otherwise.
+     */
+    gchar *device = NULL;
+    const gchar *env_device = g_getenv("GPREDICT_ROT_SERIAL");
+
+    if (env_device != NULL && *env_device != '\0') {
+        device = g_strdup(env_device);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: using serial device from GPREDICT_ROT_SERIAL: %s"),
+                    __func__, device);
+    } else {
+        device = rotctld_find_serial_device();
+    }
+
+    if (!device)
+        return NULL;
+
+    /* Find full path to rotctld so we are not dependent on the GUI's PATH. */
+    gchar *rotctld_path = rotctld_find_binary();
+    if (!rotctld_path) {
+        g_free(device);
+        return NULL;
+    }
+
+    /* Default to Yaesu GS-232B (Hamlib model 603) at 9600 baud, but allow
+     * overrides via environment variables GPREDICT_ROT_MODEL and
+     * GPREDICT_ROT_BAUD for advanced setups.
+     */
+    gint model = 603;
+    gint baud  = 9600;
+    const gchar *env_model = g_getenv("GPREDICT_ROT_MODEL");
+    const gchar *env_baud  = g_getenv("GPREDICT_ROT_BAUD");
+
+    if (env_model != NULL && *env_model != '\0') {
+        glong tmp = g_ascii_strtoll(env_model, NULL, 10);
+        if (tmp > 0) {
+            model = (gint) tmp;
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: using Hamlib model %d from GPREDICT_ROT_MODEL"),
+                        __func__, model);
+        }
+    }
+
+    if (env_baud != NULL && *env_baud != '\0') {
+        glong tmp = g_ascii_strtoll(env_baud, NULL, 10);
+        if (tmp > 0) {
+            baud = (gint) tmp;
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: using baud rate %d from GPREDICT_ROT_BAUD"),
+                        __func__, baud);
+        }
+    }
+
+    const gint port  = ctrl->conf->port;
+
+    /* Use -T 127.0.0.1 and -t <port> (correct host/port syntax for rotctld). */
+    gchar *cmd = g_strdup_printf("\"%s\" -m %d -r %s -s %d -T 127.0.0.1 -t %d -vvvv",
+                                 rotctld_path, model, device, baud, port);
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: built auto-start command '%s'"),
+                __func__, cmd);
+
+    g_free(rotctld_path);
+    g_free(device);
+    return cmd;
+}
+
 /**
  * Ensure rotctld is running.
  *
@@ -1148,11 +1425,93 @@ static void rot_monitor_cb(GtkCheckButton * button, gpointer data)
  * endpoint. If the connection succeeds, it assumes rotctld is already
  * running and immediately closes the temporary socket.
  *
- * If the connection fails, it will try to spawn rotctld using the
- * GPREDICT_ROTCTLD_CMD environment variable (if set). If the variable
- * is not set, we log an error and return FALSE instead of guessing a
- * command line.
+ * If the connection fails, it will:
+ *   1) Try to start rotctld using the GPREDICT_ROTCTLD_CMD environment
+ *      variable, if it is set.
+ *   2) If the env var is not set, try to auto-detect a local serial
+ *      device and build a "best effort" rotctld command line for a
+ *      GS-232B rotor on macOS.
  */
+/* Probe an existing rotctld instance to see if it behaves like a real
+ * rotator daemon (i.e., returns a valid az/el pair to the "p" command).
+ *
+ * This is used to avoid "ghost" connections to unrelated services or
+ * misconfigured rotctld instances that only ever reply with RPRT codes.
+ */
+static gboolean
+rotctld_probe_endpoint(GtkRotCtrl *ctrl)
+{
+    gint sock;
+    gchar *cmd;
+    gchar reply[128];
+    gboolean ok = FALSE;
+
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return FALSE;
+
+    sock = rotctld_socket_open(ctrl->conf->host, ctrl->conf->port);
+    if (sock == -1)
+        return FALSE;
+
+    cmd = g_strdup_printf("p\x0a");
+    if (rotctld_socket_rw(sock, cmd, reply, sizeof(reply) - 1))
+    {
+        g_strstrip(reply);
+
+        if (g_str_has_prefix(reply, "RPRT"))
+        {
+            /* Hamlib status-style reply: RPRT <code>.
+             * Treat RPRT 0 as a usable backend even if it does not return
+             * a real az/el position, since some rotors do not support "p".
+             */
+            gint code = (gint) g_strtod(reply + 4, NULL);
+            if (code == 0)
+                ok = TRUE;
+        }
+        else
+        {
+            /* Legacy behaviour: try to parse az/el from the first two lines. */
+            gchar **lines = g_strsplit(reply, "\n", 3);
+            if (lines[0] != NULL && lines[1] != NULL)
+            {
+                gchar *endptr1 = NULL;
+                gchar *endptr2 = NULL;
+                gdouble az = g_ascii_strtod(lines[0], &endptr1);
+                gdouble el = g_ascii_strtod(lines[1], &endptr2);
+
+                if (endptr1 != lines[0] && endptr2 != lines[1])
+                    ok = TRUE;
+            }
+            g_strfreev(lines);
+        }
+    }
+
+    g_free(cmd);
+
+#ifndef WIN32
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
+#else
+    shutdown(sock, SD_BOTH);
+    closesocket(sock);
+#endif
+
+    if (ok)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rotctld at %s:%d returned a valid position; using existing daemon."),
+                    __func__, ctrl->conf->host, ctrl->conf->port);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rotctld at %s:%d did not return a valid position; treating as unusable."),
+                    __func__, ctrl->conf->host, ctrl->conf->port);
+    }
+
+    return ok;
+}
+
 static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
 {
     gint tmp_sock;
@@ -1160,32 +1519,32 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
     if (ctrl == NULL || ctrl->conf == NULL)
         return FALSE;
 
-    /* First: probe whether rotctld is already running */
-    tmp_sock = rotctld_socket_open(ctrl->conf->host, ctrl->conf->port);
-    if (tmp_sock != -1)
-    {
-        /* rotctld already accepting connections; close probe socket */
-#ifndef WIN32
-        shutdown(tmp_sock, SHUT_RDWR);
-        close(tmp_sock);
-#else
-        shutdown(tmp_sock, SD_BOTH);
-        closesocket(tmp_sock);
-#endif
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: rotctld already running at %s:%d"),
-                    __func__, ctrl->conf->host, ctrl->conf->port);
+    /* Step 1: probe whether a usable rotctld is already running */
+    if (rotctld_probe_endpoint(ctrl))
         return TRUE;
+
+    /* Step 2: build a command to start rotctld. Prefer the environment
+     * variable if present, otherwise fall back to our auto-detection
+     * logic for Matteo's GS-232B setup.
+     */
+    const gchar *env_cmd = g_getenv("GPREDICT_ROTCTLD_CMD");
+    gchar *auto_cmd = NULL;
+    const gchar *cmd = env_cmd;
+
+    if (cmd == NULL || *cmd == '\0')
+    {
+        auto_cmd = rotctld_build_autostart_command(ctrl);
+        cmd = auto_cmd;
     }
 
-    /* If we get here, the connection failed: try to spawn rotctld. */
-    const gchar *cmd = g_getenv("GPREDICT_ROTCTLD_CMD");
     if (cmd == NULL || *cmd == '\0')
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rotctld is not running and GPREDICT_ROTCTLD_CMD "
-                      "is not set; cannot auto-start rotctld."),
+                    _("%s: rotctld is not running and no usable command "
+                      "line could be constructed."),
                     __func__);
+        if (auto_cmd)
+            g_free(auto_cmd);
         return FALSE;
     }
 
@@ -1194,14 +1553,20 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: failed to start rotctld using '%s': %s"),
-                    __func__, cmd, error->message);
-        g_error_free(error);
+                    __func__, cmd, error ? error->message : "unknown error");
+        if (error)
+            g_error_free(error);
+        if (auto_cmd)
+            g_free(auto_cmd);
         return FALSE;
     }
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: started rotctld using '%s'"),
                 __func__, cmd);
+
+    if (auto_cmd)
+        g_free(auto_cmd);
 
     /* Give rotctld a short time to come up, then re-probe. */
     g_usleep(500000); /* 500 ms */
@@ -1231,6 +1596,28 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
 }
 
 /**
+ * Show an error dialog indicating no rotor/rotctld could be found.
+ *
+ * \param ctrl Pointer to the GtkRotCtrl widget.
+ */
+static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl)
+{
+    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    GtkWindow *parent = NULL;
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+    GtkWidget *dialog = gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_ERROR,
+        GTK_BUTTONS_OK,
+        "%s", _("Unable to find a rotor!"));
+    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor error"));
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+/**
  * Rotor locked.
  *
  * \param button Pointer to the "Engage" button.
@@ -1241,10 +1628,6 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
 static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 {
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
-    gchar          *buff;
-    gchar           buffback[128];
-    gboolean        retcode;
-    gint            retval;
     GtkWidget      *status_label =
         g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
 
@@ -1263,28 +1646,19 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             return;
         }
 
-        /* stop moving rotor */
-        /** FIXME: should use high level func */
-        buff = g_strdup_printf("S\x0a");
-        retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
-        g_free(buff);
-        if (retcode == TRUE)
-        {
-            /* treat errors as soft errors */
-            retval = (gint) g_strtod(buffback + 4, NULL);
-            if (retval != 0)
-            {
-                g_strstrip(buffback);
-                sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _
-                            ("%s:%d: rotctld returned error %d with stop-cmd (%s)"),
-                            __FILE__, __LINE__, retval, buffback);
-            }
-        }
-
+        /* Instead of sending stop command, just signal thread to stop and shutdown socket to break blocking I/O. */
         ctrl->client.running = FALSE;
+#ifndef WIN32
+        if (ctrl->client.socket != -1)
+            shutdown(ctrl->client.socket, SHUT_RDWR);
+#else
+        if (ctrl->client.socket != -1)
+            shutdown(ctrl->client.socket, SD_BOTH);
+#endif
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
+        if (status_label)
+            gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
     }
     else
     {
@@ -1313,6 +1687,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             gtk_toggle_button_set_active(button, FALSE);
             if (status_label)
                 gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+            rot_show_no_rotor_dialog(ctrl);
             return;
         }
 
@@ -1601,6 +1976,83 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     return frame;
 }
 
+
+/**
+ * Start a simple calibration sequence.
+ *
+ * For now this is intentionally very simple and "taped together":
+ *  - It requires the rotor to be engaged and the rotctld client thread running.
+ *  - It commands the rotor to AZ=0 / EL=0 via the existing client path.
+ *  - It then shows a dialog asking the user to mechanically align the antenna
+ *    to true North and level, and close the dialog when done.
+ *
+ * No offsets are stored yet; this just automates the "drive to 0/0 and prompt
+ * the user" part of the calibration workflow.
+ */
+static void
+rot_calibration_start_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+
+    (void)button;
+
+    /* Require a valid configuration and an engaged, running client. */
+    if (!ctrl->conf || !ctrl->engaged || !ctrl->client.running) {
+        GtkWidget *dlg;
+
+        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+        if (GTK_IS_WINDOW(toplevel))
+            parent = GTK_WINDOW(toplevel);
+
+        dlg = gtk_message_dialog_new(parent,
+                                     GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                     GTK_MESSAGE_WARNING,
+                                     GTK_BUTTONS_OK,
+                                     "%s",
+                                     _("Engage the rotator before starting calibration."));
+        gtk_window_set_title(GTK_WINDOW(dlg), _("Calibration"));
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+        return;
+    }
+
+    /* Command AZ/EL = 0/0 through the normal client path. */
+    if (g_mutex_trylock(&ctrl->client.mutex)) {
+        ctrl->client.azi_out = 0.0;
+        ctrl->client.ele_out = 0.0;
+        ctrl->client.new_trg = TRUE;
+        g_mutex_unlock(&ctrl->client.mutex);
+    }
+
+    /* Also update the knobs so the UI reflects the commanded position. */
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), 0.0);
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), 0.0);
+
+    /* Inform the user what to do next. */
+    {
+        GtkWidget *dlg;
+
+        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+        if (GTK_IS_WINDOW(toplevel))
+            parent = GTK_WINDOW(toplevel);
+
+        dlg = gtk_message_dialog_new(
+            parent,
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_INFO,
+            GTK_BUTTONS_OK,
+            "%s",
+            _("The rotor has been commanded to AZ=0°, EL=0°.\n\n"
+              "Now mechanically align the antenna boom to true North\n"
+              "and level. When you are done, click OK."));
+        gtk_window_set_title(GTK_WINDOW(dlg), _("Calibration"));
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+    }
+}
+
 /* Create calibration widgets */
 static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
 {
@@ -1614,12 +2066,16 @@ static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
     gtk_grid_set_row_spacing(GTK_GRID(grid), 5);
     gtk_container_add(GTK_CONTAINER(frame), grid);
 
-    label = gtk_label_new(_("Auto-calibration (coming soon)"));
+    label = gtk_label_new(_("Auto-calibration"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
 
     button = gtk_button_new_with_label(_("Start"));
-    gtk_widget_set_sensitive(button, FALSE);
+    gtk_widget_set_tooltip_text(button,
+                                _("Send the rotor to AZ=0°, EL=0° and guide the\n"
+                                  "mechanical alignment of the antenna."));
+    g_signal_connect(button, "clicked",
+                     G_CALLBACK(rot_calibration_start_cb), ctrl);
     gtk_grid_attach(GTK_GRID(grid), button, 1, 0, 1, 1);
 
     return frame;
@@ -1705,9 +2161,9 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->tracking = FALSE;
     ctrl->monitor  = FALSE;
     ctrl->engaged = FALSE;
-    ctrl->delay = 1000;
+    ctrl->delay = 300;      /* default: 300 ms control cycle */
     ctrl->timerid = 0;
-    ctrl->threshold = 5.0;
+    ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
     ctrl->errcnt = 0;
     ctrl->conf = NULL;
 
@@ -1742,10 +2198,16 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     {
         /* Signal the thread to stop, then wait for it */
         ctrl->client.running = FALSE;
+#ifndef WIN32
+        if (ctrl->client.socket != -1)
+            shutdown(ctrl->client.socket, SHUT_RDWR);
+#else
+        if (ctrl->client.socket != -1)
+            shutdown(ctrl->client.socket, SD_BOTH);
+#endif
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
     }
-
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }

@@ -91,7 +91,45 @@ static void     rigctrl_open(GtkRigCtrl * data);
 static void     rigctrl_close(GtkRigCtrl * data);
 static void     setconfig(gpointer data);
 static void     remove_timer(GtkRigCtrl * data);
+
 static void     start_timer(GtkRigCtrl * data);
+
+/* Show a simple error dialog related to radio control */
+static void
+rig_show_error_dialog(GtkRigCtrl *ctrl,
+                      const gchar *primary,
+                      const gchar *secondary)
+{
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+    GtkWidget *dialog;
+
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    dialog =
+        gtk_message_dialog_new(parent,
+                               GTK_DIALOG_MODAL |
+                                   GTK_DIALOG_DESTROY_WITH_PARENT,
+                               GTK_MESSAGE_ERROR,
+                               GTK_BUTTONS_CLOSE,
+                               "%s",
+                               primary ? primary : _("Radio error"));
+
+    if (secondary != NULL && *secondary != '\0')
+    {
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+                                                 "%s",
+                                                 secondary);
+    }
+
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
 
 static GtkBoxClass *parent_class = NULL;
 
@@ -970,39 +1008,59 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
 
 static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
 {
-    GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
 
     if (ctrl->conf == NULL)
     {
-        /* we don't have a working configuration */
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: Controller does not have a valid configuration"),
-                    __func__);
+        /* We don't have a working configuration – inform the user and
+         * immediately revert the toggle.
+         */
+        rig_show_error_dialog(
+            ctrl,
+            _("Unable to engage radio"),
+            _("No valid radio configuration is selected.\n"
+              "Please create or select a radio configuration in\n"
+              "Interfaces → Radios before engaging radio control."));
+        gtk_toggle_button_set_active(button, FALSE);
         return;
     }
 
     if (!gtk_toggle_button_get_active(button))
     {
-        /* close socket */
+        /* Disengage: close socket / stop worker thread */
         gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
         gtk_widget_set_sensitive(ctrl->DevSel2, TRUE);
         ctrl->engaged = FALSE;
 
-        /*  stop worker thread... */
+        /* Notify worker thread about the new configuration/state */
         setconfig(ctrl);
+        /* The worker thread will clean up and exit; we just clear the
+         * handle so a new thread can be started on the next engage.
+         */
         ctrl->rigctl_thread = NULL;
     }
     else
     {
+        /* Engage: start worker thread */
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         gtk_widget_set_sensitive(ctrl->DevSel2, FALSE);
         ctrl->engaged = TRUE;
 
-        /*  start worker thread... */
-        ctrl->rigctlq = g_async_queue_new();
-        ctrl->rigctl_thread = g_thread_new("rigctl_run", rigctl_run, ctrl);
+        /* Start worker thread if not already running */
+        if (ctrl->rigctl_thread == NULL)
+        {
+            ctrl->rigctlq = g_async_queue_new();
+            ctrl->rigctl_thread =
+                g_thread_new("rigctl_run", rigctl_run, ctrl);
+        }
+
+        /* Push initial configuration to the worker */
         setconfig(ctrl);
     }
+
+    /* Always clear secondary rig configuration when toggling engage
+     * state; this mirrors the previous behaviour.
+     */
     ctrl->conf2 = NULL;
 }
 
