@@ -884,15 +884,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
-        /* if tolerance exceeded */
+        /* if tolerance exceeded between desired (setaz/setel)
+         * and current (rotaz/rotel) position
+         */
         if (fabs(setaz - rotaz) > ctrl->threshold ||
             fabs(setel - rotel) > ctrl->threshold)
         {
+            /* If tracking is enabled, refine the target to "lead" the pass
+             * a bit into the future, like the original code did.
+             * Manual mode skips this and just uses the knob values.
+             */
             if (ctrl->tracking && ctrl->target && ctrl->conf)
             {
-                /* if we are in a pass try to lead the satellite some
-                 * so we are not always chasing it
-                 */
                 if (ctrl->target->el > 0.0)
                 {
                     /* use a working copy so data does not get corrupted */
@@ -953,14 +956,28 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 }
             }
 
-            /* send controller values to rotator device (via client thread) */
+            /* Now drive the rotor towards setaz/setel for BOTH:
+             *  - tracking mode (satellite following)
+             *  - manual mode (knob control)
+             *
+             * We only post a new target to the client thread if it
+             * really changed compared to the last command, to avoid
+             * "rotor talking alone".
+             */
+
+            /* keep knobs in sync with the commanded position */
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), setaz);
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), setel);
+
             if (g_mutex_trylock(&ctrl->client.mutex))
             {
-                ctrl->client.azi_out = setaz;
-                ctrl->client.ele_out = setel;
-                ctrl->client.new_trg = TRUE;
+                if (fabs(setaz - ctrl->client.azi_out) > ctrl->threshold ||
+                    fabs(setel - ctrl->client.ele_out) > ctrl->threshold)
+                {
+                    ctrl->client.azi_out = setaz;
+                    ctrl->client.ele_out = setel;
+                    ctrl->client.new_trg = TRUE;
+                }
                 g_mutex_unlock(&ctrl->client.mutex);
             }
         }
@@ -1460,17 +1477,24 @@ rotctld_probe_endpoint(GtkRotCtrl *ctrl)
 
         if (g_str_has_prefix(reply, "RPRT"))
         {
-            /* Hamlib status-style reply: RPRT <code>.
-             * Treat RPRT 0 as a usable backend even if it does not return
-             * a real az/el position, since some rotors do not support "p".
+            /* Hamlib-style status reply: RPRT <code>.
+             *
+             * For Matteo's GS-232B/rotctld setup we treat *any* RPRT reply
+             * as proof that we are talking to a live rotctld instance,
+             * even if the backend does not support the "p" (position) query
+             * and returns an error code such as RPRT -6.
+             *
+             * We no longer require RPRT 0 specifically here because we rely
+             * on send-only control and do not depend on true position
+             * read-back from rotctld.
              */
-            gint code = (gint) g_strtod(reply + 4, NULL);
-            if (code == 0)
-                ok = TRUE;
+            ok = TRUE;
         }
         else
         {
-            /* Legacy behaviour: try to parse az/el from the first two lines. */
+            /* Legacy behaviour: try to parse az/el from the first two lines
+             * for older backends that still return numeric az/el values.
+             */
             gchar **lines = g_strsplit(reply, "\n", 3);
             if (lines[0] != NULL && lines[1] != NULL)
             {
