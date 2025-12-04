@@ -791,14 +791,27 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             {
                 if (ctrl->t < ctrl->pass->aos)
                 {
-                    setaz = SAFE_AZI(ctrl->pass->aos_az);
+                    /* Before AOS: you could choose to pre-point to AOS azimuth,
+                     * but for Matteo's station we keep the rotor at the
+                     * calibrated zero position when idle.
+                     */
+                    setaz = SAFE_AZI(0.0);
                     setel = SAFE_ELE(0.0);
                 }
                 else if (ctrl->t > ctrl->pass->los)
                 {
-                    setaz = SAFE_AZI(ctrl->pass->los_az);
+                    /* After LOS: automatically park the antenna at the
+                     * calibrated rest position AZ=0°, EL=0°.
+                     */
+                    setaz = SAFE_AZI(0.0);
                     setel = SAFE_ELE(0.0);
                 }
+            }
+            else
+            {
+                /* No current pass information: default to calibrated zero. */
+                setaz = SAFE_AZI(0.0);
+                setel = SAFE_ELE(0.0);
             }
         }
         else
@@ -1696,6 +1709,15 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             return;
         }
 
+        /* Automatically disable tracking when engaging so the rotor does not
+         * immediately jump to the current satellite target before calibration
+         * or manual positioning.
+         */
+        if (ctrl->tracking) {
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+            ctrl->tracking = FALSE;
+        }
+
         /* ensure we are not in monitor mode when engaging by default */
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->MonitorCheckBox), FALSE);
         ctrl->monitor = FALSE;
@@ -2042,6 +2064,15 @@ rot_calibration_start_cb(GtkButton *button, gpointer data)
         return;
     }
 
+    /* Disable tracking while calibration is running so that the
+     * control loop does not immediately override the 0/0 command
+     * with a satellite target az/el.
+     */
+    if (ctrl->tracking) {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+        ctrl->tracking = FALSE;
+    }
+
     /* Command AZ/EL = 0/0 through the normal client path. */
     if (g_mutex_trylock(&ctrl->client.mutex)) {
         ctrl->client.azi_out = 0.0;
@@ -2077,6 +2108,79 @@ rot_calibration_start_cb(GtkButton *button, gpointer data)
     }
 }
 
+/**
+ * Park the rotor at a "rest" position.
+ *
+ * For Matteo's current station we define the park position as
+ * AZ=0°, EL=90° (true North, antenna pointing straight up).
+ *
+ * This does NOT change the logical calibration (which remains
+ * AZ=0°, EL=0° at the North horizon). It is only a convenience
+ * command to move the rotor to a preferred rest position.
+ */
+static void
+rot_park_zenith_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+
+    (void)button;
+
+    /* Require a valid configuration and an engaged, running client. */
+    if (!ctrl->conf || !ctrl->engaged || !ctrl->client.running) {
+        GtkWidget *dlg;
+
+        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+        if (GTK_IS_WINDOW(toplevel))
+            parent = GTK_WINDOW(toplevel);
+
+        dlg = gtk_message_dialog_new(parent,
+                                     GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                     GTK_MESSAGE_WARNING,
+                                     GTK_BUTTONS_OK,
+                                     "%s",
+                                     _("Engage the rotator before parking it."));
+        gtk_window_set_title(GTK_WINDOW(dlg), _("Park rotor"));
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+        return;
+    }
+
+    /* Command AZ/EL = 0/90 through the normal client path. */
+    if (g_mutex_trylock(&ctrl->client.mutex)) {
+        ctrl->client.azi_out = 0.0;
+        ctrl->client.ele_out = 90.0;
+        ctrl->client.new_trg = TRUE;
+        g_mutex_unlock(&ctrl->client.mutex);
+    }
+
+    /* Also update the knobs so the UI reflects the commanded position. */
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), 0.0);
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), 90.0);
+
+    /* Inform the user what was commanded. */
+    {
+        GtkWidget *dlg;
+
+        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+        if (GTK_IS_WINDOW(toplevel))
+            parent = GTK_WINDOW(toplevel);
+
+        dlg = gtk_message_dialog_new(
+            parent,
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_INFO,
+            GTK_BUTTONS_OK,
+            "%s",
+            _("The rotor has been commanded to AZ=0°, EL=90° (park position).\n\n"
+              "Verify that the antenna is pointing straight up over true North."));
+        gtk_window_set_title(GTK_WINDOW(dlg), _("Park rotor"));
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+    }
+}
+
 /* Create calibration widgets */
 static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
 {
@@ -2101,6 +2205,18 @@ static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
     g_signal_connect(button, "clicked",
                      G_CALLBACK(rot_calibration_start_cb), ctrl);
     gtk_grid_attach(GTK_GRID(grid), button, 1, 0, 1, 1);
+
+    /* Park button: move rotor to AZ=0°, EL=90° (rest position) */
+    label = gtk_label_new(_("Park (AZ=0°, EL=90°)"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
+
+    button = gtk_button_new_with_label(_("Park"));
+    gtk_widget_set_tooltip_text(button,
+                                _("Send the rotor to AZ=0°, EL=90° as a rest/park position."));
+    g_signal_connect(button, "clicked",
+                     G_CALLBACK(rot_park_zenith_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(grid), button, 1, 1, 1, 1);
 
     return frame;
 }
