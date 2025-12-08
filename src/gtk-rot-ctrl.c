@@ -55,18 +55,68 @@
 #include "gtk-polar-plot.h"
 #include "gtk-rot-knob.h"
 #include "gtk-rot-ctrl.h"
+#include "gtk-sat-module.h"
 #include "predict-tools.h"
 #include "sat-log.h"
+#include "rotor-conf.h"
 
 
 #define FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
+
+typedef struct {
+    GThread        *thread;
+    GMutex          mutex;
+    gint            socket;
+    gboolean        running, new_trg;
+    gdouble         azi_out, ele_out;
+    gdouble         azi_in, ele_in;
+    gboolean        io_error;
+    GTimer         *timer;
+} rotctld_client_t;
+
+struct _GtkRotCtrl {
+    GtkBox          box;
+
+    GtkWidget      *AzSet, *AzRead;
+    GtkWidget      *ElSet, *ElRead;
+    GtkWidget      *SatSel, *AzSat, *ElSat, *SatCnt;
+    GtkWidget      *DevSel, *LockBut, *MonitorCheckBox;
+    GtkWidget      *track, *cycle_spin, *thld_spin;
+    GtkWidget      *plot;
+
+    GSList         *sats;
+    sat_t          *target;
+    pass_t         *pass;
+    qth_t          *qth;
+
+    guint           delay, timerid;
+    gdouble         threshold, t;
+    gint            errcnt;
+
+    gboolean        tracking, engaged, monitor, flipped;
+
+    rotor_conf_t   *conf;
+    rotctld_client_t client;
+
+    gboolean        use_offset;
+    gdouble         az_offset_deg, el_offset_deg;
+};
+
+struct _GtkRotCtrlClass {
+    GtkBoxClass     parent_class;
+};
 
 
 static GtkVBoxClass *parent_class = NULL;
 
 /* Forward declaration for error dialog helper */
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
+
+/* Offset controls callbacks */
+static void offset_toggle_cb(GtkToggleButton *button, gpointer data);
+static void az_offset_changed_cb(GtkSpinButton *spin, gpointer data);
+static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data);
 
 
 /* Open the rotcld socket. Returns file descriptor or -1 if an error occurs */
@@ -774,9 +824,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gdouble time_delta;
     gdouble step_size;
 
-#define SAFE_AZI(azi) CLAMP(azi, ctrl->conf->minaz, ctrl->conf->maxaz)
-#define SAFE_ELE(ele) CLAMP(ele, ctrl->conf->minel, ctrl->conf->maxel)
-
     /* If we are tracking and the target satellite is within range, set the
      * rotor position controller knob values to the target values. If the
      * target satellite is out of range set the rotor controller to 0 deg El
@@ -795,29 +842,29 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                      * but for Matteo's station we keep the rotor at the
                      * calibrated zero position when idle.
                      */
-                    setaz = SAFE_AZI(0.0);
-                    setel = SAFE_ELE(0.0);
+                    setaz = 0.0;
+                    setel = 0.0;
                 }
                 else if (ctrl->t > ctrl->pass->los)
                 {
                     /* After LOS: automatically park the antenna at the
                      * calibrated rest position AZ=0°, EL=0°.
                      */
-                    setaz = SAFE_AZI(0.0);
-                    setel = SAFE_ELE(0.0);
+                    setaz = 0.0;
+                    setel = 0.0;
                 }
             }
             else
             {
                 /* No current pass information: default to calibrated zero. */
-                setaz = SAFE_AZI(0.0);
-                setel = SAFE_ELE(0.0);
+                setaz = 0.0;
+                setel = 0.0;
             }
         }
         else
         {
-            setaz = SAFE_AZI(ctrl->target->az);
-            setel = SAFE_ELE(ctrl->target->el);
+            setaz = ctrl->target->az;
+            setel = ctrl->target->el;
         }
 
         /* if this is a flipped pass and the rotor supports it */
@@ -964,8 +1011,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         step_size /= 2.0;
                     }
 
-                    setel = SAFE_ELE(sat->el);
-                    setaz = SAFE_AZI(sat->az);
+                    setel = sat->el;
+                    setaz = sat->az;
                 }
             }
 
@@ -978,17 +1025,63 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
              * "rotor talking alone".
              */
 
-            /* keep knobs in sync with the commanded position */
+            /* Compute the actual command values to send to rotctld, applying offsets if needed. */
+            gdouble cmdaz = setaz;
+            gdouble cmdel = setel;
+
+            /* Apply software offsets (if enabled) and clamp to rotor mechanical limits
+             * before sending commands to rotctld. The logical setaz/setel values are
+             * kept for UI and sky-coordinate logic; cmdaz/cmdel are what the rotor
+             * actually sees.
+             */
+            if (ctrl->conf) {
+                if (ctrl->use_offset) {
+                    /* First apply user offsets in degrees. */
+                    cmdaz += ctrl->az_offset_deg;
+                    cmdel += ctrl->el_offset_deg;
+
+                    /* Normalize azimuth into a range that can be wrapped into
+                     * [minaz, maxaz]. We assume a 360-degree span for typical
+                     * azimuth rotators.
+                     */
+                    while (cmdaz < ctrl->conf->minaz)
+                        cmdaz += 360.0;
+                    while (cmdaz > ctrl->conf->maxaz)
+                        cmdaz -= 360.0;
+                }
+
+                /* For elevation we simply clamp to the configured range. */
+                cmdel = CLAMP(cmdel, ctrl->conf->minel, ctrl->conf->maxel);
+
+                /* If the rotor is configured as ROT_AZ_TYPE_180, ensure cmdaz is
+                 * in the expected [-180,+180] range. The existing code that
+                 * adjusts setaz for ROT_AZ_TYPE_180 should already have run, so
+                 * here we just clamp/wrap the final command to the allowed span.
+                 */
+                if (ctrl->conf->aztype == ROT_AZ_TYPE_180) {
+                    while (cmdaz > 180.0)
+                        cmdaz -= 360.0;
+                    while (cmdaz < -180.0)
+                        cmdaz += 360.0;
+                } else {
+                    /* For 0-360 style rotators, enforce min/max bounds even when
+                     * offsets are disabled.
+                     */
+                    cmdaz = CLAMP(cmdaz, ctrl->conf->minaz, ctrl->conf->maxaz);
+                }
+            }
+
+            /* keep knobs in sync with the commanded position (logical) */
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), setaz);
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), setel);
 
             if (g_mutex_trylock(&ctrl->client.mutex))
             {
-                if (fabs(setaz - ctrl->client.azi_out) > ctrl->threshold ||
-                    fabs(setel - ctrl->client.ele_out) > ctrl->threshold)
+                if (fabs(cmdaz - ctrl->client.azi_out) > ctrl->threshold ||
+                    fabs(cmdel - ctrl->client.ele_out) > ctrl->threshold)
                 {
-                    ctrl->client.azi_out = setaz;
-                    ctrl->client.ele_out = setel;
+                    ctrl->client.azi_out = cmdaz;
+                    ctrl->client.ele_out = cmdel;
                     ctrl->client.new_trg = TRUE;
                 }
                 g_mutex_unlock(&ctrl->client.mutex);
@@ -1872,7 +1965,7 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
 
 static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 {
-    GtkWidget      *frame, *table, *label;
+    GtkWidget      *frame, *main_table, *offset_table, *label, *outer;
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */
     gchar          *dirname;    /* directory name */
@@ -1880,14 +1973,14 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     const gchar    *filename;   /* file name */
     gchar          *rotname;
 
-    table = gtk_grid_new();
-    gtk_container_set_border_width(GTK_CONTAINER(table), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(table), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(table), 5);
+    main_table = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(main_table), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(main_table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(main_table), 5);
 
     label = gtk_label_new(_("Device:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), label, 0, 0, 1, 1);
 
     ctrl->DevSel = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ctrl->DevSel,
@@ -1943,7 +2036,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->DevSel), 0);
     g_signal_connect(ctrl->DevSel, "changed", G_CALLBACK(rot_selected_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->DevSel, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->DevSel, 1, 0, 1, 1);
 
     /* Engage button */
     ctrl->LockBut = gtk_toggle_button_new_with_label(_("Engage"));
@@ -1951,7 +2044,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                 _("Engage the selected rotor device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->LockBut, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->LockBut, 2, 0, 1, 1);
 
     /* Monitor checkbox */
     ctrl->MonitorCheckBox = gtk_check_button_new_with_label(_("Monitor"));
@@ -1960,12 +2053,12 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "position commands"));
     g_signal_connect(ctrl->MonitorCheckBox, "toggled",
                      G_CALLBACK(rot_monitor_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->MonitorCheckBox, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->MonitorCheckBox, 1, 1, 1, 1);
 
     /* cycle period */
     label = gtk_label_new(_("Cycle:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), label, 0, 2, 1, 1);
 
     ctrl->cycle_spin = gtk_spin_button_new_with_range(10, 10000, 10);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->cycle_spin), 0);
@@ -1974,16 +2067,16 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "commands sent to the rotator."));
     g_signal_connect(ctrl->cycle_spin, "value-changed",
                      G_CALLBACK(delay_changed_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->cycle_spin, 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->cycle_spin, 1, 2, 1, 1);
 
     label = gtk_label_new(_("msec"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), label, 2, 2, 1, 1);
 
     /* Tolerance */
     label = gtk_label_new(_("Threshold:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), label, 0, 3, 1, 1);
 
     ctrl->thld_spin = gtk_spin_button_new_with_range(0.01, 50.0, 0.01);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->thld_spin), 2);
@@ -1995,29 +2088,87 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "threshold, no new commands are sent"));
     g_signal_connect(ctrl->thld_spin, "value-changed",
                      G_CALLBACK(threshold_changed_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->thld_spin, 1, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->thld_spin, 1, 3, 1, 1);
 
     label = gtk_label_new(_("deg"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), label, 2, 3, 1, 1);
 
     /* Status line */
     label = gtk_label_new(_("Status:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), label, 0, 4, 1, 1);
 
     GtkWidget *status = gtk_label_new(_("DISENGAGED"));
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), status, 1, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(main_table), status, 1, 4, 2, 1);
 
     /* store pointer on the controller object for later updates */
     g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
+
+    /* Offsets UI in a compact secondary column */
+    offset_table = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(offset_table), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(offset_table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(offset_table), 5);
+
+    GtkWidget *offset_check = gtk_check_button_new_with_label(_("Enable Az/El offsets"));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(offset_check), ctrl->use_offset);
+    gtk_widget_set_tooltip_text(offset_check,
+                                _("Apply fixed software offsets to azimuth and elevation before sending commands to the rotor."));
+    g_signal_connect(offset_check, "toggled",
+                     G_CALLBACK(offset_toggle_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(offset_table), offset_check, 0, 0, 2, 1);
+
+    label = gtk_label_new(_("Az offset:"));
+    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(offset_table), label, 0, 1, 1, 1);
+
+    GtkWidget *az_spin = gtk_spin_button_new_with_range(-360.0, 360.0, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(az_spin), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_spin), ctrl->az_offset_deg);
+    gtk_widget_set_tooltip_text(az_spin,
+                                _("Azimuth offset in degrees. This value is added to the logical azimuth before sending commands to the rotor."));
+    g_signal_connect(az_spin, "value-changed",
+                     G_CALLBACK(az_offset_changed_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(offset_table), az_spin, 1, 1, 1, 1);
+
+    label = gtk_label_new(_("deg"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(offset_table), label, 2, 1, 1, 1);
+
+    label = gtk_label_new(_("El offset:"));
+    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(offset_table), label, 0, 2, 1, 1);
+
+    GtkWidget *el_spin = gtk_spin_button_new_with_range(-90.0, 90.0, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_spin), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_spin), ctrl->el_offset_deg);
+    gtk_widget_set_tooltip_text(el_spin,
+                                _("Elevation offset in degrees. This value is added to the logical elevation before sending commands to the rotor."));
+    g_signal_connect(el_spin, "value-changed",
+                     G_CALLBACK(el_offset_changed_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(offset_table), el_spin, 1, 2, 1, 1);
+
+    label = gtk_label_new(_("deg"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(offset_table), label, 2, 2, 1, 1);
+
+    GtkWidget *offset_frame = gtk_frame_new(_("Offsets"));
+    gtk_container_add(GTK_CONTAINER(offset_frame), offset_table);
+
+    /* Combine main settings and offsets side-by-side */
+    outer = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(outer), 0);
+    gtk_grid_set_column_spacing(GTK_GRID(outer), 10);
+    gtk_grid_attach(GTK_GRID(outer), main_table, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(outer), offset_frame, 1, 0, 1, 1);
 
     /* load initial rotator configuration */
     rot_selected_cb(GTK_COMBO_BOX(ctrl->DevSel), ctrl);
 
     frame = gtk_frame_new(_("Settings"));
-    gtk_container_add(GTK_CONTAINER(frame), table);
+    gtk_container_add(GTK_CONTAINER(frame), outer);
 
     return frame;
 }
@@ -2307,6 +2458,11 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->errcnt = 0;
     ctrl->conf = NULL;
 
+    /* Offset defaults */
+    ctrl->use_offset   = FALSE;
+    ctrl->az_offset_deg = 0.0;
+    ctrl->el_offset_deg = 0.0;
+
     g_mutex_init(&ctrl->client.mutex);
     ctrl->client.thread = NULL;
     ctrl->client.socket = -1;
@@ -2458,4 +2614,23 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     }
 
     return GTK_WIDGET(rot_ctrl);
+}
+
+/* Offset controls callbacks */
+static void offset_toggle_cb(GtkToggleButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    ctrl->use_offset = gtk_toggle_button_get_active(button);
+}
+
+static void az_offset_changed_cb(GtkSpinButton *spin, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    ctrl->az_offset_deg = gtk_spin_button_get_value(spin);
+}
+
+static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    ctrl->el_offset_deg = gtk_spin_button_get_value(spin);
 }
