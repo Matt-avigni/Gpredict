@@ -101,6 +101,9 @@ struct _GtkRotCtrl {
 
     gboolean        use_offset;
     gdouble         az_offset_deg, el_offset_deg;
+
+    /* Reserved flag; currently always kept FALSE (no special SEND-ONLY mode). */
+    gboolean        send_only_mode;
 };
 
 struct _GtkRotCtrlClass {
@@ -215,7 +218,8 @@ static gboolean rotctld_socket_rw(gint sock, gchar * buff, gchar * buffout,
     gint            written;
     gint            size;
 
-    g_print("rotctld_socket_rw: sending command '%s'\n", buff);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                _("%s: sending command '%s'"), __func__, buff);
     size = strlen(buff);
 
     /* send command */
@@ -227,7 +231,6 @@ static gboolean rotctld_socket_rw(gint sock, gchar * buff, gchar * buffout,
     }
     if (written == -1)
     {
-        g_print("rotctld_socket_rw: send() failed for command '%s'\n", buff);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld Socket Down"), __func__);
         return FALSE;
@@ -395,8 +398,6 @@ static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
         return FALSE;
     }
 
-    g_print("MATTEO_DEBUG: get_pos stub using commanded values\n");
-
     /* Send-only mode: reuse last commanded values instead of asking rotctld. */
     g_mutex_lock(&ctrl->client.mutex);
     *az = ctrl->client.azi_out;
@@ -424,32 +425,56 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gchar           buffback[128];
     gboolean        retcode;
 
-    g_print("set_pos: az=%.2f el=%.2f\n", az, el);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                _("%s: set_pos az=%.2f el=%.2f"), __func__, az, el);
 
     /* send command */
     {
-        gchar azbuf[G_ASCII_DTOSTR_BUF_SIZE];
-        gchar elbuf[G_ASCII_DTOSTR_BUF_SIZE];
+        /* Many Hamlib backends for rotators like the GS-232B expect
+         * integer degrees for the P command. Sending floats can result
+         * in RPRT -6 (invalid parameter). Round to nearest integer
+         * before formatting the command string.
+         */
+        gint iaz = (gint) lround(az);
+        gint iel = (gint) lround(el);
 
-        g_ascii_dtostr(azbuf, sizeof(azbuf), az);
-        g_ascii_dtostr(elbuf, sizeof(elbuf), el);
-
-        buff = g_strdup_printf("P %s %s\x0a", azbuf, elbuf);
+        buff = g_strdup_printf("P %d %d\x0a", iaz, iel);
     }
+    
     retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
     g_free(buff);
 
-    if (retcode == TRUE)
-    {
-        /* Ignore Hamlib RPRT codes here and treat any successful socket
-         * round-trip as a successful command. Some backends may return
-         * RPRT -5 or similar even though the command was accepted, and
-         * we don't want that to disengage the rotor.
-         */
-        g_print("set_pos: rotctld replied '%s'\n", buffback);
+    if (!retcode) {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rotctld I/O error while sending P command"), __func__);
+        g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
+        return FALSE;
     }
 
-    return retcode;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                _("%s: rotctld replied '%s'"), __func__, buffback);
+    g_printerr("MISSION_SOPHIE: set_pos reply '%s'\n", buffback);
+
+    /* Interpret reply:
+     *  - If it starts with "RPRT 0"  → success.
+     *  - If it starts with "RPRT "   → treat as ERROR.
+     *  - Otherwise (numeric az/el echo, or something else) → assume success.
+     */
+    g_strstrip(buffback);
+
+    if (g_str_has_prefix(buffback, "RPRT 0")) {
+        return TRUE;
+    }
+
+    if (g_str_has_prefix(buffback, "RPRT ")) {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rotctld returned error reply '%s'"), __func__, buffback);
+        g_printerr("MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
+        return FALSE;
+    }
+
+    /* Legacy / non-Hamlib style replies (e.g. numeric echoes) are treated as OK. */
+    return TRUE;
 }
 
 /* Rotctl client thread */
@@ -461,7 +486,8 @@ static gpointer rotctld_client_thread(gpointer data)
     gboolean        io_error = FALSE;
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
 
-    g_print("IUT_ROT_DEBUG: rotctld_client_thread started\n");
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                _("%s: rotctld_client_thread started"), __func__);
 
     ctrl->client.socket = rotctld_socket_open(ctrl->conf->host,
                                               ctrl->conf->port);
@@ -469,6 +495,14 @@ static gpointer rotctld_client_thread(gpointer data)
         return GINT_TO_POINTER(-1);
 
     ctrl->client.timer = g_timer_new();
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "MISSION_SOPHIE: rotctld_client_thread started for %s:%d",
+                ctrl->conf ? ctrl->conf->host : "(null)",
+                ctrl->conf ? ctrl->conf->port : 0);
+
+    g_printerr("MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
+                ctrl->conf ? ctrl->conf->host : "(null)",
+                ctrl->conf ? ctrl->conf->port : 0);
 
     ctrl->client.new_trg = FALSE;
     ctrl->client.running = TRUE;
@@ -497,35 +531,59 @@ static gpointer rotctld_client_thread(gpointer data)
 
         if (send_cmd)
         {
-            g_print("MATTEO_DEBUG: set_pos (new target) (engaged=%d monitor=%d az=%.2f el=%.2f)\n",
-                    ctrl->engaged ? 1 : 0,
-                    ctrl->monitor ? 1 : 0,
-                    azi, ele);
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d",
+                        azi, ele,
+                        ctrl->engaged ? 1 : 0,
+                        ctrl->monitor ? 1 : 0);
+            g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d\n",
+                       azi, ele,
+                       ctrl->engaged ? 1 : 0,
+                       ctrl->monitor ? 1 : 0);
 
             if (!set_pos(ctrl, azi, ele))
             {
                 io_error = TRUE;
-                g_print("MATTEO_DEBUG: set_pos FAILED\n");
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: set_pos failed"), __func__);
             }
             else
             {
-                g_print("MATTEO_DEBUG: set_pos SUCCESS\n");
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            _("%s: set_pos success"), __func__);
             }
         }
         else
         {
-            g_print("MATTEO_DEBUG: no new target, skipping set_pos\n");
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "MISSION_SOPHIE: client thread idle – no new target (last_out=(%.2f, %.2f))",
+                        azi, ele);
+            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%.2f, %.2f))\n",
+                       azi, ele);
         }
 
         /* Treat last commanded az/el as the "measured" position for
          * display purposes, since some rotctld backends only return
          * RPRT codes to the "p" command and do not support true
          * position read-back.
+         *
+         * IMPORTANT:
+         *  - Do NOT overwrite azi_in/ele_in on I/O error; keep the last
+         *    known-good position so the UI does not "jump" to the target
+         *    when the rotor failed to move.
+         *  - Make io_error sticky so that once we have seen a failure,
+         *    the timeout callback will keep counting errors until the
+         *    user disengages/re-engages or a future command succeeds.
          */
         g_mutex_lock(&ctrl->client.mutex);
-        ctrl->client.azi_in   = ctrl->client.azi_out;
-        ctrl->client.ele_in   = ctrl->client.ele_out;
-        ctrl->client.io_error = io_error;
+        if (!io_error) {
+            ctrl->client.azi_in = ctrl->client.azi_out;
+            ctrl->client.ele_in = ctrl->client.ele_out;
+        }
+        /* Sticky error flag: once TRUE it stays TRUE until explicitly reset
+         * (on engage or after a later successful command).
+         */
+        ctrl->client.io_error = ctrl->client.io_error || io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
         /* ensure rotctl duty cycle stays below 50%, but wait at least 700 ms */
@@ -533,7 +591,13 @@ static gpointer rotctld_client_thread(gpointer data)
         g_usleep(elapsed_time * 1e6);
     }
 
-    g_print("Stopping rotctld client thread\n");
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "MISSION_SOPHIE: rotctld_client_thread stopping");
+
+    g_printerr("MISSION_SOPHIE: rotctld_client_thread stopping\n");
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: stopping rotctld client thread"), __func__);
     g_timer_destroy(ctrl->client.timer);
     rotctld_socket_close(&ctrl->client.socket);
 
@@ -1088,46 +1152,48 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
-        /* check error status */
-        if (!error)
+        /* check error status
+         *
+         * We treat errors as cumulative for the duration of an engage cycle:
+         *  - Any iteration that sees an I/O error bumps errcnt.
+         *  - We do NOT reset errcnt back to zero on a "clean" loop; this avoids
+         *    races between the worker thread and the UI thread where a transient
+         *    read of io_error==FALSE could clear the accumulated error state.
+         *  - errcnt is explicitly reset when (re)engaging the rotor.
+         */
+        if (error)
         {
-            ctrl->errcnt = 0;
-        }
-        else
-        {
-            if (ctrl->errcnt >= MAX_ERROR_COUNT)
-            {
-                /* disengage device */
-                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut),
-                                             FALSE);
-                ctrl->engaged = FALSE;
-                sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _("%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
-                            __func__, MAX_ERROR_COUNT);
-
-                /* Reflect the failure in the status label and show a dialog
-                 * so it's obvious that the rotor/rotctld backend is not usable.
-                 */
-                if (status_label)
-                    gtk_label_set_text(GTK_LABEL(status_label),
-                                       _("ERROR: link/rotator"));
-
-                rot_show_no_rotor_dialog(ctrl);
-
-                ctrl->errcnt = 0;
-            }
-            else
-            {
+            if (ctrl->errcnt < G_MAXINT)
                 ctrl->errcnt++;
-            }
         }
 
-        /* update status label if present, based on real data */
+        if (ctrl->errcnt >= MAX_ERROR_COUNT && ctrl->engaged)
+        {
+            /* disengage device */
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut),
+                                         FALSE);
+            ctrl->engaged = FALSE;
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
+                        __func__, MAX_ERROR_COUNT);
+
+            /* Reflect the failure in the status label and show a dialog
+             * so it's obvious that the rotor/rotctld backend is not usable.
+             */
+            if (status_label)
+                gtk_label_set_text(GTK_LABEL(status_label),
+                                   _("ERROR: link/rotator"));
+
+            rot_show_no_rotor_dialog(ctrl);
+        }
+
+        /* update status label if present, based on data and feedback mode */
         if (status_label)
         {
             const gchar *status_text = NULL;
+            gboolean has_error = error || (ctrl->errcnt > 0);
 
-            if (error)
+            if (has_error)
                 status_text = _("ERROR: link/rotator");
             else if (fabs(setaz - rotaz) > ctrl->threshold ||
                      fabs(setel - rotel) > ctrl->threshold)
@@ -1136,6 +1202,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 status_text = _("ON TARGET");
 
             gtk_label_set_text(GTK_LABEL(status_label), status_text);
+
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d",
+                        status_text,
+                        setaz, setel,
+                        rotaz, rotel,
+                        error ? 1 : 0);
+            g_printerr("MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
+                        status_text,
+                        setaz, setel,
+                        rotaz, rotel,
+                        error ? 1 : 0);
         }
     }
     else
@@ -1583,24 +1661,22 @@ rotctld_probe_endpoint(GtkRotCtrl *ctrl)
 
         if (g_str_has_prefix(reply, "RPRT"))
         {
-            /* Hamlib-style status reply: RPRT <code>.
-             *
-             * For Matteo's GS-232B/rotctld setup we treat *any* RPRT reply
-             * as proof that we are talking to a live rotctld instance,
-             * even if the backend does not support the "p" (position) query
-             * and returns an error code such as RPRT -6.
-             *
-             * We no longer require RPRT 0 specifically here because we rely
-             * on send-only control and do not depend on true position
-             * read-back from rotctld.
+            /* We accept RPRT-only backends as usable, but we do not expose a special
+             * SEND-ONLY mode in the UI anymore. The controller already derives its
+             * displayed position from the last commanded az/el, so feedback-less
+             * daemons are handled transparently.
              */
+            ctrl->send_only_mode = FALSE;
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "MISSION_SOPHIE: rotctld probe at %s:%d returned RPRT reply '%s' – treating as feedback-less but usable endpoint",
+                        ctrl->conf ? ctrl->conf->host : "(null)",
+                        ctrl->conf ? ctrl->conf->port : 0,
+                        reply);
             ok = TRUE;
         }
         else
         {
-            /* Legacy behaviour: try to parse az/el from the first two lines
-             * for older backends that still return numeric az/el values.
-             */
+            /* Try legacy numeric az/el parsing. */
             gchar **lines = g_strsplit(reply, "\n", 3);
             if (lines[0] != NULL && lines[1] != NULL)
             {
@@ -1610,7 +1686,15 @@ rotctld_probe_endpoint(GtkRotCtrl *ctrl)
                 gdouble el = g_ascii_strtod(lines[1], &endptr2);
 
                 if (endptr1 != lines[0] && endptr2 != lines[1])
+                {
+                    ctrl->send_only_mode = FALSE;
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "MISSION_SOPHIE: rotctld probe at %s:%d returned numeric position az=%.2f el=%.2f – enabling FEEDBACK mode",
+                                ctrl->conf ? ctrl->conf->host : "(null)",
+                                ctrl->conf ? ctrl->conf->port : 0,
+                                az, el);
                     ok = TRUE;
+                }
             }
             g_strfreev(lines);
         }
@@ -1829,6 +1913,23 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             rot_show_no_rotor_dialog(ctrl);
             return;
         }
+
+        /* Re-synchronise client state with current knob values so the rotor
+         * does not move on its own when we first engage. We treat the
+         * existing knob positions as the current physical position and do
+         * not post a new target yet.
+         */
+        g_mutex_lock(&ctrl->client.mutex);
+        ctrl->client.azi_out   = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+        ctrl->client.ele_out   = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+        ctrl->client.azi_in    = ctrl->client.azi_out;
+        ctrl->client.ele_in    = ctrl->client.ele_out;
+        ctrl->client.io_error  = FALSE;
+        ctrl->client.new_trg   = FALSE;
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        /* Reset error counter when (re)engaging the rotor. */
+        ctrl->errcnt = 0;
 
         ctrl->client.thread =
             g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
@@ -2225,11 +2326,22 @@ rot_calibration_start_cb(GtkButton *button, gpointer data)
     }
 
     /* Command AZ/EL = 0/0 through the normal client path. */
-    if (g_mutex_trylock(&ctrl->client.mutex)) {
+    if (g_mutex_trylock(&ctrl->client.mutex))
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "MISSION_SOPHIE: calibration posting rotor target cmd=(0.00, 0.00) engaged=%d monitor=%d",
+                    ctrl->engaged ? 1 : 0,
+                    ctrl->monitor ? 1 : 0);
+
         ctrl->client.azi_out = 0.0;
         ctrl->client.ele_out = 0.0;
         ctrl->client.new_trg = TRUE;
         g_mutex_unlock(&ctrl->client.mutex);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "MISSION_SOPHIE: calibration skipped command post – client mutex busy");
     }
 
     /* Also update the knobs so the UI reflects the commanded position. */
@@ -2462,6 +2574,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->use_offset   = FALSE;
     ctrl->az_offset_deg = 0.0;
     ctrl->el_offset_deg = 0.0;
+    /* Default to conservative send-only until rotctld probe says otherwise. */
+    ctrl->send_only_mode = TRUE;
 
     g_mutex_init(&ctrl->client.mutex);
     ctrl->client.thread = NULL;
