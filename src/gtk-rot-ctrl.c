@@ -49,9 +49,9 @@
 #include <gtk/gtk.h>
 #include <math.h>
 #include <string.h>             /* strerror() */
+#include <stdarg.h>
 
 #include "compat.h"
-#include "gp-debug-terminal.h"
 #include "gpredict-utils.h"
 #include "gtk-polar-plot.h"
 #include "gtk-rot-knob.h"
@@ -99,7 +99,6 @@ struct _GtkRotCtrl {
 
     rotor_conf_t   *conf;
     rotctld_client_t client;
-    GpDbgTerm     *terminal;
 
     gboolean        use_offset;
     gdouble         az_offset_deg, el_offset_deg;
@@ -116,12 +115,63 @@ struct _GtkRotCtrlClass {
 static GtkVBoxClass *parent_class = NULL;
 
 /* Forward declaration for error dialog helper */
+
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
 
 /* Offset controls callbacks */
+
 static void offset_toggle_cb(GtkToggleButton *button, gpointer data);
 static void az_offset_changed_cb(GtkSpinButton *spin, gpointer data);
 static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data);
+
+/* Park position helper.
+ *
+ * Default is AZ=0 / EL=0, but can be overridden for station-specific setups:
+ *   GPREDICT_ROT_PARK_AZ  (double, degrees)
+ *   GPREDICT_ROT_PARK_EL  (double, degrees)
+ */
+static void rot_get_park_position(GtkRotCtrl *ctrl, gdouble *park_az, gdouble *park_el)
+{
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+
+    const gchar *env_az = g_getenv("GPREDICT_ROT_PARK_AZ");
+    const gchar *env_el = g_getenv("GPREDICT_ROT_PARK_EL");
+
+    if (env_az && *env_az) {
+        gchar *endp = NULL;
+        gdouble v = g_ascii_strtod(env_az, &endp);
+        if (endp != env_az)
+            az = v;
+    }
+    if (env_el && *env_el) {
+        gchar *endp = NULL;
+        gdouble v = g_ascii_strtod(env_el, &endp);
+        if (endp != env_el)
+            el = v;
+    }
+
+    /* Clamp to configured mechanical limits if available. */
+    if (ctrl && ctrl->conf) {
+        /* Elevation: clamp. */
+        el = CLAMP(el, ctrl->conf->minel, ctrl->conf->maxel);
+
+        /* Azimuth: keep inside allowed span. */
+        if (ctrl->conf->aztype == ROT_AZ_TYPE_180) {
+            while (az > 180.0) az -= 360.0;
+            while (az < -180.0) az += 360.0;
+            az = CLAMP(az, ctrl->conf->minaz, ctrl->conf->maxaz);
+        } else {
+            /* Typical 0-360 style: wrap, then clamp. */
+            while (az < ctrl->conf->minaz) az += 360.0;
+            while (az > ctrl->conf->maxaz) az -= 360.0;
+            az = CLAMP(az, ctrl->conf->minaz, ctrl->conf->maxaz);
+        }
+    }
+
+    if (park_az) *park_az = az;
+    if (park_el) *park_el = el;
+}
 
 
 /* Open the rotcld socket. Returns file descriptor or -1 if an error occurs */
@@ -449,14 +499,13 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     if (!retcode) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld I/O error while sending P command"), __func__);
-        gp_dbg_term_log(ctrl->terminal, "MISSION_SOPHIE: set_pos I/O error\n");
+        g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
         return FALSE;
     }
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: rotctld replied '%s'"), __func__, buffback);
-    gp_dbg_term_log(ctrl->terminal, "MISSION_SOPHIE: set_pos reply '%s'\n",
-                    buffback);
+    g_printerr("MISSION_SOPHIE: set_pos reply '%s'\n", buffback);
 
     /* Interpret reply:
      *  - If it starts with "RPRT 0"  → success.
@@ -472,8 +521,7 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     if (g_str_has_prefix(buffback, "RPRT ")) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld returned error reply '%s'"), __func__, buffback);
-        gp_dbg_term_log(ctrl->terminal,
-                        "MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
+        g_printerr("MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
         return FALSE;
     }
 
@@ -504,10 +552,9 @@ static gpointer rotctld_client_thread(gpointer data)
                 ctrl->conf ? ctrl->conf->host : "(null)",
                 ctrl->conf ? ctrl->conf->port : 0);
 
-    gp_dbg_term_log(ctrl->terminal,
-                    "MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
-                    ctrl->conf ? ctrl->conf->host : "(null)",
-                    ctrl->conf ? ctrl->conf->port : 0);
+    g_printerr("MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
+                ctrl->conf ? ctrl->conf->host : "(null)",
+                ctrl->conf ? ctrl->conf->port : 0);
 
     ctrl->client.new_trg = FALSE;
     ctrl->client.running = TRUE;
@@ -541,11 +588,10 @@ static gpointer rotctld_client_thread(gpointer data)
                         azi, ele,
                         ctrl->engaged ? 1 : 0,
                         ctrl->monitor ? 1 : 0);
-            gp_dbg_term_log(ctrl->terminal,
-                            "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d\n",
-                            azi, ele,
-                            ctrl->engaged ? 1 : 0,
-                            ctrl->monitor ? 1 : 0);
+            g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d\n",
+                       azi, ele,
+                       ctrl->engaged ? 1 : 0,
+                       ctrl->monitor ? 1 : 0);
 
             if (!set_pos(ctrl, azi, ele))
             {
@@ -564,9 +610,8 @@ static gpointer rotctld_client_thread(gpointer data)
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "MISSION_SOPHIE: client thread idle – no new target (last_out=(%.2f, %.2f))",
                         azi, ele);
-            gp_dbg_term_log(ctrl->terminal,
-                            "MISSION_SOPHIE: idle – no new target (last_out=(%.2f, %.2f))\n",
-                            azi, ele);
+            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%.2f, %.2f))\n",
+                       azi, ele);
         }
 
         /* Treat last commanded az/el as the "measured" position for
@@ -601,8 +646,7 @@ static gpointer rotctld_client_thread(gpointer data)
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "MISSION_SOPHIE: rotctld_client_thread stopping");
 
-    gp_dbg_term_log(ctrl->terminal,
-                    "MISSION_SOPHIE: rotctld_client_thread stopping\n");
+    g_printerr("MISSION_SOPHIE: rotctld_client_thread stopping\n");
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: stopping rotctld client thread"), __func__);
@@ -910,27 +954,33 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             {
                 if (ctrl->t < ctrl->pass->aos)
                 {
-                    /* Before AOS: you could choose to pre-point to AOS azimuth,
-                     * but for Matteo's station we keep the rotor at the
-                     * calibrated zero position when idle.
+                    /*
+                     * PRE-TRACK: Satellite is below horizon but we already know the
+                     * AOS azimuth from the predicted pass. Pre-position the rotor to
+                     * the AOS azimuth and hold elevation at the lowest allowed value.
+                     *
+                     * This avoids the rotor sitting at an arbitrary park (e.g. 0/0)
+                     * and only starting to move once the satellite is already in range.
                      */
-                    setaz = 0.0;
-                    setel = 0.0;
+                    setaz = ctrl->pass->aos_az;
+                    setel = (ctrl->conf ? ctrl->conf->minel : 0.0);
                 }
                 else if (ctrl->t > ctrl->pass->los)
                 {
-                    /* After LOS: automatically park the antenna at the
-                     * calibrated rest position AZ=0°, EL=0°.
-                     */
-                    setaz = 0.0;
-                    setel = 0.0;
+                    /* After LOS: park at configured park position. */
+                    rot_get_park_position(ctrl, &setaz, &setel);
+                }
+                else
+                {
+                    /* In/near-pass but still below horizon: keep current pre-positioning. */
+                    setaz = ctrl->pass->aos_az;
+                    setel = (ctrl->conf ? ctrl->conf->minel : 0.0);
                 }
             }
             else
             {
-                /* No current pass information: default to calibrated zero. */
-                setaz = 0.0;
-                setel = 0.0;
+                /* No current pass information: park at configured park position. */
+                rot_get_park_position(ctrl, &setaz, &setel);
             }
         }
         else
@@ -1217,12 +1267,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         setaz, setel,
                         rotaz, rotel,
                         error ? 1 : 0);
-            gp_dbg_term_log(ctrl->terminal,
-                            "MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
-                            status_text,
-                            setaz, setel,
-                            rotaz, rotel,
-                            error ? 1 : 0);
+            g_printerr("MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
+                        status_text,
+                        setaz, setel,
+                        rotaz, rotel,
+                        error ? 1 : 0);
         }
     }
     else
@@ -1622,6 +1671,9 @@ static gchar *rotctld_build_autostart_command(GtkRotCtrl *ctrl)
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: built auto-start command '%s'"),
                 __func__, cmd);
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "MISSION_SOPHIE: rotctld autostart params model=%d baud=%d device=%s port=%d",
+                model, baud, device, port);
 
     g_free(rotctld_path);
     g_free(device);
@@ -2073,17 +2125,6 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     return frame;
 }
 
-static void
-rot_terminal_show_cb(GtkButton *button, gpointer data)
-{
-    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
-
-    (void)button;
-
-    if (ctrl->terminal)
-        gp_dbg_term_show(ctrl->terminal);
-}
-
 static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 {
     GtkWidget      *frame, *main_table, *offset_table, *label, *outer;
@@ -2175,13 +2216,6 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_signal_connect(ctrl->MonitorCheckBox, "toggled",
                      G_CALLBACK(rot_monitor_cb), ctrl);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->MonitorCheckBox, 1, 1, 1, 1);
-
-    GtkWidget *terminal_btn = gtk_button_new_with_label(_("Terminal"));
-    gtk_widget_set_tooltip_text(terminal_btn,
-                                _("Open the antenna/rotator debug terminal"));
-    g_signal_connect(terminal_btn, "clicked",
-                     G_CALLBACK(rot_terminal_show_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), terminal_btn, 2, 1, 1, 1);
 
     /* cycle period */
     label = gtk_label_new(_("Cycle:"));
@@ -2596,7 +2630,6 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
     ctrl->errcnt = 0;
     ctrl->conf = NULL;
-    ctrl->terminal = NULL;
 
     /* Offset defaults */
     ctrl->use_offset   = FALSE;
@@ -2645,12 +2678,6 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
 #endif
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
-    }
-
-    if (ctrl->terminal != NULL)
-    {
-        gp_dbg_term_free(ctrl->terminal);
-        ctrl->terminal = NULL;
     }
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
@@ -2704,8 +2731,6 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
         return NULL;
 
     rot_ctrl = GTK_ROT_CTRL(g_object_new(GTK_TYPE_ROT_CTRL, NULL));
-
-    rot_ctrl->terminal = gp_dbg_term_new(_("Antenna / Rotator Terminal"));
 
     /* store satellites */
     g_hash_table_foreach(module->satellites, store_sats, rot_ctrl);
