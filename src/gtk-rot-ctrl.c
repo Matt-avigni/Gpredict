@@ -51,6 +51,7 @@
 #include <string.h>             /* strerror() */
 
 #include "compat.h"
+#include "gp-debug-terminal.h"
 #include "gpredict-utils.h"
 #include "gtk-polar-plot.h"
 #include "gtk-rot-knob.h"
@@ -98,6 +99,7 @@ struct _GtkRotCtrl {
 
     rotor_conf_t   *conf;
     rotctld_client_t client;
+    GpDbgTerm     *terminal;
 
     gboolean        use_offset;
     gdouble         az_offset_deg, el_offset_deg;
@@ -2064,6 +2066,17 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     return frame;
 }
 
+static void
+rot_terminal_show_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)button;
+
+    if (ctrl->terminal)
+        gp_dbg_term_show(ctrl->terminal);
+}
+
 static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 {
     GtkWidget      *frame, *main_table, *offset_table, *label, *outer;
@@ -2155,6 +2168,13 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_signal_connect(ctrl->MonitorCheckBox, "toggled",
                      G_CALLBACK(rot_monitor_cb), ctrl);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->MonitorCheckBox, 1, 1, 1, 1);
+
+    GtkWidget *terminal_btn = gtk_button_new_with_label(_("Terminal"));
+    gtk_widget_set_tooltip_text(terminal_btn,
+                                _("Open the antenna/rotator debug terminal"));
+    g_signal_connect(terminal_btn, "clicked",
+                     G_CALLBACK(rot_terminal_show_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(main_table), terminal_btn, 2, 1, 1, 1);
 
     /* cycle period */
     label = gtk_label_new(_("Cycle:"));
@@ -2569,6 +2589,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
     ctrl->errcnt = 0;
     ctrl->conf = NULL;
+    ctrl->terminal = NULL;
 
     /* Offset defaults */
     ctrl->use_offset   = FALSE;
@@ -2617,6 +2638,12 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
 #endif
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
+    }
+
+    if (ctrl->terminal != NULL)
+    {
+        gp_dbg_term_free(ctrl->terminal);
+        ctrl->terminal = NULL;
     }
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
@@ -2670,6 +2697,8 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
         return NULL;
 
     rot_ctrl = GTK_ROT_CTRL(g_object_new(GTK_TYPE_ROT_CTRL, NULL));
+
+    rot_ctrl->terminal = gp_dbg_term_new(_("Antenna / Rotator Terminal"));
 
     /* store satellites */
     g_hash_table_foreach(module->satellites, store_sats, rot_ctrl);
