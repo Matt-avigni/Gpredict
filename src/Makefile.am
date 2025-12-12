@@ -35,6 +35,7 @@ gpredict_SOURCES = \
     about.c about.h \
     compat.c compat.h config-keys.h \
     first-time.c first-time.h \
+    gp-debug-terminal.c gp-debug-terminal.h \
     gpredict-help.c gpredict-help.h \
     gpredict-utils.c gpredict-utils.h \
     gtk-azel-plot.c gtk-azel-plot.h \
@@ -122,4 +123,3 @@ gpredict_SOURCES = \
 gpredict_LDADD = @PACKAGE_LIBS@
 
 ## $(INTLLIBS)
-
