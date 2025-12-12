@@ -449,13 +449,14 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     if (!retcode) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld I/O error while sending P command"), __func__);
-        g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
+        gp_dbg_term_log(ctrl->terminal, "MISSION_SOPHIE: set_pos I/O error\n");
         return FALSE;
     }
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: rotctld replied '%s'"), __func__, buffback);
-    g_printerr("MISSION_SOPHIE: set_pos reply '%s'\n", buffback);
+    gp_dbg_term_log(ctrl->terminal, "MISSION_SOPHIE: set_pos reply '%s'\n",
+                    buffback);
 
     /* Interpret reply:
      *  - If it starts with "RPRT 0"  → success.
@@ -471,7 +472,8 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     if (g_str_has_prefix(buffback, "RPRT ")) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld returned error reply '%s'"), __func__, buffback);
-        g_printerr("MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
+        gp_dbg_term_log(ctrl->terminal,
+                        "MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
         return FALSE;
     }
 
@@ -502,9 +504,10 @@ static gpointer rotctld_client_thread(gpointer data)
                 ctrl->conf ? ctrl->conf->host : "(null)",
                 ctrl->conf ? ctrl->conf->port : 0);
 
-    g_printerr("MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
-                ctrl->conf ? ctrl->conf->host : "(null)",
-                ctrl->conf ? ctrl->conf->port : 0);
+    gp_dbg_term_log(ctrl->terminal,
+                    "MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
+                    ctrl->conf ? ctrl->conf->host : "(null)",
+                    ctrl->conf ? ctrl->conf->port : 0);
 
     ctrl->client.new_trg = FALSE;
     ctrl->client.running = TRUE;
@@ -538,10 +541,11 @@ static gpointer rotctld_client_thread(gpointer data)
                         azi, ele,
                         ctrl->engaged ? 1 : 0,
                         ctrl->monitor ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d\n",
-                       azi, ele,
-                       ctrl->engaged ? 1 : 0,
-                       ctrl->monitor ? 1 : 0);
+            gp_dbg_term_log(ctrl->terminal,
+                            "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d\n",
+                            azi, ele,
+                            ctrl->engaged ? 1 : 0,
+                            ctrl->monitor ? 1 : 0);
 
             if (!set_pos(ctrl, azi, ele))
             {
@@ -560,8 +564,9 @@ static gpointer rotctld_client_thread(gpointer data)
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "MISSION_SOPHIE: client thread idle – no new target (last_out=(%.2f, %.2f))",
                         azi, ele);
-            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%.2f, %.2f))\n",
-                       azi, ele);
+            gp_dbg_term_log(ctrl->terminal,
+                            "MISSION_SOPHIE: idle – no new target (last_out=(%.2f, %.2f))\n",
+                            azi, ele);
         }
 
         /* Treat last commanded az/el as the "measured" position for
@@ -596,7 +601,8 @@ static gpointer rotctld_client_thread(gpointer data)
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "MISSION_SOPHIE: rotctld_client_thread stopping");
 
-    g_printerr("MISSION_SOPHIE: rotctld_client_thread stopping\n");
+    gp_dbg_term_log(ctrl->terminal,
+                    "MISSION_SOPHIE: rotctld_client_thread stopping\n");
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: stopping rotctld client thread"), __func__);
@@ -1211,11 +1217,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         setaz, setel,
                         rotaz, rotel,
                         error ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
-                        status_text,
-                        setaz, setel,
-                        rotaz, rotel,
-                        error ? 1 : 0);
+            gp_dbg_term_log(ctrl->terminal,
+                            "MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
+                            status_text,
+                            setaz, setel,
+                            rotaz, rotel,
+                            error ? 1 : 0);
         }
     }
     else
