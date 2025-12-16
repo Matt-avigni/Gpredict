@@ -48,6 +48,23 @@
 
 #define DEFAULT_CYCLE_MS    1000
 
+static gboolean radio_supports_rit_xit(const gchar *name)
+{
+    gboolean        match = FALSE;
+    gchar          *lower;
+
+    if (name == NULL)
+        return FALSE;
+
+    /* Simple name match is sufficient for now; extend as new rigs are added */
+    lower = g_ascii_strdown(name, -1);
+    match = (g_strrstr(lower, "ic-9700") != NULL) ||
+        (g_strrstr(lower, "ic9700") != NULL);
+    g_free(lower);
+
+    return match;
+}
+
 /**
  * \brief Read radio configuration.
  * \param conf Pointer to a radio_conf_t structure where the data will be
@@ -77,6 +94,8 @@ gboolean radio_conf_read(radio_conf_t * conf)
     confdir = get_hwconf_dir();
     fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rig", NULL);
     g_free(confdir);
+
+    conf->supports_rit_xit = radio_supports_rit_xit(conf->name);
 
     /* open .rig file */
     cfg = g_key_file_new();

@@ -57,6 +57,7 @@
 #include "gtk-rot-knob.h"
 #include "gtk-rot-ctrl.h"
 #include "gtk-sat-module.h"
+#include "gp-debug-terminal.h"
 #include "predict-tools.h"
 #include "sat-log.h"
 #include "rotor-conf.h"
@@ -100,6 +101,8 @@ struct _GtkRotCtrl {
     rotor_conf_t   *conf;
     rotctld_client_t client;
 
+    GpDbgTerm      *dbgterm;
+
     gboolean        use_offset;
     gdouble         az_offset_deg, el_offset_deg;
 
@@ -117,6 +120,7 @@ static GtkVBoxClass *parent_class = NULL;
 /* Forward declaration for error dialog helper */
 
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
+static void rot_terminal_cb(GtkButton *button, gpointer data);
 
 /* Offset controls callbacks */
 
@@ -237,6 +241,9 @@ static gint rotctld_socket_open(const gchar * host, gint port)
 static void rotctld_socket_close(gint * sock)
 {
     gint            written;
+
+    if (sock == NULL || *sock == -1)
+        return;
 
     /*shutdown the rotctld connect */
     written = send(*sock, "q\x0a", 2, 0);
@@ -632,10 +639,7 @@ static gpointer rotctld_client_thread(gpointer data)
             ctrl->client.azi_in = ctrl->client.azi_out;
             ctrl->client.ele_in = ctrl->client.ele_out;
         }
-        /* Sticky error flag: once TRUE it stays TRUE until explicitly reset
-         * (on engage or after a later successful command).
-         */
-        ctrl->client.io_error = ctrl->client.io_error || io_error;
+        ctrl->client.io_error = io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
         /* ensure rotctl duty cycle stays below 50%, but wait at least 700 ms */
@@ -917,6 +921,21 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
                              !(ctrl->tracking || locked));
     gtk_widget_set_sensitive(ctrl->AzSet, !ctrl->tracking);
     gtk_widget_set_sensitive(ctrl->ElSet, !ctrl->tracking);
+
+    if (ctrl->tracking && ctrl->target && ctrl->qth)
+    {
+        if (ctrl->pass != NULL)
+            free_pass(ctrl->pass);
+
+        if (ctrl->target->el > 0.0)
+            ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, ctrl->t);
+        else
+            ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
+
+        set_flipped_pass(ctrl);
+        if (ctrl->plot != NULL)
+            gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), ctrl->pass);
+    }
 }
 
 /**
@@ -1892,6 +1911,19 @@ static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl)
     gtk_widget_destroy(dialog);
 }
 
+static void rot_terminal_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)button;
+
+    if (ctrl->dbgterm == NULL)
+        ctrl->dbgterm = gp_dbg_term_new(_("Rotor debug"));
+
+    if (ctrl->dbgterm != NULL)
+        gp_dbg_term_show(ctrl->dbgterm);
+}
+
 /**
  * Rotor locked.
  *
@@ -1932,6 +1964,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 #endif
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
+        ctrl->client.socket = -1;
         if (status_label)
             gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
     }
@@ -1994,6 +2027,28 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 
         ctrl->client.thread =
             g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
+
+        /* Give the client thread a brief moment to attempt its initial connect. */
+        g_usleep(100000);
+
+        if (!ctrl->client.running)
+        {
+            gpointer ret = g_thread_join(ctrl->client.thread);
+            ctrl->client.thread = NULL;
+            ctrl->client.socket = -1;
+            gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
+            ctrl->engaged = FALSE;
+            gtk_toggle_button_set_active(button, FALSE);
+
+            if (status_label)
+                gtk_label_set_text(GTK_LABEL(status_label),
+                                   _("ERROR: rotctld"));
+
+            if (GPOINTER_TO_INT(ret) == -1)
+                rot_show_no_rotor_dialog(ctrl);
+
+            return;
+        }
 
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         ctrl->engaged = TRUE;
@@ -2267,6 +2322,12 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     /* store pointer on the controller object for later updates */
     g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
+
+    /* Debug terminal button */
+    GtkWidget *term_btn = gtk_button_new_with_label(_("Terminal…"));
+    gtk_widget_set_tooltip_text(term_btn, _("Open rotor debug terminal"));
+    g_signal_connect(term_btn, "clicked", G_CALLBACK(rot_terminal_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(main_table), term_btn, 2, 1, 1, 1);
 
     /* Offsets UI in a compact secondary column */
     offset_table = gtk_grid_new();
@@ -2630,6 +2691,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
     ctrl->errcnt = 0;
     ctrl->conf = NULL;
+    ctrl->dbgterm = NULL;
 
     /* Offset defaults */
     ctrl->use_offset   = FALSE;
@@ -2642,6 +2704,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.thread = NULL;
     ctrl->client.socket = -1;
     ctrl->client.running = FALSE;
+    ctrl->client.io_error = FALSE;
 }
 
 static void gtk_rot_ctrl_destroy(GtkWidget * widget)
@@ -2665,8 +2728,8 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     }
 
     /* stop client thread */
-    if (ctrl->client.thread)
-    {
+   if (ctrl->client.thread)
+   {
         /* Signal the thread to stop, then wait for it */
         ctrl->client.running = FALSE;
 #ifndef WIN32
@@ -2678,6 +2741,13 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
 #endif
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
+        ctrl->client.socket = -1;
+    }
+
+    if (ctrl->dbgterm != NULL)
+    {
+        gp_dbg_term_free(ctrl->dbgterm);
+        ctrl->dbgterm = NULL;
     }
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);

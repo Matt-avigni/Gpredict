@@ -74,6 +74,8 @@ typedef struct {
     gboolean        signal_los; /*!< Send LOS notification to RIG */
 
     gint            vfo_opt;    /*!< Keep track of vfo_opt being enabled in rigctld */
+
+    gboolean        supports_rit_xit; /*!< Radio supports Doppler via RIT/XIT offsets */
 } radio_conf_t;
 
 

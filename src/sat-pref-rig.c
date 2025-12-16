@@ -394,7 +394,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .lo = 0.0,
         .loup = 0.0,
         .signal_aos = FALSE,
-        .signal_los = FALSE
+        .signal_los = FALSE,
+        .supports_rit_xit = FALSE
     };
 
     /* If there are no entries, we have a bug since the button should 
@@ -690,6 +691,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .loup = 0.0,
         .signal_aos = FALSE,
         .signal_los = FALSE,
+        .supports_rit_xit = FALSE,
     };
 
     /* run rig conf editor */
@@ -813,7 +815,8 @@ void sat_pref_rig_ok()
         .lo = 0.0,
         .loup = 0.0,
         .signal_aos = FALSE,
-        .signal_los = FALSE
+        .signal_los = FALSE,
+        .supports_rit_xit = FALSE
     };
 
     /* delete all .rig files */
