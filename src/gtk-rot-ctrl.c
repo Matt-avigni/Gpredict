@@ -65,6 +65,10 @@
 
 #define FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
+#define ROT_PLAN_SAMPLE_DT_SEC 1.0
+#define ROT_PLAN_EL_WEIGHT 1.0
+#define ROT_PLAN_NEAR_LIMIT_MARGIN 2.0
+#define ROT_PLAN_NEAR_LIMIT_PENALTY 5.0
 
 typedef struct {
     GThread        *thread;
@@ -76,6 +80,26 @@ typedef struct {
     gboolean        io_error;
     GTimer         *timer;
 } rotctld_client_t;
+
+typedef enum {
+    ROT_PLAN_MODE_NORMAL = 0,
+    ROT_PLAN_MODE_FLIP   = 1
+} rot_plan_mode_t;
+
+typedef struct {
+    gboolean        valid;
+    rot_plan_mode_t mode;
+    gdouble         start_az_cmd;
+    gdouble         start_el_cmd;
+    gdouble         end_az_cmd;
+    gdouble         end_el_cmd;
+    gdouble         total_motion;
+    gdouble         peak_az_rate;
+    gdouble         peak_el_rate;
+    gdouble         window_start;
+    gdouble         window_end;
+    gchar          *reason;
+} rot_plan_t;
 
 struct _GtkRotCtrl {
     GtkBox          box;
@@ -100,6 +124,7 @@ struct _GtkRotCtrl {
 
     rotor_conf_t   *conf;
     rotctld_client_t client;
+    rot_plan_t      trajectory_plan;
 
     GpDbgTerm      *dbgterm;
 
@@ -120,6 +145,7 @@ static GtkVBoxClass *parent_class = NULL;
 /* Forward declaration for error dialog helper */
 
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
+static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_terminal_cb(GtkButton *button, gpointer data);
 
 /* Offset controls callbacks */
@@ -432,11 +458,421 @@ static gboolean is_flipped_pass(pass_t * pass, rot_az_type_t type,
     return retval;
 }
 
+static void rot_plan_reset(rot_plan_t *plan)
+{
+    if (plan == NULL)
+        return;
+
+    if (plan->reason) {
+        g_free(plan->reason);
+        plan->reason = NULL;
+    }
+
+    plan->valid = FALSE;
+    plan->mode = ROT_PLAN_MODE_NORMAL;
+    plan->start_az_cmd = 0.0;
+    plan->start_el_cmd = 0.0;
+    plan->end_az_cmd = 0.0;
+    plan->end_el_cmd = 0.0;
+    plan->total_motion = 0.0;
+    plan->peak_az_rate = 0.0;
+    plan->peak_el_rate = 0.0;
+    plan->window_start = 0.0;
+    plan->window_end = 0.0;
+}
+
+static inline gboolean rot_plan_matches_pass(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->pass == NULL || !ctrl->trajectory_plan.valid)
+        return FALSE;
+
+    return (fabs(ctrl->trajectory_plan.window_start - ctrl->pass->aos) < 1e-4 &&
+            fabs(ctrl->trajectory_plan.window_end - ctrl->pass->los) < 1e-4);
+}
+
 static inline void set_flipped_pass(GtkRotCtrl * ctrl)
 {
+    if (rot_plan_matches_pass(ctrl)) {
+        ctrl->flipped = (ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP);
+        return;
+    }
+
     if (ctrl->conf && ctrl->pass)
         ctrl->flipped = is_flipped_pass(ctrl->pass, ctrl->conf->aztype,
                                         ctrl->conf->azstoppos);
+    else
+        ctrl->flipped = FALSE;
+}
+
+typedef struct {
+    rot_plan_mode_t mode;
+    gboolean        valid;
+    gdouble         start_az_cmd;
+    gdouble         start_el_cmd;
+    gdouble         end_az_cmd;
+    gdouble         end_el_cmd;
+    gdouble         total_motion;
+    gdouble         peak_az_rate;
+    gdouble         peak_el_rate;
+    gchar          *reason;
+} rot_plan_candidate_t;
+
+static gdouble rot_wrap_to_conf(const rotor_conf_t *conf, gdouble az)
+{
+    gdouble span = 360.0;
+    gdouble minaz = 0.0;
+    gdouble maxaz = 360.0;
+
+    if (conf != NULL) {
+        minaz = conf->minaz;
+        maxaz = conf->maxaz;
+        span = maxaz - minaz;
+    }
+
+    if (span <= 0.0)
+        span = 360.0;
+
+    while (az < minaz)
+        az += span;
+    while (az > maxaz)
+        az -= span;
+
+    return az;
+}
+
+static gdouble rot_unwrap_near(const rotor_conf_t *conf, gdouble prev,
+                               gdouble current_wrapped)
+{
+    gdouble span = 360.0;
+
+    if (conf != NULL) {
+        span = conf->maxaz - conf->minaz;
+    }
+
+    if (span <= 0.0)
+        span = 360.0;
+
+    /* Try the three closest equivalents and pick the one nearest to prev. */
+    gdouble candidates[3];
+    candidates[0] = current_wrapped;
+    candidates[1] = current_wrapped + span;
+    candidates[2] = current_wrapped - span;
+
+    gdouble best = candidates[0];
+    gdouble best_diff = fabs(candidates[0] - prev);
+
+    for (int i = 1; i < 3; i++) {
+        gdouble diff = fabs(candidates[i] - prev);
+        if (diff < best_diff) {
+            best = candidates[i];
+            best_diff = diff;
+        }
+    }
+
+    return best;
+}
+
+static gboolean crosses_endstop(gdouble prev_az_mech, gdouble next_az_mech,
+                                gdouble endstop_az,
+                                gdouble az_min, gdouble az_max)
+{
+    gdouble span = az_max - az_min;
+
+    if (span <= 0.0)
+        return FALSE;
+
+    /* Normalize end-stop to the primary interval, then check repeats. */
+    gdouble stop = endstop_az;
+    while (stop < az_min)
+        stop += span;
+    while (stop > az_max)
+        stop -= span;
+
+    if (prev_az_mech == next_az_mech)
+        return FALSE;
+
+    if (prev_az_mech < next_az_mech) {
+        for (gdouble s = stop; s <= next_az_mech; s += span) {
+            if (s > prev_az_mech && s < next_az_mech)
+                return TRUE;
+        }
+    } else {
+        for (gdouble s = stop; s >= next_az_mech; s -= span) {
+            if (s < prev_az_mech && s > next_az_mech)
+                return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static gdouble rot_near_limit_penalty(GtkRotCtrl *ctrl,
+                                      gdouble az_norm,
+                                      gdouble el_mech)
+{
+    if (ROT_PLAN_NEAR_LIMIT_MARGIN <= 0.0 ||
+        ROT_PLAN_NEAR_LIMIT_PENALTY <= 0.0 ||
+        ctrl == NULL || ctrl->conf == NULL)
+        return 0.0;
+
+    gdouble penalty = 0.0;
+
+    if ((az_norm - ctrl->conf->minaz) < ROT_PLAN_NEAR_LIMIT_MARGIN)
+        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
+    if ((ctrl->conf->maxaz - az_norm) < ROT_PLAN_NEAR_LIMIT_MARGIN)
+        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
+    if ((el_mech - ctrl->conf->minel) < ROT_PLAN_NEAR_LIMIT_MARGIN)
+        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
+    if ((ctrl->conf->maxel - el_mech) < ROT_PLAN_NEAR_LIMIT_MARGIN)
+        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
+
+    return penalty;
+}
+
+static gboolean rot_plan_candidate(GtkRotCtrl *ctrl, pass_t *pass,
+                                   rot_plan_mode_t mode,
+                                   rot_plan_candidate_t *out)
+{
+    rot_plan_candidate_t cand;
+    GArray *az_samples = NULL;
+    GArray *el_samples = NULL;
+    GArray *time_samples = NULL;
+    gboolean have_prev = FALSE;
+    gdouble prev_az_cont = 0.0;
+    gdouble prev_mech_az = 0.0;
+    gdouble prev_el = 0.0;
+    gdouble t0, t1;
+    guint steps;
+
+    memset(&cand, 0, sizeof(cand));
+    cand.mode = mode;
+    cand.valid = FALSE;
+    cand.reason = NULL;
+
+    if (ctrl == NULL || pass == NULL || ctrl->conf == NULL ||
+        ctrl->target == NULL || ctrl->qth == NULL) {
+        cand.reason = g_strdup(_("Missing rotor configuration, pass or target data"));
+        goto done;
+    }
+
+    t0 = pass->aos;
+    t1 = pass->los;
+
+    /* Start planning no earlier than "now" if we are already in the pass. */
+    if (ctrl->t > t0)
+        t0 = ctrl->t;
+
+    if (t1 <= t0) {
+        cand.reason = g_strdup(_("Invalid pass window for trajectory planning"));
+        goto done;
+    }
+
+    steps = (guint)ceil(((t1 - t0) * secday) / ROT_PLAN_SAMPLE_DT_SEC);
+    if (steps < 1)
+        steps = 1;
+
+    az_samples = g_array_new(FALSE, FALSE, sizeof(gdouble));
+    el_samples = g_array_new(FALSE, FALSE, sizeof(gdouble));
+    time_samples = g_array_new(FALSE, FALSE, sizeof(gdouble));
+
+    for (guint i = 0; i <= steps; i++) {
+        gdouble t = t0 + (i * ROT_PLAN_SAMPLE_DT_SEC) / secday;
+        gdouble az_cmd, el_cmd;
+        gdouble az_cont;
+        gdouble mech_az_cont;
+        gdouble mech_az_norm;
+        gdouble mech_el;
+
+        if (t > t1)
+            t = t1;
+
+        /* Work on a copy so we don't corrupt the shared sat data. */
+        sat_t sat = *ctrl->target;
+        predict_calc(&sat, ctrl->qth, t);
+
+        az_cmd = sat.az;
+        el_cmd = sat.el;
+
+        if (mode == ROT_PLAN_MODE_FLIP) {
+            el_cmd = 180.0 - el_cmd;
+            az_cmd += 180.0;
+        }
+
+        az_cmd = rot_wrap_to_conf(ctrl->conf, az_cmd);
+
+        g_array_append_val(az_samples, az_cmd);
+        g_array_append_val(el_samples, el_cmd);
+        g_array_append_val(time_samples, t);
+
+        az_cont = az_cmd;
+        if (have_prev)
+            az_cont = rot_unwrap_near(ctrl->conf, prev_az_cont, az_cmd);
+
+        mech_az_cont = az_cont + (ctrl->use_offset ? ctrl->az_offset_deg : 0.0);
+        if (have_prev)
+            mech_az_cont = rot_unwrap_near(ctrl->conf, prev_mech_az, mech_az_cont);
+
+        mech_az_norm = rot_wrap_to_conf(ctrl->conf, mech_az_cont);
+        mech_el = el_cmd + (ctrl->use_offset ? ctrl->el_offset_deg : 0.0);
+
+        if (mech_el < ctrl->conf->minel || mech_el > ctrl->conf->maxel) {
+            cand.reason = g_strdup_printf(_("Elevation %.2f outside limits [%.2f..%.2f] at +%.1fs"),
+                                          mech_el, ctrl->conf->minel, ctrl->conf->maxel,
+                                          (t - pass->aos) * secday);
+            goto done;
+        }
+
+        if (mech_az_norm < ctrl->conf->minaz || mech_az_norm > ctrl->conf->maxaz) {
+            cand.reason = g_strdup_printf(_("Azimuth %.2f outside limits [%.2f..%.2f] at +%.1fs"),
+                                          mech_az_norm, ctrl->conf->minaz, ctrl->conf->maxaz,
+                                          (t - pass->aos) * secday);
+            goto done;
+        }
+
+        if (have_prev &&
+            crosses_endstop(prev_mech_az, mech_az_cont,
+                            ctrl->conf->azstoppos,
+                            ctrl->conf->minaz, ctrl->conf->maxaz)) {
+            cand.reason = g_strdup_printf(_("Move crosses forbidden end-stop at %.2f deg near +%.1fs"),
+                                          ctrl->conf->azstoppos,
+                                          (t - pass->aos) * secday);
+            goto done;
+        }
+
+        if (have_prev) {
+            gdouble delta_az = fabs(mech_az_cont - prev_mech_az);
+            gdouble delta_el = fabs(mech_el - prev_el);
+            gdouble az_rate = delta_az / ROT_PLAN_SAMPLE_DT_SEC;
+            gdouble el_rate = delta_el / ROT_PLAN_SAMPLE_DT_SEC;
+
+            cand.total_motion += delta_az + ROT_PLAN_EL_WEIGHT * delta_el;
+            cand.total_motion += rot_near_limit_penalty(ctrl, mech_az_norm, mech_el);
+            if (az_rate > cand.peak_az_rate)
+                cand.peak_az_rate = az_rate;
+            if (el_rate > cand.peak_el_rate)
+                cand.peak_el_rate = el_rate;
+        } else {
+            cand.start_az_cmd = az_cmd;
+            cand.start_el_cmd = el_cmd;
+        }
+
+        cand.end_az_cmd = az_cmd;
+        cand.end_el_cmd = el_cmd;
+
+        prev_az_cont = az_cont;
+        prev_mech_az = mech_az_cont;
+        prev_el = mech_el;
+        have_prev = TRUE;
+    }
+
+    cand.valid = TRUE;
+
+done:
+    if (az_samples)
+        g_array_free(az_samples, TRUE);
+    if (el_samples)
+        g_array_free(el_samples, TRUE);
+    if (time_samples)
+        g_array_free(time_samples, TRUE);
+
+    if (out != NULL) {
+        *out = cand;
+    } else if (cand.reason) {
+        g_free(cand.reason);
+    }
+
+    return cand.valid;
+}
+
+static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
+{
+    rot_plan_candidate_t normal = { 0 };
+    rot_plan_candidate_t flip = { 0 };
+    gboolean normal_valid = FALSE;
+    gboolean flip_valid = FALSE;
+    gboolean flip_allowed = FALSE;
+    rot_plan_candidate_t *chosen = NULL;
+
+    rot_plan_reset(&ctrl->trajectory_plan);
+
+    if (ctrl == NULL || ctrl->conf == NULL || ctrl->pass == NULL ||
+        ctrl->target == NULL || ctrl->qth == NULL) {
+        ctrl->trajectory_plan.reason = g_strdup(_("Missing rotor configuration, pass or target data"));
+        return FALSE;
+    }
+
+    normal_valid = rot_plan_candidate(ctrl, ctrl->pass, ROT_PLAN_MODE_NORMAL, &normal);
+    flip_allowed = (ctrl->conf->maxel >= 180.0);
+
+    if (flip_allowed)
+        flip_valid = rot_plan_candidate(ctrl, ctrl->pass, ROT_PLAN_MODE_FLIP, &flip);
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "%s: candidate NORMAL valid=%d total_motion=%.2f reason=%s",
+                __func__, normal_valid ? 1 : 0, normal.total_motion,
+                normal.reason ? normal.reason : "none");
+
+    if (flip_allowed) {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "%s: candidate FLIP valid=%d total_motion=%.2f reason=%s",
+                    __func__, flip_valid ? 1 : 0, flip.total_motion,
+                    flip.reason ? flip.reason : "none");
+    } else {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "%s: candidate FLIP skipped (maxel=%.2f)",
+                    __func__, ctrl->conf->maxel);
+    }
+
+    if (normal_valid)
+        chosen = &normal;
+
+    if (flip_valid) {
+        if (chosen == NULL || flip.total_motion < chosen->total_motion)
+            chosen = &flip;
+    }
+
+    if (chosen != NULL) {
+        ctrl->trajectory_plan.valid = TRUE;
+        ctrl->trajectory_plan.mode = chosen->mode;
+        ctrl->trajectory_plan.start_az_cmd = chosen->start_az_cmd;
+        ctrl->trajectory_plan.start_el_cmd = chosen->start_el_cmd;
+        ctrl->trajectory_plan.end_az_cmd = chosen->end_az_cmd;
+        ctrl->trajectory_plan.end_el_cmd = chosen->end_el_cmd;
+        ctrl->trajectory_plan.total_motion = chosen->total_motion;
+        ctrl->trajectory_plan.peak_az_rate = chosen->peak_az_rate;
+        ctrl->trajectory_plan.peak_el_rate = chosen->peak_el_rate;
+        ctrl->trajectory_plan.window_start = ctrl->pass->aos;
+        ctrl->trajectory_plan.window_end = ctrl->pass->los;
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "%s: selected %s plan start=(%.2f, %.2f) end=(%.2f, %.2f) total_motion=%.2f peak_rate=(%.2f, %.2f)",
+                    __func__,
+                    (chosen->mode == ROT_PLAN_MODE_FLIP) ? "FLIP" : "NORMAL",
+                    chosen->start_az_cmd, chosen->start_el_cmd,
+                    chosen->end_az_cmd, chosen->end_el_cmd,
+                    chosen->total_motion,
+                    chosen->peak_az_rate, chosen->peak_el_rate);
+    } else {
+        ctrl->trajectory_plan.valid = FALSE;
+
+        if (flip_allowed) {
+            ctrl->trajectory_plan.reason =
+                g_strdup_printf(_("No valid trajectory. Normal failed: %s. Flip failed: %s."),
+                                normal.reason ? normal.reason : _("unknown"),
+                                flip.reason ? flip.reason : _("unknown"));
+        } else {
+            ctrl->trajectory_plan.reason =
+                g_strdup_printf(_("No valid trajectory. Normal failed: %s. Flip not available (max elevation < 180)."),
+                                normal.reason ? normal.reason : _("unknown"));
+        }
+    }
+
+    if (normal.reason && chosen != &normal)
+        g_free(normal.reason);
+    if (flip.reason && chosen != &flip)
+        g_free(flip.reason);
+
+    return ctrl->trajectory_plan.valid;
 }
 
 /**
@@ -734,6 +1170,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
         if ((ctrl->pass != NULL))
             if (qth_small_dist(ctrl->qth, ctrl->pass->qth_comp) > 1.0)
             {
+                rot_plan_reset(&ctrl->trajectory_plan);
                 free_pass(ctrl->pass);
                 ctrl->pass = NULL;
                 ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
@@ -757,6 +1194,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                 if (ctrl->target->el >= 0.0)
                 {
                     /* inside an unexpected/unpredicted pass */
+                    rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
                     ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, t);
@@ -774,6 +1212,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                        fraction of it as a threshold for deciding a new pass */
 
                     /* if the next pass is not the one for the target */
+                    rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
                     ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
@@ -789,6 +1228,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                    horizon so look for a new pass */
                 if (ctrl->target->el < 0.0)
                 {
+                    rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
                     ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
@@ -802,6 +1242,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
         else
         {
             /* we don't have any current pass; store the current one */
+            rot_plan_reset(&ctrl->trajectory_plan);
             if (ctrl->target->el > 0.0)
                 ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, t);
             else
@@ -922,6 +1363,12 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     gtk_widget_set_sensitive(ctrl->AzSet, !ctrl->tracking);
     gtk_widget_set_sensitive(ctrl->ElSet, !ctrl->tracking);
 
+    if (!ctrl->tracking) {
+        rot_plan_reset(&ctrl->trajectory_plan);
+        set_flipped_pass(ctrl);
+        return;
+    }
+
     if (ctrl->tracking && ctrl->target && ctrl->qth)
     {
         if (ctrl->pass != NULL)
@@ -932,9 +1379,28 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         else
             ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
 
+        rot_plan_reset(&ctrl->trajectory_plan);
+
+        if (!rot_build_tracking_plan(ctrl)) {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        "%s: blocking tracking – %s",
+                        __func__,
+                        ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "trajectory planning failed");
+            rot_show_plan_error(ctrl, ctrl->trajectory_plan.reason);
+            gtk_toggle_button_set_active(button, FALSE);
+            ctrl->tracking = FALSE;
+            set_flipped_pass(ctrl);
+            return;
+        }
+
+        ctrl->flipped = (ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP);
         set_flipped_pass(ctrl);
         if (ctrl->plot != NULL)
             gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), ctrl->pass);
+    }
+    else if (ctrl->tracking) {
+        rot_plan_reset(&ctrl->trajectory_plan);
+        set_flipped_pass(ctrl);
     }
 }
 
@@ -954,6 +1420,10 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     sat_t sat_working, *sat;
     GtkWidget *status_label =
         g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
+    gboolean plan_active = rot_plan_matches_pass(ctrl);
+    gboolean use_flip = plan_active
+                        ? (ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP)
+                        : ctrl->flipped;
 
     /* parameters for path predictions */
     gdouble time_delta;
@@ -981,8 +1451,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                      * This avoids the rotor sitting at an arbitrary park (e.g. 0/0)
                      * and only starting to move once the satellite is already in range.
                      */
-                    setaz = ctrl->pass->aos_az;
-                    setel = (ctrl->conf ? ctrl->conf->minel : 0.0);
+                    if (plan_active && ctrl->trajectory_plan.valid) {
+                        setaz = ctrl->trajectory_plan.start_az_cmd;
+                        setel = ctrl->trajectory_plan.start_el_cmd;
+                    }
+                    else {
+                        setaz = ctrl->pass->aos_az;
+                        setel = (ctrl->conf ? ctrl->conf->minel : 0.0);
+                    }
                 }
                 else if (ctrl->t > ctrl->pass->los)
                 {
@@ -992,8 +1468,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 else
                 {
                     /* In/near-pass but still below horizon: keep current pre-positioning. */
-                    setaz = ctrl->pass->aos_az;
-                    setel = (ctrl->conf ? ctrl->conf->minel : 0.0);
+                    if (plan_active && ctrl->trajectory_plan.valid) {
+                        setaz = ctrl->trajectory_plan.start_az_cmd;
+                        setel = ctrl->trajectory_plan.start_el_cmd;
+                    }
+                    else {
+                        setaz = ctrl->pass->aos_az;
+                        setel = (ctrl->conf ? ctrl->conf->minel : 0.0);
+                    }
                 }
             }
             else
@@ -1009,7 +1491,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
 
         /* if this is a flipped pass and the rotor supports it */
-        if (ctrl->flipped && ctrl->conf->maxel >= 180.0)
+        if (use_flip && ctrl->conf->maxel >= 180.0)
         {
             setel = 180 - setel;
             if (setaz > 180)
@@ -1125,7 +1607,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         /* update sat->az and sat->el to account for flips
                          * and az range
                          */
-                        if (ctrl->flipped && ctrl->conf->maxel >= 180.0)
+                        if (use_flip && ctrl->conf->maxel >= 180.0)
                         {
                             sat->el = 180.0 - sat->el;
                             if (sat->az > 180.0)
@@ -1415,6 +1897,7 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
         gtk_rot_knob_set_range(GTK_ROT_KNOB(ctrl->ElSet), ctrl->conf->minel,
                                ctrl->conf->maxel);
 
+        rot_plan_reset(&ctrl->trajectory_plan);
         /* Update flipped when changing rotor if there is a plot */
         set_flipped_pass(ctrl);
     }
@@ -1911,6 +2394,27 @@ static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl)
     gtk_widget_destroy(dialog);
 }
 
+static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason)
+{
+    const gchar *msg = reason ? reason
+                              : _("No valid rotor trajectory for this pass.");
+    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    GtkWindow *parent = NULL;
+
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_ERROR,
+        GTK_BUTTONS_OK,
+        "%s", msg);
+    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor trajectory blocked"));
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
 static void rot_terminal_cb(GtkButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
@@ -2073,6 +2577,7 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
     if (i >= 0)
     {
         ctrl->target = SAT(g_slist_nth_data(ctrl->sats, i));
+        rot_plan_reset(&ctrl->trajectory_plan);
 
         /* update next pass */
         if (ctrl->pass != NULL)
@@ -2697,6 +3202,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->use_offset   = FALSE;
     ctrl->az_offset_deg = 0.0;
     ctrl->el_offset_deg = 0.0;
+    memset(&ctrl->trajectory_plan, 0, sizeof(ctrl->trajectory_plan));
+    rot_plan_reset(&ctrl->trajectory_plan);
     /* Default to conservative send-only until rotctld probe says otherwise. */
     ctrl->send_only_mode = TRUE;
 
@@ -2749,6 +3256,8 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         gp_dbg_term_free(ctrl->dbgterm);
         ctrl->dbgterm = NULL;
     }
+
+    rot_plan_reset(&ctrl->trajectory_plan);
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }
