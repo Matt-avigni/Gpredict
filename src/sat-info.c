@@ -20,10 +20,10 @@
 #include <build-config.h>
 #endif
 
-#ifndef WIN32
-#define _DEFAULT_SOURCE     // see man timegm
-#else
+#if defined(G_OS_WIN32) || defined(_WIN32) || defined(WIN32)
 #define timegm _mkgmtime    // https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/mkgmtime-mkgmtime32-mkgmtime64?view=vs-2017
+#else
+#define _DEFAULT_SOURCE     // see man timegm
 #endif
 
 #include <glib/gi18n.h>
