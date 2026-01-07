@@ -25,7 +25,7 @@
 #include <gtk/gtk.h>
 #include <signal.h>
 #include <stdlib.h>
-#ifdef WIN32
+#ifdef G_OS_WIN32
 #include <winsock2.h>
 #endif
 
@@ -87,10 +87,8 @@ static gpointer update_tle_thread(gpointer data);
 static void     clean_tle(void);
 static void     clean_trsp(void);
 
-#ifdef G_OS_WIN32
 static void     InitWinSock2(void);
 static void     CloseWinSock2(void);
-#endif
 
 
 int main(int argc, char *argv[])
@@ -152,10 +150,7 @@ int main(int argc, char *argv[])
     /* launch TLE monitoring task; 10 min interval */
     tle_mon_id = g_timeout_add(600000, tle_mon_task, NULL);
 
-#ifdef WIN32
-    // Initializing Windozze Sockets
     InitWinSock2();
-#endif
 
     gtk_main();
 
@@ -165,17 +160,14 @@ int main(int argc, char *argv[])
     sat_log_close();
     sat_cfg_close();
 
-#ifdef WIN32
     CloseWinSock2();
-#endif
 
     return 0;
 }
 
-#ifdef WIN32
-/* This code was given from MSDN */
 static void InitWinSock2(void)
 {
+#ifdef G_OS_WIN32
     WORD            wVersionRequested;
     WSADATA         wsaData;
     int             err;
@@ -203,13 +195,19 @@ static void InitWinSock2(void)
         WSACleanup();
         return;
     }
+#else
+    return;
+#endif
 }
 
 static void CloseWinSock2(void)
 {
+#ifdef G_OS_WIN32
     WSACleanup();
-}
+#else
+    return;
 #endif
+}
 
 /**
  * Create main application window.
