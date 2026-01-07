@@ -33,14 +33,14 @@
 #endif
 
 /* NETWORK */
-#ifndef WIN32
+#if defined(_WIN32) || defined(WIN32)
+#include <winsock2.h>
+#include <windows.h>
+#else
 #include <arpa/inet.h>          /* htons() */
 #include <netdb.h>              /* gethostbyname() */
 #include <netinet/in.h>         /* struct sockaddr_in */
 #include <sys/socket.h>         /* socket(), connect(), send() */
-#else
-#include <winsock2.h>
-#include <windows.h>
 #endif
 
 #include <errno.h>
