@@ -117,6 +117,20 @@ fi
 AC_SUBST(CFLAGS)
 AC_SUBST(LDFLAGS)
 
+# Compute .cat file list for data/satdata without make-time globbing.
+satdata_cat_files=""
+set -- "$srcdir"/data/satdata/*.cat
+if test "x$1" != "x$srcdir/data/satdata/*.cat"; then
+    for f in "$@"; do
+        case "$f" in
+            "$srcdir"/*) f=${f#$srcdir/} ;;
+        esac
+        satdata_cat_files="$satdata_cat_files $f"
+    done
+fi
+SATDATA_CAT_FILES="$satdata_cat_files"
+AC_SUBST(SATDATA_CAT_FILES)
+
 
 AC_CONFIG_FILES([
 Makefile
@@ -155,4 +169,3 @@ if test "$havelibgps" = true ; then
 fi
 # echo Enable coverage.... : $enable_coverage
 # echo
-
