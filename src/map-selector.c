@@ -76,7 +76,7 @@ static GtkWidget *create_preview_widget(const gchar * selection)
     gchar          *buff;
     gint            w, h;
     gint64          size;
-    struct stat     sb;
+    GStatBuf        sb;
     gchar          *bf = NULL;
 
 
@@ -148,7 +148,7 @@ static void update_preview_widget(GtkFileChooser * chooser, gpointer data)
     GdkPixbuf      *obuf, *sbuf;
     gint            w, h;
     gint64          size;
-    struct stat     sb;
+    GStatBuf        sb;
     gchar          *buff = NULL;
 
 
