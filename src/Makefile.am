@@ -82,6 +82,7 @@ gpredict_SOURCES = \
     rotor-conf.c rotor-conf.h \
     trsp-conf.c trsp-conf.h \
     trsp-update.c trsp-update.h \
+    win32-fetch.c win32-fetch.h \
     sat-cfg.c sat-cfg.h \
     sat-info.c sat-info.h \
     sat-log.c sat-log.h \

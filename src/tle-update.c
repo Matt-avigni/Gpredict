@@ -33,7 +33,7 @@
 #include <build-config.h>
 #endif
 #ifdef G_OS_WIN32
-#include "../win32/win32-fetch.h"
+#include "win32-fetch.h"
 #else
 #include <curl/curl.h>
 #endif
