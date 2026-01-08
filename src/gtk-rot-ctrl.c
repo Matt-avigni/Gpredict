@@ -55,6 +55,12 @@
 #include <glib/gi18n.h>
 #include <gtk/gtk.h>
 #include <math.h>
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <locale.h>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
+#endif
 #include <string.h>             /* strerror() */
 #include <stdarg.h>
 
@@ -934,6 +940,14 @@ static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
     return TRUE;
 }
 
+static void rot_format_deg_2(char *out, gsize outsz, gdouble val)
+{
+    gchar buf[G_ASCII_DTOSTR_BUF_SIZE];
+
+    g_ascii_formatd(buf, sizeof(buf), "%.2f", val);
+    g_strlcpy(out, buf, outsz);
+}
+
 /**
  * Send new position to rotator device
  *
@@ -948,28 +962,26 @@ static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
  */
 static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
 {
-    gchar          *buff;
+    gchar           txbuf[64];
     gchar           buffback[128];
     gboolean        retcode;
+    gchar           azbuf[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar           elbuf[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar           log_az[32];
+    gchar           log_el[32];
 
+    rot_format_deg_2(log_az, sizeof(log_az), az);
+    rot_format_deg_2(log_el, sizeof(log_el), el);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s: set_pos az=%.2f el=%.2f"), __func__, az, el);
+                _("%s: set_pos az=%s el=%s"), __func__, log_az, log_el);
 
-    /* send command */
-    {
-        /* Many Hamlib backends for rotators like the GS-232B expect
-         * integer degrees for the P command. Sending floats can result
-         * in RPRT -6 (invalid parameter). Round to nearest integer
-         * before formatting the command string.
-         */
-        gint iaz = (gint) lround(az);
-        gint iel = (gint) lround(el);
-
-        buff = g_strdup_printf("P %d %d\x0a", iaz, iel);
-    }
+    /* send command (ASCII-safe, locale independent) */
+    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az);
+    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el);
+    g_snprintf(txbuf, sizeof(txbuf), "P %s %s\n", azbuf, elbuf);
+    g_message("ROTCTLD TX: '%s'", txbuf);
     
-    retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
-    g_free(buff);
+    retcode = rotctld_socket_rw(ctrl->client.socket, txbuf, buffback, 128);
 
     if (!retcode) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -1018,6 +1030,13 @@ static gpointer rotctld_client_thread(gpointer data)
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: rotctld_client_thread started"), __func__);
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    locale_t c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+    locale_t old_locale = (locale_t)0;
+    if (c_locale)
+        old_locale = uselocale(c_locale);
+#endif
 
     ctrl->client.timer = g_timer_new();
     ctrl->client.new_trg = FALSE;
@@ -1083,13 +1102,17 @@ static gpointer rotctld_client_thread(gpointer data)
 
         if (send_cmd)
         {
+            gchar azs[32];
+            gchar els[32];
+            rot_format_deg_2(azs, sizeof(azs), azi);
+            rot_format_deg_2(els, sizeof(els), ele);
             sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d",
-                        azi, ele,
+                        "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%s, %s) engaged=%d monitor=%d",
+                        azs, els,
                         ctrl->engaged ? 1 : 0,
                         ctrl->monitor ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%.2f, %.2f) engaged=%d monitor=%d\n",
-                       azi, ele,
+            g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%s, %s) engaged=%d monitor=%d\n",
+                       azs, els,
                        ctrl->engaged ? 1 : 0,
                        ctrl->monitor ? 1 : 0);
 
@@ -1107,11 +1130,15 @@ static gpointer rotctld_client_thread(gpointer data)
         }
         else
         {
+            gchar azs[32];
+            gchar els[32];
+            rot_format_deg_2(azs, sizeof(azs), azi);
+            rot_format_deg_2(els, sizeof(els), ele);
             sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: client thread idle – no new target (last_out=(%.2f, %.2f))",
-                        azi, ele);
-            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%.2f, %.2f))\n",
-                       azi, ele);
+                        "MISSION_SOPHIE: client thread idle – no new target (last_out=(%s, %s))",
+                        azs, els);
+            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%s, %s))\n",
+                       azs, els);
         }
 
         if (io_error) {
@@ -1145,6 +1172,13 @@ static gpointer rotctld_client_thread(gpointer data)
                 _("%s: stopping rotctld client thread"), __func__);
     g_timer_destroy(ctrl->client.timer);
     rotctld_socket_close(&ctrl->client.socket);
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if (c_locale) {
+        uselocale(old_locale);
+        freelocale(c_locale);
+    }
+#endif
 
     return GINT_TO_POINTER(0);
 }
@@ -1787,17 +1821,27 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
             gtk_label_set_text(GTK_LABEL(status_label), status_text);
 
+            char cmdaz_str[32];
+            char cmdel_str[32];
+            char rotaz_str[32];
+            char rotel_str[32];
+
+            rot_format_deg_2(cmdaz_str, sizeof(cmdaz_str), cmdaz);
+            rot_format_deg_2(cmdel_str, sizeof(cmdel_str), cmdel);
+            rot_format_deg_2(rotaz_str, sizeof(rotaz_str), rotaz);
+            rot_format_deg_2(rotel_str, sizeof(rotel_str), rotel);
+
             sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d",
+                        "MISSION_SOPHIE: status=%s set=(%s, %s) rot=(%s, %s) error=%d",
                         status_text,
-                        cmdaz, cmdel,
-                        rotaz, rotel,
+                        cmdaz_str, cmdel_str,
+                        rotaz_str, rotel_str,
                         error ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
-                        status_text,
-                        cmdaz, cmdel,
-                        rotaz, rotel,
-                        error ? 1 : 0);
+            g_printerr("MISSION_SOPHIE: status=%s set=(%s, %s) rot=(%s, %s) error=%d\n",
+                       status_text,
+                       cmdaz_str, cmdel_str,
+                       rotaz_str, rotel_str,
+                       error ? 1 : 0);
         }
     }
     else
@@ -2293,11 +2337,17 @@ rotctld_probe_endpoint(GtkRotCtrl *ctrl)
                 if (endptr1 != lines[0] && endptr2 != lines[1])
                 {
                     ctrl->send_only_mode = FALSE;
+                    char az_str[32];
+                    char el_str[32];
+
+                    rot_format_deg_2(az_str, sizeof(az_str), az);
+                    rot_format_deg_2(el_str, sizeof(el_str), el);
+
                     sat_log_log(SAT_LOG_LEVEL_INFO,
-                                "MISSION_SOPHIE: rotctld probe at %s:%d returned numeric position az=%.2f el=%.2f – enabling FEEDBACK mode",
+                                "MISSION_SOPHIE: rotctld probe at %s:%d returned numeric position az=%s el=%s – enabling FEEDBACK mode",
                                 ctrl->conf ? ctrl->conf->host : "(null)",
                                 ctrl->conf ? ctrl->conf->port : 0,
-                                az, el);
+                                az_str, el_str);
                     ok = TRUE;
                 }
             }
