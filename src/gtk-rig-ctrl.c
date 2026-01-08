@@ -1080,6 +1080,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
     if (gtk_combo_box_get_active(box) == 0)
     {
         /* first entry is "None" */
+        rigctrl_reset_reconnect(ctrl, TRUE);
 
         /* reset uplink LO to what's in ctrl->conf */
         if (ctrl->conf != NULL)
@@ -2943,10 +2944,10 @@ static void apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
         tx_support = rx_support;
     }
 
-    if (rx_support && ctrl->sock > 0)
+    if (rx_support && ctrl->sock >= 0)
         applied_rit = set_rit(ctrl, ctrl->sock, rit);
 
-    if (tx_support && tx_sock > 0)
+    if (tx_support && tx_sock >= 0)
         applied_xit = set_xit(ctrl, tx_sock, xit);
 
     if (applied_rit || applied_xit)
@@ -2995,14 +2996,14 @@ static gboolean check_aos_los(GtkRigCtrl * ctrl)
         if (ctrl->prev_ele < 0.0 && ctrl->target->el >= 0.0)
         {
             /* AOS has occurred */
-            if (ctrl->conf->signal_aos && ctrl->sock > 0)
+            if (ctrl->conf->signal_aos && ctrl->sock >= 0)
             {
                 retcode &= send_rigctld_command(ctrl, ctrl->sock, "AOS\n",
                                                 retbuf, 10);
             }
             if (ctrl->conf2 != NULL)
             {
-                if (ctrl->conf2->signal_aos && ctrl->sock2 > 0)
+                if (ctrl->conf2->signal_aos && ctrl->sock2 >= 0)
                 {
                     retcode &= send_rigctld_command(ctrl, ctrl->sock2, "AOS\n",
                                                     retbuf, 10);
@@ -3012,14 +3013,14 @@ static gboolean check_aos_los(GtkRigCtrl * ctrl)
         else if (ctrl->prev_ele >= 0.0 && ctrl->target->el < 0.0)
         {
             /* LOS has occurred */
-            if (ctrl->conf->signal_los && ctrl->sock > 0)
+            if (ctrl->conf->signal_los && ctrl->sock >= 0)
             {
                 retcode &= send_rigctld_command(ctrl, ctrl->sock, "LOS\n",
                                                 retbuf, 10);
             }
             if (ctrl->conf2 != NULL)
             {
-                if (ctrl->conf2->signal_los && ctrl->sock2 > 0)
+                if (ctrl->conf2->signal_los && ctrl->sock2 >= 0)
                 {
                     retcode &= send_rigctld_command(ctrl, ctrl->sock2, "LOS\n",
                                                     retbuf, 10);
@@ -4108,7 +4109,7 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     if (!ctrl->timerid)
         start_timer(ctrl);
 
-    if (ctrl->sock <= 0)
+    if (ctrl->sock < 0)
     {
         ctrl->wrops = 0;
         sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -4151,7 +4152,7 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     }
 
     /* set initial frequency */
-    if (ctrl->conf2 != NULL && ctrl->sock2 <= 0)
+    if (ctrl->conf2 != NULL && ctrl->sock2 < 0)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: opening uplink rig %s:%d"), __func__,
@@ -4193,14 +4194,14 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         }
     }
 
-    if (ctrl->sock <= 0)
+    if (ctrl->sock < 0)
         return FALSE;
 
     if ((rx_opened || tx_opened))
     {
         if (ctrl->conf2 != NULL)
         {
-            if (ctrl->sock > 0 && ctrl->sock2 > 0)
+            if (ctrl->sock >= 0 && ctrl->sock2 >= 0)
                 exec_dual_rig_cycle(ctrl);
         }
         else
@@ -4271,7 +4272,7 @@ gpointer rigctl_run(gpointer data)
         {
             gint64 now_us = g_get_monotonic_time();
 
-            if (t_ctrl->sock <= 0)
+            if (t_ctrl->sock < 0)
             {
                 if (rigctrl_reconnect_due(t_ctrl, FALSE, now_us))
                 {
@@ -4284,11 +4285,11 @@ gpointer rigctl_run(gpointer data)
                                                    _("receiver"));
                     }
                 }
-                if (t_ctrl->sock <= 0)
+                if (t_ctrl->sock < 0)
                     continue;
             }
 
-            if (t_ctrl->conf2 != NULL && t_ctrl->sock2 <= 0)
+            if (t_ctrl->conf2 != NULL && t_ctrl->sock2 < 0)
             {
                 gboolean attempted_tx = FALSE;
 
@@ -4302,7 +4303,7 @@ gpointer rigctl_run(gpointer data)
                                     __func__);
                     }
                 }
-                if (attempted_tx && t_ctrl->sock2 <= 0)
+                if (attempted_tx && t_ctrl->sock2 < 0)
                     rigctrl_schedule_reconnect(t_ctrl, TRUE, _("uplink"));
             }
 
@@ -4328,7 +4329,7 @@ gpointer rigctl_run(gpointer data)
 
         if (t_ctrl->conf2 != NULL)
         {
-            if (t_ctrl->sock2 > 0)
+            if (t_ctrl->sock2 >= 0)
             {
                 exec_dual_rig_cycle(t_ctrl);
             }
@@ -4391,7 +4392,7 @@ gpointer rigctl_run(gpointer data)
         //g_print ("       WROPS = %d\n", ctrl->wrops);
     }
 
-    if (t_ctrl->sock > 0)
+    if (t_ctrl->sock >= 0)
         rigctrl_close(t_ctrl);
 
     if (t_ctrl->timerid)
