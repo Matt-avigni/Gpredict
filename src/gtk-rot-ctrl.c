@@ -92,6 +92,10 @@ typedef struct {
     gdouble         azi_out, ele_out;
     gdouble         azi_in, ele_in;
     gboolean        io_error;
+    gboolean        cmd_rejected;
+    gboolean        limits_valid;
+    gdouble         az_min, az_max;
+    gdouble         el_min, el_max;
     GTimer         *timer;
 } rotctld_client_t;
 
@@ -948,6 +952,131 @@ static void rot_format_deg_2(char *out, gsize outsz, gdouble val)
     g_strlcpy(out, buf, outsz);
 }
 
+static gboolean rot_parse_first_number(const gchar *line, gdouble *out)
+{
+    if (line == NULL || out == NULL)
+        return FALSE;
+
+    const gchar *p = line;
+    while (*p != '\0' && !g_ascii_isdigit(*p) && *p != '-' && *p != '+')
+        p++;
+
+    if (*p == '\0')
+        return FALSE;
+
+    gchar *endptr = NULL;
+    gdouble v = g_ascii_strtod(p, &endptr);
+    if (endptr == p)
+        return FALSE;
+
+    *out = v;
+    return TRUE;
+}
+
+static gboolean rotctld_parse_limits(const gchar *reply,
+                                     gdouble *az_min, gdouble *az_max,
+                                     gdouble *el_min, gdouble *el_max)
+{
+    gboolean have_az_min = FALSE;
+    gboolean have_az_max = FALSE;
+    gboolean have_el_min = FALSE;
+    gboolean have_el_max = FALSE;
+
+    if (reply == NULL)
+        return FALSE;
+
+    gchar **lines = g_strsplit(reply, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++) {
+        gchar *line = g_strstrip(lines[i]);
+        if (line[0] == '\0')
+            continue;
+
+        gchar *lower = g_ascii_strdown(line, -1);
+        if (g_strrstr(lower, "min az") != NULL) {
+            gdouble val = 0.0;
+            if (rot_parse_first_number(line, &val)) {
+                if (az_min)
+                    *az_min = val;
+                have_az_min = TRUE;
+            }
+        } else if (g_strrstr(lower, "max az") != NULL) {
+            gdouble val = 0.0;
+            if (rot_parse_first_number(line, &val)) {
+                if (az_max)
+                    *az_max = val;
+                have_az_max = TRUE;
+            }
+        } else if (g_strrstr(lower, "min el") != NULL) {
+            gdouble val = 0.0;
+            if (rot_parse_first_number(line, &val)) {
+                if (el_min)
+                    *el_min = val;
+                have_el_min = TRUE;
+            }
+        } else if (g_strrstr(lower, "max el") != NULL) {
+            gdouble val = 0.0;
+            if (rot_parse_first_number(line, &val)) {
+                if (el_max)
+                    *el_max = val;
+                have_el_max = TRUE;
+            }
+        }
+        g_free(lower);
+    }
+    g_strfreev(lines);
+
+    return have_az_min && have_az_max && have_el_min && have_el_max;
+}
+
+static gboolean rotctld_query_limits(GtkRotCtrl *ctrl)
+{
+    gchar reply[4096];
+    gchar cmd[] = "\\dump_state\n";
+
+    if (ctrl == NULL || ctrl->client.socket < 0)
+        return FALSE;
+
+    if (!rotctld_socket_rw(ctrl->client.socket, cmd, reply, sizeof(reply) - 1))
+        return FALSE;
+
+    gdouble az_min = 0.0;
+    gdouble az_max = 0.0;
+    gdouble el_min = 0.0;
+    gdouble el_max = 0.0;
+    if (!rotctld_parse_limits(reply, &az_min, &az_max, &el_min, &el_max))
+        return FALSE;
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.az_min = az_min;
+    ctrl->client.az_max = az_max;
+    ctrl->client.el_min = el_min;
+    ctrl->client.el_max = el_max;
+    ctrl->client.limits_valid = TRUE;
+    g_mutex_unlock(&ctrl->client.mutex);
+
+    char azmin_str[32];
+    char azmax_str[32];
+    char elmin_str[32];
+    char elmax_str[32];
+    rot_format_deg_2(azmin_str, sizeof(azmin_str), az_min);
+    rot_format_deg_2(azmax_str, sizeof(azmax_str), az_max);
+    rot_format_deg_2(elmin_str, sizeof(elmin_str), el_min);
+    rot_format_deg_2(elmax_str, sizeof(elmax_str), el_max);
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "MISSION_SOPHIE: rotctld limits az=[%s..%s] el=[%s..%s]",
+                azmin_str, azmax_str, elmin_str, elmax_str);
+    g_printerr("MISSION_SOPHIE: rotctld limits az=[%s..%s] el=[%s..%s]\n",
+               azmin_str, azmax_str, elmin_str, elmax_str);
+    return TRUE;
+}
+
+typedef enum {
+    ROT_SET_OK = 0,
+    ROT_SET_REJECTED = 1,
+    ROT_SET_IO_ERROR = 2
+} rot_set_result_t;
+
 /**
  * Send new position to rotator device
  *
@@ -960,7 +1089,7 @@ static void rot_format_deg_2(char *out, gsize outsz, gdouble val)
  * \note The function does not perform any range check since the GtkRotKnob
  * should always keep its value within range.
  */
-static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
+static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
 {
     gchar           txbuf[64];
     gchar           buffback[128];
@@ -969,15 +1098,57 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gchar           elbuf[G_ASCII_DTOSTR_BUF_SIZE];
     gchar           log_az[32];
     gchar           log_el[32];
+    gchar           norm_az_str[32];
+    gchar           norm_el_str[32];
+    gchar           send_az_str[32];
+    gchar           send_el_str[32];
+    gdouble         raw_az = az;
+    gdouble         raw_el = el;
+    gdouble         az_norm = normalize_az_0_360(az);
+    gdouble         az_send = az_norm;
+    gdouble         el_send = el;
 
-    rot_format_deg_2(log_az, sizeof(log_az), az);
-    rot_format_deg_2(log_el, sizeof(log_el), el);
+    gboolean        limits_valid = FALSE;
+    gdouble         az_min = 0.0;
+    gdouble         az_max = 360.0;
+    gdouble         el_min = 0.0;
+    gdouble         el_max = 180.0;
+
+    g_mutex_lock(&ctrl->client.mutex);
+    limits_valid = ctrl->client.limits_valid;
+    az_min = ctrl->client.az_min;
+    az_max = ctrl->client.az_max;
+    el_min = ctrl->client.el_min;
+    el_max = ctrl->client.el_max;
+    g_mutex_unlock(&ctrl->client.mutex);
+
+    if (limits_valid) {
+        if (az_min < 0.0 && az_max <= 180.0 + 1e-6) {
+            if (az_send > 180.0)
+                az_send -= 360.0;
+            az_send = CLAMP(az_send, az_min, az_max);
+        } else {
+            az_send = CLAMP(az_send, az_min, az_max);
+        }
+        el_send = CLAMP(el_send, el_min, el_max);
+    }
+
+    rot_format_deg_2(log_az, sizeof(log_az), raw_az);
+    rot_format_deg_2(log_el, sizeof(log_el), raw_el);
+    rot_format_deg_2(norm_az_str, sizeof(norm_az_str), az_norm);
+    rot_format_deg_2(norm_el_str, sizeof(norm_el_str), raw_el);
+    rot_format_deg_2(send_az_str, sizeof(send_az_str), az_send);
+    rot_format_deg_2(send_el_str, sizeof(send_el_str), el_send);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s: set_pos az=%s el=%s"), __func__, log_az, log_el);
+                _("%s: set_pos raw=(%s, %s) norm=(%s, %s) send=(%s, %s)"),
+                __func__, log_az, log_el, norm_az_str, norm_el_str,
+                send_az_str, send_el_str);
+    g_printerr("MISSION_SOPHIE: set_pos raw=(%s, %s) norm=(%s, %s) send=(%s, %s)\n",
+               log_az, log_el, norm_az_str, norm_el_str, send_az_str, send_el_str);
 
     /* send command (ASCII-safe, locale independent) */
-    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az);
-    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el);
+    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az_send);
+    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el_send);
     g_snprintf(txbuf, sizeof(txbuf), "P %s %s\n", azbuf, elbuf);
     g_message("ROTCTLD TX: '%s'", txbuf);
     
@@ -988,7 +1159,7 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
                     _("%s: rotctld I/O error while sending P command"), __func__);
         g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
         rotctld_socket_close_quiet(&ctrl->client.socket);
-        return FALSE;
+        return ROT_SET_IO_ERROR;
     }
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -1003,18 +1174,18 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     g_strstrip(buffback);
 
     if (g_str_has_prefix(buffback, "RPRT 0")) {
-        return TRUE;
+        return ROT_SET_OK;
     }
 
     if (g_str_has_prefix(buffback, "RPRT ")) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld returned error reply '%s'"), __func__, buffback);
         g_printerr("MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
-        return FALSE;
+        return ROT_SET_REJECTED;
     }
 
     /* Legacy / non-Hamlib style replies (e.g. numeric echoes) are treated as OK. */
-    return TRUE;
+    return ROT_SET_OK;
 }
 
 /* Rotctl client thread */
@@ -1042,6 +1213,8 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.new_trg = FALSE;
     ctrl->client.running = TRUE;
     ctrl->client.socket = -1;
+    ctrl->client.cmd_rejected = FALSE;
+    ctrl->client.limits_valid = FALSE;
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "MISSION_SOPHIE: rotctld_client_thread started for %s:%d",
@@ -1079,6 +1252,16 @@ static gpointer rotctld_client_thread(gpointer data)
             g_mutex_unlock(&ctrl->client.mutex);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "%s: rotctld link re-established", __func__);
+
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.limits_valid = FALSE;
+            g_mutex_unlock(&ctrl->client.mutex);
+
+            if (!rotctld_query_limits(ctrl)) {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "%s: failed to parse rotctld limits from dump_state",
+                            __func__);
+            }
         }
 
         io_error = FALSE;
@@ -1116,17 +1299,27 @@ static gpointer rotctld_client_thread(gpointer data)
                        ctrl->engaged ? 1 : 0,
                        ctrl->monitor ? 1 : 0);
 
-            if (!set_pos(ctrl, azi, ele))
+            rot_set_result_t set_res = set_pos(ctrl, azi, ele);
+            if (set_res == ROT_SET_IO_ERROR)
             {
                 io_error = TRUE;
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: set_pos failed"), __func__);
+            }
+            else if (set_res == ROT_SET_REJECTED)
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: set_pos rejected by rotctld"), __func__);
             }
             else
             {
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             _("%s: set_pos success"), __func__);
             }
+
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.cmd_rejected = (set_res == ROT_SET_REJECTED);
+            g_mutex_unlock(&ctrl->client.mutex);
         }
         else
         {
@@ -1139,10 +1332,17 @@ static gpointer rotctld_client_thread(gpointer data)
                         azs, els);
             g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%s, %s))\n",
                        azs, els);
+
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.cmd_rejected = FALSE;
+            g_mutex_unlock(&ctrl->client.mutex);
         }
 
         if (io_error) {
             rotctld_socket_close_quiet(&ctrl->client.socket);
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.limits_valid = FALSE;
+            g_mutex_unlock(&ctrl->client.mutex);
         }
 
         /* Treat last commanded az/el as the "measured" position for
@@ -1151,7 +1351,7 @@ static gpointer rotctld_client_thread(gpointer data)
          * position read-back.
          */
         g_mutex_lock(&ctrl->client.mutex);
-        if (!io_error) {
+        if (!io_error && send_cmd && !ctrl->client.cmd_rejected) {
             ctrl->client.azi_in = ctrl->client.azi_out;
             ctrl->client.ele_in = ctrl->client.ele_out;
         }
@@ -1506,6 +1706,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean cmd_from_plan = FALSE;
     gchar *text;
     gboolean error = FALSE;
+    gboolean cmd_rejected = FALSE;
     sat_t sat_working, *sat;
     GtkWidget *status_label =
         g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
@@ -1626,6 +1827,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (g_mutex_trylock(&ctrl->client.mutex))
         {
             error = ctrl->client.io_error;
+            cmd_rejected = ctrl->client.cmd_rejected;
             rotaz = ctrl->client.azi_in;
             rotel = ctrl->client.ele_in;
             g_mutex_unlock(&ctrl->client.mutex);
@@ -1807,7 +2009,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             const gchar *status_text = NULL;
             gboolean has_error = error || (ctrl->errcnt > 0);
 
-            if (has_error)
+            if (cmd_rejected)
+                status_text = _("CMD REJECTED");
+            else if (has_error)
                 status_text = _("LINK DOWN");
             else if (ctrl->tracking && plan_active &&
                      ctrl->trajectory_plan.valid &&
@@ -2639,6 +2843,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->client.azi_in    = ctrl->client.azi_out;
         ctrl->client.ele_in    = ctrl->client.ele_out;
         ctrl->client.io_error  = FALSE;
+        ctrl->client.cmd_rejected = FALSE;
+        ctrl->client.limits_valid = FALSE;
         ctrl->client.new_trg   = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
 
@@ -3337,6 +3543,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.socket = -1;
     ctrl->client.running = FALSE;
     ctrl->client.io_error = FALSE;
+    ctrl->client.cmd_rejected = FALSE;
+    ctrl->client.limits_valid = FALSE;
 
     if (g_getenv("GPREDICT_ROT_PLAN_TEST"))
         rot_plan_debug_harness();
