@@ -61,7 +61,16 @@ static GtkTreeModel *create_and_fill_model()
                                    G_TYPE_DOUBLE,       // LO DOWN
                                    G_TYPE_DOUBLE,       // LO UO
                                    G_TYPE_BOOLEAN,      // AOS signalling
-                                   G_TYPE_BOOLEAN       // LOS signalling
+                                   G_TYPE_BOOLEAN,      // LOS signalling
+                                   G_TYPE_BOOLEAN,      // rigctld autostart
+                                   G_TYPE_BOOLEAN,      // rigctld auto power-on
+                                   G_TYPE_STRING,       // rigctld path
+                                   G_TYPE_INT,          // rigctld model
+                                   G_TYPE_STRING,       // rigctld device
+                                   G_TYPE_INT,          // rigctld baud
+                                   G_TYPE_STRING,       // rigctld CI-V addr
+                                   G_TYPE_STRING,       // rigctld extra args
+                                   G_TYPE_BOOLEAN       // IC-9700 SAT mode
         );
 
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
@@ -98,6 +107,24 @@ static GtkTreeModel *create_and_fill_model()
                                        RIG_LIST_COL_LOUP, conf.loup,
                                        RIG_LIST_COL_SIGAOS, conf.signal_aos,
                                        RIG_LIST_COL_SIGLOS, conf.signal_los,
+                                       RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                                       conf.rigctld_autostart,
+                                       RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                                       conf.rigctld_auto_power_on,
+                                       RIG_LIST_COL_RIGCTLD_PATH,
+                                       conf.rigctld_path,
+                                       RIG_LIST_COL_RIGCTLD_MODEL,
+                                       conf.rigctld_model,
+                                       RIG_LIST_COL_RIGCTLD_DEVICE,
+                                       conf.rigctld_device,
+                                       RIG_LIST_COL_RIGCTLD_BAUD,
+                                       conf.rigctld_baud,
+                                       RIG_LIST_COL_RIGCTLD_CIVADDR,
+                                       conf.rigctld_civaddr,
+                                       RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
+                                       conf.rigctld_extra_args,
+                                       RIG_LIST_COL_IC9700_SATMODE,
+                                       conf.supports_dual_vfo_sat,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -109,6 +136,18 @@ static GtkTreeModel *create_and_fill_model()
 
                     if (conf.host)
                         g_free(conf.host);
+
+                    if (conf.rigctld_path)
+                        g_free(conf.rigctld_path);
+
+                    if (conf.rigctld_device)
+                        g_free(conf.rigctld_device);
+
+                    if (conf.rigctld_civaddr)
+                        g_free(conf.rigctld_civaddr);
+
+                    if (conf.rigctld_extra_args)
+                        g_free(conf.rigctld_extra_args);
                 }
                 else
                 {
@@ -398,7 +437,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .supports_rit_xit = FALSE,
         .supports_full_duplex = FALSE,
         .supports_dual_vfo_sat = FALSE,
-        .rigctld_autostart = FALSE,
+        .rigctld_autostart = TRUE,
+        .rigctld_auto_power_on = FALSE,
         .rigctld_path = NULL,
         .rigctld_model = 0,
         .rigctld_device = NULL,
@@ -436,7 +476,26 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_LO, &conf.lo,
                            RIG_LIST_COL_LOUP, &conf.loup,
                            RIG_LIST_COL_SIGAOS, &conf.signal_aos,
-                           RIG_LIST_COL_SIGLOS, &conf.signal_los, -1);
+                           RIG_LIST_COL_SIGLOS, &conf.signal_los,
+                           RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                           &conf.rigctld_autostart,
+                           RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                           &conf.rigctld_auto_power_on,
+                           RIG_LIST_COL_RIGCTLD_PATH,
+                           &conf.rigctld_path,
+                           RIG_LIST_COL_RIGCTLD_MODEL,
+                           &conf.rigctld_model,
+                           RIG_LIST_COL_RIGCTLD_DEVICE,
+                           &conf.rigctld_device,
+                           RIG_LIST_COL_RIGCTLD_BAUD,
+                           &conf.rigctld_baud,
+                           RIG_LIST_COL_RIGCTLD_CIVADDR,
+                           &conf.rigctld_civaddr,
+                           RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
+                           &conf.rigctld_extra_args,
+                           RIG_LIST_COL_IC9700_SATMODE,
+                           &conf.supports_dual_vfo_sat,
+                           -1);
     }
     else
     {
@@ -472,7 +531,21 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_LO, conf.lo,
                            RIG_LIST_COL_LOUP, conf.loup,
                            RIG_LIST_COL_SIGAOS, conf.signal_aos,
-                           RIG_LIST_COL_SIGLOS, conf.signal_los, -1);
+                           RIG_LIST_COL_SIGLOS, conf.signal_los,
+                           RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                           conf.rigctld_autostart,
+                           RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                           conf.rigctld_auto_power_on,
+                           RIG_LIST_COL_RIGCTLD_PATH, conf.rigctld_path,
+                           RIG_LIST_COL_RIGCTLD_MODEL, conf.rigctld_model,
+                           RIG_LIST_COL_RIGCTLD_DEVICE, conf.rigctld_device,
+                           RIG_LIST_COL_RIGCTLD_BAUD, conf.rigctld_baud,
+                           RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
+                           RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
+                           conf.rigctld_extra_args,
+                           RIG_LIST_COL_IC9700_SATMODE,
+                           conf.supports_dual_vfo_sat,
+                           -1);
     }
 
     /* clean up memory */
@@ -481,6 +554,18 @@ static void edit_cb(GtkWidget * button, gpointer data)
 
     if (conf.host != NULL)
         g_free(conf.host);
+
+    if (conf.rigctld_path)
+        g_free(conf.rigctld_path);
+
+    if (conf.rigctld_device)
+        g_free(conf.rigctld_device);
+
+    if (conf.rigctld_civaddr)
+        g_free(conf.rigctld_civaddr);
+
+    if (conf.rigctld_extra_args)
+        g_free(conf.rigctld_extra_args);
 }
 
 static void row_activated_cb(GtkTreeView * tree_view,
@@ -703,7 +788,8 @@ static void add_cb(GtkWidget * button, gpointer data)
         .supports_rit_xit = FALSE,
         .supports_full_duplex = FALSE,
         .supports_dual_vfo_sat = FALSE,
-        .rigctld_autostart = FALSE,
+        .rigctld_autostart = TRUE,
+        .rigctld_auto_power_on = FALSE,
         .rigctld_path = NULL,
         .rigctld_model = 0,
         .rigctld_device = NULL,
@@ -732,12 +818,38 @@ static void add_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_LO, conf.lo,
                            RIG_LIST_COL_LOUP, conf.loup,
                            RIG_LIST_COL_SIGAOS, conf.signal_aos,
-                           RIG_LIST_COL_SIGLOS, conf.signal_los, -1);
+                           RIG_LIST_COL_SIGLOS, conf.signal_los,
+                           RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                           conf.rigctld_autostart,
+                           RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                           conf.rigctld_auto_power_on,
+                           RIG_LIST_COL_RIGCTLD_PATH, conf.rigctld_path,
+                           RIG_LIST_COL_RIGCTLD_MODEL, conf.rigctld_model,
+                           RIG_LIST_COL_RIGCTLD_DEVICE, conf.rigctld_device,
+                           RIG_LIST_COL_RIGCTLD_BAUD, conf.rigctld_baud,
+                           RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
+                           RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
+                           conf.rigctld_extra_args,
+                           RIG_LIST_COL_IC9700_SATMODE,
+                           conf.supports_dual_vfo_sat,
+                           -1);
 
         g_free(conf.name);
 
         if (conf.host != NULL)
             g_free(conf.host);
+
+        if (conf.rigctld_path)
+            g_free(conf.rigctld_path);
+
+        if (conf.rigctld_device)
+            g_free(conf.rigctld_device);
+
+        if (conf.rigctld_civaddr)
+            g_free(conf.rigctld_civaddr);
+
+        if (conf.rigctld_extra_args)
+            g_free(conf.rigctld_extra_args);
     }
 }
 
@@ -837,7 +949,8 @@ void sat_pref_rig_ok()
         .supports_rit_xit = FALSE,
         .supports_full_duplex = FALSE,
         .supports_dual_vfo_sat = FALSE,
-        .rigctld_autostart = FALSE,
+        .rigctld_autostart = TRUE,
+        .rigctld_auto_power_on = FALSE,
         .rigctld_path = NULL,
         .rigctld_model = 0,
         .rigctld_device = NULL,
@@ -889,7 +1002,26 @@ void sat_pref_rig_ok()
                                RIG_LIST_COL_LO, &conf.lo,
                                RIG_LIST_COL_LOUP, &conf.loup,
                                RIG_LIST_COL_SIGAOS, &conf.signal_aos,
-                               RIG_LIST_COL_SIGLOS, &conf.signal_los, -1);
+                               RIG_LIST_COL_SIGLOS, &conf.signal_los,
+                               RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                               &conf.rigctld_autostart,
+                               RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                               &conf.rigctld_auto_power_on,
+                               RIG_LIST_COL_RIGCTLD_PATH,
+                               &conf.rigctld_path,
+                               RIG_LIST_COL_RIGCTLD_MODEL,
+                               &conf.rigctld_model,
+                               RIG_LIST_COL_RIGCTLD_DEVICE,
+                               &conf.rigctld_device,
+                               RIG_LIST_COL_RIGCTLD_BAUD,
+                               &conf.rigctld_baud,
+                               RIG_LIST_COL_RIGCTLD_CIVADDR,
+                               &conf.rigctld_civaddr,
+                               RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
+                               &conf.rigctld_extra_args,
+                               RIG_LIST_COL_IC9700_SATMODE,
+                               &conf.supports_dual_vfo_sat,
+                               -1);
             radio_conf_save(&conf);
 
             /* free conf buffer */
@@ -898,6 +1030,18 @@ void sat_pref_rig_ok()
 
             if (conf.host)
                 g_free(conf.host);
+
+            if (conf.rigctld_path)
+                g_free(conf.rigctld_path);
+
+            if (conf.rigctld_device)
+                g_free(conf.rigctld_device);
+
+            if (conf.rigctld_civaddr)
+                g_free(conf.rigctld_civaddr);
+
+            if (conf.rigctld_extra_args)
+                g_free(conf.rigctld_extra_args);
         }
         else
         {

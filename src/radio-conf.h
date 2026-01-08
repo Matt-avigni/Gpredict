@@ -80,6 +80,7 @@ typedef struct {
     gboolean        supports_dual_vfo_sat; /*!< Radio supports dual VFO satellite mode */
 
     gboolean        rigctld_autostart; /*!< Auto-start rigctld on connection failure */
+    gboolean        rigctld_auto_power_on; /*!< Auto power-on rig during rigctld start */
     gchar          *rigctld_path; /*!< rigctld binary path (empty uses PATH) */
     gint            rigctld_model; /*!< rigctld model number */
     gchar          *rigctld_device; /*!< rigctld serial device path */

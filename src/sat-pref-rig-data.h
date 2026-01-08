@@ -40,6 +40,15 @@ typedef enum {
     RIG_LIST_COL_LOUP,          /*!< Local oscillato freq (uplink) */
     RIG_LIST_COL_SIGAOS,        /*!< Signal AOS */
     RIG_LIST_COL_SIGLOS,        /*!< Signal LOS */
+    RIG_LIST_COL_RIGCTLD_AUTOSTART, /*!< Auto-start rigctld */
+    RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON, /*!< rigctld auto power-on */
+    RIG_LIST_COL_RIGCTLD_PATH,  /*!< rigctld path */
+    RIG_LIST_COL_RIGCTLD_MODEL, /*!< rigctld model */
+    RIG_LIST_COL_RIGCTLD_DEVICE, /*!< rigctld device */
+    RIG_LIST_COL_RIGCTLD_BAUD,  /*!< rigctld baud */
+    RIG_LIST_COL_RIGCTLD_CIVADDR, /*!< rigctld CI-V address */
+    RIG_LIST_COL_RIGCTLD_EXTRA_ARGS, /*!< rigctld extra args */
+    RIG_LIST_COL_IC9700_SATMODE, /*!< IC-9700 SAT mode */
     RIG_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rig_list_col_t;
 

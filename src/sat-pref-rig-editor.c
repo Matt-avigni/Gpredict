@@ -43,7 +43,9 @@ static GtkWidget *lo;           /* local oscillator of downconverter */
 static GtkWidget *loup;         /* local oscillator of upconverter */
 static GtkWidget *sigaos;       /* AOS signalling */
 static GtkWidget *siglos;       /* LOS signalling */
+static GtkWidget *ic9700_satmode; /* IC-9700 SAT mode override */
 static GtkWidget *autostart;    /* auto-start rigctld */
+static GtkWidget *rigctld_auto_power_on; /* rigctld auto power-on */
 static GtkWidget *rigctld_path; /* rigctld path */
 static GtkWidget *rigctld_model; /* rigctld model */
 static GtkWidget *rigctld_device; /* rigctld device */
@@ -53,6 +55,7 @@ static GtkWidget *rigctld_extra_args; /* rigctld extra args */
 
 static void update_autostart_sensitivity(gboolean enabled)
 {
+    gtk_widget_set_sensitive(rigctld_auto_power_on, enabled);
     gtk_widget_set_sensitive(rigctld_path, enabled);
     gtk_widget_set_sensitive(rigctld_model, enabled);
     gtk_widget_set_sensitive(rigctld_device, enabled);
@@ -75,14 +78,17 @@ static void clear_widgets()
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ptt), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sigaos), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(siglos), FALSE);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ic9700_satmode), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(rigctld_auto_power_on),
+                                 FALSE);
     gtk_entry_set_text(GTK_ENTRY(rigctld_path), "");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model), 0);
     gtk_entry_set_text(GTK_ENTRY(rigctld_device), "");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_baud), 0);
     gtk_entry_set_text(GTK_ENTRY(rigctld_civaddr), "");
     gtk_entry_set_text(GTK_ENTRY(rigctld_extra_args), "");
-    update_autostart_sensitivity(FALSE);
+    update_autostart_sensitivity(TRUE);
 }
 
 static void update_widgets(radio_conf_t * conf)
@@ -128,8 +134,12 @@ static void update_widgets(radio_conf_t * conf)
     /* AOS / LOS signalling */
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sigaos), conf->signal_aos);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(siglos), conf->signal_los);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ic9700_satmode),
+                                 conf->supports_dual_vfo_sat);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart),
                                  conf->rigctld_autostart);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(rigctld_auto_power_on),
+                                 conf->rigctld_auto_power_on);
     gtk_entry_set_text(GTK_ENTRY(rigctld_path), "");
     if (conf->rigctld_path)
         gtk_entry_set_text(GTK_ENTRY(rigctld_path), conf->rigctld_path);
@@ -436,10 +446,20 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                    "<b>TS-2000:</b> B\342\206\221 / A\342\206\223"));
     gtk_grid_attach(GTK_GRID(table), vfo, 1, 5, 2, 1);
 
+    /* IC-9700 SAT mode */
+    label = gtk_label_new(_("IC-9700 SAT mode"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
+
+    ic9700_satmode = gtk_check_button_new_with_label(_("Enable"));
+    gtk_grid_attach(GTK_GRID(table), ic9700_satmode, 1, 6, 1, 1);
+    gtk_widget_set_tooltip_text(ic9700_satmode,
+                                _("Force Main/Sub VFO use in satellite mode."));
+
     /* Downconverter LO frequency */
     label = gtk_label_new(_("LO Down"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
 
     lo = gtk_spin_button_new_with_range(-10000, 10000, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(lo), 0);
@@ -448,16 +468,16 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _
                                 ("Enter the frequency of the local oscillator "
                                  " of the downconverter, if any."));
-    gtk_grid_attach(GTK_GRID(table), lo, 1, 6, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), lo, 1, 7, 2, 1);
 
     label = gtk_label_new(_("MHz"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 3, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 3, 7, 1, 1);
 
     /* Upconverter LO frequency */
     label = gtk_label_new(_("LO Up"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 8, 1, 1);
 
     loup = gtk_spin_button_new_with_range(-10000, 10000, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(loup), 0);
@@ -466,108 +486,118 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _
                                 ("Enter the frequency of the local oscillator "
                                  "of the upconverter, if any."));
-    gtk_grid_attach(GTK_GRID(table), loup, 1, 7, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), loup, 1, 8, 2, 1);
 
     label = gtk_label_new(_("MHz"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 3, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 3, 8, 1, 1);
 
     /* AOS / LOS signalling */
     label = gtk_label_new(_("Signalling"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 9, 1, 1);
 
     sigaos = gtk_check_button_new_with_label(_("AOS"));
-    gtk_grid_attach(GTK_GRID(table), sigaos, 1, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), sigaos, 1, 9, 1, 1);
     gtk_widget_set_tooltip_text(sigaos,
                                 _("Enable AOS signalling for this radio."));
 
     siglos = gtk_check_button_new_with_label(_("LOS"));
-    gtk_grid_attach(GTK_GRID(table), siglos, 2, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), siglos, 2, 9, 1, 1);
     gtk_widget_set_tooltip_text(siglos,
                                 _("Enable LOS signalling for this radio."));
 
     /* Auto-start rigctld */
     label = gtk_label_new(_("Auto-start rigctld"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 9, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 10, 1, 1);
 
     autostart = gtk_check_button_new_with_label(_("Enable"));
-    gtk_grid_attach(GTK_GRID(table), autostart, 1, 9, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), autostart, 1, 10, 1, 1);
     gtk_widget_set_tooltip_text(autostart,
                                 _("Start rigctld automatically if connection fails."));
     g_signal_connect(autostart, "toggled", G_CALLBACK(autostart_toggled), NULL);
 
+    /* rigctld auto power-on */
+    label = gtk_label_new(_("Auto power-on"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
+
+    rigctld_auto_power_on = gtk_check_button_new_with_label(_("Enable"));
+    gtk_grid_attach(GTK_GRID(table), rigctld_auto_power_on, 1, 11, 1, 1);
+    gtk_widget_set_tooltip_text(rigctld_auto_power_on,
+                                _("Enable rigctld auto power-on if supported."));
+
     /* rigctld path */
     label = gtk_label_new(_("rigctld path"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 10, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
 
     rigctld_path = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_path), 200);
     gtk_widget_set_tooltip_text(rigctld_path,
                                 _("Path to rigctld binary (leave empty to use PATH)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_path, 1, 10, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_path, 1, 12, 3, 1);
 
     /* rigctld model */
     label = gtk_label_new(_("Rig model"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
 
     rigctld_model = gtk_spin_button_new_with_range(0, 99999, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_model), 0);
     gtk_widget_set_tooltip_text(rigctld_model,
                                 _("Hamlib rig model number (e.g. 3081)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 11, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 13, 1, 1);
 
     /* rigctld device */
     label = gtk_label_new(_("Serial device"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
 
     rigctld_device = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
     gtk_widget_set_tooltip_text(rigctld_device,
                                 _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 12, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 14, 3, 1);
 
     /* rigctld baud */
     label = gtk_label_new(_("Baud"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
 
     rigctld_baud = gtk_spin_button_new_with_range(0, 1000000, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_baud), 0);
     gtk_widget_set_tooltip_text(rigctld_baud,
                                 _("Serial baud rate for rigctld (e.g. 19200)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_baud, 1, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_baud, 1, 15, 1, 1);
 
     /* rigctld CI-V address */
     label = gtk_label_new(_("CI-V addr"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 16, 1, 1);
 
     rigctld_civaddr = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_civaddr), 16);
     gtk_widget_set_tooltip_text(rigctld_civaddr,
                                 _("Optional CI-V address (e.g. 0xA2)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_civaddr, 1, 14, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_civaddr, 1, 16, 2, 1);
 
     /* rigctld extra args */
     label = gtk_label_new(_("Extra args"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
 
     rigctld_extra_args = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_extra_args), 200);
     gtk_widget_set_tooltip_text(rigctld_extra_args,
                                 _("Extra rigctld arguments (optional)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_extra_args, 1, 15, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_extra_args, 1, 17, 3, 1);
 
     if (conf->name != NULL)
         update_widgets(conf);
     else
-        update_autostart_sensitivity(FALSE);
+        update_autostart_sensitivity(TRUE);
 
     gtk_widget_show_all(table);
 
@@ -640,10 +670,14 @@ static gboolean apply_changes(radio_conf_t * conf)
     /* AOS / LOS signalling */
     conf->signal_aos = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sigaos));
     conf->signal_los = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(siglos));
+    conf->supports_dual_vfo_sat =
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ic9700_satmode));
 
     /* rigctld auto-start */
     conf->rigctld_autostart =
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
+    conf->rigctld_auto_power_on =
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(rigctld_auto_power_on));
 
     if (conf->rigctld_path)
         g_free(conf->rigctld_path);

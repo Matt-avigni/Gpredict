@@ -46,12 +46,14 @@
 #define KEY_SIG_AOS     "SIGNAL_AOS"
 #define KEY_SIG_LOS     "SIGNAL_LOS"
 #define KEY_RIGCTLD_AUTOSTART   "RIGCTLD_AUTOSTART"
+#define KEY_RIGCTLD_AUTO_POWER_ON "RIGCTLD_AUTO_POWER_ON"
 #define KEY_RIGCTLD_PATH        "RIGCTLD_PATH"
 #define KEY_RIGCTLD_MODEL       "RIGCTLD_MODEL"
 #define KEY_RIGCTLD_DEVICE      "RIGCTLD_DEVICE"
 #define KEY_RIGCTLD_BAUD        "RIGCTLD_BAUD"
 #define KEY_RIGCTLD_CIVADDR     "RIGCTLD_CIVADDR"
 #define KEY_RIGCTLD_EXTRA_ARGS  "RIGCTLD_EXTRA_ARGS"
+#define KEY_IC9700_SATMODE      "IC9700_SATMODE"
 
 #define DEFAULT_CYCLE_MS    1000
 
@@ -120,7 +122,8 @@ gboolean radio_conf_read(radio_conf_t * conf)
     conf->supports_rit_xit = radio_supports_rit_xit(conf->name);
     conf->supports_full_duplex = radio_supports_full_duplex(conf->name);
     conf->supports_dual_vfo_sat = radio_supports_dual_vfo_sat(conf->name);
-    conf->rigctld_autostart = FALSE;
+    conf->rigctld_autostart = TRUE;
+    conf->rigctld_auto_power_on = FALSE;
     conf->rigctld_path = NULL;
     conf->rigctld_model = 0;
     conf->rigctld_device = NULL;
@@ -290,6 +293,10 @@ gboolean radio_conf_read(radio_conf_t * conf)
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_AUTOSTART, NULL))
         conf->rigctld_autostart =
             g_key_file_get_boolean(cfg, GROUP, KEY_RIGCTLD_AUTOSTART, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_AUTO_POWER_ON, NULL))
+        conf->rigctld_auto_power_on =
+            g_key_file_get_boolean(cfg, GROUP,
+                                   KEY_RIGCTLD_AUTO_POWER_ON, NULL);
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_PATH, NULL))
         conf->rigctld_path =
             g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_PATH, NULL);
@@ -308,6 +315,9 @@ gboolean radio_conf_read(radio_conf_t * conf)
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL))
         conf->rigctld_extra_args =
             g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_IC9700_SATMODE, NULL))
+        conf->supports_dual_vfo_sat =
+            g_key_file_get_boolean(cfg, GROUP, KEY_IC9700_SATMODE, NULL);
 
     g_key_file_free(cfg);
     sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -360,8 +370,12 @@ void radio_conf_save(radio_conf_t * conf)
 
     g_key_file_set_boolean(cfg, GROUP, KEY_SIG_AOS, conf->signal_aos);
     g_key_file_set_boolean(cfg, GROUP, KEY_SIG_LOS, conf->signal_los);
+    g_key_file_set_boolean(cfg, GROUP, KEY_IC9700_SATMODE,
+                           conf->supports_dual_vfo_sat);
     g_key_file_set_boolean(cfg, GROUP, KEY_RIGCTLD_AUTOSTART,
                            conf->rigctld_autostart);
+    g_key_file_set_boolean(cfg, GROUP, KEY_RIGCTLD_AUTO_POWER_ON,
+                           conf->rigctld_auto_power_on);
     if (conf->rigctld_path && *conf->rigctld_path)
         g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_PATH,
                               conf->rigctld_path);

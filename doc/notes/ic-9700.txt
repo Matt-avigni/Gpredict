@@ -45,6 +45,13 @@ $ rigctld -m 3081 -r /dev/ttyUSB0 --civaddr \0xA2
 
 Or you can initiate with "systemd/rc-init" once testing is stable.
 
+Quick rigctl SAT VFO test (Main/Sub):
+$ rigctl -m 2 -r localhost:4532
+V Main
+F 145500000
+V Sub
+F 435500000
+
 
 
 
@@ -75,5 +82,4 @@ Currently working well on firmware revision 1.23
 (to be enhanced...)
 
 May. 2020, Brett Coady (VK2KYB)
-
 

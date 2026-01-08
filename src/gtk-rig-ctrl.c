@@ -38,6 +38,7 @@
 #include <gdk/gdkkeysyms.h>
 #include <glib.h>
 #include <glib/gi18n.h>
+#include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 #include <math.h>
@@ -118,6 +119,12 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    gboolean secondary,
                                                    const gchar *role,
                                                    gboolean *error_reported);
+static gboolean open_rigctld_socket_host(const gchar *host, gint port,
+                                         gint *sock);
+static gboolean rigctld_wait_for_port_host(const gchar *host, gint port,
+                                           gint timeout_ms);
+static gchar   *rigctld_log_path(const radio_conf_t *conf);
+static gchar   *rigctld_read_log_tail(const gchar *path);
 static void     schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                         const gchar *role);
 static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
@@ -125,6 +132,7 @@ static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
                                              const gchar *detail);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static gboolean is_ic9700_satmode(const radio_conf_t *conf);
+static const gchar *vfo_name(vfo_t vfo);
 static void     rigctld_terminate_process(GSubprocess **proc);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
 static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
@@ -982,6 +990,14 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
 
     ctrl->tracking = gtk_toggle_button_get_active(button);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE: tracking %s",
+                ctrl->tracking ? "on" : "off");
+    if (is_ic9700_satmode(ctrl->conf))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "SATMODE IC-9700: downlink -> %s, uplink -> %s",
+                    vfo_name(VFO_MAIN), vfo_name(VFO_SUB));
+    }
 
     /* invalidate sync with radio */
     ctrl->lastrxf = 0.0;
@@ -1760,7 +1776,8 @@ static gboolean satmode_vfo_for_role(const radio_conf_t *conf,
     if (!is_ic9700_satmode(conf) || vfo == NULL)
         return FALSE;
 
-    *vfo = (role == VFO_ROLE_DOWNLINK) ? VFO_A : VFO_B;
+    /* IC-9700 SAT mode expects Main/Sub and explicit VFO commands; avoid VFO switching. */
+    *vfo = (role == VFO_ROLE_DOWNLINK) ? VFO_MAIN : VFO_SUB;
     return TRUE;
 }
 
@@ -1768,10 +1785,9 @@ static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
                                    vfo_role_t role, const gchar *action,
                                    gdouble freq, gboolean log_freq)
 {
-    gchar           buffback[128];
-    gchar          *buff;
-    gboolean        retcode;
     vfo_t           vfo;
+
+    (void)sock;
 
     if (!satmode_vfo_for_role(ctrl->conf, role, &vfo))
         return TRUE;
@@ -1782,19 +1798,15 @@ static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
     {
         if (log_freq)
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: selecting %s before %s %.0f",
+                        "SATMODE IC-9700: using %s for %s %.0f",
                         vfo_name(vfo), action, freq);
         else
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: selecting %s before %s",
+                        "SATMODE IC-9700: using %s for %s",
                         vfo_name(vfo), action);
     }
 
-    buff = g_strdup_printf("V %s\x0a", vfo_name(vfo));
-    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
-    g_free(buff);
-
-    return check_set_response(buffback, retcode, __func__);
+    return TRUE;
 }
 
 static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
@@ -1804,10 +1816,13 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     gchar           buffback[128];
     gboolean        retcode;
 
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("F %s %10.0f\x0a", vfo_name(vfo), freq);
-    else
-        buff = g_strdup_printf("F %10.0f\x0a", freq);
+    if (!ctrl->conf->vfo_opt)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "SATMODE IC-9700: vfo_opt disabled; sending explicit VFO");
+    }
+
+    buff = g_strdup_printf("F %s %10.0f\x0a", vfo_name(vfo), freq);
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -1827,10 +1842,13 @@ static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     gboolean        retval = TRUE;
     gchar         **vbuff;
 
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("f %s\x0a", vfo_name(vfo));
-    else
-        buff = g_strdup_printf("f\x0a");
+    if (!ctrl->conf->vfo_opt)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "SATMODE IC-9700: vfo_opt disabled; requesting explicit VFO");
+    }
+
+    buff = g_strdup_printf("f %s\x0a", vfo_name(vfo));
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
@@ -1862,10 +1880,13 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     gchar           buffback[128];
     gboolean        retcode;
 
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("I %s %10.0f\x0a", vfo_name(vfo), freq);
-    else
-        buff = g_strdup_printf("I %10.0f\x0a", freq);
+    if (!ctrl->conf->vfo_opt)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "SATMODE IC-9700: vfo_opt disabled; sending explicit VFO");
+    }
+
+    buff = g_strdup_printf("I %s %10.0f\x0a", vfo_name(vfo), freq);
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -1892,10 +1913,13 @@ static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
         return FALSE;
     }
 
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("i %s\x0a", vfo_name(vfo));
-    else
-        buff = g_strdup_printf("i\x0a");
+    if (!ctrl->conf->vfo_opt)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "SATMODE IC-9700: vfo_opt disabled; requesting explicit VFO");
+    }
+
+    buff = g_strdup_printf("i %s\x0a", vfo_name(vfo));
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
@@ -2043,10 +2067,9 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     gboolean        ptt = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
-    vfo_t           sat_vfo = VFO_A;
+    vfo_t           sat_vfo = VFO_MAIN;
     gboolean        use_sat_vfo =
-        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_DOWNLINK, &sat_vfo) &&
-        ctrl->conf->vfo_opt;
+        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_DOWNLINK, &sat_vfo);
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
@@ -2138,6 +2161,13 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     if ((ctrl->engaged) && (ptt == FALSE) &&
         (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
     {
+        if (use_sat_vfo)
+        {
+            gdouble dd = (ctrl->tracking && !use_rit_xit) ? ctrl->dd : 0.0;
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "SATMODE IC-9700: downlink sat=%.0f dd=%.0f lo=%.0f rig=%.0f",
+                        satfreqd, dd, ctrl->conf->lo, tmpfreq);
+        }
         if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
                                "setting downlink freq", tmpfreq, TRUE) &&
             (use_sat_vfo ?
@@ -2154,7 +2184,10 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                the tuning step is larger than what we work with (e.g. FT-817 has a
                smallest tuning step of 10 Hz). Therefore we read back the actual
                frequency from the rig. */
-            get_freq_simplex(ctrl, ctrl->sock, &tmpfreq);
+            if (use_sat_vfo)
+                get_freq_simplex_vfo(ctrl, ctrl->sock, &tmpfreq, sat_vfo);
+            else
+                get_freq_simplex(ctrl, ctrl->sock, &tmpfreq);
             ctrl->lastrxf = tmpfreq;
 
             /* This is only effective in RIG_TYPE_TRX mode.
@@ -2404,10 +2437,9 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     gboolean        dialchanged = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
-    vfo_t           sat_vfo = VFO_B;
+    vfo_t           sat_vfo = VFO_SUB;
     gboolean        use_sat_vfo =
-        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &sat_vfo) &&
-        ctrl->conf->vfo_opt;
+        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &sat_vfo);
 
     /* Dial feedback:
        If radio device is engaged read frequency from radio and compare it to the
@@ -2502,6 +2534,13 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
     {
+        if (use_sat_vfo)
+        {
+            gdouble du = (ctrl->tracking && !use_rit_xit) ? ctrl->du : 0.0;
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "SATMODE IC-9700: uplink sat=%.0f du=%.0f loup=%.0f rig=%.0f",
+                        satfrequ, du, ctrl->conf->loup, tmpfreq);
+        }
         if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
                                "setting uplink freq", tmpfreq, TRUE) &&
             (use_sat_vfo ?
@@ -2518,7 +2557,10 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                the tuning step is larger than what we work with (e.g. FT-817 has a
                smallest tuning step of 10 Hz). Therefore we read back the actual
                frequency from the rig. */
-            get_freq_toggle(ctrl, ctrl->sock, &tmpfreq);
+            if (use_sat_vfo)
+                get_freq_toggle_vfo(ctrl, ctrl->sock, &tmpfreq, sat_vfo);
+            else
+                get_freq_toggle(ctrl, ctrl->sock, &tmpfreq);
             ctrl->lasttxf = tmpfreq;
         }
         else
@@ -3474,6 +3516,33 @@ static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
     return connected;
 }
 
+static gboolean open_rigctld_socket_host(const gchar *host, gint port,
+                                         gint *sock)
+{
+    const gchar    *target = host;
+
+    if (host == NULL || sock == NULL)
+        return FALSE;
+
+    if (port <= 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: Missing rigctld host/port"), __func__);
+        return FALSE;
+    }
+
+    if (g_ascii_strcasecmp(host, "localhost") == 0)
+        target = "127.0.0.1";
+
+    if (rigctld_connect_addrinfo(target, port, sock))
+        return TRUE;
+
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                _("%s: Failed to connect to %s:%d"),
+                __func__, target, port);
+    return FALSE;
+}
+
 static gboolean open_rigctld_socket(radio_conf_t * conf, gint * sock)
 {
     if (conf == NULL || sock == NULL)
@@ -3486,21 +3555,7 @@ static gboolean open_rigctld_socket(radio_conf_t * conf, gint * sock)
         return FALSE;
     }
 
-    if (g_ascii_strcasecmp(conf->host, "localhost") == 0)
-    {
-        if (rigctld_connect_addrinfo("127.0.0.1", conf->port, sock))
-            return TRUE;
-        if (rigctld_connect_addrinfo("::1", conf->port, sock))
-            return TRUE;
-    }
-
-    if (rigctld_connect_addrinfo(conf->host, conf->port, sock))
-        return TRUE;
-
-    sat_log_log(SAT_LOG_LEVEL_ERROR,
-                _("%s: Failed to connect to %s:%d"),
-                __func__, conf->host, conf->port);
-    return FALSE;
+    return open_rigctld_socket_host(conf->host, conf->port, sock);
 }
 
 static gboolean close_rigctld_socket(gint * sock)
@@ -3657,14 +3712,15 @@ static gboolean rigctld_port_is_open(const gchar *host, gint port,
     return ok;
 }
 
-static gboolean rigctld_wait_for_port(const radio_conf_t *conf, gint timeout_ms)
+static gboolean rigctld_wait_for_port_host(const gchar *host, gint port,
+                                           gint timeout_ms)
 {
     const gint      interval_ms = 100;
     gint            waited = 0;
 
     while (waited < timeout_ms)
     {
-        if (rigctld_port_is_open(conf->host, conf->port, interval_ms))
+        if (rigctld_port_is_open(host, port, interval_ms))
             return TRUE;
 
         g_usleep(interval_ms * 1000);
@@ -3674,70 +3730,67 @@ static gboolean rigctld_wait_for_port(const radio_conf_t *conf, gint timeout_ms)
     return FALSE;
 }
 
-static gchar *rigctld_read_stderr(GSubprocess *proc)
+static gchar *rigctld_log_path(const radio_conf_t *conf)
 {
-    GInputStream          *stream;
-    GPollableInputStream  *pollable;
-    GString               *output;
-    gchar                  buffer[256];
-    GError                *error = NULL;
-    gssize                 bytes;
+    gchar *confdir;
+    gchar *path;
 
-    if (proc == NULL)
+    if (conf == NULL || conf->port <= 0)
         return NULL;
 
-    stream = g_subprocess_get_stderr_pipe(proc);
-    if (stream == NULL)
+    confdir = get_user_conf_dir();
+    if (confdir == NULL)
         return NULL;
 
-    pollable = G_POLLABLE_INPUT_STREAM(stream);
-    if (!g_pollable_input_stream_is_readable(pollable))
-        return NULL;
-
-    output = g_string_new(NULL);
-    while (g_pollable_input_stream_is_readable(pollable))
+    if (g_mkdir_with_parents(confdir, 0700) != 0)
     {
-        bytes = g_pollable_input_stream_read_nonblocking(
-            pollable, buffer, sizeof(buffer) - 1, NULL, &error);
-        if (bytes > 0)
-        {
-            buffer[bytes] = '\0';
-            g_string_append(output, buffer);
-        }
-        else if (bytes == 0)
-        {
-            break;
-        }
-        else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
-        {
-            g_clear_error(&error);
-            break;
-        }
-        else
-        {
-            g_clear_error(&error);
-            break;
-        }
-    }
-
-    if (output->len == 0)
-    {
-        g_string_free(output, TRUE);
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: failed to create config dir %s"),
+                    __func__, confdir);
+        g_free(confdir);
         return NULL;
     }
 
-    return g_string_free(output, FALSE);
+    path = g_strdup_printf("%s%crigctld-%d.log",
+                           confdir, G_DIR_SEPARATOR, conf->port);
+    g_free(confdir);
+
+    return path;
 }
 
-static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out)
+static gchar *rigctld_read_log_tail(const gchar *path)
+{
+    gchar   *contents = NULL;
+    gsize    len = 0;
+    gsize    max_len = 2048;
+    gchar   *tail = NULL;
+
+    if (path == NULL)
+        return NULL;
+
+    if (!g_file_get_contents(path, &contents, &len, NULL) || contents == NULL)
+        return NULL;
+
+    if (len <= max_len)
+        return contents;
+
+    tail = g_strdup(contents + (len - max_len));
+    g_free(contents);
+    return tail;
+}
+
+static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out,
+                                  gchar **log_path_out)
 {
     GSubprocess    *proc = NULL;
+    GSubprocessLauncher *launcher = NULL;
     GPtrArray      *argv = NULL;
     GError         *error = NULL;
     gchar          *path = NULL;
     gchar          *model = NULL;
     gchar          *baud = NULL;
     gchar          *port = NULL;
+    gchar          *log_path = NULL;
 
     if (conf == NULL)
     {
@@ -3772,8 +3825,19 @@ static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out)
         return NULL;
     }
 
+    log_path = rigctld_log_path(conf);
+    if (log_path == NULL)
+    {
+        if (error_out)
+            *error_out = g_strdup("Failed to create rigctld log file.");
+        g_free(path);
+        return NULL;
+    }
+
     argv = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(argv, g_strdup(path));
+    g_ptr_array_add(argv, g_strdup("-b"));
+    g_ptr_array_add(argv, g_strdup("127.0.0.1"));
     g_ptr_array_add(argv, g_strdup("-m"));
     model = g_strdup_printf("%d", conf->rigctld_model);
     g_ptr_array_add(argv, model);
@@ -3793,6 +3857,11 @@ static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out)
         g_ptr_array_add(argv, g_strdup("-C"));
         g_ptr_array_add(argv,
                         g_strdup_printf("civaddr=%s", conf->rigctld_civaddr));
+    }
+    if (conf->rigctld_auto_power_on)
+    {
+        g_ptr_array_add(argv, g_strdup("-C"));
+        g_ptr_array_add(argv, g_strdup("auto_power_on=1"));
     }
     if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
     {
@@ -3817,11 +3886,13 @@ static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out)
     }
 
     g_ptr_array_add(argv, NULL);
-    proc = g_subprocess_newv((const gchar * const *) argv->pdata,
-                             G_SUBPROCESS_FLAGS_STDIN_DEV_NULL |
-                                 G_SUBPROCESS_FLAGS_STDERR_PIPE |
-                                 G_SUBPROCESS_FLAGS_STDOUT_SILENCE,
-                             &error);
+    launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_DEV_NULL);
+    g_subprocess_launcher_set_stdout_file_path(launcher, log_path);
+    g_subprocess_launcher_set_stderr_file_path(launcher, log_path);
+    proc = g_subprocess_launcher_spawnv(launcher,
+                                        (const gchar * const *) argv->pdata,
+                                        &error);
+    g_object_unref(launcher);
     if (proc == NULL)
     {
         if (error_out)
@@ -3831,6 +3902,10 @@ static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out)
 
     g_ptr_array_free(argv, TRUE);
     g_free(path);
+    if (log_path_out != NULL)
+        *log_path_out = log_path;
+    else
+        g_free(log_path);
 
     return proc;
 }
@@ -3854,14 +3929,37 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    gboolean *error_reported)
 {
     GSubprocess   **proc = secondary ? &ctrl->rigctld_proc2 : &ctrl->rigctld_proc;
+    const gchar    *host;
     gchar          *errmsg = NULL;
+    gchar          *log_path = NULL;
     gboolean        reported = FALSE;
 
     if (error_reported)
         *error_reported = FALSE;
 
-    if (open_rigctld_socket(conf, sock))
+    host = (conf && conf->rigctld_autostart &&
+            conf->host &&
+            g_ascii_strcasecmp(conf->host, "localhost") == 0) ?
+        "127.0.0.1" : (conf ? conf->host : NULL);
+
+    if (conf && conf->rigctld_autostart &&
+        conf->host &&
+        g_ascii_strcasecmp(conf->host, "localhost") == 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-start enabled; using 127.0.0.1 instead of localhost"),
+                    __func__);
+    }
+
+    if (conf != NULL && host != NULL && g_strcmp0(host, conf->host) == 0)
+    {
+        if (open_rigctld_socket(conf, sock))
+            return TRUE;
+    }
+    else if (open_rigctld_socket_host(host, conf ? conf->port : 0, sock))
+    {
         return TRUE;
+    }
 
     if (conf == NULL || !conf->rigctld_autostart)
         return FALSE;
@@ -3880,50 +3978,76 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
     if (*proc != NULL && g_subprocess_get_if_exited(*proc))
         g_clear_object(proc);
 
-    if (rigctld_port_is_open(conf->host, conf->port, 100))
+    if (rigctld_port_is_open(host, conf->port, 100))
     {
-        if (open_rigctld_socket(conf, sock))
+        if (conf != NULL && host != NULL && g_strcmp0(host, conf->host) == 0)
+        {
+            if (open_rigctld_socket(conf, sock))
+                return TRUE;
+        }
+        else if (open_rigctld_socket_host(host, conf->port, sock))
+        {
             return TRUE;
+        }
         return FALSE;
     }
 
     if (*proc == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: auto-starting rigctld for %s:%d"),
-                    __func__, conf->host ? conf->host : "(null)", conf->port);
-        *proc = rigctld_spawn(conf, &errmsg);
+                    _("%s: rigctld not reachable; attempting auto-start for %s:%d"),
+                    __func__, host ? host : "(null)", conf->port);
+        *proc = rigctld_spawn(conf, &errmsg, &log_path);
         if (*proc == NULL)
         {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: auto-start failed for %s:%d"),
+                        __func__, host ? host : "(null)", conf->port);
             schedule_rig_autostart_error(ctrl, role,
                                          errmsg ? errmsg :
                                          _("Failed to spawn rigctld."));
             g_free(errmsg);
+            g_free(log_path);
             reported = TRUE;
             if (error_reported)
                 *error_reported = reported;
             return FALSE;
         }
+
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rigctld started pid=%s log=%s"),
+                    __func__,
+                    g_subprocess_get_identifier(*proc),
+                    log_path ? log_path : "(null)");
     }
 
-    if (!rigctld_wait_for_port(conf, 3000))
+    if (log_path == NULL)
+        log_path = rigctld_log_path(conf);
+
+    if (!rigctld_wait_for_port_host(host, conf->port, 2000))
     {
-        gchar *stderr_text = rigctld_read_stderr(*proc);
+        gchar *stderr_text = rigctld_read_log_tail(log_path);
         gchar *detail = NULL;
+
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: auto-start failed; rigctld not listening on %s:%d"),
+                    __func__, host ? host : "(null)", conf->port);
 
         if (stderr_text && *stderr_text)
             detail = g_strdup_printf(
                 _("rigctld did not start listening on %s:%d.\n%s"),
-                conf->host ? conf->host : "(null)", conf->port, stderr_text);
+                host ? host : "(null)", conf->port, stderr_text);
         else
             detail = g_strdup_printf(
-                _("rigctld did not start listening on %s:%d."),
-                conf->host ? conf->host : "(null)", conf->port);
+                _("rigctld did not start listening on %s:%d.\nLog: %s"),
+                host ? host : "(null)", conf->port,
+                log_path ? log_path : _("(unknown)"));
 
         schedule_rig_autostart_error(ctrl, role, detail);
         rigctld_terminate_process(proc);
         g_free(stderr_text);
         g_free(detail);
+        g_free(log_path);
 
         reported = TRUE;
         if (error_reported)
@@ -3931,8 +4055,30 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
         return FALSE;
     }
 
-    if (!open_rigctld_socket(conf, sock))
+    if (conf != NULL && host != NULL && g_strcmp0(host, conf->host) == 0)
+    {
+        if (!open_rigctld_socket(conf, sock))
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: auto-start failed to connect to %s:%d"),
+                        __func__, host ? host : "(null)", conf->port);
+            g_free(log_path);
+            return FALSE;
+        }
+    }
+    else if (!open_rigctld_socket_host(host, conf->port, sock))
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: auto-start failed to connect to %s:%d"),
+                    __func__, host ? host : "(null)", conf->port);
+        g_free(log_path);
         return FALSE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: connected after auto-start to %s:%d"),
+                __func__, host ? host : "(null)", conf->port);
+    g_free(log_path);
 
     if (error_reported)
         *error_reported = reported;
