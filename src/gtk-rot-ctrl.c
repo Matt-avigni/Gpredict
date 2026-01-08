@@ -85,6 +85,8 @@ typedef struct {
     gdouble         azi_out, ele_out;
     gdouble         azi_in, ele_in;
     gboolean        io_error;
+    gboolean        cmd_error;
+    gint            last_rprt;
     GTimer         *timer;
 } rotctld_client_t;
 
@@ -146,6 +148,10 @@ struct _GtkRotCtrl {
 
     /* Reserved flag; currently always kept FALSE (no special SEND-ONLY mode). */
     gboolean        send_only_mode;
+
+    gboolean        have_last_knob;
+    gdouble         last_knob_az;
+    gdouble         last_knob_el;
 };
 
 struct _GtkRotCtrlClass {
@@ -158,6 +164,7 @@ static GtkVBoxClass *parent_class = NULL;
 /* Forward declaration for error dialog helper */
 
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
+static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_terminal_cb(GtkButton *button, gpointer data);
 
@@ -677,7 +684,7 @@ static void rot_sanitize_cmd(GtkRotCtrl *ctrl, gdouble *az, gdouble *el)
     *el = CLAMP(*el, ctrl->conf->minel, ctrl->conf->maxel);
 
     if (fabs(*az - orig_az) > 1e-6 || fabs(*el - orig_el) > 1e-6) {
-        sat_log_log(SAT_LOG_LEVEL_WARNING,
+        sat_log_log(SAT_LOG_LEVEL_WARN,
                     "%s: clamped command from (%.2f, %.2f) to (%.2f, %.2f)",
                     __func__, orig_az, orig_el, *az, *el);
     }
@@ -716,6 +723,7 @@ static GArray *rot_build_samples(GtkRotCtrl *ctrl, pass_t *pass,
                                  rot_plan_mode_t mode,
                                  gdouble t0, gdouble t1)
 {
+    (void)pass;
     GArray *samples = NULL;
     guint steps;
 
@@ -879,7 +887,7 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
                         ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
                         ctrl->trajectory_plan.strategy);
         } else {
-            sat_log_log(SAT_LOG_LEVEL_WARNING,
+            sat_log_log(SAT_LOG_LEVEL_WARN,
                         "%s: selected %s plan strategy=%d (%s)",
                         __func__,
                         ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
@@ -948,23 +956,19 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gchar          *buff;
     gchar           buffback[128];
     gboolean        retcode;
+    gchar           azbuf[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar           elbuf[G_ASCII_DTOSTR_BUF_SIZE];
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: set_pos az=%.2f el=%.2f"), __func__, az, el);
 
-    /* send command */
-    {
-        /* Many Hamlib backends for rotators like the GS-232B expect
-         * integer degrees for the P command. Sending floats can result
-         * in RPRT -6 (invalid parameter). Round to nearest integer
-         * before formatting the command string.
-         */
-        gint iaz = (gint) lround(az);
-        gint iel = (gint) lround(el);
+    /* send command (ASCII-safe, locale independent) */
+    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az);
+    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el);
+    buff = g_strdup_printf("P %s %s\x0a", azbuf, elbuf);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "MISSION_SOPHIE: rotctld cmd '%s'", buff);
 
-        buff = g_strdup_printf("P %d %d\x0a", iaz, iel);
-    }
-    
     retcode = rotctld_socket_rw(ctrl->client.socket, buff, buffback, 128);
     g_free(buff);
 
@@ -987,16 +991,29 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
      */
     g_strstrip(buffback);
 
-    if (g_str_has_prefix(buffback, "RPRT 0")) {
+    if (g_str_has_prefix(buffback, "RPRT")) {
+        gchar *endp = NULL;
+        gint code = (gint) g_ascii_strtoll(buffback + 4, &endp, 10);
+        g_mutex_lock(&ctrl->client.mutex);
+        ctrl->client.last_rprt = code;
+        ctrl->client.cmd_error = (code != 0);
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        if (code == 0)
+            return TRUE;
+
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    _("%s: rotctld rejected command (RPRT %d)"), __func__, code);
+        g_printerr("MISSION_SOPHIE: set_pos rotctld ERROR 'RPRT %d'\n", code);
+        /* Parameter errors are not link failures. */
         return TRUE;
     }
 
-    if (g_str_has_prefix(buffback, "RPRT ")) {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rotctld returned error reply '%s'"), __func__, buffback);
-        g_printerr("MISSION_SOPHIE: set_pos rotctld ERROR '%s'\n", buffback);
-        return FALSE;
-    }
+    /* Non-RPRT replies treated as OK; clear command error. */
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.last_rprt = 0;
+    ctrl->client.cmd_error = FALSE;
+    g_mutex_unlock(&ctrl->client.mutex);
 
     /* Legacy / non-Hamlib style replies (e.g. numeric echoes) are treated as OK. */
     return TRUE;
@@ -1042,7 +1059,7 @@ static gpointer rotctld_client_thread(gpointer data)
                 g_mutex_lock(&ctrl->client.mutex);
                 ctrl->client.io_error = TRUE;
                 g_mutex_unlock(&ctrl->client.mutex);
-                sat_log_log(SAT_LOG_LEVEL_WARNING,
+                sat_log_log(SAT_LOG_LEVEL_WARN,
                             "%s: rotctld link down, retrying in %.1fs",
                             __func__, backoff_sec);
                 g_usleep((gulong)(backoff_sec * 1e6));
@@ -1054,6 +1071,8 @@ static gpointer rotctld_client_thread(gpointer data)
             io_error = FALSE;
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->client.io_error = FALSE;
+            ctrl->client.cmd_error = FALSE;
+            ctrl->client.last_rprt = 0;
             g_mutex_unlock(&ctrl->client.mutex);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "%s: rotctld link re-established", __func__);
@@ -1467,6 +1486,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gdouble setaz = 0.0, setel = 45.0;
     gdouble cmdaz = 0.0, cmdel = 0.0;
     gboolean cmd_from_plan = FALSE;
+    gboolean manual_change = FALSE;
+    gboolean allow_send = FALSE;
+    gboolean cmd_error = FALSE;
+    gint last_rprt = 0;
+    gdouble knobaz = 0.0;
+    gdouble knobel = 0.0;
     gchar *text;
     gboolean error = FALSE;
     sat_t sat_working, *sat;
@@ -1579,8 +1604,15 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     else
     {
         /* Not tracking: use current knob values */
-        setaz = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
-        setel = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+        knobaz = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+        knobel = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+        setaz = knobaz;
+        setel = knobel;
+
+        if (ctrl->have_last_knob) {
+            manual_change = (fabs(knobaz - ctrl->last_knob_az) > ctrl->threshold ||
+                             fabs(knobel - ctrl->last_knob_el) > ctrl->threshold);
+        }
     }
 
     /* Handle I/O with rotctld client if running and not in monitor mode */
@@ -1589,6 +1621,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (g_mutex_trylock(&ctrl->client.mutex))
         {
             error = ctrl->client.io_error;
+            cmd_error = ctrl->client.cmd_error;
+            last_rprt = ctrl->client.last_rprt;
             rotaz = ctrl->client.azi_in;
             rotel = ctrl->client.ele_in;
             g_mutex_unlock(&ctrl->client.mutex);
@@ -1635,8 +1669,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         cmd_from_plan = rot_get_command(ctrl, plan_active, setaz, setel,
                                         ctrl->t, &cmdaz, &cmdel);
 
-        if (fabs(cmdaz - rotaz) > ctrl->threshold ||
-            fabs(cmdel - rotel) > ctrl->threshold)
+        allow_send = (ctrl->tracking && ctrl->target && ctrl->pass) || manual_change;
+
+        if (allow_send &&
+            (fabs(cmdaz - rotaz) > ctrl->threshold ||
+             fabs(cmdel - rotel) > ctrl->threshold))
         {
             /* If tracking is enabled, refine the target to "lead" the pass
              * a bit into the future, like the original code did.
@@ -1734,6 +1771,17 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 g_mutex_unlock(&ctrl->client.mutex);
             }
         }
+        else if (!allow_send &&
+                 (fabs(cmdaz - rotaz) > ctrl->threshold ||
+                  fabs(cmdel - rotel) > ctrl->threshold))
+        {
+            static gdouble last_idle_log = 0.0;
+            if ((ctrl->t - last_idle_log) > (5.0 / secday)) {
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "%s: idle, not sending set_pos", __func__);
+                last_idle_log = ctrl->t;
+            }
+        }
 
         /* check error status
          *
@@ -1756,7 +1804,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (ctrl->errcnt == MAX_ERROR_COUNT && ctrl->engaged)
         {
-            sat_log_log(SAT_LOG_LEVEL_WARNING,
+            sat_log_log(SAT_LOG_LEVEL_WARN,
                         _("%s: MAX_ERROR_COUNT (%d) reached. Keeping tracking alive, link down."),
                         __func__, MAX_ERROR_COUNT);
 
@@ -1772,6 +1820,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
             if (has_error)
                 status_text = _("LINK DOWN");
+            else if (cmd_error)
+                status_text = _("CMD REJECTED");
             else if (ctrl->tracking && plan_active &&
                      ctrl->trajectory_plan.valid &&
                      ctrl->trajectory_plan.status != ROT_PLAN_STATUS_FULL_TRACK)
@@ -1795,6 +1845,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         cmdaz, cmdel,
                         rotaz, rotel,
                         error ? 1 : 0);
+
+            if (cmd_error) {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "MISSION_SOPHIE: command rejected (RPRT %d)",
+                            last_rprt);
+            }
         }
     }
     else
@@ -1824,6 +1880,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot), dispaz, dispel);
         gtk_widget_queue_draw(ctrl->plot);
+    }
+
+    if (!ctrl->tracking) {
+        ctrl->last_knob_az = knobaz;
+        ctrl->last_knob_el = knobel;
+        ctrl->have_last_knob = TRUE;
     }
 
     return TRUE;
@@ -2586,14 +2648,20 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->client.azi_in    = ctrl->client.azi_out;
         ctrl->client.ele_in    = ctrl->client.ele_out;
         ctrl->client.io_error  = FALSE;
+        ctrl->client.cmd_error = FALSE;
+        ctrl->client.last_rprt = 0;
         ctrl->client.new_trg   = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
+
+        ctrl->last_knob_az = ctrl->client.azi_out;
+        ctrl->last_knob_el = ctrl->client.ele_out;
+        ctrl->have_last_knob = TRUE;
 
         /* Reset error counter when (re)engaging the rotor. */
         ctrl->errcnt = 0;
 
         if (ctrl->client.thread != NULL) {
-            sat_log_log(SAT_LOG_LEVEL_WARNING,
+            sat_log_log(SAT_LOG_LEVEL_WARN,
                         _("%s: rotctld client thread already running; reusing existing thread"),
                         __func__);
             gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
@@ -3284,6 +3352,12 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.socket = -1;
     ctrl->client.running = FALSE;
     ctrl->client.io_error = FALSE;
+    ctrl->client.cmd_error = FALSE;
+    ctrl->client.last_rprt = 0;
+
+    ctrl->have_last_knob = FALSE;
+    ctrl->last_knob_az = 0.0;
+    ctrl->last_knob_el = 0.0;
 
     if (g_getenv("GPREDICT_ROT_PLAN_TEST"))
         rot_plan_debug_harness();
