@@ -11,6 +11,8 @@
 #include "sgpsdp/sgp4sdp4.h"
 #include "trsp-conf.h"
 
+typedef struct _GSubprocess GSubprocess;
+
 
 #define GTK_TYPE_RIG_CTRL          (gtk_rig_ctrl_get_type ())
 #define GTK_RIG_CTRL(obj)          G_TYPE_CHECK_INSTANCE_CAST (obj,\
@@ -82,6 +84,12 @@ struct _gtk_rig_ctrl {
                                            -1 indicates that an update should be performed ASAP */
 
     gint            sock, sock2;        /*!< Sockets for controlling the radio(s). */
+    gint            reconnect_backoff_ms;   /*!< Exponential backoff for reconnect (primary). */
+    gint            reconnect_backoff_ms2;  /*!< Exponential backoff for reconnect (secondary). */
+    gint64          reconnect_next_us;      /*!< Next reconnect time (monotonic us, primary). */
+    gint64          reconnect_next_us2;     /*!< Next reconnect time (monotonic us, secondary). */
+    gboolean        rx_conn_error_reported; /*!< Avoid repeated connect error popups (primary). */
+    gboolean        tx_conn_error_reported; /*!< Avoid repeated connect error popups (secondary). */
 
     /* debug related */
     guint           wrops;
@@ -96,6 +104,9 @@ struct _gtk_rig_ctrl {
     GCond           widgetready;        /*!< Condition when work is done (sync stuff) */
     GAsyncQueue    *rigctlq;    /*!< Message queue to indicate something has changed */
     GThread        *rigctl_thread;      /*!< Pointer to current rigctl-thread */
+
+    GSubprocess    *rigctld_proc;       /*!< Auto-started rigctld process (primary) */
+    GSubprocess    *rigctld_proc2;      /*!< Auto-started rigctld process (secondary) */
 };
 
 struct _GtkRigCtrlClass {

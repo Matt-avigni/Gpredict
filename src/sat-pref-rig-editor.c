@@ -43,6 +43,23 @@ static GtkWidget *lo;           /* local oscillator of downconverter */
 static GtkWidget *loup;         /* local oscillator of upconverter */
 static GtkWidget *sigaos;       /* AOS signalling */
 static GtkWidget *siglos;       /* LOS signalling */
+static GtkWidget *autostart;    /* auto-start rigctld */
+static GtkWidget *rigctld_path; /* rigctld path */
+static GtkWidget *rigctld_model; /* rigctld model */
+static GtkWidget *rigctld_device; /* rigctld device */
+static GtkWidget *rigctld_baud; /* rigctld baud */
+static GtkWidget *rigctld_civaddr; /* rigctld CI-V address */
+static GtkWidget *rigctld_extra_args; /* rigctld extra args */
+
+static void update_autostart_sensitivity(gboolean enabled)
+{
+    gtk_widget_set_sensitive(rigctld_path, enabled);
+    gtk_widget_set_sensitive(rigctld_model, enabled);
+    gtk_widget_set_sensitive(rigctld_device, enabled);
+    gtk_widget_set_sensitive(rigctld_baud, enabled);
+    gtk_widget_set_sensitive(rigctld_civaddr, enabled);
+    gtk_widget_set_sensitive(rigctld_extra_args, enabled);
+}
 
 
 static void clear_widgets()
@@ -58,6 +75,14 @@ static void clear_widgets()
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ptt), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sigaos), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(siglos), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), FALSE);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_path), "");
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model), 0);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_device), "");
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_baud), 0);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_civaddr), "");
+    gtk_entry_set_text(GTK_ENTRY(rigctld_extra_args), "");
+    update_autostart_sensitivity(FALSE);
 }
 
 static void update_widgets(radio_conf_t * conf)
@@ -103,6 +128,26 @@ static void update_widgets(radio_conf_t * conf)
     /* AOS / LOS signalling */
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sigaos), conf->signal_aos);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(siglos), conf->signal_los);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart),
+                                 conf->rigctld_autostart);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_path), "");
+    if (conf->rigctld_path)
+        gtk_entry_set_text(GTK_ENTRY(rigctld_path), conf->rigctld_path);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model),
+                              conf->rigctld_model);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_device), "");
+    if (conf->rigctld_device)
+        gtk_entry_set_text(GTK_ENTRY(rigctld_device), conf->rigctld_device);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_baud),
+                              conf->rigctld_baud);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_civaddr), "");
+    if (conf->rigctld_civaddr)
+        gtk_entry_set_text(GTK_ENTRY(rigctld_civaddr), conf->rigctld_civaddr);
+    gtk_entry_set_text(GTK_ENTRY(rigctld_extra_args), "");
+    if (conf->rigctld_extra_args)
+        gtk_entry_set_text(GTK_ENTRY(rigctld_extra_args),
+                           conf->rigctld_extra_args);
+    update_autostart_sensitivity(conf->rigctld_autostart);
 }
 
 /*
@@ -223,6 +268,12 @@ static void type_changed(GtkWidget * widget, gpointer data)
     {
         gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 1);
     }
+}
+
+static void autostart_toggled(GtkToggleButton *button, gpointer data)
+{
+    (void)data;
+    update_autostart_sensitivity(gtk_toggle_button_get_active(button));
 }
 
 static GtkWidget *create_editor_widgets(radio_conf_t * conf)
@@ -436,8 +487,87 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     gtk_widget_set_tooltip_text(siglos,
                                 _("Enable LOS signalling for this radio."));
 
+    /* Auto-start rigctld */
+    label = gtk_label_new(_("Auto-start rigctld"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 9, 1, 1);
+
+    autostart = gtk_check_button_new_with_label(_("Enable"));
+    gtk_grid_attach(GTK_GRID(table), autostart, 1, 9, 1, 1);
+    gtk_widget_set_tooltip_text(autostart,
+                                _("Start rigctld automatically if connection fails."));
+    g_signal_connect(autostart, "toggled", G_CALLBACK(autostart_toggled), NULL);
+
+    /* rigctld path */
+    label = gtk_label_new(_("rigctld path"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 10, 1, 1);
+
+    rigctld_path = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(rigctld_path), 200);
+    gtk_widget_set_tooltip_text(rigctld_path,
+                                _("Path to rigctld binary (leave empty to use PATH)."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_path, 1, 10, 3, 1);
+
+    /* rigctld model */
+    label = gtk_label_new(_("Rig model"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
+
+    rigctld_model = gtk_spin_button_new_with_range(0, 99999, 1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_model), 0);
+    gtk_widget_set_tooltip_text(rigctld_model,
+                                _("Hamlib rig model number (e.g. 3081)."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 11, 1, 1);
+
+    /* rigctld device */
+    label = gtk_label_new(_("Serial device"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+
+    rigctld_device = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
+    gtk_widget_set_tooltip_text(rigctld_device,
+                                _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 12, 3, 1);
+
+    /* rigctld baud */
+    label = gtk_label_new(_("Baud"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
+
+    rigctld_baud = gtk_spin_button_new_with_range(0, 1000000, 1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_baud), 0);
+    gtk_widget_set_tooltip_text(rigctld_baud,
+                                _("Serial baud rate for rigctld (e.g. 19200)."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_baud, 1, 13, 1, 1);
+
+    /* rigctld CI-V address */
+    label = gtk_label_new(_("CI-V addr"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
+
+    rigctld_civaddr = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(rigctld_civaddr), 16);
+    gtk_widget_set_tooltip_text(rigctld_civaddr,
+                                _("Optional CI-V address (e.g. 0xA2)."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_civaddr, 1, 14, 2, 1);
+
+    /* rigctld extra args */
+    label = gtk_label_new(_("Extra args"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
+
+    rigctld_extra_args = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(rigctld_extra_args), 200);
+    gtk_widget_set_tooltip_text(rigctld_extra_args,
+                                _("Extra rigctld arguments (optional)."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_extra_args, 1, 15, 3, 1);
+
     if (conf->name != NULL)
         update_widgets(conf);
+    else
+        update_autostart_sensitivity(FALSE);
 
     gtk_widget_show_all(table);
 
@@ -510,6 +640,36 @@ static gboolean apply_changes(radio_conf_t * conf)
     /* AOS / LOS signalling */
     conf->signal_aos = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sigaos));
     conf->signal_los = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(siglos));
+
+    /* rigctld auto-start */
+    conf->rigctld_autostart =
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
+
+    if (conf->rigctld_path)
+        g_free(conf->rigctld_path);
+    conf->rigctld_path =
+        g_strdup(gtk_entry_get_text(GTK_ENTRY(rigctld_path)));
+
+    conf->rigctld_model =
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(rigctld_model));
+
+    if (conf->rigctld_device)
+        g_free(conf->rigctld_device);
+    conf->rigctld_device =
+        g_strdup(gtk_entry_get_text(GTK_ENTRY(rigctld_device)));
+
+    conf->rigctld_baud =
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(rigctld_baud));
+
+    if (conf->rigctld_civaddr)
+        g_free(conf->rigctld_civaddr);
+    conf->rigctld_civaddr =
+        g_strdup(gtk_entry_get_text(GTK_ENTRY(rigctld_civaddr)));
+
+    if (conf->rigctld_extra_args)
+        g_free(conf->rigctld_extra_args);
+    conf->rigctld_extra_args =
+        g_strdup(gtk_entry_get_text(GTK_ENTRY(rigctld_extra_args)));
 
     return TRUE;
 }

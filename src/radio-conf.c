@@ -45,6 +45,13 @@
 #define KEY_VFO_UP      "VFO_UP"
 #define KEY_SIG_AOS     "SIGNAL_AOS"
 #define KEY_SIG_LOS     "SIGNAL_LOS"
+#define KEY_RIGCTLD_AUTOSTART   "RIGCTLD_AUTOSTART"
+#define KEY_RIGCTLD_PATH        "RIGCTLD_PATH"
+#define KEY_RIGCTLD_MODEL       "RIGCTLD_MODEL"
+#define KEY_RIGCTLD_DEVICE      "RIGCTLD_DEVICE"
+#define KEY_RIGCTLD_BAUD        "RIGCTLD_BAUD"
+#define KEY_RIGCTLD_CIVADDR     "RIGCTLD_CIVADDR"
+#define KEY_RIGCTLD_EXTRA_ARGS  "RIGCTLD_EXTRA_ARGS"
 
 #define DEFAULT_CYCLE_MS    1000
 
@@ -113,6 +120,13 @@ gboolean radio_conf_read(radio_conf_t * conf)
     conf->supports_rit_xit = radio_supports_rit_xit(conf->name);
     conf->supports_full_duplex = radio_supports_full_duplex(conf->name);
     conf->supports_dual_vfo_sat = radio_supports_dual_vfo_sat(conf->name);
+    conf->rigctld_autostart = FALSE;
+    conf->rigctld_path = NULL;
+    conf->rigctld_model = 0;
+    conf->rigctld_device = NULL;
+    conf->rigctld_baud = 0;
+    conf->rigctld_civaddr = NULL;
+    conf->rigctld_extra_args = NULL;
 
     /* open .rig file */
     cfg = g_key_file_new();
@@ -273,6 +287,28 @@ gboolean radio_conf_read(radio_conf_t * conf)
     conf->signal_aos = g_key_file_get_boolean(cfg, GROUP, KEY_SIG_AOS, NULL);
     conf->signal_los = g_key_file_get_boolean(cfg, GROUP, KEY_SIG_LOS, NULL);
 
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_AUTOSTART, NULL))
+        conf->rigctld_autostart =
+            g_key_file_get_boolean(cfg, GROUP, KEY_RIGCTLD_AUTOSTART, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_PATH, NULL))
+        conf->rigctld_path =
+            g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_PATH, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_MODEL, NULL))
+        conf->rigctld_model =
+            g_key_file_get_integer(cfg, GROUP, KEY_RIGCTLD_MODEL, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_DEVICE, NULL))
+        conf->rigctld_device =
+            g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_DEVICE, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_BAUD, NULL))
+        conf->rigctld_baud =
+            g_key_file_get_integer(cfg, GROUP, KEY_RIGCTLD_BAUD, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_CIVADDR, NULL))
+        conf->rigctld_civaddr =
+            g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_CIVADDR, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL))
+        conf->rigctld_extra_args =
+            g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL);
+
     g_key_file_free(cfg);
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: Read radio configuration %s"), __func__, conf->name);
@@ -324,6 +360,38 @@ void radio_conf_save(radio_conf_t * conf)
 
     g_key_file_set_boolean(cfg, GROUP, KEY_SIG_AOS, conf->signal_aos);
     g_key_file_set_boolean(cfg, GROUP, KEY_SIG_LOS, conf->signal_los);
+    g_key_file_set_boolean(cfg, GROUP, KEY_RIGCTLD_AUTOSTART,
+                           conf->rigctld_autostart);
+    if (conf->rigctld_path && *conf->rigctld_path)
+        g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_PATH,
+                              conf->rigctld_path);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_PATH, NULL);
+    if (conf->rigctld_model > 0)
+        g_key_file_set_integer(cfg, GROUP, KEY_RIGCTLD_MODEL,
+                               conf->rigctld_model);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_MODEL, NULL);
+    if (conf->rigctld_device && *conf->rigctld_device)
+        g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_DEVICE,
+                              conf->rigctld_device);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_DEVICE, NULL);
+    if (conf->rigctld_baud > 0)
+        g_key_file_set_integer(cfg, GROUP, KEY_RIGCTLD_BAUD,
+                               conf->rigctld_baud);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_BAUD, NULL);
+    if (conf->rigctld_civaddr && *conf->rigctld_civaddr)
+        g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_CIVADDR,
+                              conf->rigctld_civaddr);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_CIVADDR, NULL);
+    if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
+        g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS,
+                              conf->rigctld_extra_args);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL);
 
     confdir = get_hwconf_dir();
     fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rig", NULL);

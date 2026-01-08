@@ -78,6 +78,14 @@ typedef struct {
     gboolean        supports_rit_xit; /*!< Radio supports Doppler via RIT/XIT offsets */
     gboolean        supports_full_duplex; /*!< Radio supports full duplex operation */
     gboolean        supports_dual_vfo_sat; /*!< Radio supports dual VFO satellite mode */
+
+    gboolean        rigctld_autostart; /*!< Auto-start rigctld on connection failure */
+    gchar          *rigctld_path; /*!< rigctld binary path (empty uses PATH) */
+    gint            rigctld_model; /*!< rigctld model number */
+    gchar          *rigctld_device; /*!< rigctld serial device path */
+    gint            rigctld_baud; /*!< rigctld baud rate */
+    gchar          *rigctld_civaddr; /*!< Optional CI-V address string */
+    gchar          *rigctld_extra_args; /*!< Optional extra rigctld args */
 } radio_conf_t;
 
 

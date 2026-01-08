@@ -397,7 +397,14 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .signal_los = FALSE,
         .supports_rit_xit = FALSE,
         .supports_full_duplex = FALSE,
-        .supports_dual_vfo_sat = FALSE
+        .supports_dual_vfo_sat = FALSE,
+        .rigctld_autostart = FALSE,
+        .rigctld_path = NULL,
+        .rigctld_model = 0,
+        .rigctld_device = NULL,
+        .rigctld_baud = 0,
+        .rigctld_civaddr = NULL,
+        .rigctld_extra_args = NULL
     };
 
     /* If there are no entries, we have a bug since the button should 
@@ -696,6 +703,13 @@ static void add_cb(GtkWidget * button, gpointer data)
         .supports_rit_xit = FALSE,
         .supports_full_duplex = FALSE,
         .supports_dual_vfo_sat = FALSE,
+        .rigctld_autostart = FALSE,
+        .rigctld_path = NULL,
+        .rigctld_model = 0,
+        .rigctld_device = NULL,
+        .rigctld_baud = 0,
+        .rigctld_civaddr = NULL,
+        .rigctld_extra_args = NULL,
     };
 
     /* run rig conf editor */
@@ -822,7 +836,14 @@ void sat_pref_rig_ok()
         .signal_los = FALSE,
         .supports_rit_xit = FALSE,
         .supports_full_duplex = FALSE,
-        .supports_dual_vfo_sat = FALSE
+        .supports_dual_vfo_sat = FALSE,
+        .rigctld_autostart = FALSE,
+        .rigctld_path = NULL,
+        .rigctld_model = 0,
+        .rigctld_device = NULL,
+        .rigctld_baud = 0,
+        .rigctld_civaddr = NULL,
+        .rigctld_extra_args = NULL
     };
 
     /* delete all .rig files */

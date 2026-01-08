@@ -39,7 +39,10 @@
 #include <glib.h>
 #include <glib/gi18n.h>
 #include <gtk/gtk.h>
+#include <gio/gio.h>
 #include <math.h>
+#include <errno.h>
+#include <sys/time.h>
 
 /* NETWORK */
 #ifndef WIN32
@@ -66,10 +69,23 @@
 #include "sat-cfg.h"
 #include "trsp-conf.h"
 
+#ifndef G_SUBPROCESS_FLAGS_STDIN_DEV_NULL
+#ifdef G_SUBPROCESS_FLAGS_STDIN_INHERIT
+#define G_SUBPROCESS_FLAGS_STDIN_DEV_NULL G_SUBPROCESS_FLAGS_STDIN_INHERIT
+#else
+#define G_SUBPROCESS_FLAGS_STDIN_DEV_NULL 0
+#endif
+#endif
+
+#ifndef AI_ADDRCONFIG
+#define AI_ADDRCONFIG 0
+#endif
+
 
 #define AZEL_FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
+#define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 
 /* radio control functions */
 static void     exec_rx_cycle(GtkRigCtrl * ctrl);
@@ -96,10 +112,27 @@ static void     apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
 static void     update_rit_xit_offsets(GtkRigCtrl * ctrl);
 static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
                               const gchar *label);
+static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
+                                                   radio_conf_t *conf,
+                                                   gint *sock,
+                                                   gboolean secondary,
+                                                   const gchar *role,
+                                                   gboolean *error_reported);
 static void     schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                         const gchar *role);
+static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
+                                             const gchar *role,
+                                             const gchar *detail);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static gboolean is_ic9700_satmode(const radio_conf_t *conf);
+static void     rigctld_terminate_process(GSubprocess **proc);
+static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
+static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
+                                      gint64 now_us);
+static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
+                                           const gchar *role);
+static void     rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
+                                            const gchar *context);
 
 /*  add thread for hamlib communication */
 gpointer        rigctl_run(gpointer data);
@@ -147,6 +180,20 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
     gtk_widget_destroy(dialog);
 }
 
+static void free_radio_conf(radio_conf_t *conf)
+{
+    if (conf == NULL)
+        return;
+
+    g_free(conf->name);
+    g_free(conf->host);
+    g_free(conf->rigctld_path);
+    g_free(conf->rigctld_device);
+    g_free(conf->rigctld_civaddr);
+    g_free(conf->rigctld_extra_args);
+    g_free(conf);
+}
+
 static void rig_show_conn_error(GtkRigCtrl *ctrl,
                                 radio_conf_t *conf,
                                 const gchar *role)
@@ -163,6 +210,70 @@ static void rig_show_conn_error(GtkRigCtrl *ctrl,
                            label, host, port);
     rig_show_error_dialog(ctrl, _("Unable to connect to rigctld"), body);
     g_free(body);
+}
+
+static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (secondary)
+    {
+        ctrl->reconnect_backoff_ms2 = 0;
+        ctrl->reconnect_next_us2 = 0;
+        ctrl->tx_conn_error_reported = FALSE;
+    }
+    else
+    {
+        ctrl->reconnect_backoff_ms = 0;
+        ctrl->reconnect_next_us = 0;
+        ctrl->rx_conn_error_reported = FALSE;
+    }
+}
+
+static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
+                                      gint64 now_us)
+{
+    gint64 next_us;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    next_us = secondary ? ctrl->reconnect_next_us2 : ctrl->reconnect_next_us;
+    if (next_us <= 0)
+        return TRUE;
+
+    return (now_us >= next_us);
+}
+
+static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
+                                       const gchar *role)
+{
+    gint    backoff;
+    gint64  now_us;
+    gint   *backoff_ptr;
+    gint64 *next_ptr;
+
+    if (ctrl == NULL)
+        return;
+
+    backoff_ptr = secondary ? &ctrl->reconnect_backoff_ms2
+                            : &ctrl->reconnect_backoff_ms;
+    next_ptr = secondary ? &ctrl->reconnect_next_us2
+                         : &ctrl->reconnect_next_us;
+
+    if (*backoff_ptr <= 0)
+        backoff = 250;
+    else
+        backoff = MIN(*backoff_ptr * 2, 5000);
+
+    *backoff_ptr = backoff;
+    now_us = g_get_monotonic_time();
+    *next_ptr = now_us + ((gint64) backoff * 1000);
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: scheduling %s reconnect in %d ms"),
+                __func__, role ? role : _("rig"), backoff);
 }
 
 static GtkBoxClass *parent_class = NULL;
@@ -184,19 +295,18 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->rigctl_thread = NULL;
     }
 
+    rigctld_terminate_process(&ctrl->rigctld_proc2);
+    rigctld_terminate_process(&ctrl->rigctld_proc);
+
     if (ctrl->conf != NULL)
     {
         radio_conf_save(ctrl->conf);
-        g_free(ctrl->conf->name);
-        g_free(ctrl->conf->host);
-        g_free(ctrl->conf);
+        free_radio_conf(ctrl->conf);
         ctrl->conf = NULL;
     }
     if (ctrl->conf2 != NULL)
     {
-        g_free(ctrl->conf2->name);
-        g_free(ctrl->conf2->host);
-        g_free(ctrl->conf2);
+        free_radio_conf(ctrl->conf2);
         ctrl->conf2 = NULL;
     }
 
@@ -239,6 +349,14 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->prev_ele = 0.0;
     ctrl->sock = -1;
     ctrl->sock2 = -1;
+    ctrl->reconnect_backoff_ms = 0;
+    ctrl->reconnect_backoff_ms2 = 0;
+    ctrl->reconnect_next_us = 0;
+    ctrl->reconnect_next_us2 = 0;
+    ctrl->rx_conn_error_reported = FALSE;
+    ctrl->tx_conn_error_reported = FALSE;
+    ctrl->rigctld_proc = NULL;
+    ctrl->rigctld_proc2 = NULL;
     g_mutex_init(&(ctrl->busy));
     ctrl->engaged = FALSE;
     ctrl->delay = 1000;
@@ -894,9 +1012,7 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
 
     if (ctrl->conf != NULL)
     {
-        g_free(ctrl->conf->name);
-        g_free(ctrl->conf->host);
-        g_free(ctrl->conf);
+        free_radio_conf(ctrl->conf);
     }
 
     ctrl->conf = g_try_new(radio_conf_t, 1);
@@ -915,6 +1031,8 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s:%s: Loaded new radio configuration %s"),
                     __FILE__, __func__, ctrl->conf->name);
+
+        rigctrl_reset_reconnect(ctrl, FALSE);
 
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->cycle_spin),
                                   ctrl->conf->cycle);
@@ -937,10 +1055,7 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
                     _("%s:%s: Failed to load radio configuration %s"),
                     __FILE__, __func__, ctrl->conf->name);
 
-        g_free(ctrl->conf->name);
-        if (ctrl->conf->host)
-            g_free(ctrl->conf->host);
-        g_free(ctrl->conf);
+        free_radio_conf(ctrl->conf);
         ctrl->conf = NULL;
     }
 }
@@ -958,9 +1073,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
 
     if (ctrl->conf2 != NULL)
     {
-        g_free(ctrl->conf2->name);
-        g_free(ctrl->conf2->host);
-        g_free(ctrl->conf2);
+        free_radio_conf(ctrl->conf2);
         ctrl->conf2 = NULL;
     }
 
@@ -1039,6 +1152,8 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
                     _("%s:%s: Loaded new radio configuration %s"),
                     __FILE__, __func__, ctrl->conf2->name);
 
+        rigctrl_reset_reconnect(ctrl, TRUE);
+
         buff = g_strdup_printf(_("%.0f MHz"), ctrl->conf2->loup / 1.0e6);
         gtk_label_set_text(GTK_LABEL(ctrl->LoUp), buff);
         g_free(buff);
@@ -1049,10 +1164,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
                     _("%s:%s: Failed to load radio configuration %s"),
                     __FILE__, __func__, ctrl->conf->name);
 
-        g_free(ctrl->conf2->name);
-        if (ctrl->conf2->host)
-            g_free(ctrl->conf2->host);
-        g_free(ctrl->conf2);
+        free_radio_conf(ctrl->conf2);
         ctrl->conf2 = NULL;
     }
 }
@@ -1278,10 +1390,7 @@ static gboolean is_rig_tx_capable(const gchar * confname)
         cantx = FALSE;
     }
 
-    g_free(conf->name);
-    if (conf->host)
-        g_free(conf->host);
-    g_free(conf);
+    free_radio_conf(conf);
 
     return cantx;
 }
@@ -1518,6 +1627,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rigctld port closed"), __func__);
+        rigctrl_handle_socket_error(ctrl, sock, "send");
         return FALSE;
     }
     /* try to read answer */
@@ -1526,6 +1636,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rigctld port closed"), __func__);
+        rigctrl_handle_socket_error(ctrl, sock, "recv");
         return FALSE;
     }
 
@@ -1534,6 +1645,8 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s:%s: Got 0 bytes from rigctld"), __FILE__, __func__);
+        rigctrl_handle_socket_error(ctrl, sock, "recv");
+        return FALSE;
     }
     else
     {
@@ -1683,6 +1796,130 @@ static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
     return check_set_response(buffback, retcode, __func__);
 }
 
+static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
+                                     gdouble freq, vfo_t vfo)
+{
+    gchar          *buff;
+    gchar           buffback[128];
+    gboolean        retcode;
+
+    if (ctrl->conf->vfo_opt)
+        buff = g_strdup_printf("F %s %10.0f\x0a", vfo_name(vfo), freq);
+    else
+        buff = g_strdup_printf("F %10.0f\x0a", freq);
+
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "SATMODE IC-9700: set %s %.0f -> %s",
+                vfo_name(vfo), freq, buffback);
+    g_free(buff);
+
+    return check_set_response(buffback, retcode, __func__);
+}
+
+static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
+                                     gdouble *freq, vfo_t vfo)
+{
+    gchar          *buff;
+    gchar           buffback[128];
+    gboolean        retcode;
+    gboolean        retval = TRUE;
+    gchar         **vbuff;
+
+    if (ctrl->conf->vfo_opt)
+        buff = g_strdup_printf("f %s\x0a", vfo_name(vfo));
+    else
+        buff = g_strdup_printf("f\x0a");
+
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+    retcode = check_get_response(buffback, retcode, __func__);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "SATMODE IC-9700: get %s -> %s",
+                vfo_name(vfo), buffback);
+    if (retcode)
+    {
+        vbuff = g_strsplit(buffback, "\n", 3);
+        if (vbuff[0])
+            *freq = g_ascii_strtod(vbuff[0], NULL);
+        else
+            retval = FALSE;
+        g_strfreev(vbuff);
+    }
+    else
+    {
+        retval = FALSE;
+    }
+
+    g_free(buff);
+    return retval;
+}
+
+static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
+                                    gdouble freq, vfo_t vfo)
+{
+    gchar          *buff;
+    gchar           buffback[128];
+    gboolean        retcode;
+
+    if (ctrl->conf->vfo_opt)
+        buff = g_strdup_printf("I %s %10.0f\x0a", vfo_name(vfo), freq);
+    else
+        buff = g_strdup_printf("I %10.0f\x0a", freq);
+
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "SATMODE IC-9700: set %s (toggle) %.0f -> %s",
+                vfo_name(vfo), freq, buffback);
+    g_free(buff);
+
+    return check_set_response(buffback, retcode, __func__);
+}
+
+static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
+                                    gdouble *freq, vfo_t vfo)
+{
+    gchar          *buff;
+    gchar           buffback[128];
+    gboolean        retcode;
+    gboolean        retval = TRUE;
+    gchar         **vbuff;
+
+    if (freq == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s:%d: NULL storage."), __FILE__, __LINE__);
+        return FALSE;
+    }
+
+    if (ctrl->conf->vfo_opt)
+        buff = g_strdup_printf("i %s\x0a", vfo_name(vfo));
+    else
+        buff = g_strdup_printf("i\x0a");
+
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+    retcode = check_get_response(buffback, retcode, __func__);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "SATMODE IC-9700: get %s (toggle) -> %s",
+                vfo_name(vfo), buffback);
+    if (retcode)
+    {
+        vbuff = g_strsplit(buffback, "\n", 3);
+        if (vbuff[0])
+            *freq = g_ascii_strtod(vbuff[0], NULL);
+        else
+            retval = FALSE;
+
+        g_strfreev(vbuff);
+    }
+    else
+    {
+        retval = FALSE;
+    }
+
+    g_free(buff);
+    return retval;
+}
+
 static int get_vfos(GtkRigCtrl * ctrl, char *rx, char *tx)
 {
     // fill rx/tx with vfo name plus space if not empty
@@ -1805,6 +2042,10 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     gboolean        ptt = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
+    vfo_t           sat_vfo = VFO_A;
+    gboolean        use_sat_vfo =
+        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_DOWNLINK, &sat_vfo) &&
+        ctrl->conf->vfo_opt;
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
@@ -1823,7 +2064,12 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
         if (!select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
                                 "reading downlink freq", 0.0, FALSE))
             ctrl->errcnt++;
-        if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
+        if (use_sat_vfo)
+        {
+            if (!get_freq_simplex_vfo(ctrl, ctrl->sock, &readfreq, sat_vfo))
+                ctrl->errcnt++;
+        }
+        else if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
             ctrl->errcnt++;
@@ -1893,7 +2139,9 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     {
         if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
                                "setting downlink freq", tmpfreq, TRUE) &&
-            set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
+            (use_sat_vfo ?
+             set_freq_simplex_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
+             set_freq_simplex(ctrl, ctrl->sock, tmpfreq)))
         {
             /* reset error counter */
             ctrl->errcnt = 0;
@@ -2155,6 +2403,10 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     gboolean        dialchanged = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
+    vfo_t           sat_vfo = VFO_B;
+    gboolean        use_sat_vfo =
+        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &sat_vfo) &&
+        ctrl->conf->vfo_opt;
 
     /* Dial feedback:
        If radio device is engaged read frequency from radio and compare it to the
@@ -2169,7 +2421,12 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
         if (!select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
                                 "reading uplink freq", 0.0, FALSE))
             ctrl->errcnt++;
-        if (!get_freq_toggle(ctrl, ctrl->sock, &readfreq))
+        if (use_sat_vfo)
+        {
+            if (!get_freq_toggle_vfo(ctrl, ctrl->sock, &readfreq, sat_vfo))
+                ctrl->errcnt++;
+        }
+        else if (!get_freq_toggle(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
             readfreq = ctrl->lasttxf;
@@ -2246,7 +2503,9 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     {
         if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
                                "setting uplink freq", tmpfreq, TRUE) &&
-            set_freq_toggle(ctrl, ctrl->sock, tmpfreq))
+            (use_sat_vfo ?
+             set_freq_toggle_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
+             set_freq_toggle(ctrl, ctrl->sock, tmpfreq)))
         {
             /* reset error counter */
             ctrl->errcnt = 0;
@@ -2736,14 +2995,14 @@ static gboolean check_aos_los(GtkRigCtrl * ctrl)
         if (ctrl->prev_ele < 0.0 && ctrl->target->el >= 0.0)
         {
             /* AOS has occurred */
-            if (ctrl->conf->signal_aos)
+            if (ctrl->conf->signal_aos && ctrl->sock > 0)
             {
                 retcode &= send_rigctld_command(ctrl, ctrl->sock, "AOS\n",
                                                 retbuf, 10);
             }
             if (ctrl->conf2 != NULL)
             {
-                if (ctrl->conf2->signal_aos)
+                if (ctrl->conf2->signal_aos && ctrl->sock2 > 0)
                 {
                     retcode &= send_rigctld_command(ctrl, ctrl->sock2, "AOS\n",
                                                     retbuf, 10);
@@ -2753,14 +3012,14 @@ static gboolean check_aos_los(GtkRigCtrl * ctrl)
         else if (ctrl->prev_ele >= 0.0 && ctrl->target->el < 0.0)
         {
             /* LOS has occurred */
-            if (ctrl->conf->signal_los)
+            if (ctrl->conf->signal_los && ctrl->sock > 0)
             {
                 retcode &= send_rigctld_command(ctrl, ctrl->sock, "LOS\n",
                                                 retbuf, 10);
             }
             if (ctrl->conf2 != NULL)
             {
-                if (ctrl->conf2->signal_los)
+                if (ctrl->conf2->signal_los && ctrl->sock2 > 0)
                 {
                     retcode &= send_rigctld_command(ctrl, ctrl->sock2, "LOS\n",
                                                     retbuf, 10);
@@ -3108,63 +3367,139 @@ static gboolean key_press_cb(GtkWidget * widget, GdkEventKey * pKey,
     return event_managed;
 }
 
+static void rigctld_close_fd(gint fd)
+{
+#ifndef WIN32
+    if (fd >= 0)
+        close(fd);
+#else
+    if (fd >= 0)
+        closesocket(fd);
+#endif
+}
+
+static void rigctld_apply_socket_timeouts(gint fd)
+{
+#ifndef WIN32
+    struct timeval tv;
+
+    tv.tv_sec = RIGCTLD_SOCKET_TIMEOUT_MS / 1000;
+    tv.tv_usec = (RIGCTLD_SOCKET_TIMEOUT_MS % 1000) * 1000;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    _("%s: failed to set SO_RCVTIMEO"), __func__);
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    _("%s: failed to set SO_SNDTIMEO"), __func__);
+#else
+    DWORD timeout = RIGCTLD_SOCKET_TIMEOUT_MS;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
+               sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
+               sizeof(timeout));
+#endif
+}
+
+static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
+                                         gint *sock)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    gchar            portstr[16];
+    gboolean         connected = FALSE;
+    gint             status;
+
+    if (host == NULL || sock == NULL)
+        return FALSE;
+
+    *sock = -1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    g_snprintf(portstr, sizeof(portstr), "%d", port);
+    status = getaddrinfo(host, portstr, &hints, &res);
+    if (status != 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: getaddrinfo failed for %s:%d (%s)"),
+                    __func__, host, port, gai_strerror(status));
+        return FALSE;
+    }
+
+    for (ai = res; ai != NULL; ai = ai->ai_next)
+    {
+        gchar addrbuf[NI_MAXHOST];
+
+        if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
+                        addrbuf, sizeof(addrbuf), NULL, 0,
+                        NI_NUMERICHOST) != 0)
+            g_strlcpy(addrbuf, host, sizeof(addrbuf));
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    _("%s: attempting connect to %s:%d (%s)"),
+                    __func__, host, port, addrbuf);
+
+        *sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (*sock < 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        _("%s: socket() failed for %s:%d (%s)"),
+                        __func__, host, port, addrbuf);
+            continue;
+        }
+
+        rigctld_apply_socket_timeouts(*sock);
+        if (connect(*sock, ai->ai_addr, ai->ai_addrlen) == 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Connected to %s:%d (%s)"),
+                        __func__, host, port, addrbuf);
+            connected = TRUE;
+            break;
+        }
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    _("%s: connect failed to %s:%d (%s): %s"),
+                    __func__, host, port, addrbuf, g_strerror(errno));
+        rigctld_close_fd(*sock);
+        *sock = -1;
+    }
+
+    freeaddrinfo(res);
+    return connected;
+}
+
 static gboolean open_rigctld_socket(radio_conf_t * conf, gint * sock)
 {
-    struct sockaddr_in ServAddr;
-    struct hostent *h;
-    gint            status;
+    if (conf == NULL || sock == NULL)
+        return FALSE;
 
-    *sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (*sock < 0)
+    if (conf->host == NULL || conf->port <= 0)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: Failed to create socket"), __func__);
-        *sock = -1;
+                    _("%s: Missing rigctld host/port"), __func__);
         return FALSE;
     }
-    else
+
+    if (g_ascii_strcasecmp(conf->host, "localhost") == 0)
     {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    _("%s: Network socket created successfully"), __func__);
+        if (rigctld_connect_addrinfo("127.0.0.1", conf->port, sock))
+            return TRUE;
+        if (rigctld_connect_addrinfo("::1", conf->port, sock))
+            return TRUE;
     }
 
-    memset(&ServAddr, 0, sizeof(ServAddr));     /* Zero out structure */
-    ServAddr.sin_family = AF_INET;      /* Internet address family */
-    h = gethostbyname(conf->host);
-    if (h == NULL || h->h_addr_list[0] == NULL)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: Name resolution failed for %s"), __func__,
-                    conf->host ? conf->host : "(null)");
-#ifndef WIN32
-        close(*sock);
-#else
-        closesocket(*sock);
-#endif
-        *sock = -1;
-        return FALSE;
-    }
-    memcpy((char *)&ServAddr.sin_addr.s_addr, h->h_addr_list[0], h->h_length);
-    ServAddr.sin_port = htons(conf->port);      /* Server port */
+    if (rigctld_connect_addrinfo(conf->host, conf->port, sock))
+        return TRUE;
 
-    /* establish connection */
-    status = connect(*sock, (struct sockaddr *)&ServAddr, sizeof(ServAddr));
-    if (status < 0)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: Failed to connect to %s:%d"),
-                    __func__, conf->host, conf->port);
-        *sock = -1;
-        return FALSE;
-    }
-    else
-    {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    _("%s: Connection opened to %s:%d"),
-                    __func__, conf->host, conf->port);
-    }
-
-    return TRUE;
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                _("%s: Failed to connect to %s:%d"),
+                __func__, conf->host, conf->port);
+    return FALSE;
 }
 
 static gboolean close_rigctld_socket(gint * sock)
@@ -3191,6 +3526,415 @@ static gboolean close_rigctld_socket(gint * sock)
 
     *sock = -1;
 
+    return TRUE;
+}
+
+static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
+                                        const gchar *context)
+{
+    const gchar *role = _("rig");
+    gboolean     secondary = FALSE;
+    gint        *sock_ptr = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    if (sock == ctrl->sock)
+    {
+        role = _("receiver");
+        secondary = FALSE;
+        sock_ptr = &ctrl->sock;
+    }
+    else if (sock == ctrl->sock2)
+    {
+        role = _("uplink");
+        secondary = TRUE;
+        sock_ptr = &ctrl->sock2;
+    }
+
+    if (sock_ptr == NULL)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                _("%s: %s socket error during %s; disconnecting"),
+                __func__, role, context ? context : "command");
+
+    close_rigctld_socket(sock_ptr);
+    rigctrl_schedule_reconnect(ctrl, secondary, role);
+}
+
+static gboolean rigctld_host_is_local(const gchar *host)
+{
+    if (host == NULL || *host == '\0')
+        return TRUE;
+
+    if (g_ascii_strcasecmp(host, "localhost") == 0)
+        return TRUE;
+    if (g_strcmp0(host, "127.0.0.1") == 0)
+        return TRUE;
+    if (g_strcmp0(host, "::1") == 0)
+        return TRUE;
+
+    return FALSE;
+}
+
+static gboolean rigctld_port_is_open(const gchar *host, gint port,
+                                     gint timeout_ms)
+{
+    gboolean        ok = FALSE;
+    GResolver      *resolver = NULL;
+    GList          *addrs = NULL;
+    GError         *error = NULL;
+    gint64          timeout_us;
+
+    if (host == NULL || *host == '\0' || port <= 0)
+        return FALSE;
+
+    resolver = g_resolver_get_default();
+    addrs = g_resolver_lookup_by_name(resolver, host, NULL, &error);
+    if (addrs == NULL)
+    {
+        g_clear_error(&error);
+        g_object_unref(resolver);
+        return FALSE;
+    }
+
+    timeout_us = (gint64) timeout_ms * 1000;
+    for (GList *iter = addrs; iter != NULL; iter = iter->next)
+    {
+        GInetAddress   *addr = G_INET_ADDRESS(iter->data);
+        GSocket        *sock = NULL;
+        GSocketAddress *sockaddr = NULL;
+
+        sock = g_socket_new(g_inet_address_get_family(addr),
+                            G_SOCKET_TYPE_STREAM,
+                            G_SOCKET_PROTOCOL_TCP, &error);
+        if (sock == NULL)
+        {
+            g_clear_error(&error);
+            continue;
+        }
+
+        g_socket_set_blocking(sock, FALSE);
+        sockaddr = g_inet_socket_address_new(addr, port);
+
+        if (g_socket_connect(sock, sockaddr, NULL, &error))
+        {
+            ok = TRUE;
+        }
+        else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
+        {
+            g_clear_error(&error);
+            if (g_socket_condition_timed_wait(sock, G_IO_OUT, timeout_us, NULL,
+                                              &error))
+            {
+                if (g_socket_check_connect_result(sock, &error))
+                    ok = TRUE;
+                else
+                    g_clear_error(&error);
+            }
+            else
+            {
+                g_clear_error(&error);
+            }
+        }
+        else
+        {
+            g_clear_error(&error);
+        }
+
+        g_object_unref(sockaddr);
+        g_object_unref(sock);
+
+        if (ok)
+            break;
+    }
+
+    g_resolver_free_addresses(addrs);
+    g_object_unref(resolver);
+
+    return ok;
+}
+
+static gboolean rigctld_wait_for_port(const radio_conf_t *conf, gint timeout_ms)
+{
+    const gint      interval_ms = 100;
+    gint            waited = 0;
+
+    while (waited < timeout_ms)
+    {
+        if (rigctld_port_is_open(conf->host, conf->port, interval_ms))
+            return TRUE;
+
+        g_usleep(interval_ms * 1000);
+        waited += interval_ms;
+    }
+
+    return FALSE;
+}
+
+static gchar *rigctld_read_stderr(GSubprocess *proc)
+{
+    GInputStream          *stream;
+    GPollableInputStream  *pollable;
+    GString               *output;
+    gchar                  buffer[256];
+    GError                *error = NULL;
+    gssize                 bytes;
+
+    if (proc == NULL)
+        return NULL;
+
+    stream = g_subprocess_get_stderr_pipe(proc);
+    if (stream == NULL)
+        return NULL;
+
+    pollable = G_POLLABLE_INPUT_STREAM(stream);
+    if (!g_pollable_input_stream_is_readable(pollable))
+        return NULL;
+
+    output = g_string_new(NULL);
+    while (g_pollable_input_stream_is_readable(pollable))
+    {
+        bytes = g_pollable_input_stream_read_nonblocking(
+            pollable, buffer, sizeof(buffer) - 1, NULL, &error);
+        if (bytes > 0)
+        {
+            buffer[bytes] = '\0';
+            g_string_append(output, buffer);
+        }
+        else if (bytes == 0)
+        {
+            break;
+        }
+        else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+        {
+            g_clear_error(&error);
+            break;
+        }
+        else
+        {
+            g_clear_error(&error);
+            break;
+        }
+    }
+
+    if (output->len == 0)
+    {
+        g_string_free(output, TRUE);
+        return NULL;
+    }
+
+    return g_string_free(output, FALSE);
+}
+
+static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out)
+{
+    GSubprocess    *proc = NULL;
+    GPtrArray      *argv = NULL;
+    GError         *error = NULL;
+    gchar          *path = NULL;
+    gchar          *model = NULL;
+    gchar          *baud = NULL;
+    gchar          *port = NULL;
+
+    if (conf == NULL)
+    {
+        if (error_out)
+            *error_out = g_strdup("Missing radio configuration.");
+        return NULL;
+    }
+
+    if (conf->rigctld_model <= 0)
+    {
+        if (error_out)
+            *error_out = g_strdup("Missing rigctld model number.");
+        return NULL;
+    }
+
+    if (conf->rigctld_device == NULL || *conf->rigctld_device == '\0')
+    {
+        if (error_out)
+            *error_out = g_strdup("Missing rigctld device path.");
+        return NULL;
+    }
+
+    if (conf->rigctld_path && *conf->rigctld_path)
+        path = g_strdup(conf->rigctld_path);
+    else
+        path = g_find_program_in_path("rigctld");
+
+    if (path == NULL)
+    {
+        if (error_out)
+            *error_out = g_strdup("rigctld not found in PATH.");
+        return NULL;
+    }
+
+    argv = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(argv, g_strdup(path));
+    g_ptr_array_add(argv, g_strdup("-m"));
+    model = g_strdup_printf("%d", conf->rigctld_model);
+    g_ptr_array_add(argv, model);
+    g_ptr_array_add(argv, g_strdup("-r"));
+    g_ptr_array_add(argv, g_strdup(conf->rigctld_device));
+    if (conf->rigctld_baud > 0)
+    {
+        g_ptr_array_add(argv, g_strdup("-s"));
+        baud = g_strdup_printf("%d", conf->rigctld_baud);
+        g_ptr_array_add(argv, baud);
+    }
+    g_ptr_array_add(argv, g_strdup("-t"));
+    port = g_strdup_printf("%d", conf->port);
+    g_ptr_array_add(argv, port);
+    if (conf->rigctld_civaddr && *conf->rigctld_civaddr)
+    {
+        g_ptr_array_add(argv, g_strdup("-C"));
+        g_ptr_array_add(argv,
+                        g_strdup_printf("civaddr=%s", conf->rigctld_civaddr));
+    }
+    if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
+    {
+        gchar **extra_argv = NULL;
+        gint    extra_argc = 0;
+
+        if (!g_shell_parse_argv(conf->rigctld_extra_args, &extra_argc,
+                                &extra_argv, &error))
+        {
+            if (error_out)
+                *error_out = g_strdup(error->message);
+            g_clear_error(&error);
+            g_strfreev(extra_argv);
+            g_ptr_array_free(argv, TRUE);
+            g_free(path);
+            return NULL;
+        }
+
+        for (gint i = 0; i < extra_argc; i++)
+            g_ptr_array_add(argv, g_strdup(extra_argv[i]));
+        g_strfreev(extra_argv);
+    }
+
+    g_ptr_array_add(argv, NULL);
+    proc = g_subprocess_newv((const gchar * const *) argv->pdata,
+                             G_SUBPROCESS_FLAGS_STDIN_DEV_NULL |
+                                 G_SUBPROCESS_FLAGS_STDERR_PIPE |
+                                 G_SUBPROCESS_FLAGS_STDOUT_SILENCE,
+                             &error);
+    if (proc == NULL)
+    {
+        if (error_out)
+            *error_out = g_strdup(error->message);
+        g_clear_error(&error);
+    }
+
+    g_ptr_array_free(argv, TRUE);
+    g_free(path);
+
+    return proc;
+}
+
+static void rigctld_terminate_process(GSubprocess **proc)
+{
+    if (proc == NULL || *proc == NULL)
+        return;
+
+    if (!g_subprocess_get_if_exited(*proc))
+        g_subprocess_force_exit(*proc);
+
+    g_clear_object(proc);
+}
+
+static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
+                                                   radio_conf_t *conf,
+                                                   gint *sock,
+                                                   gboolean secondary,
+                                                   const gchar *role,
+                                                   gboolean *error_reported)
+{
+    GSubprocess   **proc = secondary ? &ctrl->rigctld_proc2 : &ctrl->rigctld_proc;
+    gchar          *errmsg = NULL;
+    gboolean        reported = FALSE;
+
+    if (error_reported)
+        *error_reported = FALSE;
+
+    if (open_rigctld_socket(conf, sock))
+        return TRUE;
+
+    if (conf == NULL || !conf->rigctld_autostart)
+        return FALSE;
+
+    if (!rigctld_host_is_local(conf->host))
+    {
+        schedule_rig_autostart_error(
+            ctrl, role,
+            _("Auto-start is only supported for localhost."));
+        reported = TRUE;
+        if (error_reported)
+            *error_reported = reported;
+        return FALSE;
+    }
+
+    if (*proc != NULL && g_subprocess_get_if_exited(*proc))
+        g_clear_object(proc);
+
+    if (rigctld_port_is_open(conf->host, conf->port, 100))
+    {
+        if (open_rigctld_socket(conf, sock))
+            return TRUE;
+        return FALSE;
+    }
+
+    if (*proc == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-starting rigctld for %s:%d"),
+                    __func__, conf->host ? conf->host : "(null)", conf->port);
+        *proc = rigctld_spawn(conf, &errmsg);
+        if (*proc == NULL)
+        {
+            schedule_rig_autostart_error(ctrl, role,
+                                         errmsg ? errmsg :
+                                         _("Failed to spawn rigctld."));
+            g_free(errmsg);
+            reported = TRUE;
+            if (error_reported)
+                *error_reported = reported;
+            return FALSE;
+        }
+    }
+
+    if (!rigctld_wait_for_port(conf, 3000))
+    {
+        gchar *stderr_text = rigctld_read_stderr(*proc);
+        gchar *detail = NULL;
+
+        if (stderr_text && *stderr_text)
+            detail = g_strdup_printf(
+                _("rigctld did not start listening on %s:%d.\n%s"),
+                conf->host ? conf->host : "(null)", conf->port, stderr_text);
+        else
+            detail = g_strdup_printf(
+                _("rigctld did not start listening on %s:%d."),
+                conf->host ? conf->host : "(null)", conf->port);
+
+        schedule_rig_autostart_error(ctrl, role, detail);
+        rigctld_terminate_process(proc);
+        g_free(stderr_text);
+        g_free(detail);
+
+        reported = TRUE;
+        if (error_reported)
+            *error_reported = reported;
+        return FALSE;
+    }
+
+    if (!open_rigctld_socket(conf, sock))
+        return FALSE;
+
+    if (error_reported)
+        *error_reported = reported;
     return TRUE;
 }
 
@@ -3273,6 +4017,43 @@ static void schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
     g_idle_add(rig_conn_error_idle, info);
 }
 
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *title;
+    gchar      *body;
+} RigAutostartErrorInfo;
+
+static gboolean rig_autostart_error_idle(gpointer data)
+{
+    RigAutostartErrorInfo *info = data;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    rig_show_error_dialog(info->ctrl,
+                          info->title ? info->title : _("rigctld error"),
+                          info->body ? info->body : "");
+    g_free(info->title);
+    g_free(info->body);
+    g_free(info);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_rig_autostart_error(GtkRigCtrl *ctrl,
+                                         const gchar *role,
+                                         const gchar *detail)
+{
+    RigAutostartErrorInfo *info = g_new0(RigAutostartErrorInfo, 1);
+    const gchar *label = (role != NULL) ? role : _("rig");
+
+    info->ctrl = ctrl;
+    info->title = g_strdup_printf(_("Unable to auto-start rigctld (%s)"), label);
+    info->body = g_strdup(detail ? detail : "");
+
+    g_idle_add(rig_autostart_error_idle, info);
+}
+
 static gboolean rig_disengage_idle(gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
@@ -3309,43 +4090,68 @@ static void rigctrl_close(GtkRigCtrl * data)
         close_rigctld_socket(&(ctrl->sock2));
     }
     close_rigctld_socket(&(ctrl->sock));
+
+    rigctld_terminate_process(&ctrl->rigctld_proc2);
+    rigctld_terminate_process(&ctrl->rigctld_proc);
+
+    rigctrl_reset_reconnect(ctrl, FALSE);
+    rigctrl_reset_reconnect(ctrl, TRUE);
 }
 
 static gboolean rigctrl_open(GtkRigCtrl * data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+    gboolean        rx_opened = FALSE;
+    gboolean        tx_opened = FALSE;
     gboolean        tx_ok = TRUE;
 
-    ctrl->wrops = 0;
+    if (!ctrl->timerid)
+        start_timer(ctrl);
 
-    start_timer(ctrl);
-
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: opening receiver rig %s:%d"), __func__,
-                ctrl->conf ? ctrl->conf->host : "(null)",
-                ctrl->conf ? ctrl->conf->port : 0);
-    g_printerr("%s: opening receiver rig %s:%d\n", __func__,
-               ctrl->conf ? ctrl->conf->host : "(null)",
-               ctrl->conf ? ctrl->conf->port : 0);
-
-    if (!open_rigctld_socket(ctrl->conf, &(ctrl->sock)) ||
-        !probe_rigctld(ctrl, ctrl->sock, _("receiver rig")))
+    if (ctrl->sock <= 0)
     {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: receiver rig open/probe failed"), __func__);
-        close_rigctld_socket(&(ctrl->sock));
-        schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
-        return FALSE;
+        ctrl->wrops = 0;
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: opening receiver rig %s:%d"), __func__,
+                    ctrl->conf ? ctrl->conf->host : "(null)",
+                    ctrl->conf ? ctrl->conf->port : 0);
+        g_printerr("%s: opening receiver rig %s:%d\n", __func__,
+                   ctrl->conf ? ctrl->conf->host : "(null)",
+                   ctrl->conf ? ctrl->conf->port : 0);
+
+        {
+            gboolean error_reported = FALSE;
+
+            if (!open_rigctld_socket_with_autostart(ctrl, ctrl->conf,
+                                                    &(ctrl->sock),
+                                                    FALSE, _("receiver"),
+                                                    &error_reported) ||
+                !probe_rigctld(ctrl, ctrl->sock, _("receiver rig")))
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: receiver rig open/probe failed"), __func__);
+                close_rigctld_socket(&(ctrl->sock));
+                if (!error_reported && !ctrl->rx_conn_error_reported)
+                {
+                    schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
+                    ctrl->rx_conn_error_reported = TRUE;
+                }
+                return FALSE;
+            }
+        }
+
+        rigctrl_reset_reconnect(ctrl, FALSE);
+        rx_opened = TRUE;
+
+        /* check to see if vfo option is enabled */
+        ctrl->conf->vfo_opt = get_vfo_opt(ctrl, ctrl->sock);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                _("%s:%s: VFO opt=%d"), __FILE__,
+                __func__, ctrl->conf->vfo_opt);
     }
 
-    // check to see if vfo option is enabled
-    ctrl->conf->vfo_opt = get_vfo_opt(ctrl, ctrl->sock);
-    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-            _("%s:%s: VFO opt=%d"), __FILE__,
-            __func__, ctrl->conf->vfo_opt);
-
     /* set initial frequency */
-    if (ctrl->conf2 != NULL)
+    if (ctrl->conf2 != NULL && ctrl->sock2 <= 0)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: opening uplink rig %s:%d"), __func__,
@@ -3355,66 +4161,88 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
                    ctrl->conf2 ? ctrl->conf2->host : "(null)",
                    ctrl->conf2 ? ctrl->conf2->port : 0);
 
-        tx_ok = open_rigctld_socket(ctrl->conf2, &(ctrl->sock2));
-        if (tx_ok)
-            tx_ok = probe_rigctld(ctrl, ctrl->sock2, _("uplink rig"));
-        if (!tx_ok)
         {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: uplink rig open/probe failed"), __func__);
-            close_rigctld_socket(&(ctrl->sock2));
-            schedule_rig_conn_error(ctrl, ctrl->conf2, _("uplink"));
+            gboolean error_reported = FALSE;
+
+            tx_ok = open_rigctld_socket_with_autostart(
+                ctrl, ctrl->conf2, &(ctrl->sock2), TRUE, _("uplink"),
+                &error_reported);
+            if (tx_ok)
+                tx_ok = probe_rigctld(ctrl, ctrl->sock2, _("uplink rig"));
+            if (!tx_ok)
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: uplink rig open/probe failed"), __func__);
+                close_rigctld_socket(&(ctrl->sock2));
+                if (!error_reported && !ctrl->tx_conn_error_reported)
+                {
+                    schedule_rig_conn_error(ctrl, ctrl->conf2, _("uplink"));
+                    ctrl->tx_conn_error_reported = TRUE;
+                }
+            }
         }
 
-        /* set initial dual mode */
         if (tx_ok)
+        {
+            rigctrl_reset_reconnect(ctrl, TRUE);
+            tx_opened = TRUE;
             ctrl->conf2->vfo_opt = get_vfo_opt(ctrl, ctrl->sock2);
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s:%s: VFO opt2=%d"), __FILE__,
-                __func__, ctrl->conf2->vfo_opt);
-
-        if (tx_ok)
-            exec_dual_rig_cycle(ctrl);
-    }
-    else
-    {
-        switch (ctrl->conf->type)
-        {
-
-        case RIG_TYPE_RX:
-            exec_rx_cycle(ctrl);
-            break;
-
-        case RIG_TYPE_TX:
-            exec_tx_cycle(ctrl);
-            break;
-
-        case RIG_TYPE_TRX:
-            exec_trx_cycle(ctrl);
-            break;
-
-        case RIG_TYPE_DUPLEX:
-            /* set rig into SAT mode (hamlib needs it even if rig already in SAT) */
-            setup_split(ctrl);
-            exec_duplex_cycle(ctrl);
-            break;
-
-        case RIG_TYPE_TOGGLE_AUTO:
-        case RIG_TYPE_TOGGLE_MAN:
-            set_toggle(ctrl, ctrl->sock);
-            ctrl->last_toggle_tx = -1;
-            exec_toggle_cycle(ctrl);
-            break;
-
-        default:
-            /* this is an error! */
-            ctrl->conf->type = RIG_TYPE_RX;
-            exec_rx_cycle(ctrl);
-            break;
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    _("%s:%s: VFO opt2=%d"), __FILE__,
+                    __func__, ctrl->conf2->vfo_opt);
         }
     }
 
-    apply_rit_xit_offsets(ctrl, 0.0, 0.0);
+    if (ctrl->sock <= 0)
+        return FALSE;
+
+    if ((rx_opened || tx_opened))
+    {
+        if (ctrl->conf2 != NULL)
+        {
+            if (ctrl->sock > 0 && ctrl->sock2 > 0)
+                exec_dual_rig_cycle(ctrl);
+        }
+        else
+        {
+            switch (ctrl->conf->type)
+            {
+
+            case RIG_TYPE_RX:
+                exec_rx_cycle(ctrl);
+                break;
+
+            case RIG_TYPE_TX:
+                exec_tx_cycle(ctrl);
+                break;
+
+            case RIG_TYPE_TRX:
+                exec_trx_cycle(ctrl);
+                break;
+
+            case RIG_TYPE_DUPLEX:
+                /* set rig into SAT mode (hamlib needs it even if rig already in SAT) */
+                setup_split(ctrl);
+                exec_duplex_cycle(ctrl);
+                break;
+
+            case RIG_TYPE_TOGGLE_AUTO:
+            case RIG_TYPE_TOGGLE_MAN:
+                set_toggle(ctrl, ctrl->sock);
+                ctrl->last_toggle_tx = -1;
+                exec_toggle_cycle(ctrl);
+                break;
+
+            default:
+                /* this is an error! */
+                ctrl->conf->type = RIG_TYPE_RX;
+                exec_rx_cycle(ctrl);
+                break;
+            }
+        }
+
+        apply_rit_xit_offsets(ctrl, 0.0, 0.0);
+    }
 
     return TRUE;
 }
@@ -3441,19 +4269,41 @@ gpointer rigctl_run(gpointer data)
 
         if (t_ctrl->engaged)
         {
+            gint64 now_us = g_get_monotonic_time();
+
             if (t_ctrl->sock <= 0)
             {
-                if (!rigctrl_open(t_ctrl))
+                if (rigctrl_reconnect_due(t_ctrl, FALSE, now_us))
                 {
-                    sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                _("%s: failed to open rig(s); disengaging"),
-                                __func__);
-                    g_printerr("%s: failed to open rig(s); disengaging\n",
-                               __func__);
-                    t_ctrl->engaged = FALSE;
-                    schedule_rig_disengage(t_ctrl);
-                    continue;
+                    if (!rigctrl_open(t_ctrl))
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                    _("%s: failed to open receiver rig"),
+                                    __func__);
+                        rigctrl_schedule_reconnect(t_ctrl, FALSE,
+                                                   _("receiver"));
+                    }
                 }
+                if (t_ctrl->sock <= 0)
+                    continue;
+            }
+
+            if (t_ctrl->conf2 != NULL && t_ctrl->sock2 <= 0)
+            {
+                gboolean attempted_tx = FALSE;
+
+                if (rigctrl_reconnect_due(t_ctrl, TRUE, now_us))
+                {
+                    attempted_tx = TRUE;
+                    if (!rigctrl_open(t_ctrl))
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                    _("%s: failed to open uplink rig"),
+                                    __func__);
+                    }
+                }
+                if (attempted_tx && t_ctrl->sock2 <= 0)
+                    rigctrl_schedule_reconnect(t_ctrl, TRUE, _("uplink"));
             }
 
             if (!t_ctrl->timerid)
@@ -3478,7 +4328,17 @@ gpointer rigctl_run(gpointer data)
 
         if (t_ctrl->conf2 != NULL)
         {
-            exec_dual_rig_cycle(t_ctrl);
+            if (t_ctrl->sock2 > 0)
+            {
+                exec_dual_rig_cycle(t_ctrl);
+            }
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            _("%s: uplink rig not connected; running downlink only"),
+                            __func__);
+                exec_rx_cycle(t_ctrl);
+            }
         }
         else
         {
@@ -3522,16 +4382,10 @@ gpointer rigctl_run(gpointer data)
         /* perform error count checking */
         if (t_ctrl->errcnt >= MAX_ERROR_COUNT)
         {
-            /* disengage device */
-            t_ctrl->engaged = FALSE;
             t_ctrl->errcnt = 0;
-            schedule_rig_disengage(t_ctrl);
             sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _
-                        ("%s:%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
+                        _("%s:%s: MAX_ERROR_COUNT (%d) reached. Resetting error counter."),
                         __FILE__, __func__, MAX_ERROR_COUNT);
-
-            //g_print ("ERROR. WROPS = %d\n", ctrl->wrops);
         }
 
         //g_print ("       WROPS = %d\n", ctrl->wrops);
