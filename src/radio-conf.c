@@ -48,7 +48,7 @@
 
 #define DEFAULT_CYCLE_MS    1000
 
-static gboolean radio_supports_rit_xit(const gchar *name)
+static gboolean radio_name_matches_ic9700(const gchar *name)
 {
     gboolean        match = FALSE;
     gchar          *lower;
@@ -63,6 +63,21 @@ static gboolean radio_supports_rit_xit(const gchar *name)
     g_free(lower);
 
     return match;
+}
+
+static gboolean radio_supports_rit_xit(const gchar *name)
+{
+    return radio_name_matches_ic9700(name);
+}
+
+static gboolean radio_supports_full_duplex(const gchar *name)
+{
+    return radio_name_matches_ic9700(name);
+}
+
+static gboolean radio_supports_dual_vfo_sat(const gchar *name)
+{
+    return radio_name_matches_ic9700(name);
 }
 
 /**
@@ -96,6 +111,8 @@ gboolean radio_conf_read(radio_conf_t * conf)
     g_free(confdir);
 
     conf->supports_rit_xit = radio_supports_rit_xit(conf->name);
+    conf->supports_full_duplex = radio_supports_full_duplex(conf->name);
+    conf->supports_dual_vfo_sat = radio_supports_dual_vfo_sat(conf->name);
 
     /* open .rig file */
     cfg = g_key_file_new();

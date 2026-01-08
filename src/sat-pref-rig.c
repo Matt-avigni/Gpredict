@@ -395,7 +395,9 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .loup = 0.0,
         .signal_aos = FALSE,
         .signal_los = FALSE,
-        .supports_rit_xit = FALSE
+        .supports_rit_xit = FALSE,
+        .supports_full_duplex = FALSE,
+        .supports_dual_vfo_sat = FALSE
     };
 
     /* If there are no entries, we have a bug since the button should 
@@ -692,6 +694,8 @@ static void add_cb(GtkWidget * button, gpointer data)
         .signal_aos = FALSE,
         .signal_los = FALSE,
         .supports_rit_xit = FALSE,
+        .supports_full_duplex = FALSE,
+        .supports_dual_vfo_sat = FALSE,
     };
 
     /* run rig conf editor */
@@ -816,7 +820,9 @@ void sat_pref_rig_ok()
         .loup = 0.0,
         .signal_aos = FALSE,
         .signal_los = FALSE,
-        .supports_rit_xit = FALSE
+        .supports_rit_xit = FALSE,
+        .supports_full_duplex = FALSE,
+        .supports_dual_vfo_sat = FALSE
     };
 
     /* delete all .rig files */

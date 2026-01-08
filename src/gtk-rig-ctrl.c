@@ -99,6 +99,7 @@ static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
 static void     schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                         const gchar *role);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
+static gboolean is_ic9700_satmode(const radio_conf_t *conf);
 
 /*  add thread for hamlib communication */
 gpointer        rigctl_run(gpointer data);
@@ -985,6 +986,23 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
         gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
     if (!g_strcmp0(name1, name2))
     {
+        if (is_ic9700_satmode(ctrl->conf))
+        {
+            /* Allow same rig: IC-9700 uses dual VFOs in SAT mode. */
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "SATMODE IC-9700: using primary rig for uplink (dual VFO)");
+            g_free(name1);
+            g_free(name2);
+            if (ctrl->conf != NULL)
+            {
+                buff = g_strdup_printf(_("%.0f MHz"), ctrl->conf->loup / 1.0e6);
+                gtk_label_set_text(GTK_LABEL(ctrl->LoUp), buff);
+                g_free(buff);
+            }
+
+            return;
+        }
+
         /* selected conf is the same as the primary one */
         g_free(name1);
         g_free(name2);
@@ -1249,7 +1267,7 @@ static gboolean is_rig_tx_capable(const gchar * confname)
     conf->name = g_strdup(confname);
     if (radio_conf_read(conf))
     {
-        cantx = (conf->type == RIG_TYPE_RX) ? FALSE : TRUE;
+        cantx = (conf->type == RIG_TYPE_RX) ? conf->supports_full_duplex : TRUE;
     }
     else
     {
@@ -1597,33 +1615,72 @@ static const gchar *vfo_name(vfo_t vfo)
     }
 }
 
+typedef enum {
+    VFO_ROLE_DOWNLINK = 0,
+    VFO_ROLE_UPLINK
+} vfo_role_t;
+
+static const gchar *vfo_role_name(vfo_role_t role)
+{
+    switch (role)
+    {
+    case VFO_ROLE_DOWNLINK:
+        return "downlink";
+    case VFO_ROLE_UPLINK:
+        return "uplink";
+    default:
+        return "unknown";
+    }
+}
+
 static gboolean is_ic9700_satmode(const radio_conf_t *conf)
 {
     return (conf != NULL) &&
         (conf->type == RIG_TYPE_DUPLEX) &&
-        conf->supports_rit_xit;
+        conf->supports_dual_vfo_sat;
 }
 
-static vfo_t map_vfo_for_satmode(const radio_conf_t *conf, vfo_t vfo)
+static gboolean satmode_vfo_for_role(const radio_conf_t *conf,
+                                     vfo_role_t role, vfo_t *vfo)
 {
-    vfo_t mapped = vfo;
+    if (!is_ic9700_satmode(conf) || vfo == NULL)
+        return FALSE;
 
-    /* IC-9700 rejects Main/Sub VFOs in SAT mode; map to VFOA/VFOB. */
-    if (is_ic9700_satmode(conf))
+    *vfo = (role == VFO_ROLE_DOWNLINK) ? VFO_A : VFO_B;
+    return TRUE;
+}
+
+static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
+                                   vfo_role_t role, const gchar *action,
+                                   gdouble freq, gboolean log_freq)
+{
+    gchar           buffback[128];
+    gchar          *buff;
+    gboolean        retcode;
+    vfo_t           vfo;
+
+    if (!satmode_vfo_for_role(ctrl->conf, role, &vfo))
+        return TRUE;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE IC-9700: %s -> %s",
+                vfo_role_name(role), vfo_name(vfo));
+    if (action != NULL)
     {
-        if (vfo == VFO_MAIN)
-            mapped = VFO_A;
-        else if (vfo == VFO_SUB)
-            mapped = VFO_B;
-
-        if (mapped != vfo)
+        if (log_freq)
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE: mapping %s->%s for IC-9700 (%s)",
-                        vfo_name(vfo), vfo_name(mapped),
-                        conf->name ? conf->name : "unnamed");
+                        "SATMODE IC-9700: selecting %s before %s %.0f",
+                        vfo_name(vfo), action, freq);
+        else
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "SATMODE IC-9700: selecting %s before %s",
+                        vfo_name(vfo), action);
     }
 
-    return mapped;
+    buff = g_strdup_printf("V %s\x0a", vfo_name(vfo));
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+    g_free(buff);
+
+    return check_set_response(buffback, retcode, __func__);
 }
 
 static int get_vfos(GtkRigCtrl * ctrl, char *rx, char *tx)
@@ -1672,7 +1729,8 @@ static gboolean setup_split(GtkRigCtrl * ctrl)
     vfo_t           vfo_up;
 
     get_vfos(ctrl, rx, tx);
-    vfo_up = map_vfo_for_satmode(ctrl->conf, ctrl->conf->vfoUp);
+    vfo_up = ctrl->conf->vfoUp;
+    satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &vfo_up);
     switch (vfo_up)
     {
     case VFO_A:
@@ -1762,6 +1820,9 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
      */
     if ((ctrl->engaged) && (ctrl->lastrxf > 0.0) && (ptt == FALSE))
     {
+        if (!select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
+                                "reading downlink freq", 0.0, FALSE))
+            ctrl->errcnt++;
         if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
@@ -1830,7 +1891,9 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     if ((ctrl->engaged) && (ptt == FALSE) &&
         (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
     {
-        if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
+        if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
+                               "setting downlink freq", tmpfreq, TRUE) &&
+            set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
         {
             /* reset error counter */
             ctrl->errcnt = 0;
@@ -2103,6 +2166,9 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
      */
     if ((ctrl->engaged) && (ctrl->lasttxf > 0.0))
     {
+        if (!select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
+                                "reading uplink freq", 0.0, FALSE))
+            ctrl->errcnt++;
         if (!get_freq_toggle(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
@@ -2178,7 +2244,9 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
     {
-        if (set_freq_toggle(ctrl, ctrl->sock, tmpfreq))
+        if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
+                               "setting uplink freq", tmpfreq, TRUE) &&
+            set_freq_toggle(ctrl, ctrl->sock, tmpfreq))
         {
             /* reset error counter */
             ctrl->errcnt = 0;
@@ -2744,7 +2812,12 @@ static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble freq)
                 _("%s: set_freq_toggle vfo_opt=%d freq=%.0f"),
                 __func__, ctrl->conf->vfo_opt, freq);
     if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("I VFOA %10.0f\x0a", freq);
+    {
+        if (is_ic9700_satmode(ctrl->conf))
+            buff = g_strdup_printf("I currVFO %10.0f\x0a", freq);
+        else
+            buff = g_strdup_printf("I VFOA %10.0f\x0a", freq);
+    }
     else
         buff = g_strdup_printf("I %10.0f\x0a", freq);
 

@@ -76,6 +76,8 @@ typedef struct {
     gint            vfo_opt;    /*!< Keep track of vfo_opt being enabled in rigctld */
 
     gboolean        supports_rit_xit; /*!< Radio supports Doppler via RIT/XIT offsets */
+    gboolean        supports_full_duplex; /*!< Radio supports full duplex operation */
+    gboolean        supports_dual_vfo_sat; /*!< Radio supports dual VFO satellite mode */
 } radio_conf_t;
 
 
