@@ -42,13 +42,18 @@
 #include <math.h>
 
 /* NETWORK */
-#if defined(_WIN32) || defined(WIN32)
-#include <winsock2.h>
+#ifndef WIN32
+#ifdef _WIN32
+  #include <winsock2.h>   /* htons(), etc. */
+  #include <ws2tcpip.h>
 #else
-#include <arpa/inet.h>          /* htons() */
+  #include <arpa/inet.h>  /* htons(), etc. */
+#endif
 #include <netdb.h>              /* gethostbyname() */
 #include <netinet/in.h>         /* struct sockaddr_in */
 #include <sys/socket.h>         /* socket(), connect(), send() */
+#else
+#include <winsock2.h>
 #endif
 
 #include "compat.h"

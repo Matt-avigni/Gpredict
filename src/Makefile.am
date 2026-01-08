@@ -80,6 +80,7 @@ gpredict_SOURCES = \
     qth-editor.c qth-editor.h \
     radio-conf.c radio-conf.h \
     rotor-conf.c rotor-conf.h \
+    rotor-trajectory-planner.c rotor-trajectory-planner.h \
     trsp-conf.c trsp-conf.h \
     trsp-update.c trsp-update.h \
     win32-fetch.c win32-fetch.h \

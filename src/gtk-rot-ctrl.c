@@ -33,14 +33,20 @@
 #endif
 
 /* NETWORK */
-#if defined(_WIN32) || defined(WIN32)
-#include <winsock2.h>
-#include <windows.h>
+#ifndef WIN32
+#ifdef _WIN32
+  #include <winsock2.h>   /* htons(), etc. */
+  #include <ws2tcpip.h>
 #else
+  #include <arpa/inet.h>  /* htons(), etc. */
+#endif
 #include <arpa/inet.h>          /* htons() */
 #include <netdb.h>              /* gethostbyname() */
 #include <netinet/in.h>         /* struct sockaddr_in */
 #include <sys/socket.h>         /* socket(), connect(), send() */
+#else
+#include <winsock2.h>
+#include <windows.h>
 #endif
 
 #include <errno.h>
@@ -61,6 +67,7 @@
 #include "predict-tools.h"
 #include "sat-log.h"
 #include "rotor-conf.h"
+#include "rotor-trajectory-planner.h"
 
 
 #define FMTSTR "%7.2f\302\260"
@@ -89,6 +96,8 @@ typedef enum {
 typedef struct {
     gboolean        valid;
     rot_plan_mode_t mode;
+    rot_plan_status_t status;
+    rot_plan_strategy_t strategy;
     gdouble         start_az_cmd;
     gdouble         start_el_cmd;
     gdouble         end_az_cmd;
@@ -98,6 +107,10 @@ typedef struct {
     gdouble         peak_el_rate;
     gdouble         window_start;
     gdouble         window_end;
+    gdouble         trackable_pct;
+    gdouble         violation_mag;
+    gdouble         sample_dt_sec;
+    GArray         *cmd_samples; /* rot_plan_cmd_t */
     gchar          *reason;
 } rot_plan_t;
 
@@ -291,6 +304,23 @@ static void rotctld_socket_close(gint * sock)
     *sock = -1;
 }
 
+/* Close a rotctld socket without sending shutdown commands. */
+static void rotctld_socket_close_quiet(gint *sock)
+{
+    if (sock == NULL || *sock == -1)
+        return;
+
+#ifndef WIN32
+    shutdown(*sock, SHUT_RDWR);
+    close(*sock);
+#else
+    shutdown(*sock, SD_BOTH);
+    closesocket(*sock);
+#endif
+
+    *sock = -1;
+}
+
 /*
  * Send a command to rotctld and read the response.
  *
@@ -467,9 +497,15 @@ static void rot_plan_reset(rot_plan_t *plan)
         g_free(plan->reason);
         plan->reason = NULL;
     }
+    if (plan->cmd_samples) {
+        g_array_free(plan->cmd_samples, TRUE);
+        plan->cmd_samples = NULL;
+    }
 
     plan->valid = FALSE;
     plan->mode = ROT_PLAN_MODE_NORMAL;
+    plan->status = ROT_PLAN_STATUS_FULL_TRACK;
+    plan->strategy = ROT_PLAN_STRATEGY_S1;
     plan->start_az_cmd = 0.0;
     plan->start_el_cmd = 0.0;
     plan->end_az_cmd = 0.0;
@@ -479,6 +515,9 @@ static void rot_plan_reset(rot_plan_t *plan)
     plan->peak_el_rate = 0.0;
     plan->window_start = 0.0;
     plan->window_end = 0.0;
+    plan->trackable_pct = 0.0;
+    plan->violation_mag = 0.0;
+    plan->sample_dt_sec = ROT_PLAN_SAMPLE_DT_SEC;
 }
 
 static inline gboolean rot_plan_matches_pass(GtkRotCtrl *ctrl)
@@ -504,189 +543,196 @@ static inline void set_flipped_pass(GtkRotCtrl * ctrl)
         ctrl->flipped = FALSE;
 }
 
-typedef struct {
-    rot_plan_mode_t mode;
-    gboolean        valid;
-    gdouble         start_az_cmd;
-    gdouble         start_el_cmd;
-    gdouble         end_az_cmd;
-    gdouble         end_el_cmd;
-    gdouble         total_motion;
-    gdouble         peak_az_rate;
-    gdouble         peak_el_rate;
-    gchar          *reason;
-} rot_plan_candidate_t;
-
-static gdouble rot_wrap_to_conf(const rotor_conf_t *conf, gdouble az)
+static void rot_get_abs_az_limits(const rotor_conf_t *conf,
+                                  gdouble *az_min, gdouble *az_max)
 {
-    gdouble span = 360.0;
     gdouble minaz = 0.0;
     gdouble maxaz = 360.0;
 
     if (conf != NULL) {
         minaz = conf->minaz;
         maxaz = conf->maxaz;
-        span = maxaz - minaz;
     }
 
+    gdouble span = maxaz - minaz;
     if (span <= 0.0)
         span = 360.0;
 
-    while (az < minaz)
-        az += span;
-    while (az > maxaz)
-        az -= span;
+    if (span >= 359.0) {
+        minaz = 0.0;
+        maxaz = 360.0;
+    } else {
+        minaz = normalize_az_0_360(minaz);
+        maxaz = normalize_az_0_360(maxaz);
+    }
 
+    if (az_min)
+        *az_min = minaz;
+    if (az_max)
+        *az_max = maxaz;
+}
+
+static gdouble rot_az_to_conf(const rotor_conf_t *conf, gdouble az_abs)
+{
+    gdouble az = normalize_az_0_360(az_abs);
+    if (conf != NULL && conf->aztype == ROT_AZ_TYPE_180 && az > 180.0)
+        az -= 360.0;
     return az;
 }
 
-static gdouble rot_unwrap_near(const rotor_conf_t *conf, gdouble prev,
-                               gdouble current_wrapped)
+static gboolean rot_conf_validate(const rotor_conf_t *conf, gchar **msg)
 {
-    gdouble span = 360.0;
+    if (msg)
+        *msg = NULL;
 
-    if (conf != NULL) {
-        span = conf->maxaz - conf->minaz;
+    if (conf == NULL) {
+        if (msg)
+            *msg = g_strdup("Missing rotor configuration");
+        return FALSE;
     }
 
-    if (span <= 0.0)
-        span = 360.0;
-
-    /* Try the three closest equivalents and pick the one nearest to prev. */
-    gdouble candidates[3];
-    candidates[0] = current_wrapped;
-    candidates[1] = current_wrapped + span;
-    candidates[2] = current_wrapped - span;
-
-    gdouble best = candidates[0];
-    gdouble best_diff = fabs(candidates[0] - prev);
-
-    for (int i = 1; i < 3; i++) {
-        gdouble diff = fabs(candidates[i] - prev);
-        if (diff < best_diff) {
-            best = candidates[i];
-            best_diff = diff;
-        }
+    if (conf->host == NULL || conf->host[0] == '\0') {
+        if (msg)
+            *msg = g_strdup("Rotator host is not set");
+        return FALSE;
     }
 
-    return best;
+    if (conf->port <= 0 || conf->port > 65535) {
+        if (msg)
+            *msg = g_strdup_printf("Rotator port %d is invalid", conf->port);
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
-static gboolean crosses_endstop(gdouble prev_az_mech, gdouble next_az_mech,
-                                gdouble endstop_az,
-                                gdouble az_min, gdouble az_max)
+static gboolean rot_plan_get_cmd_at_time(const rot_plan_t *plan, gdouble t,
+                                         gdouble *az, gdouble *el)
 {
-    gdouble span = az_max - az_min;
-
-    if (span <= 0.0)
+    if (plan == NULL || !plan->cmd_samples || plan->cmd_samples->len == 0)
         return FALSE;
 
-    /* Normalize end-stop to the primary interval, then check repeats. */
-    gdouble stop = endstop_az;
-    while (stop < az_min)
-        stop += span;
-    while (stop > az_max)
-        stop -= span;
-
-    if (prev_az_mech == next_az_mech)
-        return FALSE;
-
-    if (prev_az_mech < next_az_mech) {
-        for (gdouble s = stop; s <= next_az_mech; s += span) {
-            if (s > prev_az_mech && s < next_az_mech)
-                return TRUE;
-        }
+    guint idx = 0;
+    if (t <= plan->window_start) {
+        idx = 0;
+    } else if (t >= plan->window_end) {
+        idx = plan->cmd_samples->len - 1;
     } else {
-        for (gdouble s = stop; s >= next_az_mech; s -= span) {
-            if (s < prev_az_mech && s > next_az_mech)
-                return TRUE;
-        }
+        gdouble dt = plan->sample_dt_sec > 0.0
+                     ? plan->sample_dt_sec
+                     : ROT_PLAN_SAMPLE_DT_SEC;
+        gdouble offset = (t - plan->window_start) * secday;
+        idx = (guint)floor(offset / dt);
+        if (idx >= plan->cmd_samples->len)
+            idx = plan->cmd_samples->len - 1;
     }
 
-    return FALSE;
+    rot_plan_cmd_t cmd = g_array_index(plan->cmd_samples, rot_plan_cmd_t, idx);
+    if (az)
+        *az = cmd.cmd_az;
+    if (el)
+        *el = cmd.cmd_el;
+    return TRUE;
 }
 
-static gdouble rot_near_limit_penalty(GtkRotCtrl *ctrl,
-                                      gdouble az_norm,
-                                      gdouble el_mech)
+static gdouble rot_angular_distance_abs(gdouble a, gdouble b)
 {
-    if (ROT_PLAN_NEAR_LIMIT_MARGIN <= 0.0 ||
-        ROT_PLAN_NEAR_LIMIT_PENALTY <= 0.0 ||
-        ctrl == NULL || ctrl->conf == NULL)
-        return 0.0;
-
-    gdouble penalty = 0.0;
-
-    if ((az_norm - ctrl->conf->minaz) < ROT_PLAN_NEAR_LIMIT_MARGIN)
-        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
-    if ((ctrl->conf->maxaz - az_norm) < ROT_PLAN_NEAR_LIMIT_MARGIN)
-        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
-    if ((el_mech - ctrl->conf->minel) < ROT_PLAN_NEAR_LIMIT_MARGIN)
-        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
-    if ((ctrl->conf->maxel - el_mech) < ROT_PLAN_NEAR_LIMIT_MARGIN)
-        penalty += ROT_PLAN_NEAR_LIMIT_PENALTY;
-
-    return penalty;
+    gdouble diff = fabs(normalize_az_0_360(a) - normalize_az_0_360(b));
+    if (diff > 180.0)
+        diff = 360.0 - diff;
+    return diff;
 }
 
-static gboolean rot_plan_candidate(GtkRotCtrl *ctrl, pass_t *pass,
-                                   rot_plan_mode_t mode,
-                                   rot_plan_candidate_t *out)
+static gboolean rot_az_in_limits(gdouble az, gdouble min, gdouble max)
 {
-    rot_plan_candidate_t cand;
-    GArray *az_samples = NULL;
-    GArray *el_samples = NULL;
-    GArray *time_samples = NULL;
-    gboolean have_prev = FALSE;
-    gdouble prev_az_cont = 0.0;
-    gdouble prev_mech_az = 0.0;
-    gdouble prev_el = 0.0;
-    gdouble t0, t1;
+    if (min <= max)
+        return (az >= min && az <= max);
+    return (az >= min || az <= max);
+}
+
+static gdouble rot_clamp_az_abs(gdouble az, gdouble min, gdouble max)
+{
+    az = normalize_az_0_360(az);
+    if (rot_az_in_limits(az, min, max))
+        return az;
+
+    gdouble dmin = rot_angular_distance_abs(az, min);
+    gdouble dmax = rot_angular_distance_abs(az, max);
+    return (dmin <= dmax) ? min : max;
+}
+
+static void rot_sanitize_cmd(GtkRotCtrl *ctrl, gdouble *az, gdouble *el)
+{
+    if (ctrl == NULL || ctrl->conf == NULL || az == NULL || el == NULL)
+        return;
+
+    gdouble orig_az = *az;
+    gdouble orig_el = *el;
+    gdouble az_min;
+    gdouble az_max;
+
+    rot_get_abs_az_limits(ctrl->conf, &az_min, &az_max);
+
+    *az = rot_clamp_az_abs(*az, az_min, az_max);
+    *el = CLAMP(*el, ctrl->conf->minel, ctrl->conf->maxel);
+
+    if (fabs(*az - orig_az) > 1e-6 || fabs(*el - orig_el) > 1e-6) {
+        sat_log_log(SAT_LOG_LEVEL_WARNING,
+                    "%s: clamped command from (%.2f, %.2f) to (%.2f, %.2f)",
+                    __func__, orig_az, orig_el, *az, *el);
+    }
+}
+
+static gboolean rot_get_command(GtkRotCtrl *ctrl, gboolean plan_active,
+                                gdouble setaz, gdouble setel, gdouble t,
+                                gdouble *cmdaz, gdouble *cmdel)
+{
+    gboolean from_plan = FALSE;
+    gdouble az = setaz;
+    gdouble el = setel;
+
+    if (plan_active && ctrl->trajectory_plan.valid) {
+        if (rot_plan_get_cmd_at_time(&ctrl->trajectory_plan, t, &az, &el))
+            from_plan = TRUE;
+    }
+
+    if (!from_plan && ctrl->use_offset) {
+        az += ctrl->az_offset_deg;
+        el += ctrl->el_offset_deg;
+    }
+
+    if (ctrl->conf)
+        rot_sanitize_cmd(ctrl, &az, &el);
+
+    if (cmdaz)
+        *cmdaz = az;
+    if (cmdel)
+        *cmdel = el;
+
+    return from_plan;
+}
+
+static GArray *rot_build_samples(GtkRotCtrl *ctrl, pass_t *pass,
+                                 rot_plan_mode_t mode,
+                                 gdouble t0, gdouble t1)
+{
+    GArray *samples = NULL;
     guint steps;
-
-    memset(&cand, 0, sizeof(cand));
-    cand.mode = mode;
-    cand.valid = FALSE;
-    cand.reason = NULL;
-
-    if (ctrl == NULL || pass == NULL || ctrl->conf == NULL ||
-        ctrl->target == NULL || ctrl->qth == NULL) {
-        cand.reason = g_strdup(_("Missing rotor configuration, pass or target data"));
-        goto done;
-    }
-
-    t0 = pass->aos;
-    t1 = pass->los;
-
-    /* Start planning no earlier than "now" if we are already in the pass. */
-    if (ctrl->t > t0)
-        t0 = ctrl->t;
-
-    if (t1 <= t0) {
-        cand.reason = g_strdup(_("Invalid pass window for trajectory planning"));
-        goto done;
-    }
 
     steps = (guint)ceil(((t1 - t0) * secday) / ROT_PLAN_SAMPLE_DT_SEC);
     if (steps < 1)
         steps = 1;
 
-    az_samples = g_array_new(FALSE, FALSE, sizeof(gdouble));
-    el_samples = g_array_new(FALSE, FALSE, sizeof(gdouble));
-    time_samples = g_array_new(FALSE, FALSE, sizeof(gdouble));
+    samples = g_array_new(FALSE, FALSE, sizeof(rot_plan_sample_t));
 
     for (guint i = 0; i <= steps; i++) {
         gdouble t = t0 + (i * ROT_PLAN_SAMPLE_DT_SEC) / secday;
-        gdouble az_cmd, el_cmd;
-        gdouble az_cont;
-        gdouble mech_az_cont;
-        gdouble mech_az_norm;
-        gdouble mech_el;
+        gdouble az_cmd;
+        gdouble el_cmd;
 
         if (t > t1)
             t = t1;
 
-        /* Work on a copy so we don't corrupt the shared sat data. */
         sat_t sat = *ctrl->target;
         predict_calc(&sat, ctrl->qth, t);
 
@@ -698,179 +744,162 @@ static gboolean rot_plan_candidate(GtkRotCtrl *ctrl, pass_t *pass,
             az_cmd += 180.0;
         }
 
-        az_cmd = rot_wrap_to_conf(ctrl->conf, az_cmd);
+        az_cmd = normalize_az_0_360(az_cmd);
 
-        g_array_append_val(az_samples, az_cmd);
-        g_array_append_val(el_samples, el_cmd);
-        g_array_append_val(time_samples, t);
-
-        az_cont = az_cmd;
-        if (have_prev)
-            az_cont = rot_unwrap_near(ctrl->conf, prev_az_cont, az_cmd);
-
-        mech_az_cont = az_cont + (ctrl->use_offset ? ctrl->az_offset_deg : 0.0);
-        if (have_prev)
-            mech_az_cont = rot_unwrap_near(ctrl->conf, prev_mech_az, mech_az_cont);
-
-        mech_az_norm = rot_wrap_to_conf(ctrl->conf, mech_az_cont);
-        mech_el = el_cmd + (ctrl->use_offset ? ctrl->el_offset_deg : 0.0);
-
-        if (mech_el < ctrl->conf->minel || mech_el > ctrl->conf->maxel) {
-            cand.reason = g_strdup_printf(_("Elevation %.2f outside limits [%.2f..%.2f] at +%.1fs"),
-                                          mech_el, ctrl->conf->minel, ctrl->conf->maxel,
-                                          (t - pass->aos) * secday);
-            goto done;
+        if (ctrl->use_offset) {
+            az_cmd = normalize_az_0_360(az_cmd + ctrl->az_offset_deg);
+            el_cmd += ctrl->el_offset_deg;
         }
 
-        if (mech_az_norm < ctrl->conf->minaz || mech_az_norm > ctrl->conf->maxaz) {
-            cand.reason = g_strdup_printf(_("Azimuth %.2f outside limits [%.2f..%.2f] at +%.1fs"),
-                                          mech_az_norm, ctrl->conf->minaz, ctrl->conf->maxaz,
-                                          (t - pass->aos) * secday);
-            goto done;
-        }
-
-        if (have_prev &&
-            crosses_endstop(prev_mech_az, mech_az_cont,
-                            ctrl->conf->azstoppos,
-                            ctrl->conf->minaz, ctrl->conf->maxaz)) {
-            cand.reason = g_strdup_printf(_("Move crosses forbidden end-stop at %.2f deg near +%.1fs"),
-                                          ctrl->conf->azstoppos,
-                                          (t - pass->aos) * secday);
-            goto done;
-        }
-
-        if (have_prev) {
-            gdouble delta_az = fabs(mech_az_cont - prev_mech_az);
-            gdouble delta_el = fabs(mech_el - prev_el);
-            gdouble az_rate = delta_az / ROT_PLAN_SAMPLE_DT_SEC;
-            gdouble el_rate = delta_el / ROT_PLAN_SAMPLE_DT_SEC;
-
-            cand.total_motion += delta_az + ROT_PLAN_EL_WEIGHT * delta_el;
-            cand.total_motion += rot_near_limit_penalty(ctrl, mech_az_norm, mech_el);
-            if (az_rate > cand.peak_az_rate)
-                cand.peak_az_rate = az_rate;
-            if (el_rate > cand.peak_el_rate)
-                cand.peak_el_rate = el_rate;
-        } else {
-            cand.start_az_cmd = az_cmd;
-            cand.start_el_cmd = el_cmd;
-        }
-
-        cand.end_az_cmd = az_cmd;
-        cand.end_el_cmd = el_cmd;
-
-        prev_az_cont = az_cont;
-        prev_mech_az = mech_az_cont;
-        prev_el = mech_el;
-        have_prev = TRUE;
+        rot_plan_sample_t sample = { t, az_cmd, el_cmd };
+        g_array_append_val(samples, sample);
     }
 
-    cand.valid = TRUE;
-
-done:
-    if (az_samples)
-        g_array_free(az_samples, TRUE);
-    if (el_samples)
-        g_array_free(el_samples, TRUE);
-    if (time_samples)
-        g_array_free(time_samples, TRUE);
-
-    if (out != NULL) {
-        *out = cand;
-    } else if (cand.reason) {
-        g_free(cand.reason);
-    }
-
-    return cand.valid;
+    return samples;
 }
 
 static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
 {
-    rot_plan_candidate_t normal = { 0 };
-    rot_plan_candidate_t flip = { 0 };
-    gboolean normal_valid = FALSE;
-    gboolean flip_valid = FALSE;
+    rot_plan_result_t normal = { 0 };
+    rot_plan_result_t flip = { 0 };
     gboolean flip_allowed = FALSE;
-    rot_plan_candidate_t *chosen = NULL;
+    gboolean have_normal = FALSE;
+    gboolean have_flip = FALSE;
+    rot_plan_result_t *chosen = NULL;
+    GArray *normal_samples = NULL;
+    GArray *flip_samples = NULL;
+    gdouble t0, t1;
+    gdouble az_min, az_max;
+    rot_plan_input_t in = { 0 };
 
     rot_plan_reset(&ctrl->trajectory_plan);
 
     if (ctrl == NULL || ctrl->conf == NULL || ctrl->pass == NULL ||
         ctrl->target == NULL || ctrl->qth == NULL) {
-        ctrl->trajectory_plan.reason = g_strdup(_("Missing rotor configuration, pass or target data"));
+        ctrl->trajectory_plan.reason = g_strdup("Missing rotor configuration, pass or target data");
         return FALSE;
     }
 
-    normal_valid = rot_plan_candidate(ctrl, ctrl->pass, ROT_PLAN_MODE_NORMAL, &normal);
-    flip_allowed = (ctrl->conf->maxel >= 180.0);
-
-    if (flip_allowed)
-        flip_valid = rot_plan_candidate(ctrl, ctrl->pass, ROT_PLAN_MODE_FLIP, &flip);
-
-    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "%s: candidate NORMAL valid=%d total_motion=%.2f reason=%s",
-                __func__, normal_valid ? 1 : 0, normal.total_motion,
-                normal.reason ? normal.reason : "none");
-
-    if (flip_allowed) {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "%s: candidate FLIP valid=%d total_motion=%.2f reason=%s",
-                    __func__, flip_valid ? 1 : 0, flip.total_motion,
-                    flip.reason ? flip.reason : "none");
-    } else {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "%s: candidate FLIP skipped (maxel=%.2f)",
-                    __func__, ctrl->conf->maxel);
+    t0 = ctrl->pass->aos;
+    t1 = ctrl->pass->los;
+    if (ctrl->t > t0)
+        t0 = ctrl->t;
+    if (t1 <= t0) {
+        ctrl->trajectory_plan.reason = g_strdup("Invalid pass window for trajectory planning");
+        return FALSE;
     }
 
-    if (normal_valid)
-        chosen = &normal;
+    rot_get_abs_az_limits(ctrl->conf, &az_min, &az_max);
 
-    if (flip_valid) {
-        if (chosen == NULL || flip.total_motion < chosen->total_motion)
+    gdouble cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+    gdouble cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+    cur_az = normalize_az_0_360(cur_az);
+    if (ctrl->use_offset) {
+        cur_az = normalize_az_0_360(cur_az + ctrl->az_offset_deg);
+        cur_el += ctrl->el_offset_deg;
+    }
+
+    in.az_min = az_min;
+    in.az_max = az_max;
+    in.el_min = ctrl->conf->minel;
+    in.el_max = ctrl->conf->maxel;
+    in.az_stop = normalize_az_0_360(ctrl->conf->azstoppos);
+    {
+        gdouble span = ctrl->conf->maxaz - ctrl->conf->minaz;
+        if (span <= 0.0)
+            span = 360.0;
+        in.use_az_stop = (span < 359.0);
+    }
+    in.az_current = cur_az;
+    in.el_current = cur_el;
+    in.have_current = TRUE;
+
+    normal_samples = rot_build_samples(ctrl, ctrl->pass,
+                                       ROT_PLAN_MODE_NORMAL, t0, t1);
+    in.samples = normal_samples;
+    have_normal = rot_plan_build(&in, &normal);
+
+    flip_allowed = (ctrl->conf->maxel >= 180.0);
+    if (flip_allowed) {
+        flip_samples = rot_build_samples(ctrl, ctrl->pass,
+                                         ROT_PLAN_MODE_FLIP, t0, t1);
+        in.samples = flip_samples;
+        have_flip = rot_plan_build(&in, &flip);
+    }
+
+    if (have_normal)
+        chosen = &normal;
+    if (have_flip) {
+        if (chosen == NULL ||
+            (flip.trackable_pct > chosen->trackable_pct) ||
+            (flip.trackable_pct == chosen->trackable_pct &&
+             (flip.violation_mag < chosen->violation_mag ||
+              (flip.violation_mag == chosen->violation_mag &&
+               flip.total_motion < chosen->total_motion))))
             chosen = &flip;
     }
 
     if (chosen != NULL) {
         ctrl->trajectory_plan.valid = TRUE;
-        ctrl->trajectory_plan.mode = chosen->mode;
-        ctrl->trajectory_plan.start_az_cmd = chosen->start_az_cmd;
-        ctrl->trajectory_plan.start_el_cmd = chosen->start_el_cmd;
-        ctrl->trajectory_plan.end_az_cmd = chosen->end_az_cmd;
-        ctrl->trajectory_plan.end_el_cmd = chosen->end_el_cmd;
+        ctrl->trajectory_plan.mode =
+            (chosen == &flip) ? ROT_PLAN_MODE_FLIP : ROT_PLAN_MODE_NORMAL;
+        ctrl->trajectory_plan.status = chosen->status;
+        ctrl->trajectory_plan.strategy = chosen->strategy;
+        ctrl->trajectory_plan.trackable_pct = chosen->trackable_pct;
+        ctrl->trajectory_plan.violation_mag = chosen->violation_mag;
         ctrl->trajectory_plan.total_motion = chosen->total_motion;
-        ctrl->trajectory_plan.peak_az_rate = chosen->peak_az_rate;
-        ctrl->trajectory_plan.peak_el_rate = chosen->peak_el_rate;
         ctrl->trajectory_plan.window_start = ctrl->pass->aos;
         ctrl->trajectory_plan.window_end = ctrl->pass->los;
+        ctrl->trajectory_plan.sample_dt_sec = ROT_PLAN_SAMPLE_DT_SEC;
+        ctrl->trajectory_plan.cmd_samples = chosen->cmds;
+        chosen->cmds = NULL;
 
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "%s: selected %s plan start=(%.2f, %.2f) end=(%.2f, %.2f) total_motion=%.2f peak_rate=(%.2f, %.2f)",
-                    __func__,
-                    (chosen->mode == ROT_PLAN_MODE_FLIP) ? "FLIP" : "NORMAL",
-                    chosen->start_az_cmd, chosen->start_el_cmd,
-                    chosen->end_az_cmd, chosen->end_el_cmd,
-                    chosen->total_motion,
-                    chosen->peak_az_rate, chosen->peak_el_rate);
+        if (ctrl->trajectory_plan.cmd_samples &&
+            ctrl->trajectory_plan.cmd_samples->len > 0) {
+            rot_plan_cmd_t first =
+                g_array_index(ctrl->trajectory_plan.cmd_samples,
+                              rot_plan_cmd_t, 0);
+            rot_plan_cmd_t last =
+                g_array_index(ctrl->trajectory_plan.cmd_samples,
+                              rot_plan_cmd_t,
+                              ctrl->trajectory_plan.cmd_samples->len - 1);
+            ctrl->trajectory_plan.start_az_cmd = first.cmd_az;
+            ctrl->trajectory_plan.start_el_cmd = first.cmd_el;
+            ctrl->trajectory_plan.end_az_cmd = last.cmd_az;
+            ctrl->trajectory_plan.end_el_cmd = last.cmd_el;
+        }
+
+        ctrl->trajectory_plan.reason = chosen->reason;
+        chosen->reason = NULL;
+
+        if (ctrl->trajectory_plan.status == ROT_PLAN_STATUS_FULL_TRACK) {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "%s: selected %s plan strategy=%d (full track)",
+                        __func__,
+                        ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
+                        ctrl->trajectory_plan.strategy);
+        } else {
+            sat_log_log(SAT_LOG_LEVEL_WARNING,
+                        "%s: selected %s plan strategy=%d (%s)",
+                        __func__,
+                        ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
+                        ctrl->trajectory_plan.strategy,
+                        ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "partial tracking");
+        }
     } else {
         ctrl->trajectory_plan.valid = FALSE;
-
-        if (flip_allowed) {
-            ctrl->trajectory_plan.reason =
-                g_strdup_printf(_("No valid trajectory. Normal failed: %s. Flip failed: %s."),
-                                normal.reason ? normal.reason : _("unknown"),
-                                flip.reason ? flip.reason : _("unknown"));
-        } else {
-            ctrl->trajectory_plan.reason =
-                g_strdup_printf(_("No valid trajectory. Normal failed: %s. Flip not available (max elevation < 180)."),
-                                normal.reason ? normal.reason : _("unknown"));
-        }
+        ctrl->trajectory_plan.reason = g_strdup("Trajectory planning failed");
     }
 
-    if (normal.reason && chosen != &normal)
-        g_free(normal.reason);
-    if (flip.reason && chosen != &flip)
-        g_free(flip.reason);
+    if (have_normal)
+        rot_plan_result_clear(&normal);
+    if (have_flip)
+        rot_plan_result_clear(&flip);
+
+    if (normal_samples)
+        g_array_free(normal_samples, TRUE);
+    if (flip_samples)
+        g_array_free(flip_samples, TRUE);
 
     return ctrl->trajectory_plan.valid;
 }
@@ -943,6 +972,7 @@ static gboolean set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld I/O error while sending P command"), __func__);
         g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
+        rotctld_socket_close_quiet(&ctrl->client.socket);
         return FALSE;
     }
 
@@ -979,17 +1009,18 @@ static gpointer rotctld_client_thread(gpointer data)
     gdouble         azi = 0.0;
     gdouble         ele = 0.0;
     gboolean        io_error = FALSE;
+    gdouble         backoff_sec = 0.5;
+    const gdouble   backoff_max = 10.0;
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: rotctld_client_thread started"), __func__);
 
-    ctrl->client.socket = rotctld_socket_open(ctrl->conf->host,
-                                              ctrl->conf->port);
-    if (ctrl->client.socket == -1)
-        return GINT_TO_POINTER(-1);
-
     ctrl->client.timer = g_timer_new();
+    ctrl->client.new_trg = FALSE;
+    ctrl->client.running = TRUE;
+    ctrl->client.socket = -1;
+
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "MISSION_SOPHIE: rotctld_client_thread started for %s:%d",
                 ctrl->conf ? ctrl->conf->host : "(null)",
@@ -999,12 +1030,35 @@ static gpointer rotctld_client_thread(gpointer data)
                 ctrl->conf ? ctrl->conf->host : "(null)",
                 ctrl->conf ? ctrl->conf->port : 0);
 
-    ctrl->client.new_trg = FALSE;
-    ctrl->client.running = TRUE;
-
     while (ctrl->client.running)
     {
         g_timer_start(ctrl->client.timer);
+
+        if (ctrl->client.socket == -1) {
+            ctrl->client.socket = rotctld_socket_open(ctrl->conf->host,
+                                                      ctrl->conf->port);
+            if (ctrl->client.socket == -1) {
+                io_error = TRUE;
+                g_mutex_lock(&ctrl->client.mutex);
+                ctrl->client.io_error = TRUE;
+                g_mutex_unlock(&ctrl->client.mutex);
+                sat_log_log(SAT_LOG_LEVEL_WARNING,
+                            "%s: rotctld link down, retrying in %.1fs",
+                            __func__, backoff_sec);
+                g_usleep((gulong)(backoff_sec * 1e6));
+                backoff_sec = MIN(backoff_sec * 2.0, backoff_max);
+                continue;
+            }
+
+            backoff_sec = 0.5;
+            io_error = FALSE;
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.io_error = FALSE;
+            g_mutex_unlock(&ctrl->client.mutex);
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "%s: rotctld link re-established", __func__);
+        }
+
         io_error = FALSE;
 
         /* get latest commanded position from controller, but only
@@ -1057,18 +1111,14 @@ static gpointer rotctld_client_thread(gpointer data)
                        azi, ele);
         }
 
+        if (io_error) {
+            rotctld_socket_close_quiet(&ctrl->client.socket);
+        }
+
         /* Treat last commanded az/el as the "measured" position for
          * display purposes, since some rotctld backends only return
          * RPRT codes to the "p" command and do not support true
          * position read-back.
-         *
-         * IMPORTANT:
-         *  - Do NOT overwrite azi_in/ele_in on I/O error; keep the last
-         *    known-good position so the UI does not "jump" to the target
-         *    when the rotor failed to move.
-         *  - Make io_error sticky so that once we have seen a failure,
-         *    the timeout callback will keep counting errors until the
-         *    user disengages/re-engages or a future command succeeds.
          */
         g_mutex_lock(&ctrl->client.mutex);
         if (!io_error) {
@@ -1080,7 +1130,7 @@ static gpointer rotctld_client_thread(gpointer data)
 
         /* ensure rotctl duty cycle stays below 50%, but wait at least 700 ms */
         elapsed_time = MAX(g_timer_elapsed(ctrl->client.timer, NULL), 0.7);
-        g_usleep(elapsed_time * 1e6);
+        g_usleep((gulong)(elapsed_time * 1e6));
     }
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -1383,7 +1433,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
 
         if (!rot_build_tracking_plan(ctrl)) {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        "%s: blocking tracking – %s",
+                        "%s: unable to build trajectory – %s",
                         __func__,
                         ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "trajectory planning failed");
             rot_show_plan_error(ctrl, ctrl->trajectory_plan.reason);
@@ -1415,6 +1465,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
     gdouble rotaz = 0.0, rotel = 0.0;
     gdouble setaz = 0.0, setel = 45.0;
+    gdouble cmdaz = 0.0, cmdel = 0.0;
+    gboolean cmd_from_plan = FALSE;
     gchar *text;
     gboolean error = FALSE;
     sat_t sat_working, *sat;
@@ -1428,6 +1480,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     /* parameters for path predictions */
     gdouble time_delta;
     gdouble step_size;
+
+    if (ctrl->tracking && ctrl->pass && !plan_active) {
+        rot_build_tracking_plan(ctrl);
+        plan_active = rot_plan_matches_pass(ctrl);
+        use_flip = plan_active
+                   ? (ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP)
+                   : ctrl->flipped;
+    }
 
     /* If we are tracking and the target satellite is within range, set the
      * rotor position controller knob values to the target values. If the
@@ -1452,7 +1512,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                      * and only starting to move once the satellite is already in range.
                      */
                     if (plan_active && ctrl->trajectory_plan.valid) {
-                        setaz = ctrl->trajectory_plan.start_az_cmd;
+                        setaz = rot_az_to_conf(ctrl->conf,
+                                               ctrl->trajectory_plan.start_az_cmd);
                         setel = ctrl->trajectory_plan.start_el_cmd;
                     }
                     else {
@@ -1469,7 +1530,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 {
                     /* In/near-pass but still below horizon: keep current pre-positioning. */
                     if (plan_active && ctrl->trajectory_plan.valid) {
-                        setaz = ctrl->trajectory_plan.start_az_cmd;
+                        setaz = rot_az_to_conf(ctrl->conf,
+                                               ctrl->trajectory_plan.start_az_cmd);
                         setel = ctrl->trajectory_plan.start_el_cmd;
                     }
                     else {
@@ -1570,14 +1632,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         /* if tolerance exceeded between desired (setaz/setel)
          * and current (rotaz/rotel) position
          */
-        if (fabs(setaz - rotaz) > ctrl->threshold ||
-            fabs(setel - rotel) > ctrl->threshold)
+        cmd_from_plan = rot_get_command(ctrl, plan_active, setaz, setel,
+                                        ctrl->t, &cmdaz, &cmdel);
+
+        if (fabs(cmdaz - rotaz) > ctrl->threshold ||
+            fabs(cmdel - rotel) > ctrl->threshold)
         {
             /* If tracking is enabled, refine the target to "lead" the pass
              * a bit into the future, like the original code did.
              * Manual mode skips this and just uses the knob values.
              */
-            if (ctrl->tracking && ctrl->target && ctrl->conf)
+            if (ctrl->tracking && ctrl->target && ctrl->conf &&
+                !cmd_from_plan)
             {
                 if (ctrl->target->el > 0.0)
                 {
@@ -1648,51 +1714,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
              * "rotor talking alone".
              */
 
-            /* Compute the actual command values to send to rotctld, applying offsets if needed. */
-            gdouble cmdaz = setaz;
-            gdouble cmdel = setel;
-
-            /* Apply software offsets (if enabled) and clamp to rotor mechanical limits
-             * before sending commands to rotctld. The logical setaz/setel values are
-             * kept for UI and sky-coordinate logic; cmdaz/cmdel are what the rotor
-             * actually sees.
-             */
-            if (ctrl->conf) {
-                if (ctrl->use_offset) {
-                    /* First apply user offsets in degrees. */
-                    cmdaz += ctrl->az_offset_deg;
-                    cmdel += ctrl->el_offset_deg;
-
-                    /* Normalize azimuth into a range that can be wrapped into
-                     * [minaz, maxaz]. We assume a 360-degree span for typical
-                     * azimuth rotators.
-                     */
-                    while (cmdaz < ctrl->conf->minaz)
-                        cmdaz += 360.0;
-                    while (cmdaz > ctrl->conf->maxaz)
-                        cmdaz -= 360.0;
-                }
-
-                /* For elevation we simply clamp to the configured range. */
-                cmdel = CLAMP(cmdel, ctrl->conf->minel, ctrl->conf->maxel);
-
-                /* If the rotor is configured as ROT_AZ_TYPE_180, ensure cmdaz is
-                 * in the expected [-180,+180] range. The existing code that
-                 * adjusts setaz for ROT_AZ_TYPE_180 should already have run, so
-                 * here we just clamp/wrap the final command to the allowed span.
-                 */
-                if (ctrl->conf->aztype == ROT_AZ_TYPE_180) {
-                    while (cmdaz > 180.0)
-                        cmdaz -= 360.0;
-                    while (cmdaz < -180.0)
-                        cmdaz += 360.0;
-                } else {
-                    /* For 0-360 style rotators, enforce min/max bounds even when
-                     * offsets are disabled.
-                     */
-                    cmdaz = CLAMP(cmdaz, ctrl->conf->minaz, ctrl->conf->maxaz);
-                }
-            }
+            /* Recompute command after any lead adjustments. */
+            cmd_from_plan = rot_get_command(ctrl, plan_active, setaz, setel,
+                                            ctrl->t, &cmdaz, &cmdel);
 
             /* keep knobs in sync with the commanded position (logical) */
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), setaz);
@@ -1725,25 +1749,19 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             if (ctrl->errcnt < G_MAXINT)
                 ctrl->errcnt++;
         }
-
-        if (ctrl->errcnt >= MAX_ERROR_COUNT && ctrl->engaged)
+        else
         {
-            /* disengage device */
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut),
-                                         FALSE);
-            ctrl->engaged = FALSE;
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: MAX_ERROR_COUNT (%d) reached. Disengaging device!"),
+            ctrl->errcnt = 0;
+        }
+
+        if (ctrl->errcnt == MAX_ERROR_COUNT && ctrl->engaged)
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARNING,
+                        _("%s: MAX_ERROR_COUNT (%d) reached. Keeping tracking alive, link down."),
                         __func__, MAX_ERROR_COUNT);
 
-            /* Reflect the failure in the status label and show a dialog
-             * so it's obvious that the rotor/rotctld backend is not usable.
-             */
             if (status_label)
-                gtk_label_set_text(GTK_LABEL(status_label),
-                                   _("ERROR: link/rotator"));
-
-            rot_show_no_rotor_dialog(ctrl);
+                gtk_label_set_text(GTK_LABEL(status_label), _("LINK DOWN"));
         }
 
         /* update status label if present, based on data and feedback mode */
@@ -1753,9 +1771,13 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             gboolean has_error = error || (ctrl->errcnt > 0);
 
             if (has_error)
-                status_text = _("ERROR: link/rotator");
-            else if (fabs(setaz - rotaz) > ctrl->threshold ||
-                     fabs(setel - rotel) > ctrl->threshold)
+                status_text = _("LINK DOWN");
+            else if (ctrl->tracking && plan_active &&
+                     ctrl->trajectory_plan.valid &&
+                     ctrl->trajectory_plan.status != ROT_PLAN_STATUS_FULL_TRACK)
+                status_text = _("PARTIAL");
+            else if (fabs(cmdaz - rotaz) > ctrl->threshold ||
+                     fabs(cmdel - rotel) > ctrl->threshold)
                 status_text = _("MOVING");
             else
                 status_text = _("ON TARGET");
@@ -1765,12 +1787,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d",
                         status_text,
-                        setaz, setel,
+                        cmdaz, cmdel,
                         rotaz, rotel,
                         error ? 1 : 0);
             g_printerr("MISSION_SOPHIE: status=%s set=(%.2f, %.2f) rot=(%.2f, %.2f) error=%d\n",
                         status_text,
-                        setaz, setel,
+                        cmdaz, cmdel,
                         rotaz, rotel,
                         error ? 1 : 0);
         }
@@ -1882,6 +1904,23 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
         gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(box));
     if (rotor_conf_read(ctrl->conf))
     {
+        gchar *conf_err = NULL;
+        if (!rot_conf_validate(ctrl->conf, &conf_err)) {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s:%d: Invalid rotator configuration %s: %s"),
+                        __FILE__, __LINE__,
+                        ctrl->conf->name ? ctrl->conf->name : "(unnamed)",
+                        conf_err ? conf_err : "unknown error");
+            rot_show_conf_error(ctrl, conf_err);
+            g_free(conf_err);
+            g_free(ctrl->conf->name);
+            if (ctrl->conf->host)
+                g_free(ctrl->conf->host);
+            g_free(ctrl->conf);
+            ctrl->conf = NULL;
+            return;
+        }
+
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("Loaded new rotator configuration %s"),
                     ctrl->conf->name);
@@ -2394,6 +2433,26 @@ static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl)
     gtk_widget_destroy(dialog);
 }
 
+static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason)
+{
+    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    GtkWindow *parent = NULL;
+    const gchar *msg = reason ? reason : _("Invalid rotor configuration.");
+
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_ERROR,
+        GTK_BUTTONS_OK,
+        "%s", msg);
+    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor configuration error"));
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason)
 {
     const gchar *msg = reason ? reason
@@ -2474,14 +2533,18 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
     }
     else
     {
-        if (ctrl->conf == NULL)
         {
-            /* we don't have a working configuration */
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _
-                        ("%s: Controller does not have a valid configuration"),
-                        __func__);
-            return;
+            gchar *conf_err = NULL;
+            if (!rot_conf_validate(ctrl->conf, &conf_err)) {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: Controller does not have a valid configuration: %s"),
+                            __func__, conf_err ? conf_err : "unknown error");
+                rot_show_conf_error(ctrl, conf_err);
+                g_free(conf_err);
+                gtk_toggle_button_set_active(button, FALSE);
+                ctrl->engaged = FALSE;
+                return;
+            }
         }
 
         /* Automatically disable tracking when engaging so the rotor does not
@@ -2528,6 +2591,15 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 
         /* Reset error counter when (re)engaging the rotor. */
         ctrl->errcnt = 0;
+
+        if (ctrl->client.thread != NULL) {
+            sat_log_log(SAT_LOG_LEVEL_WARNING,
+                        _("%s: rotctld client thread already running; reusing existing thread"),
+                        __func__);
+            gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
+            ctrl->engaged = TRUE;
+            return;
+        }
 
         ctrl->client.thread =
             g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
@@ -3212,6 +3284,9 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.socket = -1;
     ctrl->client.running = FALSE;
     ctrl->client.io_error = FALSE;
+
+    if (g_getenv("GPREDICT_ROT_PLAN_TEST"))
+        rot_plan_debug_harness();
 }
 
 static void gtk_rot_ctrl_destroy(GtkWidget * widget)
@@ -3375,16 +3450,25 @@ static void offset_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
     ctrl->use_offset = gtk_toggle_button_get_active(button);
+    rot_plan_reset(&ctrl->trajectory_plan);
+    if (ctrl->tracking && ctrl->pass)
+        rot_build_tracking_plan(ctrl);
 }
 
 static void az_offset_changed_cb(GtkSpinButton *spin, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
     ctrl->az_offset_deg = gtk_spin_button_get_value(spin);
+    rot_plan_reset(&ctrl->trajectory_plan);
+    if (ctrl->tracking && ctrl->pass)
+        rot_build_tracking_plan(ctrl);
 }
 
 static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
     ctrl->el_offset_deg = gtk_spin_button_get_value(spin);
+    rot_plan_reset(&ctrl->trajectory_plan);
+    if (ctrl->tracking && ctrl->pass)
+        rot_build_tracking_plan(ctrl);
 }
