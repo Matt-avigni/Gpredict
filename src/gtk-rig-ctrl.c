@@ -1580,6 +1580,52 @@ static inline gboolean check_get_response(gchar * buffback, gboolean retcode,
     return retcode;
 }
 
+static const gchar *vfo_name(vfo_t vfo)
+{
+    switch (vfo)
+    {
+    case VFO_A:
+        return "VFOA";
+    case VFO_B:
+        return "VFOB";
+    case VFO_MAIN:
+        return "Main";
+    case VFO_SUB:
+        return "Sub";
+    default:
+        return "Unknown";
+    }
+}
+
+static gboolean is_ic9700_satmode(const radio_conf_t *conf)
+{
+    return (conf != NULL) &&
+        (conf->type == RIG_TYPE_DUPLEX) &&
+        conf->supports_rit_xit;
+}
+
+static vfo_t map_vfo_for_satmode(const radio_conf_t *conf, vfo_t vfo)
+{
+    vfo_t mapped = vfo;
+
+    /* IC-9700 rejects Main/Sub VFOs in SAT mode; map to VFOA/VFOB. */
+    if (is_ic9700_satmode(conf))
+    {
+        if (vfo == VFO_MAIN)
+            mapped = VFO_A;
+        else if (vfo == VFO_SUB)
+            mapped = VFO_B;
+
+        if (mapped != vfo)
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "SATMODE: mapping %s->%s for IC-9700 (%s)",
+                        vfo_name(vfo), vfo_name(mapped),
+                        conf->name ? conf->name : "unnamed");
+    }
+
+    return mapped;
+}
+
 static int get_vfos(GtkRigCtrl * ctrl, char *rx, char *tx)
 {
     // fill rx/tx with vfo name plus space if not empty
@@ -1623,9 +1669,11 @@ static gboolean setup_split(GtkRigCtrl * ctrl)
     gchar           buffback[256];
     gboolean        retcode;
     gchar          *rx="", *tx="";
+    vfo_t           vfo_up;
 
     get_vfos(ctrl, rx, tx);
-    switch (ctrl->conf->vfoUp)
+    vfo_up = map_vfo_for_satmode(ctrl->conf, ctrl->conf->vfoUp);
+    switch (vfo_up)
     {
     case VFO_A:
         if (ctrl->conf->vfo_opt)
