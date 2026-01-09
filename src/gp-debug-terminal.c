@@ -27,7 +27,7 @@
 #include <pango/pango.h>
 #include <stdarg.h>
 
-#define GP_DBG_TERM_MAX_LINES 1000
+#define GP_DBG_TERM_MAX_LINES 10000
 
 typedef struct {
     guint64        seq;
