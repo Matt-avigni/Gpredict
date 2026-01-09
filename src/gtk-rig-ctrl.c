@@ -131,7 +131,8 @@ static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
                                              const gchar *role,
                                              const gchar *detail);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
-static gboolean is_ic9700_satmode(const radio_conf_t *conf);
+static gboolean is_ic9700_satmode_configured(const radio_conf_t *conf);
+static gboolean is_ic9700_satmode_active(const GtkRigCtrl *ctrl);
 static const gchar *vfo_name(vfo_t vfo);
 static void     rigctld_terminate_process(GSubprocess **proc);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
@@ -992,7 +993,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     ctrl->tracking = gtk_toggle_button_get_active(button);
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE: tracking %s",
                 ctrl->tracking ? "on" : "off");
-    if (is_ic9700_satmode(ctrl->conf))
+    if (is_ic9700_satmode_configured(ctrl->conf))
     {
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "SATMODE IC-9700: downlink -> %s, uplink -> %s",
@@ -1116,7 +1117,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
         gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
     if (!g_strcmp0(name1, name2))
     {
-        if (is_ic9700_satmode(ctrl->conf))
+        if (is_ic9700_satmode_configured(ctrl->conf))
         {
             /* Allow same rig: IC-9700 uses dual VFOs in SAT mode. */
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -1763,17 +1764,24 @@ static const gchar *vfo_role_name(vfo_role_t role)
     }
 }
 
-static gboolean is_ic9700_satmode(const radio_conf_t *conf)
+static gboolean is_ic9700_satmode_configured(const radio_conf_t *conf)
 {
     return (conf != NULL) &&
         (conf->type == RIG_TYPE_DUPLEX) &&
         conf->supports_dual_vfo_sat;
 }
 
+static gboolean is_ic9700_satmode_active(const GtkRigCtrl *ctrl)
+{
+    return (ctrl != NULL) &&
+        ctrl->tracking &&
+        is_ic9700_satmode_configured(ctrl->conf);
+}
+
 static gboolean satmode_vfo_for_role(const radio_conf_t *conf,
                                      vfo_role_t role, vfo_t *vfo)
 {
-    if (!is_ic9700_satmode(conf) || vfo == NULL)
+    if (!is_ic9700_satmode_configured(conf) || vfo == NULL)
         return FALSE;
 
     /* IC-9700 SAT mode expects Main/Sub and explicit VFO commands; avoid VFO switching. */
@@ -2070,10 +2078,16 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     vfo_t           sat_vfo = VFO_MAIN;
     gboolean        use_sat_vfo =
         satmode_vfo_for_role(ctrl->conf, VFO_ROLE_DOWNLINK, &sat_vfo);
+    gdouble         base_freq = 0.0;
+    gdouble         doppler_hz = 0.0;
+    gdouble         sent_freq = 0.0;
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
         ptt = get_ptt(ctrl, ctrl->sock);
+
+    if (is_ic9700_satmode_active(ctrl))
+        use_rit_xit = FALSE;
 
     /* Dial feedback:
        If radio device is engaged read frequency from radio and compare it to the
@@ -2155,56 +2169,81 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                                 satfrequ - ctrl->conf->loup);
     }
 
-    tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqDown));
+    base_freq = satfreqd - ctrl->conf->lo;
+    doppler_hz = (ctrl->tracking && !use_rit_xit) ? ctrl->dd : 0.0;
+    sent_freq = base_freq + doppler_hz;
+    tmpfreq = sent_freq;
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (ptt == FALSE) &&
         (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
     {
-        if (use_sat_vfo)
         {
-            gdouble dd = (ctrl->tracking && !use_rit_xit) ? ctrl->dd : 0.0;
+            gboolean set_ok;
+            gboolean read_ok;
+            gdouble  readback = 0.0;
+            const gchar *vfo_label =
+                use_sat_vfo ? vfo_name(sat_vfo) :
+                (ctrl->conf->vfo_opt ? "currVFO" : "default");
+
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: downlink sat=%.0f dd=%.0f lo=%.0f rig=%.0f",
-                        satfreqd, dd, ctrl->conf->lo, tmpfreq);
-        }
-        if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
-                               "setting downlink freq", tmpfreq, TRUE) &&
-            (use_sat_vfo ?
-             set_freq_simplex_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
-             set_freq_simplex(ctrl, ctrl->sock, tmpfreq)))
-        {
-            /* reset error counter */
-            ctrl->errcnt = 0;
+                        "rig update: side=RX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
+                        base_freq, doppler_hz, sent_freq, vfo_label);
 
-            /* give radio a chance to set frequency */
-            g_usleep(WR_DEL);
+            set_ok = select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
+                                        "setting downlink freq", tmpfreq, TRUE) &&
+                (use_sat_vfo ?
+                 set_freq_simplex_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
+                 set_freq_simplex(ctrl, ctrl->sock, tmpfreq));
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: side=RX set=%s", set_ok ? "ok" : "fail");
 
-            /* The actual frequency might be different from what we have set because
-               the tuning step is larger than what we work with (e.g. FT-817 has a
-               smallest tuning step of 10 Hz). Therefore we read back the actual
-               frequency from the rig. */
-            if (use_sat_vfo)
-                get_freq_simplex_vfo(ctrl, ctrl->sock, &tmpfreq, sat_vfo);
+            if (set_ok)
+            {
+                /* give radio a chance to set frequency */
+                g_usleep(WR_DEL);
+
+                /* The actual frequency might be different from what we have set because
+                   the tuning step is larger than what we work with (e.g. FT-817 has a
+                   smallest tuning step of 10 Hz). Therefore we read back the actual
+                   frequency from the rig. */
+                read_ok = use_sat_vfo ?
+                    get_freq_simplex_vfo(ctrl, ctrl->sock, &readback, sat_vfo) :
+                    get_freq_simplex(ctrl, ctrl->sock, &readback);
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rig update: side=RX readback=%.0f ok=%d",
+                            readback, read_ok ? 1 : 0);
+
+                if (read_ok && fabs(readback - sent_freq) <= 100.0)
+                {
+                    ctrl->errcnt = 0;
+                    ctrl->lastrxf = readback;
+
+                    /* This is only effective in RIG_TYPE_TRX mode.
+                       Invalidate ctrl->lasttxf for two reasons.
+
+                       1. Prevent dial feedback from changing the uplink frequency.
+                       In the first TX cycle get_freq_simplex() returns the downlink
+                       frequency instead of uplink. The mismatch would thus trigger
+                       an uplink update as long as the VFO has not been updated.
+                       2. Force updating the VFO in the first TX cycle.
+                     */
+                    if (ctrl->lastrxptt != ptt)
+                        ctrl->lasttxf = 0.0;
+                }
+                else
+                {
+                    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                "rig update: side=RX readback mismatch (sent=%.0f read=%.0f); tracking unsynced",
+                                sent_freq, readback);
+                    ctrl->errcnt++;
+                    ctrl->lastrxf = 0.0;
+                }
+            }
             else
-                get_freq_simplex(ctrl, ctrl->sock, &tmpfreq);
-            ctrl->lastrxf = tmpfreq;
-
-            /* This is only effective in RIG_TYPE_TRX mode.
-               Invalidate ctrl->lasttxf for two reasons.
-
-               1. Prevent dial feedback from changing the uplink frequency.
-               In the first TX cycle get_freq_simplex() returns the downlink
-               frequency instead of uplink. The mismatch would thus trigger
-               an uplink update as long as the VFO has not been updated.
-               2. Force updating the VFO in the first TX cycle.
-             */
-            if (ctrl->lastrxptt != ptt)
-                ctrl->lasttxf = 0.0;
-        }
-        else
-        {
-            ctrl->errcnt++;
+            {
+                ctrl->errcnt++;
+            }
         }
     }
 
@@ -2220,12 +2259,18 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
     gboolean        ptt = TRUE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
+    gdouble         base_freq = 0.0;
+    gdouble         doppler_hz = 0.0;
+    gdouble         sent_freq = 0.0;
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
     {
         ptt = get_ptt(ctrl, ctrl->sock);
     }
+
+    if (is_ic9700_satmode_active(ctrl))
+        use_rit_xit = FALSE;
 
     /* Dial feedback:
        If radio device is engaged read frequency from radio and compare it to the
@@ -2297,43 +2342,75 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                                 satfrequ - ctrl->conf->loup);
     }
 
-    tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqUp));
+    base_freq = satfrequ - ctrl->conf->loup;
+    doppler_hz = (ctrl->tracking && !use_rit_xit) ? ctrl->du : 0.0;
+    sent_freq = base_freq + doppler_hz;
+    tmpfreq = sent_freq;
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (ptt == TRUE) &&
         (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
     {
-        if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
         {
-            /* reset error counter */
-            ctrl->errcnt = 0;
+            gboolean set_ok;
+            gboolean read_ok;
+            gdouble  readback = 0.0;
+            const gchar *vfo_label =
+                ctrl->conf->vfo_opt ? "currVFO" : "default";
 
-            /* give radio a chance to set frequency */
-            g_usleep(WR_DEL);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: side=TX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
+                        base_freq, doppler_hz, sent_freq, vfo_label);
 
-            /* The actual frequency migh be different from what we have set because
-               the tuning step is larger than what we work with (e.g. FT-817 has a
-               smallest tuning step of 10 Hz). Therefore we read back the actual
-               frequency from the rig. */
-            get_freq_simplex(ctrl, ctrl->sock, &tmpfreq);
-            ctrl->lasttxf = tmpfreq;
+            set_ok = set_freq_simplex(ctrl, ctrl->sock, tmpfreq);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: side=TX set=%s", set_ok ? "ok" : "fail");
 
-            /* This is only effective in RIG_TYPE_TRX mode.
-               Invalidate ctrl->lastrxf for two reasons.
+            if (set_ok)
+            {
+                /* give radio a chance to set frequency */
+                g_usleep(WR_DEL);
 
-               1. Prevent dial feedback from changing the downlink frequency.
-               In the first RX cycle get_freq_simplex() returns the uplink
-               frequency instead of downlink. The mismatch would thus
-               trigger a downlink update as long as the VFO has not been
-               updated.
-               2. Force updating the VFO in the first RX cycle.
-             */
-            if (ctrl->lasttxptt != ptt)
-                ctrl->lastrxf = 0.0;
-        }
-        else
-        {
-            ctrl->errcnt++;
+                /* The actual frequency migh be different from what we have set because
+                   the tuning step is larger than what we work with (e.g. FT-817 has a
+                   smallest tuning step of 10 Hz). Therefore we read back the actual
+                   frequency from the rig. */
+                read_ok = get_freq_simplex(ctrl, ctrl->sock, &readback);
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rig update: side=TX readback=%.0f ok=%d",
+                            readback, read_ok ? 1 : 0);
+
+                if (read_ok && fabs(readback - sent_freq) <= 100.0)
+                {
+                    ctrl->errcnt = 0;
+                    ctrl->lasttxf = readback;
+
+                    /* This is only effective in RIG_TYPE_TRX mode.
+                       Invalidate ctrl->lastrxf for two reasons.
+
+                       1. Prevent dial feedback from changing the downlink frequency.
+                       In the first RX cycle get_freq_simplex() returns the uplink
+                       frequency instead of downlink. The mismatch would thus
+                       trigger a downlink update as long as the VFO has not been
+                       updated.
+                       2. Force updating the VFO in the first RX cycle.
+                     */
+                    if (ctrl->lasttxptt != ptt)
+                        ctrl->lastrxf = 0.0;
+                }
+                else
+                {
+                    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                "rig update: side=TX readback mismatch (sent=%.0f read=%.0f); tracking unsynced",
+                                sent_freq, readback);
+                    ctrl->errcnt++;
+                    ctrl->lasttxf = 0.0;
+                }
+            }
+            else
+            {
+                ctrl->errcnt++;
+            }
         }
     }
 
@@ -2440,6 +2517,12 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     vfo_t           sat_vfo = VFO_SUB;
     gboolean        use_sat_vfo =
         satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &sat_vfo);
+    gdouble         base_freq = 0.0;
+    gdouble         doppler_hz = 0.0;
+    gdouble         sent_freq = 0.0;
+
+    if (is_ic9700_satmode_active(ctrl))
+        use_rit_xit = FALSE;
 
     /* Dial feedback:
        If radio device is engaged read frequency from radio and compare it to the
@@ -2529,43 +2612,68 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                                 satfrequ - ctrl->conf->loup);
     }
 
-    tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqUp));
+    base_freq = satfrequ - ctrl->conf->loup;
+    doppler_hz = (ctrl->tracking && !use_rit_xit) ? ctrl->du : 0.0;
+    sent_freq = base_freq + doppler_hz;
+    tmpfreq = sent_freq;
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
     {
-        if (use_sat_vfo)
         {
-            gdouble du = (ctrl->tracking && !use_rit_xit) ? ctrl->du : 0.0;
+            gboolean set_ok;
+            gboolean read_ok;
+            gdouble  readback = 0.0;
+            const gchar *vfo_label =
+                use_sat_vfo ? vfo_name(sat_vfo) :
+                (ctrl->conf->vfo_opt ? "currVFO" : "default");
+
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: uplink sat=%.0f du=%.0f loup=%.0f rig=%.0f",
-                        satfrequ, du, ctrl->conf->loup, tmpfreq);
-        }
-        if (select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
-                               "setting uplink freq", tmpfreq, TRUE) &&
-            (use_sat_vfo ?
-             set_freq_toggle_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
-             set_freq_toggle(ctrl, ctrl->sock, tmpfreq)))
-        {
-            /* reset error counter */
-            ctrl->errcnt = 0;
+                        "rig update: side=TX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
+                        base_freq, doppler_hz, sent_freq, vfo_label);
 
-            /* give radio a chance to set frequency */
-            g_usleep(WR_DEL);
+            set_ok = select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
+                                        "setting uplink freq", tmpfreq, TRUE) &&
+                (use_sat_vfo ?
+                 set_freq_toggle_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
+                 set_freq_toggle(ctrl, ctrl->sock, tmpfreq));
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: side=TX set=%s", set_ok ? "ok" : "fail");
 
-            /* The actual frequency migh be different from what we have set because
-               the tuning step is larger than what we work with (e.g. FT-817 has a
-               smallest tuning step of 10 Hz). Therefore we read back the actual
-               frequency from the rig. */
-            if (use_sat_vfo)
-                get_freq_toggle_vfo(ctrl, ctrl->sock, &tmpfreq, sat_vfo);
+            if (set_ok)
+            {
+                /* give radio a chance to set frequency */
+                g_usleep(WR_DEL);
+
+                /* The actual frequency migh be different from what we have set because
+                   the tuning step is larger than what we work with (e.g. FT-817 has a
+                   smallest tuning step of 10 Hz). Therefore we read back the actual
+                   frequency from the rig. */
+                read_ok = use_sat_vfo ?
+                    get_freq_toggle_vfo(ctrl, ctrl->sock, &readback, sat_vfo) :
+                    get_freq_toggle(ctrl, ctrl->sock, &readback);
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rig update: side=TX readback=%.0f ok=%d",
+                            readback, read_ok ? 1 : 0);
+
+                if (read_ok && fabs(readback - sent_freq) <= 100.0)
+                {
+                    ctrl->errcnt = 0;
+                    ctrl->lasttxf = readback;
+                }
+                else
+                {
+                    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                "rig update: side=TX readback mismatch (sent=%.0f read=%.0f); tracking unsynced",
+                                sent_freq, readback);
+                    ctrl->errcnt++;
+                    ctrl->lasttxf = 0.0;
+                }
+            }
             else
-                get_freq_toggle(ctrl, ctrl->sock, &tmpfreq);
-            ctrl->lasttxf = tmpfreq;
-        }
-        else
-        {
-            ctrl->errcnt++;
+            {
+                ctrl->errcnt++;
+            }
         }
     }
 }
@@ -3010,6 +3118,9 @@ static void update_rit_xit_offsets(GtkRigCtrl * ctrl)
     if (ctrl->engaged == FALSE)
         return;
 
+    if (is_ic9700_satmode_active(ctrl))
+        return;
+
     if (!rx_support && !tx_support)
         return;
 
@@ -3115,7 +3226,7 @@ static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble freq)
                 __func__, ctrl->conf->vfo_opt, freq);
     if (ctrl->conf->vfo_opt)
     {
-        if (is_ic9700_satmode(ctrl->conf))
+        if (is_ic9700_satmode_configured(ctrl->conf))
             buff = g_strdup_printf("I currVFO %10.0f\x0a", freq);
         else
             buff = g_strdup_printf("I VFOA %10.0f\x0a", freq);
