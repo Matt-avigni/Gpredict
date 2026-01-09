@@ -36,6 +36,7 @@ gpredict_SOURCES = \
     compat.c compat.h config-keys.h \
     first-time.c first-time.h \
     gp-debug-terminal.c gp-debug-terminal.h \
+    gp-term-view.c gp-term-view.h \
     gpredict-help.c gpredict-help.h \
     gpredict-utils.c gpredict-utils.h \
     gtk-azel-plot.c gtk-azel-plot.h \

@@ -44,6 +44,7 @@
 #include <math.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <stdarg.h>
 
 /* NETWORK */
 #ifndef WIN32
@@ -61,6 +62,7 @@
 #endif
 
 #include "compat.h"
+#include "gp-term-view.h"
 #include "gpredict-utils.h"
 #include "gtk-freq-knob.h"
 #include "gtk-rig-ctrl.h"
@@ -134,6 +136,17 @@ static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
                                              const gchar *role,
                                              const gchar *detail);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
+static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
+static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
+                             const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
+static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
+static void     rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply);
+static void     rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
+                                      gint code);
+static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out);
+static const gchar *rig_rprt_error_string(gint code);
+static void     rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
+                               const gchar *line, gpointer user_data);
 static gboolean is_ic9700_satmode_configured(const radio_conf_t *conf);
 static gboolean is_ic9700_satmode_active(const GtkRigCtrl *ctrl);
 static const gchar *vfo_name(vfo_t vfo);
@@ -203,6 +216,181 @@ static void free_radio_conf(radio_conf_t *conf)
     g_free(conf->rigctld_civaddr);
     g_free(conf->rigctld_extra_args);
     g_free(conf);
+}
+
+static gchar *rig_term_format_timestamp(void)
+{
+    GDateTime *now = g_date_time_new_now_local();
+    gchar *base = NULL;
+    gchar *stamp = NULL;
+    gint ms = 0;
+
+    if (now == NULL)
+        return g_strdup("00:00:00.000");
+
+    base = g_date_time_format(now, "%H:%M:%S");
+    ms = g_date_time_get_microsecond(now) / 1000;
+    stamp = g_strdup_printf("%s.%03d", base ? base : "00:00:00", ms);
+    g_free(base);
+    g_date_time_unref(now);
+    return stamp;
+}
+
+static void rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
+                         const gchar *fmt, ...)
+{
+    va_list ap;
+    gchar *msg = NULL;
+    gchar *stamp = NULL;
+
+    if (ctrl == NULL || ctrl->term_view == NULL || prefix == NULL ||
+        fmt == NULL)
+        return;
+
+    va_start(ap, fmt);
+    msg = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+
+    if (msg == NULL)
+        return;
+
+    stamp = rig_term_format_timestamp();
+    gp_term_view_log(ctrl->term_view, "%s [%s] %s", stamp, prefix, msg);
+    g_free(stamp);
+    g_free(msg);
+}
+
+static void rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd)
+{
+    gchar *trim;
+
+    if (ctrl == NULL || cmd == NULL)
+        return;
+
+    trim = g_strdup(cmd);
+    g_strchomp(trim);
+    g_strstrip(trim);
+    if (*trim != '\0')
+        rig_term_log(ctrl, "gpredict:tx", "%s", trim);
+    g_free(trim);
+}
+
+static void rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply)
+{
+    gchar *trim;
+
+    if (ctrl == NULL || reply == NULL)
+        return;
+
+    trim = g_strdup(reply);
+    g_strchomp(trim);
+    g_strstrip(trim);
+    if (*trim != '\0')
+        rig_term_log(ctrl, "gpredict:rx", "%s", trim);
+    g_free(trim);
+}
+
+static const gchar *rig_rprt_error_string(gint code)
+{
+    switch (code)
+    {
+    case -1:
+        return "Invalid parameter";
+    case -2:
+        return "Configuration error";
+    case -3:
+        return "Out of memory";
+    case -4:
+        return "Function not implemented";
+    case -5:
+        return "Timeout";
+    case -6:
+        return "I/O error";
+    case -7:
+        return "Internal error";
+    case -8:
+        return "Protocol error";
+    case -9:
+        return "Command rejected";
+    case -10:
+        return "Truncated response";
+    case -11:
+        return "Unavailable";
+    default:
+        return "Hamlib error";
+    }
+}
+
+static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out)
+{
+    const gchar *start = reply;
+    gchar *endp = NULL;
+    glong code;
+
+    if (reply == NULL)
+        return FALSE;
+
+    if (!g_str_has_prefix(reply, "RPRT"))
+        return FALSE;
+
+    start += 4;
+    while (*start == ' ')
+        start++;
+
+    code = g_ascii_strtoll(start, &endp, 10);
+    if (endp == start)
+        return FALSE;
+
+    if (code_out)
+        *code_out = (gint) code;
+    return TRUE;
+}
+
+static void rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
+                                  gint code)
+{
+    gchar *trim;
+
+    if (ctrl == NULL || cmd == NULL)
+        return;
+
+    trim = g_strdup(cmd);
+    g_strchomp(trim);
+    g_strstrip(trim);
+    if (*trim == '\0')
+    {
+        g_free(trim);
+        return;
+    }
+
+    rig_term_log(ctrl, "gpredict:err", "%s failed: %s (%d)",
+                 trim, rig_rprt_error_string(code), code);
+    g_free(trim);
+}
+
+static void rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
+                           const gchar *line, gpointer user_data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(user_data);
+
+    (void)mgr;
+
+    if (ctrl == NULL || line == NULL || prefix == NULL)
+        return;
+
+    rig_term_log(ctrl, prefix, "%s", line);
+}
+
+static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+    gboolean visible;
+
+    if (ctrl == NULL || ctrl->term_view == NULL)
+        return;
+
+    visible = gtk_toggle_button_get_active(button);
+    gp_term_view_set_visible(ctrl->term_view, visible);
 }
 
 static void rig_show_conn_error(GtkRigCtrl *ctrl,
@@ -285,6 +473,9 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: scheduling %s reconnect in %d ms"),
                 __func__, role ? role : _("rig"), backoff);
+    rig_term_log(ctrl, "gpredict",
+                 "reconnect %s in %d ms",
+                 role ? role : "rig", backoff);
 }
 
 static GtkBoxClass *parent_class = NULL;
@@ -308,6 +499,13 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
 
     rigctld_mgr_terminate(&ctrl->rigctld_mgr2);
     rigctld_mgr_terminate(&ctrl->rigctld_mgr);
+
+    if (ctrl->term_view != NULL)
+    {
+        gp_term_view_free(ctrl->term_view);
+        ctrl->term_view = NULL;
+    }
+    ctrl->log_toggle = NULL;
 
     if (ctrl->conf != NULL)
     {
@@ -368,6 +566,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->tx_conn_error_reported = FALSE;
     ctrl->rigctld_mgr = NULL;
     ctrl->rigctld_mgr2 = NULL;
+    ctrl->term_view = gp_term_view_new(_("Follow tail"), FALSE, FALSE);
+    ctrl->log_toggle = NULL;
     g_mutex_init(&(ctrl->busy));
     ctrl->engaged = FALSE;
     ctrl->delay = 1000;
@@ -1214,6 +1414,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
         gtk_widget_set_sensitive(ctrl->DevSel2, TRUE);
         ctrl->engaged = FALSE;
+        rig_term_log(ctrl, "gpredict", "disengage");
 
         /* Notify worker thread about the new configuration/state */
         setconfig(ctrl);
@@ -1228,6 +1429,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         gtk_widget_set_sensitive(ctrl->DevSel2, FALSE);
         ctrl->engaged = TRUE;
+        rig_term_log(ctrl, "gpredict", "engage");
 
         /* Start worker thread if not already running */
         if (ctrl->rigctl_thread == NULL)
@@ -1553,6 +1755,14 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel2, 1, 1, 1, 1);
 
+    /* Logs button */
+    ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Logs"));
+    gtk_widget_set_tooltip_text(ctrl->log_toggle,
+                                _("Show or hide the radio control logs"));
+    g_signal_connect(ctrl->log_toggle, "toggled",
+                     G_CALLBACK(rig_logs_toggle_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(table), ctrl->log_toggle, 2, 1, 1, 1);
+
     /* Engage button */
     ctrl->LockBut = gtk_toggle_button_new_with_label(_("Engage"));
     gtk_widget_set_tooltip_text(ctrl->LockBut,
@@ -1630,9 +1840,11 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
 {
     gint            written;
     gint            size;
+    gint            rprt = 0;
 
     size = strlen(buff);
 
+    rig_term_log_tx(ctrl, buff);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: sending %d bytes to rigctld as \"%s\""),
                 __FILE__, __func__, size, buff);
@@ -1647,6 +1859,8 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rigctld port closed"), __func__);
+        rig_term_log(ctrl, "gpredict:err",
+                     "send failed (%s)", strerror(errno));
         rigctrl_handle_socket_error(ctrl, sock, "send");
         return FALSE;
     }
@@ -1656,6 +1870,12 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rigctld port closed"), __func__);
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            rig_term_log(ctrl, "gpredict:err",
+                         "timeout waiting for rigctld reply");
+        else
+            rig_term_log(ctrl, "gpredict:err",
+                         "recv failed (%s)", strerror(errno));
         rigctrl_handle_socket_error(ctrl, sock, "recv");
         return FALSE;
     }
@@ -1665,6 +1885,8 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s:%s: Got 0 bytes from rigctld"), __FILE__, __func__);
+        rig_term_log(ctrl, "gpredict:err",
+                     "rigctld closed connection");
         rigctrl_handle_socket_error(ctrl, sock, "recv");
         return FALSE;
     }
@@ -1675,6 +1897,10 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                     __FILE__, __func__, size);
     }
     ctrl->wrops++;
+
+    rig_term_log_rx(ctrl, buffout);
+    if (rig_parse_rprt_code(buffout, &rprt) && rprt != 0)
+        rig_term_log_err_rprt(ctrl, buff, rprt);
 
     return TRUE;
 }
@@ -3712,6 +3938,10 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
     sat_log_log(SAT_LOG_LEVEL_ERROR,
                 _("%s: %s socket error during %s; disconnecting"),
                 __func__, role, context ? context : "command");
+    rig_term_log(ctrl, "gpredict:err",
+                 "%s socket error during %s",
+                 role ? role : "rig",
+                 context ? context : "command");
 
     close_rigctld_socket(sock_ptr);
     rigctrl_schedule_reconnect(ctrl, secondary, role);
@@ -3751,6 +3981,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: Missing rigctld host/port"), __func__);
+        rig_term_log(ctrl, "gpredict:err",
+                     "missing rigctld host/port");
         goto out;
     }
 
@@ -3775,6 +4007,9 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
             _("Auto-start is only supported for 127.0.0.1.\nHost: %s"),
             conf->host ? conf->host : _("(missing)"));
         schedule_rig_autostart_error(ctrl, role, detail);
+        rig_term_log(ctrl, "gpredict:err",
+                     "auto-start only supported for 127.0.0.1 (host=%s)",
+                     conf->host ? conf->host : "(missing)");
         g_free(detail);
         reported = TRUE;
         goto out;
@@ -3785,6 +4020,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
 
     if (rigctld_mgr_port_is_open(host, conf->port, 200))
     {
+        rig_term_log(ctrl, "gpredict",
+                     "rigctld reachable at %s:%d", host, conf->port);
         ok = TRUE;
         goto out;
     }
@@ -3794,6 +4031,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: rigctld not reachable; attempting auto-start for %s:%d"),
                     __func__, host, conf->port);
+        rig_term_log(ctrl, "gpredict",
+                     "auto-start rigctld for %s:%d", host, conf->port);
         *mgr = rigctld_mgr_spawn(conf, host, &errmsg);
         if (*mgr == NULL)
         {
@@ -3801,6 +4040,10 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                         _("%s: auto-start failed for %s:%d (%s)"),
                         __func__, host, conf->port,
                         errmsg ? errmsg : "unknown");
+            rig_term_log(ctrl, "gpredict:err",
+                         "auto-start failed for %s:%d (%s)",
+                         host, conf->port,
+                         errmsg ? errmsg : "unknown");
             if (errmsg && *errmsg)
                 detail = g_strdup_printf(
                     _("Failed to spawn rigctld for %s:%d.\n%s"),
@@ -3821,6 +4064,11 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                     __func__,
                     rigctld_mgr_get_identifier(*mgr) ?
                         rigctld_mgr_get_identifier(*mgr) : "(unknown)");
+        rig_term_log(ctrl, "gpredict",
+                     "rigctld started pid=%s",
+                     rigctld_mgr_get_identifier(*mgr) ?
+                         rigctld_mgr_get_identifier(*mgr) : "(unknown)");
+        rigctld_mgr_set_log_callback(*mgr, rigctld_log_cb, ctrl);
     }
 
     if (!rigctld_mgr_wait_for_port(host, conf->port, 5000))
@@ -3830,6 +4078,9 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: auto-start failed; rigctld not listening on %s:%d"),
                     __func__, host, conf->port);
+        rig_term_log(ctrl, "gpredict:err",
+                     "rigctld not listening on %s:%d",
+                     host, conf->port);
 
         if (mgr)
             stderr_text = rigctld_mgr_get_log_tail(*mgr);
@@ -3854,6 +4105,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     ok = TRUE;
 
 out:
+    if (mgr && *mgr != NULL)
+        rigctld_mgr_set_log_callback(*mgr, rigctld_log_cb, ctrl);
     if (error_reported)
         *error_reported = reported;
     if (own_host)
@@ -3889,17 +4142,22 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
         return FALSE;
     }
 
+    rig_term_log(ctrl, "gpredict",
+                 "connecting to %s:%d", host, conf->port);
     if (!open_rigctld_socket_host(host, conf->port, sock))
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: Failed to connect to %s:%d"),
                     __func__, host, conf->port);
+        rig_term_log(ctrl, "gpredict:err",
+                     "connect failed to %s:%d", host, conf->port);
         g_free(host);
         if (error_reported)
             *error_reported = reported;
         return FALSE;
     }
 
+    rig_term_log(ctrl, "gpredict", "connected to %s:%d", host, conf->port);
     g_free(host);
     if (error_reported)
         *error_reported = reported;
@@ -4243,6 +4501,8 @@ gpointer rigctl_run(gpointer data)
             {
                 if (rigctrl_reconnect_due(t_ctrl, FALSE, now_us))
                 {
+                    rig_term_log(t_ctrl, "gpredict",
+                                 "retry connect receiver");
                     if (!rigctrl_open(t_ctrl))
                     {
                         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -4263,6 +4523,8 @@ gpointer rigctl_run(gpointer data)
                 if (rigctrl_reconnect_due(t_ctrl, TRUE, now_us))
                 {
                     attempted_tx = TRUE;
+                    rig_term_log(t_ctrl, "gpredict",
+                                 "retry connect uplink");
                     if (!rigctrl_open(t_ctrl))
                     {
                         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -4441,8 +4703,10 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
     gtk_grid_attach(GTK_GRID(table), create_target_widgets(rigctrl),
                     0, 1, 1, 1);
     gtk_grid_attach(GTK_GRID(table), create_conf_widgets(rigctrl), 1, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_count_down_widgets(rigctrl),
+    gtk_grid_attach(GTK_GRID(table), gp_term_view_get_widget(rigctrl->term_view),
                     0, 2, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), create_count_down_widgets(rigctrl),
+                    0, 3, 2, 1);
 
     gtk_container_add(GTK_CONTAINER(rigctrl), table);
 

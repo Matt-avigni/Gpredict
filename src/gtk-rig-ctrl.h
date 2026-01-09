@@ -12,6 +12,7 @@
 #include "trsp-conf.h"
 
 typedef struct _RigctldMgr RigctldMgr;
+typedef struct _GpTermView GpTermView;
 
 
 #define GTK_TYPE_RIG_CTRL          (gtk_rig_ctrl_get_type ())
@@ -107,6 +108,9 @@ struct _gtk_rig_ctrl {
 
     RigctldMgr     *rigctld_mgr;        /*!< Auto-started rigctld manager (primary) */
     RigctldMgr     *rigctld_mgr2;       /*!< Auto-started rigctld manager (secondary) */
+
+    GpTermView     *term_view;          /*!< Embedded radio debug terminal */
+    GtkWidget      *log_toggle;         /*!< Logs toggle button */
 };
 
 struct _GtkRigCtrlClass {

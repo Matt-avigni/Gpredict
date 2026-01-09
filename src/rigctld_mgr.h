@@ -6,6 +6,10 @@
 #include "radio-conf.h"
 
 typedef struct _RigctldMgr RigctldMgr;
+typedef void (*RigctldMgrLogFunc)(RigctldMgr *mgr,
+                                  const gchar *prefix,
+                                  const gchar *line,
+                                  gpointer user_data);
 
 gchar       *rigctld_mgr_normalize_host(const gchar *host);
 gboolean     rigctld_mgr_host_is_local(const gchar *host);
@@ -20,6 +24,9 @@ RigctldMgr  *rigctld_mgr_spawn(const radio_conf_t *conf,
 gboolean     rigctld_mgr_is_running(const RigctldMgr *mgr);
 const gchar *rigctld_mgr_get_identifier(const RigctldMgr *mgr);
 gchar       *rigctld_mgr_get_log_tail(RigctldMgr *mgr);
+void         rigctld_mgr_set_log_callback(RigctldMgr *mgr,
+                                          RigctldMgrLogFunc cb,
+                                          gpointer user_data);
 void         rigctld_mgr_terminate(RigctldMgr **mgr_ptr);
 
 #endif
