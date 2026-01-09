@@ -71,7 +71,7 @@
 #include "gtk-rot-knob.h"
 #include "gtk-rot-ctrl.h"
 #include "gtk-sat-module.h"
-#include "gp-debug-terminal.h"
+#include "gp-term-view.h"
 #include "predict-tools.h"
 #include "sat-log.h"
 #include "rotor-conf.h"
@@ -105,6 +105,7 @@ typedef struct {
     gboolean        limits_valid;
     gdouble         az_min, az_max;
     gdouble         el_min, el_max;
+    gboolean        daemon_ok;
     GTimer         *timer;
 } rotctld_client_t;
 
@@ -159,7 +160,8 @@ struct _GtkRotCtrl {
     rotctld_client_t client;
     rot_plan_t      trajectory_plan;
 
-    GpDbgTerm      *dbgterm;
+    GpTermView     *term_view;
+    GtkWidget      *log_toggle;
     GSubprocess    *rotctld_proc;
     GThread        *rotctld_out_thread;
     GThread        *rotctld_err_thread;
@@ -185,8 +187,10 @@ static GtkVBoxClass *parent_class = NULL;
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
 static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
-static void rot_terminal_cb(GtkButton *button, gpointer data);
+static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data);
+static void rot_schedule_wrong_daemon(GtkRotCtrl *ctrl,
+                                      const gchar *host, gint port);
 
 static void rot_term_log(GtkRotCtrl *ctrl, const gchar *prefix,
                          const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
@@ -283,7 +287,7 @@ static void rot_term_log(GtkRotCtrl *ctrl, const gchar *prefix,
     gchar *msg = NULL;
     gchar *stamp = NULL;
 
-    if (ctrl == NULL || ctrl->dbgterm == NULL || prefix == NULL || fmt == NULL)
+    if (ctrl == NULL || ctrl->term_view == NULL || prefix == NULL || fmt == NULL)
         return;
 
     va_start(ap, fmt);
@@ -294,7 +298,7 @@ static void rot_term_log(GtkRotCtrl *ctrl, const gchar *prefix,
         return;
 
     stamp = rot_term_format_timestamp();
-    gp_dbg_term_log(ctrl->dbgterm, "%s [%s] %s", stamp, prefix, msg);
+    gp_term_view_log(ctrl->term_view, "%s [%s] %s", stamp, prefix, msg);
     g_free(stamp);
     g_free(msg);
 }
@@ -307,7 +311,7 @@ static void rot_term_log_verbose(GtkRotCtrl *ctrl, const gchar *prefix,
     gchar *stamp = NULL;
 
     if (ctrl == NULL || !ctrl->verbose_logging ||
-        ctrl->dbgterm == NULL || prefix == NULL || fmt == NULL)
+        ctrl->term_view == NULL || prefix == NULL || fmt == NULL)
         return;
 
     va_start(ap, fmt);
@@ -318,7 +322,7 @@ static void rot_term_log_verbose(GtkRotCtrl *ctrl, const gchar *prefix,
         return;
 
     stamp = rot_term_format_timestamp();
-    gp_dbg_term_log(ctrl->dbgterm, "%s [%s] %s", stamp, prefix, msg);
+    gp_term_view_log(ctrl->term_view, "%s [%s] %s", stamp, prefix, msg);
     g_free(stamp);
     g_free(msg);
 }
@@ -508,6 +512,13 @@ static gint rotctld_socket_open(const gchar * host, gint port)
     struct hostent *h;
     gint            sock;
     gint            status;
+    const gchar    *target = host;
+
+    if (host == NULL)
+        return -1;
+
+    if (g_ascii_strcasecmp(host, "localhost") == 0)
+        target = "127.0.0.1";
 
     sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == -1)
@@ -522,11 +533,11 @@ static gint rotctld_socket_open(const gchar * host, gint port)
 
     memset(&ServAddr, 0, sizeof(ServAddr));
     ServAddr.sin_family = AF_INET;      /* Internet address family */
-    h = gethostbyname(host);
+    h = gethostbyname(target);
     if (h == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("Name resolution of rotctld server %s failed."), host);
+                    _("Name resolution of rotctld server %s failed."), target);
 #ifdef WIN32
         closesocket(sock);
 #else
@@ -544,7 +555,7 @@ static gint rotctld_socket_open(const gchar * host, gint port)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("Connection to rotctld server at %s:%d failed: %s"),
-                    host, port, strerror(errno));
+                    target, port, strerror(errno));
 
 #ifdef WIN32
         closesocket(sock);
@@ -555,7 +566,7 @@ static gint rotctld_socket_open(const gchar * host, gint port)
     }
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG, _("%s: Connection opened to %s:%d"),
-                __func__, host, port);
+                __func__, target, port);
 
     return sock;
 }
@@ -621,6 +632,10 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
     gint            written;
     gint            size;
     gint64          start_us = 0;
+    const gchar    *host = (ctrl && ctrl->conf && ctrl->conf->host)
+                           ? ctrl->conf->host
+                           : "(null)";
+    gint            port = (ctrl && ctrl->conf) ? ctrl->conf->port : 0;
 
     if (ctrl != NULL)
         rot_term_log_tx(ctrl, buff);
@@ -644,9 +659,14 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld Socket Down"), __func__);
         if (ctrl != NULL)
+        {
+            gchar *cmd = g_strdup(buff ? buff : "");
+            g_strchomp(cmd);
             rot_term_log(ctrl, "gpredict:err",
-                         "%s failed: send error (%s)",
-                         __func__, strerror(errno));
+                         "%s failed: send '%s' to %s:%d (%s)",
+                         __func__, cmd, host, port, strerror(errno));
+            g_free(cmd);
+        }
         return FALSE;
     }
 
@@ -666,9 +686,14 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         _("%s: select() timeout or error waiting for rotctld reply"), __func__);
             if (ctrl != NULL)
+            {
+                gchar *cmd = g_strdup(buff ? buff : "");
+                g_strchomp(cmd);
                 rot_term_log(ctrl, "gpredict:err",
-                             "%s failed: timeout waiting for reply",
-                             __func__);
+                             "%s failed: timeout waiting for reply to '%s' from %s:%d",
+                             __func__, cmd, host, port);
+                g_free(cmd);
+            }
             return FALSE;
         }
 #else
@@ -686,9 +711,14 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         _("%s: select() timeout or error waiting for rotctld reply"), __func__);
             if (ctrl != NULL)
+            {
+                gchar *cmd = g_strdup(buff ? buff : "");
+                g_strchomp(cmd);
                 rot_term_log(ctrl, "gpredict:err",
-                             "%s failed: timeout waiting for reply",
-                             __func__);
+                             "%s failed: timeout waiting for reply to '%s' from %s:%d",
+                             __func__, cmd, host, port);
+                g_free(cmd);
+            }
             return FALSE;
         }
 #endif
@@ -701,9 +731,14 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld Socket Down"), __func__);
         if (ctrl != NULL)
+        {
+            gchar *cmd = g_strdup(buff ? buff : "");
+            g_strchomp(cmd);
             rot_term_log(ctrl, "gpredict:err",
-                         "%s failed: recv error (%s)",
-                         __func__, strerror(errno));
+                         "%s failed: recv error for '%s' from %s:%d (%s)",
+                         __func__, cmd, host, port, strerror(errno));
+            g_free(cmd);
+        }
         return FALSE;
     }
 
@@ -1283,6 +1318,60 @@ static gboolean rot_parse_first_number(const gchar *line, gdouble *out)
     return TRUE;
 }
 
+typedef enum {
+    ROT_DAEMON_UNKNOWN = 0,
+    ROT_DAEMON_ROTCTLD = 1,
+    ROT_DAEMON_RIGCTLD = 2
+} rot_daemon_type_t;
+
+static rot_daemon_type_t rotctld_detect_daemon(const gchar *reply)
+{
+    gchar *lower;
+    gboolean has_rot = FALSE;
+    gboolean has_rig = FALSE;
+
+    if (reply == NULL || *reply == '\0')
+        return ROT_DAEMON_UNKNOWN;
+
+    lower = g_ascii_strdown(reply, -1);
+    if (lower == NULL)
+        return ROT_DAEMON_UNKNOWN;
+
+    has_rot = (g_strrstr(lower, "rotator") != NULL) ||
+              (g_strrstr(lower, "rot_model") != NULL) ||
+              (g_strrstr(lower, "azimuth") != NULL) ||
+              (g_strrstr(lower, "elevation") != NULL);
+
+    has_rig = (g_strrstr(lower, "rig_model") != NULL) ||
+              (g_strrstr(lower, "rigctld") != NULL) ||
+              (g_strrstr(lower, "vfo") != NULL) ||
+              (g_strrstr(lower, "ptt") != NULL);
+
+    g_free(lower);
+
+    if (has_rot && !has_rig)
+        return ROT_DAEMON_ROTCTLD;
+    if (has_rig && !has_rot)
+        return ROT_DAEMON_RIGCTLD;
+
+    return ROT_DAEMON_UNKNOWN;
+}
+
+static rot_daemon_type_t rotctld_dump_state(GtkRotCtrl *ctrl, gint sock,
+                                            gchar *reply, gsize reply_size)
+{
+    gchar cmd[] = "\\dump_state\n";
+
+    if (reply == NULL || reply_size == 0)
+        return ROT_DAEMON_UNKNOWN;
+
+    reply[0] = '\0';
+    if (!rotctld_socket_rw(ctrl, sock, cmd, reply, reply_size - 1))
+        return ROT_DAEMON_UNKNOWN;
+
+    return rotctld_detect_daemon(reply);
+}
+
 static gboolean rotctld_parse_limits(const gchar *reply,
                                      gdouble *az_min, gdouble *az_max,
                                      gdouble *el_min, gdouble *el_max)
@@ -1338,24 +1427,29 @@ static gboolean rotctld_parse_limits(const gchar *reply,
     return have_az_min && have_az_max && have_el_min && have_el_max;
 }
 
-static gboolean rotctld_query_limits(GtkRotCtrl *ctrl)
+static rot_daemon_type_t rotctld_query_limits(GtkRotCtrl *ctrl,
+                                              gboolean *limits_ok)
 {
     gchar reply[4096];
-    gchar cmd[] = "\\dump_state\n";
+    rot_daemon_type_t daemon;
 
     if (ctrl == NULL || ctrl->client.socket < 0)
-        return FALSE;
+        return ROT_DAEMON_UNKNOWN;
 
-    if (!rotctld_socket_rw(ctrl, ctrl->client.socket, cmd, reply,
-                           sizeof(reply) - 1))
-        return FALSE;
+    if (limits_ok)
+        *limits_ok = FALSE;
+
+    daemon = rotctld_dump_state(ctrl, ctrl->client.socket, reply,
+                                sizeof(reply));
+    if (daemon != ROT_DAEMON_ROTCTLD)
+        return daemon;
 
     gdouble az_min = 0.0;
     gdouble az_max = 0.0;
     gdouble el_min = 0.0;
     gdouble el_max = 0.0;
     if (!rotctld_parse_limits(reply, &az_min, &az_max, &el_min, &el_max))
-        return FALSE;
+        return daemon;
 
     g_mutex_lock(&ctrl->client.mutex);
     ctrl->client.az_min = az_min;
@@ -1379,7 +1473,9 @@ static gboolean rotctld_query_limits(GtkRotCtrl *ctrl)
                 azmin_str, azmax_str, elmin_str, elmax_str);
     g_printerr("MISSION_SOPHIE: rotctld limits az=[%s..%s] el=[%s..%s]\n",
                azmin_str, azmax_str, elmin_str, elmax_str);
-    return TRUE;
+    if (limits_ok)
+        *limits_ok = TRUE;
+    return daemon;
 }
 
 typedef enum {
@@ -1418,6 +1514,10 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gdouble         az_norm = normalize_az_0_360(az);
     gdouble         az_send = az_norm;
     gdouble         el_send = el;
+    const gchar    *host = (ctrl && ctrl->conf && ctrl->conf->host)
+                           ? ctrl->conf->host
+                           : "(null)";
+    gint            port = (ctrl && ctrl->conf) ? ctrl->conf->port : 0;
 
     gboolean        limits_valid = FALSE;
     gdouble         az_min = 0.0;
@@ -1489,6 +1589,18 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
         return ROT_SET_OK;
     }
 
+    if (g_str_has_prefix(buffback, "RPRT -6")) {
+        gchar *cmd = g_strdup(txbuf);
+        g_strchomp(cmd);
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rotctld returned I/O error '%s'"), __func__, buffback);
+        rot_term_log(ctrl, "gpredict:err",
+                     "set_position failed: I/O error (-6) for %s:%d (cmd=%s)",
+                     host, port, cmd);
+        g_free(cmd);
+        return ROT_SET_IO_ERROR;
+    }
+
     if (g_str_has_prefix(buffback, "RPRT ")) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld returned error reply '%s'"), __func__, buffback);
@@ -1527,6 +1639,7 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.socket = -1;
     ctrl->client.cmd_rejected = FALSE;
     ctrl->client.limits_valid = FALSE;
+    ctrl->client.daemon_ok = FALSE;
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "MISSION_SOPHIE: rotctld_client_thread started for %s:%d",
@@ -1553,12 +1666,15 @@ static gpointer rotctld_client_thread(gpointer data)
                 io_error = TRUE;
                 g_mutex_lock(&ctrl->client.mutex);
                 ctrl->client.io_error = TRUE;
+                ctrl->client.daemon_ok = FALSE;
                 g_mutex_unlock(&ctrl->client.mutex);
                 sat_log_log(SAT_LOG_LEVEL_WARN,
                             "%s: rotctld link down, retrying in %.1fs",
                             __func__, backoff_sec);
                 rot_term_log(ctrl, "gpredict:err",
-                             "rotctld connect failed; retrying in %.1fs",
+                             "rotctld connect failed to %s:%d; retrying in %.1fs",
+                             ctrl->conf ? ctrl->conf->host : "(null)",
+                             ctrl->conf ? ctrl->conf->port : 0,
                              backoff_sec);
                 g_usleep((gulong)(backoff_sec * 1e6));
                 backoff_sec = MIN(backoff_sec * 2.0, backoff_max);
@@ -1569,6 +1685,7 @@ static gpointer rotctld_client_thread(gpointer data)
             io_error = FALSE;
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->client.io_error = FALSE;
+            ctrl->client.daemon_ok = FALSE;
             g_mutex_unlock(&ctrl->client.mutex);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "%s: rotctld link re-established", __func__);
@@ -1577,14 +1694,46 @@ static gpointer rotctld_client_thread(gpointer data)
 
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->client.limits_valid = FALSE;
+            ctrl->client.daemon_ok = FALSE;
             g_mutex_unlock(&ctrl->client.mutex);
 
-            if (!rotctld_query_limits(ctrl)) {
-                sat_log_log(SAT_LOG_LEVEL_WARN,
-                            "%s: failed to parse rotctld limits from dump_state",
-                            __func__);
-                rot_term_log_verbose(ctrl, "gpredict:err",
-                                     "rotctld limits parse failed");
+            {
+                gboolean limits_ok = FALSE;
+                rot_daemon_type_t daemon = rotctld_query_limits(ctrl, &limits_ok);
+
+                if (daemon != ROT_DAEMON_ROTCTLD) {
+                    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                "%s: non-rotctld daemon on %s:%d",
+                                __func__,
+                                ctrl->conf ? ctrl->conf->host : "(null)",
+                                ctrl->conf ? ctrl->conf->port : 0);
+                    rot_term_log(ctrl, "gpredict:err",
+                                 "connected to non-rotctld server on %s:%d",
+                                 ctrl->conf ? ctrl->conf->host : "(null)",
+                                 ctrl->conf ? ctrl->conf->port : 0);
+                    rotctld_socket_close_quiet(&ctrl->client.socket);
+                    g_mutex_lock(&ctrl->client.mutex);
+                    ctrl->client.daemon_ok = FALSE;
+                    ctrl->client.io_error = TRUE;
+                    g_mutex_unlock(&ctrl->client.mutex);
+                    rot_schedule_wrong_daemon(ctrl,
+                                              ctrl->conf ? ctrl->conf->host : NULL,
+                                              ctrl->conf ? ctrl->conf->port : 0);
+                    ctrl->client.running = FALSE;
+                    break;
+                }
+
+                g_mutex_lock(&ctrl->client.mutex);
+                ctrl->client.daemon_ok = TRUE;
+                g_mutex_unlock(&ctrl->client.mutex);
+
+                if (!limits_ok) {
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                "%s: failed to parse rotctld limits from dump_state",
+                                __func__);
+                    rot_term_log_verbose(ctrl, "gpredict:err",
+                                         "rotctld limits parse failed");
+                }
             }
         }
 
@@ -1611,6 +1760,7 @@ static gpointer rotctld_client_thread(gpointer data)
         {
             gchar azs[32];
             gchar els[32];
+            gboolean daemon_ok = FALSE;
             rot_format_deg_2(azs, sizeof(azs), azi);
             rot_format_deg_2(els, sizeof(els), ele);
             sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -1622,6 +1772,24 @@ static gpointer rotctld_client_thread(gpointer data)
                        azs, els,
                        ctrl->engaged ? 1 : 0,
                        ctrl->monitor ? 1 : 0);
+
+            g_mutex_lock(&ctrl->client.mutex);
+            daemon_ok = ctrl->client.daemon_ok;
+            g_mutex_unlock(&ctrl->client.mutex);
+
+            if (!daemon_ok) {
+                io_error = TRUE;
+                rot_term_log(ctrl, "gpredict:err",
+                             "rotctld connection not verified; skipping set_position to %s:%d",
+                             ctrl->conf ? ctrl->conf->host : "(null)",
+                             ctrl->conf ? ctrl->conf->port : 0);
+                rotctld_socket_close_quiet(&ctrl->client.socket);
+                g_mutex_lock(&ctrl->client.mutex);
+                ctrl->client.limits_valid = FALSE;
+                ctrl->client.daemon_ok = FALSE;
+                g_mutex_unlock(&ctrl->client.mutex);
+                continue;
+            }
 
             rot_set_result_t set_res = set_pos(ctrl, azi, ele);
             if (set_res == ROT_SET_IO_ERROR)
@@ -1675,6 +1843,7 @@ static gpointer rotctld_client_thread(gpointer data)
             rotctld_socket_close_quiet(&ctrl->client.socket);
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->client.limits_valid = FALSE;
+            ctrl->client.daemon_ok = FALSE;
             g_mutex_unlock(&ctrl->client.mutex);
         }
 
@@ -2852,6 +3021,7 @@ static gchar **rotctld_build_autostart_argv(GtkRotCtrl *ctrl)
     gchar *rotctld_path = NULL;
     gint model = 603;
     gint baud = 9600;
+    gint port = 4533;
     const gchar *env_device = NULL;
     const gchar *env_model = NULL;
     const gchar *env_baud = NULL;
@@ -2899,6 +3069,9 @@ static gchar **rotctld_build_autostart_argv(GtkRotCtrl *ctrl)
             baud = (gint) tmp;
     }
 
+    if (ctrl->conf && ctrl->conf->port > 0)
+        port = ctrl->conf->port;
+
     argv = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(argv, g_strdup(rotctld_path));
     g_ptr_array_add(argv, g_strdup("-m"));
@@ -2910,13 +3083,13 @@ static gchar **rotctld_build_autostart_argv(GtkRotCtrl *ctrl)
     g_ptr_array_add(argv, g_strdup("-T"));
     g_ptr_array_add(argv, g_strdup("127.0.0.1"));
     g_ptr_array_add(argv, g_strdup("-t"));
-    g_ptr_array_add(argv, g_strdup_printf("%d", ctrl->conf->port));
+    g_ptr_array_add(argv, g_strdup_printf("%d", port));
     g_ptr_array_add(argv, g_strdup(ctrl->verbose_logging ? "-vvvv" : "-v"));
     g_ptr_array_add(argv, NULL);
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: prepared rotctld auto-start (model=%d baud=%d device=%s port=%d)"),
-                __func__, model, baud, device, ctrl->conf->port);
+                __func__, model, baud, device, port);
 
     g_free(rotctld_path);
     g_free(device);
@@ -3015,79 +3188,32 @@ static gboolean rotctld_spawn_process(GtkRotCtrl *ctrl, gchar **argv)
  *      GS-232B rotor on macOS.
  */
 /* Probe an existing rotctld instance to see if it behaves like a real
- * rotator daemon (i.e., returns a valid az/el pair to the "p" command).
+ * rotator daemon (i.e., returns a recognizable dump_state response).
  *
  * This is used to avoid "ghost" connections to unrelated services or
  * misconfigured rotctld instances that only ever reply with RPRT codes.
  */
-static gboolean
-rotctld_probe_endpoint(GtkRotCtrl *ctrl)
+static rot_daemon_type_t
+rotctld_probe_endpoint(GtkRotCtrl *ctrl, gboolean *connected)
 {
     gint sock;
-    gchar *cmd;
-    gchar reply[128];
-    gboolean ok = FALSE;
+    gchar reply[4096];
+    rot_daemon_type_t daemon = ROT_DAEMON_UNKNOWN;
+
+    if (connected)
+        *connected = FALSE;
 
     if (ctrl == NULL || ctrl->conf == NULL)
-        return FALSE;
+        return ROT_DAEMON_UNKNOWN;
 
     sock = rotctld_socket_open(ctrl->conf->host, ctrl->conf->port);
     if (sock == -1)
-        return FALSE;
+        return ROT_DAEMON_UNKNOWN;
 
-    cmd = g_strdup_printf("p\x0a");
-    if (rotctld_socket_rw(ctrl, sock, cmd, reply, sizeof(reply) - 1))
-    {
-        g_strstrip(reply);
+    if (connected)
+        *connected = TRUE;
 
-        if (g_str_has_prefix(reply, "RPRT"))
-        {
-            /* We accept RPRT-only backends as usable, but we do not expose a special
-             * SEND-ONLY mode in the UI anymore. The controller already derives its
-             * displayed position from the last commanded az/el, so feedback-less
-             * daemons are handled transparently.
-             */
-            ctrl->send_only_mode = FALSE;
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: rotctld probe at %s:%d returned RPRT reply '%s' – treating as feedback-less but usable endpoint",
-                        ctrl->conf ? ctrl->conf->host : "(null)",
-                        ctrl->conf ? ctrl->conf->port : 0,
-                        reply);
-            ok = TRUE;
-        }
-        else
-        {
-            /* Try legacy numeric az/el parsing. */
-            gchar **lines = g_strsplit(reply, "\n", 3);
-            if (lines[0] != NULL && lines[1] != NULL)
-            {
-                gchar *endptr1 = NULL;
-                gchar *endptr2 = NULL;
-                gdouble az = g_ascii_strtod(lines[0], &endptr1);
-                gdouble el = g_ascii_strtod(lines[1], &endptr2);
-
-                if (endptr1 != lines[0] && endptr2 != lines[1])
-                {
-                    ctrl->send_only_mode = FALSE;
-                    char az_str[32];
-                    char el_str[32];
-
-                    rot_format_deg_2(az_str, sizeof(az_str), az);
-                    rot_format_deg_2(el_str, sizeof(el_str), el);
-
-                    sat_log_log(SAT_LOG_LEVEL_INFO,
-                                "MISSION_SOPHIE: rotctld probe at %s:%d returned numeric position az=%s el=%s – enabling FEEDBACK mode",
-                                ctrl->conf ? ctrl->conf->host : "(null)",
-                                ctrl->conf ? ctrl->conf->port : 0,
-                                az_str, el_str);
-                    ok = TRUE;
-                }
-            }
-            g_strfreev(lines);
-        }
-    }
-
-    g_free(cmd);
+    daemon = rotctld_dump_state(ctrl, sock, reply, sizeof(reply));
 
 #ifndef WIN32
     shutdown(sock, SHUT_RDWR);
@@ -3097,25 +3223,41 @@ rotctld_probe_endpoint(GtkRotCtrl *ctrl)
     closesocket(sock);
 #endif
 
-    if (ok)
+    if (daemon == ROT_DAEMON_ROTCTLD)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: rotctld at %s:%d returned a valid position; using existing daemon."),
+                    _("%s: rotctld at %s:%d returned a valid dump_state"),
                     __func__, ctrl->conf->host, ctrl->conf->port);
     }
     else
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rotctld at %s:%d did not return a valid position; treating as unusable."),
+                    _("%s: unexpected daemon at %s:%d; dump_state did not look like rotctld"),
                     __func__, ctrl->conf->host, ctrl->conf->port);
     }
 
-    return ok;
+    return daemon;
 }
 
-static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
+static gboolean rot_host_is_local(const gchar *host)
 {
-    gint tmp_sock;
+    if (host == NULL)
+        return FALSE;
+
+    if (g_ascii_strcasecmp(host, "localhost") == 0)
+        return TRUE;
+
+    if (g_strcmp0(host, "127.0.0.1") == 0)
+        return TRUE;
+
+    return FALSE;
+}
+
+static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
+                                       gboolean *error_reported)
+{
+    if (error_reported)
+        *error_reported = FALSE;
 
     if (ctrl == NULL || ctrl->conf == NULL)
         return FALSE;
@@ -3125,8 +3267,35 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
         rotctld_process_stop(ctrl);
 
     /* Step 1: probe whether a usable rotctld is already running */
-    if (rotctld_probe_endpoint(ctrl))
-        return TRUE;
+    {
+        gboolean connected = FALSE;
+        rot_daemon_type_t daemon = rotctld_probe_endpoint(ctrl, &connected);
+
+        if (connected)
+        {
+            if (daemon == ROT_DAEMON_ROTCTLD)
+                return TRUE;
+
+            rot_term_log(ctrl, "gpredict:err",
+                         "connected to non-rotctld server on %s:%d",
+                         ctrl->conf ? ctrl->conf->host : "(null)",
+                         ctrl->conf ? ctrl->conf->port : 0);
+            rot_schedule_wrong_daemon(ctrl,
+                                      ctrl->conf ? ctrl->conf->host : NULL,
+                                      ctrl->conf ? ctrl->conf->port : 0);
+            if (error_reported)
+                *error_reported = TRUE;
+            return FALSE;
+        }
+    }
+
+    if (!rot_host_is_local(ctrl->conf->host))
+    {
+        rot_term_log(ctrl, "gpredict:err",
+                     "auto-start only supported for 127.0.0.1 (host=%s)",
+                     ctrl->conf->host ? ctrl->conf->host : "(missing)");
+        return FALSE;
+    }
 
     /* Step 2: build a command to start rotctld. Prefer the environment
      * variable if present, otherwise fall back to our auto-detection
@@ -3164,32 +3333,60 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
                 _("%s: started rotctld using '%s'"),
                 __func__, env_cmd ? env_cmd : "(auto)");
 
-    /* Give rotctld a short time to come up, then re-probe. */
-    rot_term_log_verbose(ctrl, "gpredict:rx",
-                         "waiting for rotctld to become reachable");
-    g_usleep(500000); /* 500 ms */
-
-    tmp_sock = rotctld_socket_open(ctrl->conf->host, ctrl->conf->port);
-    if (tmp_sock == -1)
+    /* Give rotctld a short time to come up, then re-probe with backoff. */
     {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rotctld did not become reachable at %s:%d"),
-                    __func__, ctrl->conf->host, ctrl->conf->port);
-        rot_term_log(ctrl, "gpredict:err",
-                     "rotctld not reachable at %s:%d",
-                     ctrl->conf->host, ctrl->conf->port);
-        if (ctrl->rotctld_spawned)
-            rotctld_process_stop(ctrl);
-        return FALSE;
-    }
+        gboolean connected = FALSE;
+        rot_daemon_type_t daemon = ROT_DAEMON_UNKNOWN;
+        gboolean ok = FALSE;
+        gint backoff_ms = 250;
 
-#ifndef WIN32
-    shutdown(tmp_sock, SHUT_RDWR);
-    close(tmp_sock);
-#else
-    shutdown(tmp_sock, SD_BOTH);
-    closesocket(tmp_sock);
-#endif
+        rot_term_log_verbose(ctrl, "gpredict:rx",
+                             "waiting for rotctld to become reachable");
+
+        for (gint attempt = 0; attempt < 5; attempt++)
+        {
+            if (attempt > 0)
+                g_usleep((gulong) backoff_ms * 1000);
+
+            daemon = rotctld_probe_endpoint(ctrl, &connected);
+            if (connected)
+            {
+                if (daemon == ROT_DAEMON_ROTCTLD)
+                {
+                    ok = TRUE;
+                    break;
+                }
+
+                rot_term_log(ctrl, "gpredict:err",
+                             "connected to non-rotctld server on %s:%d",
+                             ctrl->conf ? ctrl->conf->host : "(null)",
+                             ctrl->conf ? ctrl->conf->port : 0);
+                rot_schedule_wrong_daemon(ctrl,
+                                          ctrl->conf ? ctrl->conf->host : NULL,
+                                          ctrl->conf ? ctrl->conf->port : 0);
+                if (ctrl->rotctld_spawned)
+                    rotctld_process_stop(ctrl);
+                if (error_reported)
+                    *error_reported = TRUE;
+                return FALSE;
+            }
+
+            backoff_ms = MIN(backoff_ms * 2, 2000);
+        }
+
+        if (!ok)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: rotctld did not become reachable at %s:%d"),
+                        __func__, ctrl->conf->host, ctrl->conf->port);
+            rot_term_log(ctrl, "gpredict:err",
+                         "rotctld not reachable at %s:%d",
+                         ctrl->conf->host, ctrl->conf->port);
+            if (ctrl->rotctld_spawned)
+                rotctld_process_stop(ctrl);
+            return FALSE;
+        }
+    }
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: rotctld is now reachable at %s:%d"),
@@ -3199,6 +3396,68 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl)
                          ctrl->conf->host, ctrl->conf->port);
 
     return TRUE;
+}
+
+typedef struct {
+    GtkRotCtrl *ctrl;
+    gchar      *host;
+    gint        port;
+} RotWrongDaemonInfo;
+
+static gboolean rot_wrong_daemon_idle(gpointer data)
+{
+    RotWrongDaemonInfo *info = data;
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+    GtkWidget *dialog;
+    GtkWidget *status_label;
+    gchar *body;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(info->ctrl));
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    body = g_strdup_printf(
+        _("Rotor control must connect to rotctld (not rigctld).\n\nHost: %s\nPort: %d"),
+        info->host ? info->host : _("(missing)"),
+        info->port);
+
+    dialog = gtk_message_dialog_new(parent,
+                                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                    GTK_MESSAGE_ERROR,
+                                    GTK_BUTTONS_OK,
+                                    "%s", body);
+    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor error"));
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    g_free(body);
+
+    if (info->ctrl && info->ctrl->LockBut)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(info->ctrl->LockBut), FALSE);
+
+    status_label = g_object_get_data(G_OBJECT(info->ctrl), "rot-status-label");
+    if (status_label)
+        gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+
+    g_free(info->host);
+    g_free(info);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void rot_schedule_wrong_daemon(GtkRotCtrl *ctrl,
+                                      const gchar *host, gint port)
+{
+    RotWrongDaemonInfo *info = g_new0(RotWrongDaemonInfo, 1);
+
+    info->ctrl = ctrl;
+    info->host = g_strdup(host);
+    info->port = port;
+
+    g_idle_add(rot_wrong_daemon_idle, info);
 }
 
 /**
@@ -3264,17 +3523,15 @@ static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason)
     gtk_widget_destroy(dialog);
 }
 
-static void rot_terminal_cb(GtkButton *button, gpointer data)
+static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
 
-    (void)button;
+    if (ctrl == NULL || ctrl->term_view == NULL)
+        return;
 
-    if (ctrl->dbgterm == NULL)
-        ctrl->dbgterm = gp_dbg_term_new(_("Rotor debug"));
-
-    if (ctrl->dbgterm != NULL)
-        gp_dbg_term_show(ctrl->dbgterm);
+    gp_term_view_set_visible(ctrl->term_view,
+                             gtk_toggle_button_get_active(button));
 }
 
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data)
@@ -3311,7 +3568,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         gtk_label_set_text(GTK_LABEL(ctrl->AzRead), "---");
         gtk_label_set_text(GTK_LABEL(ctrl->ElRead), "---");
 
-        if (!ctrl->client.running)
+        if (!ctrl->client.running && ctrl->client.thread == NULL)
         {
             /* client thread is not running; nothing to do */
             if (status_label)
@@ -3364,18 +3621,22 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->monitor = FALSE;
 
         /* ensure rotctld daemon is running (start it if needed) */
-        if (!rotctld_ensure_running(ctrl))
         {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: failed to connect to or start rotctld"),
-                        __func__);
+            gboolean error_reported = FALSE;
+            if (!rotctld_ensure_running(ctrl, &error_reported))
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: failed to connect to or start rotctld"),
+                            __func__);
 
-            /* Reset engage button and show error to the user */
-            gtk_toggle_button_set_active(button, FALSE);
-            if (status_label)
-                gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
-            rot_show_no_rotor_dialog(ctrl);
-            return;
+                /* Reset engage button and show error to the user */
+                gtk_toggle_button_set_active(button, FALSE);
+                if (status_label)
+                    gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+                if (!error_reported)
+                    rot_show_no_rotor_dialog(ctrl);
+                return;
+            }
         }
 
         /* Re-synchronise client state with current knob values so the rotor
@@ -3720,11 +3981,13 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                      G_CALLBACK(rot_verbose_cb), ctrl);
     gtk_grid_attach(GTK_GRID(main_table), verbose_check, 1, 5, 1, 1);
 
-    /* Debug terminal button */
-    GtkWidget *term_btn = gtk_button_new_with_label(_("Terminal…"));
-    gtk_widget_set_tooltip_text(term_btn, _("Open rotor debug terminal"));
-    g_signal_connect(term_btn, "clicked", G_CALLBACK(rot_terminal_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), term_btn, 2, 1, 1, 1);
+    /* Logs button */
+    ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Logs"));
+    gtk_widget_set_tooltip_text(ctrl->log_toggle,
+                                _("Show or hide the rotor control logs"));
+    g_signal_connect(ctrl->log_toggle, "toggled",
+                     G_CALLBACK(rot_logs_toggle_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->log_toggle, 2, 1, 1, 1);
 
     /* Offsets UI in a compact secondary column */
     offset_table = gtk_grid_new();
@@ -4088,7 +4351,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
     ctrl->errcnt = 0;
     ctrl->conf = NULL;
-    ctrl->dbgterm = gp_dbg_term_new(_("Rotor debug"));
+    ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
+    ctrl->log_toggle = NULL;
     ctrl->rotctld_proc = NULL;
     ctrl->rotctld_out_thread = NULL;
     ctrl->rotctld_err_thread = NULL;
@@ -4111,6 +4375,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.io_error = FALSE;
     ctrl->client.cmd_rejected = FALSE;
     ctrl->client.limits_valid = FALSE;
+    ctrl->client.daemon_ok = FALSE;
 
     if (g_getenv("GPREDICT_ROT_PLAN_TEST"))
         rot_plan_debug_harness();
@@ -4155,11 +4420,12 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
 
     rotctld_process_stop(ctrl);
 
-    if (ctrl->dbgterm != NULL)
+    if (ctrl->term_view != NULL)
     {
-        gp_dbg_term_free(ctrl->dbgterm);
-        ctrl->dbgterm = NULL;
+        gp_term_view_free(ctrl->term_view);
+        ctrl->term_view = NULL;
     }
+    ctrl->log_toggle = NULL;
 
     rot_plan_reset(&ctrl->trajectory_plan);
 
@@ -4255,6 +4521,9 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     gtk_grid_attach(GTK_GRID(table), create_conf_widgets(rot_ctrl),
                     1, 1, 1, 1);
     gtk_grid_attach(GTK_GRID(table), create_cal_widgets(rot_ctrl), 0, 2, 2, 1);
+    gtk_grid_attach(GTK_GRID(table),
+                    gp_term_view_get_widget(rot_ctrl->term_view),
+                    0, 3, 2, 1);
 
     gtk_box_pack_start(GTK_BOX(rot_ctrl), create_plot_widget(rot_ctrl),
                        TRUE, TRUE, 5);

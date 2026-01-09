@@ -566,7 +566,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->tx_conn_error_reported = FALSE;
     ctrl->rigctld_mgr = NULL;
     ctrl->rigctld_mgr2 = NULL;
-    ctrl->term_view = gp_term_view_new(_("Follow tail"), FALSE, FALSE);
+    ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
     g_mutex_init(&(ctrl->busy));
     ctrl->engaged = FALSE;

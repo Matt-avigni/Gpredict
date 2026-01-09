@@ -117,8 +117,11 @@ static void gp_term_view_copy_clicked(GtkButton *button, gpointer user_data)
         return;
 
     buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view->text_view));
-    gtk_text_buffer_get_start_iter(buffer, &start);
-    gtk_text_buffer_get_end_iter(buffer, &end);
+    if (!gtk_text_buffer_get_selection_bounds(buffer, &start, &end))
+    {
+        gtk_text_buffer_get_start_iter(buffer, &start);
+        gtk_text_buffer_get_end_iter(buffer, &end);
+    }
 
     text = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
 
