@@ -30,7 +30,7 @@
 /** \brief Coumn definitions for radio list. */
 typedef enum {
     RIG_LIST_COL_NAME = 0,      /*!< File name. */
-    RIG_LIST_COL_HOST,          /*!< Hostname, e.g. localhost */
+    RIG_LIST_COL_HOST,          /*!< Hostname, e.g. 127.0.0.1 */
     RIG_LIST_COL_PORT,          /*!< Port number */
     RIG_LIST_COL_TYPE,          /*!< Radio type */
     RIG_LIST_COL_PTT,           /*!< PTT */

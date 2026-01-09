@@ -66,6 +66,7 @@
 #include "gtk-rig-ctrl.h"
 #include "predict-tools.h"
 #include "radio-conf.h"
+#include "rigctld_mgr.h"
 #include "sat-log.h"
 #include "sat-cfg.h"
 #include "trsp-conf.h"
@@ -119,12 +120,14 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    gboolean secondary,
                                                    const gchar *role,
                                                    gboolean *error_reported);
+static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
+                                       radio_conf_t *conf,
+                                       RigctldMgr **mgr,
+                                       const gchar *role,
+                                       gchar **connect_host,
+                                       gboolean *error_reported);
 static gboolean open_rigctld_socket_host(const gchar *host, gint port,
                                          gint *sock);
-static gboolean rigctld_wait_for_port_host(const gchar *host, gint port,
-                                           gint timeout_ms);
-static gchar   *rigctld_log_path(const radio_conf_t *conf);
-static gchar   *rigctld_read_log_tail(const gchar *path);
 static void     schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                         const gchar *role);
 static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
@@ -134,7 +137,6 @@ static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static gboolean is_ic9700_satmode_configured(const radio_conf_t *conf);
 static gboolean is_ic9700_satmode_active(const GtkRigCtrl *ctrl);
 static const gchar *vfo_name(vfo_t vfo);
-static void     rigctld_terminate_process(GSubprocess **proc);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
 static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
                                       gint64 now_us);
@@ -304,8 +306,8 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->rigctl_thread = NULL;
     }
 
-    rigctld_terminate_process(&ctrl->rigctld_proc2);
-    rigctld_terminate_process(&ctrl->rigctld_proc);
+    rigctld_mgr_terminate(&ctrl->rigctld_mgr2);
+    rigctld_mgr_terminate(&ctrl->rigctld_mgr);
 
     if (ctrl->conf != NULL)
     {
@@ -364,8 +366,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->reconnect_next_us2 = 0;
     ctrl->rx_conn_error_reported = FALSE;
     ctrl->tx_conn_error_reported = FALSE;
-    ctrl->rigctld_proc = NULL;
-    ctrl->rigctld_proc2 = NULL;
+    ctrl->rigctld_mgr = NULL;
+    ctrl->rigctld_mgr2 = NULL;
     g_mutex_init(&(ctrl->busy));
     ctrl->engaged = FALSE;
     ctrl->delay = 1000;
@@ -3654,21 +3656,6 @@ static gboolean open_rigctld_socket_host(const gchar *host, gint port,
     return FALSE;
 }
 
-static gboolean open_rigctld_socket(radio_conf_t * conf, gint * sock)
-{
-    if (conf == NULL || sock == NULL)
-        return FALSE;
-
-    if (conf->host == NULL || conf->port <= 0)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: Missing rigctld host/port"), __func__);
-        return FALSE;
-    }
-
-    return open_rigctld_socket_host(conf->host, conf->port, sock);
-}
-
 static gboolean close_rigctld_socket(gint * sock)
 {
     gint            written;
@@ -3730,306 +3717,148 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
     rigctrl_schedule_reconnect(ctrl, secondary, role);
 }
 
-static gboolean rigctld_host_is_local(const gchar *host)
+
+static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
+                                       radio_conf_t *conf,
+                                       RigctldMgr **mgr,
+                                       const gchar *role,
+                                       gchar **connect_host,
+                                       gboolean *error_reported)
 {
-    if (host == NULL || *host == '\0')
-        return TRUE;
-
-    if (g_ascii_strcasecmp(host, "localhost") == 0)
-        return TRUE;
-    if (g_strcmp0(host, "127.0.0.1") == 0)
-        return TRUE;
-    if (g_strcmp0(host, "::1") == 0)
-        return TRUE;
-
-    return FALSE;
-}
-
-static gboolean rigctld_port_is_open(const gchar *host, gint port,
-                                     gint timeout_ms)
-{
+    gchar          *host = NULL;
+    gchar          *errmsg = NULL;
+    gchar          *detail = NULL;
+    gboolean        reported = FALSE;
     gboolean        ok = FALSE;
-    GResolver      *resolver = NULL;
-    GList          *addrs = NULL;
-    GError         *error = NULL;
-    gint64          timeout_us;
+    gboolean        own_host = FALSE;
 
-    if (host == NULL || *host == '\0' || port <= 0)
-        return FALSE;
+    if (error_reported)
+        *error_reported = FALSE;
 
-    resolver = g_resolver_get_default();
-    addrs = g_resolver_lookup_by_name(resolver, host, NULL, &error);
-    if (addrs == NULL)
-    {
-        g_clear_error(&error);
-        g_object_unref(resolver);
-        return FALSE;
-    }
-
-    timeout_us = (gint64) timeout_ms * 1000;
-    for (GList *iter = addrs; iter != NULL; iter = iter->next)
-    {
-        GInetAddress   *addr = G_INET_ADDRESS(iter->data);
-        GSocket        *sock = NULL;
-        GSocketAddress *sockaddr = NULL;
-
-        sock = g_socket_new(g_inet_address_get_family(addr),
-                            G_SOCKET_TYPE_STREAM,
-                            G_SOCKET_PROTOCOL_TCP, &error);
-        if (sock == NULL)
-        {
-            g_clear_error(&error);
-            continue;
-        }
-
-        g_socket_set_blocking(sock, FALSE);
-        sockaddr = g_inet_socket_address_new(addr, port);
-
-        if (g_socket_connect(sock, sockaddr, NULL, &error))
-        {
-            ok = TRUE;
-        }
-        else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
-        {
-            g_clear_error(&error);
-            if (g_socket_condition_timed_wait(sock, G_IO_OUT, timeout_us, NULL,
-                                              &error))
-            {
-                if (g_socket_check_connect_result(sock, &error))
-                    ok = TRUE;
-                else
-                    g_clear_error(&error);
-            }
-            else
-            {
-                g_clear_error(&error);
-            }
-        }
-        else
-        {
-            g_clear_error(&error);
-        }
-
-        g_object_unref(sockaddr);
-        g_object_unref(sock);
-
-        if (ok)
-            break;
-    }
-
-    g_resolver_free_addresses(addrs);
-    g_object_unref(resolver);
-
-    return ok;
-}
-
-static gboolean rigctld_wait_for_port_host(const gchar *host, gint port,
-                                           gint timeout_ms)
-{
-    const gint      interval_ms = 100;
-    gint            waited = 0;
-
-    while (waited < timeout_ms)
-    {
-        if (rigctld_port_is_open(host, port, interval_ms))
-            return TRUE;
-
-        g_usleep(interval_ms * 1000);
-        waited += interval_ms;
-    }
-
-    return FALSE;
-}
-
-static gchar *rigctld_log_path(const radio_conf_t *conf)
-{
-    gchar *confdir;
-    gchar *path;
-
-    if (conf == NULL || conf->port <= 0)
-        return NULL;
-
-    confdir = get_user_conf_dir();
-    if (confdir == NULL)
-        return NULL;
-
-    if (g_mkdir_with_parents(confdir, 0700) != 0)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: failed to create config dir %s"),
-                    __func__, confdir);
-        g_free(confdir);
-        return NULL;
-    }
-
-    path = g_strdup_printf("%s%crigctld-%d.log",
-                           confdir, G_DIR_SEPARATOR, conf->port);
-    g_free(confdir);
-
-    return path;
-}
-
-static gchar *rigctld_read_log_tail(const gchar *path)
-{
-    gchar   *contents = NULL;
-    gsize    len = 0;
-    gsize    max_len = 2048;
-    gchar   *tail = NULL;
-
-    if (path == NULL)
-        return NULL;
-
-    if (!g_file_get_contents(path, &contents, &len, NULL) || contents == NULL)
-        return NULL;
-
-    if (len <= max_len)
-        return contents;
-
-    tail = g_strdup(contents + (len - max_len));
-    g_free(contents);
-    return tail;
-}
-
-static GSubprocess *rigctld_spawn(const radio_conf_t *conf, gchar **error_out,
-                                  gchar **log_path_out)
-{
-    GSubprocess    *proc = NULL;
-    GSubprocessLauncher *launcher = NULL;
-    GPtrArray      *argv = NULL;
-    GError         *error = NULL;
-    gchar          *path = NULL;
-    gchar          *model = NULL;
-    gchar          *baud = NULL;
-    gchar          *port = NULL;
-    gchar          *log_path = NULL;
+    if (connect_host)
+        *connect_host = NULL;
 
     if (conf == NULL)
-    {
-        if (error_out)
-            *error_out = g_strdup("Missing radio configuration.");
-        return NULL;
-    }
+        return FALSE;
 
-    if (conf->rigctld_model <= 0)
-    {
-        if (error_out)
-            *error_out = g_strdup("Missing rigctld model number.");
-        return NULL;
-    }
-
-    if (conf->rigctld_device == NULL || *conf->rigctld_device == '\0')
-    {
-        if (error_out)
-            *error_out = g_strdup("Missing rigctld device path.");
-        return NULL;
-    }
-
-    if (conf->rigctld_path && *conf->rigctld_path)
-        path = g_strdup(conf->rigctld_path);
+    host = rigctld_mgr_normalize_host(conf->host);
+    if (connect_host)
+        *connect_host = host;
     else
-        path = g_find_program_in_path("rigctld");
+        own_host = TRUE;
 
-    if (path == NULL)
+    if (host == NULL || conf->port <= 0)
     {
-        if (error_out)
-            *error_out = g_strdup("rigctld not found in PATH.");
-        return NULL;
-    }
-
-    log_path = rigctld_log_path(conf);
-    if (log_path == NULL)
-    {
-        if (error_out)
-            *error_out = g_strdup("Failed to create rigctld log file.");
-        g_free(path);
-        return NULL;
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: Missing rigctld host/port"), __func__);
+        goto out;
     }
 
-    argv = g_ptr_array_new_with_free_func(g_free);
-    g_ptr_array_add(argv, g_strdup(path));
-    g_ptr_array_add(argv, g_strdup("-b"));
-    g_ptr_array_add(argv, g_strdup("127.0.0.1"));
-    g_ptr_array_add(argv, g_strdup("-m"));
-    model = g_strdup_printf("%d", conf->rigctld_model);
-    g_ptr_array_add(argv, model);
-    g_ptr_array_add(argv, g_strdup("-r"));
-    g_ptr_array_add(argv, g_strdup(conf->rigctld_device));
-    if (conf->rigctld_baud > 0)
+    if (conf->rigctld_autostart &&
+        conf->host &&
+        g_ascii_strcasecmp(conf->host, "localhost") == 0)
     {
-        g_ptr_array_add(argv, g_strdup("-s"));
-        baud = g_strdup_printf("%d", conf->rigctld_baud);
-        g_ptr_array_add(argv, baud);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-start enabled; using 127.0.0.1 instead of localhost"),
+                    __func__);
     }
-    g_ptr_array_add(argv, g_strdup("-t"));
-    port = g_strdup_printf("%d", conf->port);
-    g_ptr_array_add(argv, port);
-    if (conf->rigctld_civaddr && *conf->rigctld_civaddr)
-    {
-        g_ptr_array_add(argv, g_strdup("-C"));
-        g_ptr_array_add(argv,
-                        g_strdup_printf("civaddr=%s", conf->rigctld_civaddr));
-    }
-    if (conf->rigctld_auto_power_on)
-    {
-        g_ptr_array_add(argv, g_strdup("-C"));
-        g_ptr_array_add(argv, g_strdup("auto_power_on=1"));
-    }
-    if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
-    {
-        gchar **extra_argv = NULL;
-        gint    extra_argc = 0;
 
-        if (!g_shell_parse_argv(conf->rigctld_extra_args, &extra_argc,
-                                &extra_argv, &error))
+    if (!conf->rigctld_autostart)
+    {
+        ok = TRUE;
+        goto out;
+    }
+
+    if (!rigctld_mgr_host_is_local(conf->host))
+    {
+        detail = g_strdup_printf(
+            _("Auto-start is only supported for 127.0.0.1.\nHost: %s"),
+            conf->host ? conf->host : _("(missing)"));
+        schedule_rig_autostart_error(ctrl, role, detail);
+        g_free(detail);
+        reported = TRUE;
+        goto out;
+    }
+
+    if (mgr && *mgr != NULL && !rigctld_mgr_is_running(*mgr))
+        rigctld_mgr_terminate(mgr);
+
+    if (rigctld_mgr_port_is_open(host, conf->port, 200))
+    {
+        ok = TRUE;
+        goto out;
+    }
+
+    if (mgr && *mgr == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rigctld not reachable; attempting auto-start for %s:%d"),
+                    __func__, host, conf->port);
+        *mgr = rigctld_mgr_spawn(conf, host, &errmsg);
+        if (*mgr == NULL)
         {
-            if (error_out)
-                *error_out = g_strdup(error->message);
-            g_clear_error(&error);
-            g_strfreev(extra_argv);
-            g_ptr_array_free(argv, TRUE);
-            g_free(path);
-            return NULL;
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: auto-start failed for %s:%d (%s)"),
+                        __func__, host, conf->port,
+                        errmsg ? errmsg : "unknown");
+            if (errmsg && *errmsg)
+                detail = g_strdup_printf(
+                    _("Failed to spawn rigctld for %s:%d.\n%s"),
+                    host, conf->port, errmsg);
+            else
+                detail = g_strdup_printf(
+                    _("Failed to spawn rigctld for %s:%d."),
+                    host, conf->port);
+            schedule_rig_autostart_error(ctrl, role, detail);
+            g_free(detail);
+            g_free(errmsg);
+            reported = TRUE;
+            goto out;
         }
 
-        for (gint i = 0; i < extra_argc; i++)
-            g_ptr_array_add(argv, g_strdup(extra_argv[i]));
-        g_strfreev(extra_argv);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rigctld started pid=%s"),
+                    __func__,
+                    rigctld_mgr_get_identifier(*mgr) ?
+                        rigctld_mgr_get_identifier(*mgr) : "(unknown)");
     }
 
-    g_ptr_array_add(argv, NULL);
-    launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_DEV_NULL);
-    g_subprocess_launcher_set_stdout_file_path(launcher, log_path);
-    g_subprocess_launcher_set_stderr_file_path(launcher, log_path);
-    proc = g_subprocess_launcher_spawnv(launcher,
-                                        (const gchar * const *) argv->pdata,
-                                        &error);
-    g_object_unref(launcher);
-    if (proc == NULL)
+    if (!rigctld_mgr_wait_for_port(host, conf->port, 5000))
     {
-        if (error_out)
-            *error_out = g_strdup(error->message);
-        g_clear_error(&error);
+        gchar *stderr_text = NULL;
+
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: auto-start failed; rigctld not listening on %s:%d"),
+                    __func__, host, conf->port);
+
+        if (mgr)
+            stderr_text = rigctld_mgr_get_log_tail(*mgr);
+
+        if (stderr_text && *stderr_text)
+            detail = g_strdup_printf(
+                _("rigctld did not start listening on %s:%d.\n%s"),
+                host, conf->port, stderr_text);
+        else
+            detail = g_strdup_printf(
+                _("rigctld did not start listening on %s:%d."),
+                host, conf->port);
+
+        schedule_rig_autostart_error(ctrl, role, detail);
+        rigctld_mgr_terminate(mgr);
+        g_free(stderr_text);
+        g_free(detail);
+        reported = TRUE;
+        goto out;
     }
 
-    g_ptr_array_free(argv, TRUE);
-    g_free(path);
-    if (log_path_out != NULL)
-        *log_path_out = log_path;
-    else
-        g_free(log_path);
+    ok = TRUE;
 
-    return proc;
-}
-
-static void rigctld_terminate_process(GSubprocess **proc)
-{
-    if (proc == NULL || *proc == NULL)
-        return;
-
-    if (!g_subprocess_get_if_exited(*proc))
-        g_subprocess_force_exit(*proc);
-
-    g_clear_object(proc);
+out:
+    if (error_reported)
+        *error_reported = reported;
+    if (own_host)
+        g_free(host);
+    return ok;
 }
 
 static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
@@ -4039,158 +3868,39 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    const gchar *role,
                                                    gboolean *error_reported)
 {
-    GSubprocess   **proc = secondary ? &ctrl->rigctld_proc2 : &ctrl->rigctld_proc;
-    const gchar    *host;
-    gchar          *errmsg = NULL;
-    gchar          *log_path = NULL;
-    gboolean        reported = FALSE;
+    RigctldMgr **mgr =
+        secondary ? &ctrl->rigctld_mgr2 : &ctrl->rigctld_mgr;
+    gchar       *host = NULL;
+    gboolean     reported = FALSE;
 
-    if (error_reported)
-        *error_reported = FALSE;
-
-    host = (conf && conf->rigctld_autostart &&
-            conf->host &&
-            g_ascii_strcasecmp(conf->host, "localhost") == 0) ?
-        "127.0.0.1" : (conf ? conf->host : NULL);
-
-    if (conf && conf->rigctld_autostart &&
-        conf->host &&
-        g_ascii_strcasecmp(conf->host, "localhost") == 0)
+    if (!ensure_rigctld_running(ctrl, conf, mgr, role, &host, &reported))
     {
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: auto-start enabled; using 127.0.0.1 instead of localhost"),
-                    __func__);
-    }
-
-    if (conf != NULL && host != NULL && g_strcmp0(host, conf->host) == 0)
-    {
-        if (open_rigctld_socket(conf, sock))
-            return TRUE;
-    }
-    else if (open_rigctld_socket_host(host, conf ? conf->port : 0, sock))
-    {
-        return TRUE;
-    }
-
-    if (conf == NULL || !conf->rigctld_autostart)
+        if (error_reported)
+            *error_reported = reported;
+        g_free(host);
         return FALSE;
+    }
 
-    if (!rigctld_host_is_local(conf->host))
+    if (conf == NULL || host == NULL)
     {
-        schedule_rig_autostart_error(
-            ctrl, role,
-            _("Auto-start is only supported for localhost."));
-        reported = TRUE;
+        if (error_reported)
+            *error_reported = reported;
+        g_free(host);
+        return FALSE;
+    }
+
+    if (!open_rigctld_socket_host(host, conf->port, sock))
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: Failed to connect to %s:%d"),
+                    __func__, host, conf->port);
+        g_free(host);
         if (error_reported)
             *error_reported = reported;
         return FALSE;
     }
 
-    if (*proc != NULL && g_subprocess_get_if_exited(*proc))
-        g_clear_object(proc);
-
-    if (rigctld_port_is_open(host, conf->port, 100))
-    {
-        if (conf != NULL && host != NULL && g_strcmp0(host, conf->host) == 0)
-        {
-            if (open_rigctld_socket(conf, sock))
-                return TRUE;
-        }
-        else if (open_rigctld_socket_host(host, conf->port, sock))
-        {
-            return TRUE;
-        }
-        return FALSE;
-    }
-
-    if (*proc == NULL)
-    {
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: rigctld not reachable; attempting auto-start for %s:%d"),
-                    __func__, host ? host : "(null)", conf->port);
-        *proc = rigctld_spawn(conf, &errmsg, &log_path);
-        if (*proc == NULL)
-        {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: auto-start failed for %s:%d"),
-                        __func__, host ? host : "(null)", conf->port);
-            schedule_rig_autostart_error(ctrl, role,
-                                         errmsg ? errmsg :
-                                         _("Failed to spawn rigctld."));
-            g_free(errmsg);
-            g_free(log_path);
-            reported = TRUE;
-            if (error_reported)
-                *error_reported = reported;
-            return FALSE;
-        }
-
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: rigctld started pid=%s log=%s"),
-                    __func__,
-                    g_subprocess_get_identifier(*proc),
-                    log_path ? log_path : "(null)");
-    }
-
-    if (log_path == NULL)
-        log_path = rigctld_log_path(conf);
-
-    if (!rigctld_wait_for_port_host(host, conf->port, 2000))
-    {
-        gchar *stderr_text = rigctld_read_log_tail(log_path);
-        gchar *detail = NULL;
-
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: auto-start failed; rigctld not listening on %s:%d"),
-                    __func__, host ? host : "(null)", conf->port);
-
-        if (stderr_text && *stderr_text)
-            detail = g_strdup_printf(
-                _("rigctld did not start listening on %s:%d.\n%s"),
-                host ? host : "(null)", conf->port, stderr_text);
-        else
-            detail = g_strdup_printf(
-                _("rigctld did not start listening on %s:%d.\nLog: %s"),
-                host ? host : "(null)", conf->port,
-                log_path ? log_path : _("(unknown)"));
-
-        schedule_rig_autostart_error(ctrl, role, detail);
-        rigctld_terminate_process(proc);
-        g_free(stderr_text);
-        g_free(detail);
-        g_free(log_path);
-
-        reported = TRUE;
-        if (error_reported)
-            *error_reported = reported;
-        return FALSE;
-    }
-
-    if (conf != NULL && host != NULL && g_strcmp0(host, conf->host) == 0)
-    {
-        if (!open_rigctld_socket(conf, sock))
-        {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: auto-start failed to connect to %s:%d"),
-                        __func__, host ? host : "(null)", conf->port);
-            g_free(log_path);
-            return FALSE;
-        }
-    }
-    else if (!open_rigctld_socket_host(host, conf->port, sock))
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: auto-start failed to connect to %s:%d"),
-                    __func__, host ? host : "(null)", conf->port);
-        g_free(log_path);
-        return FALSE;
-    }
-
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: connected after auto-start to %s:%d"),
-                __func__, host ? host : "(null)", conf->port);
-    g_free(log_path);
-
+    g_free(host);
     if (error_reported)
         *error_reported = reported;
     return TRUE;
@@ -4268,7 +3978,7 @@ static void schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
     RigConnErrorInfo *info = g_new0(RigConnErrorInfo, 1);
 
     info->ctrl = ctrl;
-    info->host = g_strdup(conf ? conf->host : NULL);
+    info->host = rigctld_mgr_normalize_host(conf ? conf->host : NULL);
     info->port = conf ? conf->port : 0;
     info->role = g_strdup(role);
 
@@ -4349,8 +4059,8 @@ static void rigctrl_close(GtkRigCtrl * data)
     }
     close_rigctld_socket(&(ctrl->sock));
 
-    rigctld_terminate_process(&ctrl->rigctld_proc2);
-    rigctld_terminate_process(&ctrl->rigctld_proc);
+    rigctld_mgr_terminate(&ctrl->rigctld_mgr2);
+    rigctld_mgr_terminate(&ctrl->rigctld_mgr);
 
     rigctrl_reset_reconnect(ctrl, FALSE);
     rigctrl_reset_reconnect(ctrl, TRUE);

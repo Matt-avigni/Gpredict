@@ -68,7 +68,7 @@ static void update_autostart_sensitivity(gboolean enabled)
 static void clear_widgets()
 {
     gtk_entry_set_text(GTK_ENTRY(name), "");
-    gtk_entry_set_text(GTK_ENTRY(host), "localhost");
+    gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4532);     /* hamlib default? */
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(lo), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(loup), 0);
@@ -320,13 +320,13 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
 
     host = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(host), 50);
-    gtk_entry_set_text(GTK_ENTRY(host), "localhost");
+    gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
     gtk_widget_set_tooltip_text(host,
                                 _("Enter the host where rigctld is running. "
                                   "You can use both host name and IP address, "
                                   "e.g. 192.168.1.100\n\n"
                                   "If gpredict and rigctld are running on the "
-                                  "same computer use localhost"));
+                                  "same computer use 127.0.0.1"));
     gtk_grid_attach(GTK_GRID(table), host, 1, 1, 3, 1);
 
     /* port */
@@ -515,7 +515,8 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     autostart = gtk_check_button_new_with_label(_("Enable"));
     gtk_grid_attach(GTK_GRID(table), autostart, 1, 10, 1, 1);
     gtk_widget_set_tooltip_text(autostart,
-                                _("Start rigctld automatically if connection fails."));
+                                _("Start rigctld automatically when engaging "
+                                  "if it is not already running."));
     g_signal_connect(autostart, "toggled", G_CALLBACK(autostart_toggled), NULL);
 
     /* rigctld auto power-on */
@@ -547,7 +548,9 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     rigctld_model = gtk_spin_button_new_with_range(0, 99999, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_model), 0);
     gtk_widget_set_tooltip_text(rigctld_model,
-                                _("Hamlib rig model number (e.g. 3081)."));
+                                _("Hamlib rig model number (e.g. 3081).\n"
+                                  "Find your model id with: rigctl -l | "
+                                  "grep -i 'IC-705'."));
     gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 13, 1, 1);
 
     /* rigctld device */

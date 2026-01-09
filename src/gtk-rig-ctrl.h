@@ -11,7 +11,7 @@
 #include "sgpsdp/sgp4sdp4.h"
 #include "trsp-conf.h"
 
-typedef struct _GSubprocess GSubprocess;
+typedef struct _RigctldMgr RigctldMgr;
 
 
 #define GTK_TYPE_RIG_CTRL          (gtk_rig_ctrl_get_type ())
@@ -105,8 +105,8 @@ struct _gtk_rig_ctrl {
     GAsyncQueue    *rigctlq;    /*!< Message queue to indicate something has changed */
     GThread        *rigctl_thread;      /*!< Pointer to current rigctl-thread */
 
-    GSubprocess    *rigctld_proc;       /*!< Auto-started rigctld process (primary) */
-    GSubprocess    *rigctld_proc2;      /*!< Auto-started rigctld process (secondary) */
+    RigctldMgr     *rigctld_mgr;        /*!< Auto-started rigctld manager (primary) */
+    RigctldMgr     *rigctld_mgr2;       /*!< Auto-started rigctld manager (secondary) */
 };
 
 struct _GtkRigCtrlClass {
