@@ -38,6 +38,11 @@ typedef enum {
     ROT_AZ_TYPE_180 = 1         /*!< Azimuth in range -180..+180 */
 } rot_az_type_t;
 
+typedef enum {
+    ROT_AXIS_MODE_AZ_EL = 0,
+    ROT_AXIS_MODE_AZ_ONLY = 1
+} rot_axis_mode_t;
+
 /** \brief Rotator configuration. */
 typedef struct {
     gchar          *name;       /*!< Configuration file name, less .rot */
@@ -45,12 +50,19 @@ typedef struct {
     gint            port;       /*!< port number */
     gint            cycle;      /*!< cycle period in msec */
     rot_az_type_t   aztype;     /*!< Az type */
+    /* Developer note: we do not infer rotor axis mode; config is source of truth. */
+    rot_axis_mode_t axis_mode; /*!< Axis mode */
     gdouble         minaz;      /*!< Lower azimuth limit */
     gdouble         maxaz;      /*!< Upper azimuth limit */
     gdouble         minel;      /*!< Lower elevation limit */
     gdouble         maxel;      /*!< Upper elevation limit */
     gdouble         azstoppos;  /*!< absolute position of rotation stops; normally = minaz */
     gdouble         threshold;  /*!< Angle difference that triggers new motion command */
+    gboolean        use_offset; /*!< Apply configured az/el offsets */
+    gdouble         az_offset;  /*!< Azimuth offset (degrees) */
+    gdouble         el_offset;  /*!< Elevation offset (degrees) */
+    gboolean        invert_az;  /*!< Invert azimuth axis */
+    gboolean        invert_el;  /*!< Invert elevation axis */
 } rotor_conf_t;
 
 

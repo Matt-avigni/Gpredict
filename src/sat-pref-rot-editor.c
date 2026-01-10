@@ -22,8 +22,10 @@
 #endif
 #include <glib/gi18n.h>
 #include <glib/gstdio.h>
+#include <gio/gio.h>
 #include <gtk/gtk.h>
 #include <math.h>
+#include <string.h>
 
 #include "gpredict-utils.h"
 #include "rotor-conf.h"
@@ -43,6 +45,214 @@ static GtkWidget *maxaz;
 static GtkWidget *minel;
 static GtkWidget *maxel;
 static GtkWidget *azstoppos;
+static GtkWidget *axismode;
+static GtkWidget *invert_az;
+static GtkWidget *invert_el;
+static GtkWidget *use_offset;
+static GtkWidget *az_offset;
+static GtkWidget *el_offset;
+
+static void rot_pref_show_dialog(GtkMessageType type,
+                                 const gchar *primary,
+                                 const gchar *secondary)
+{
+    GtkWindow *parent = dialog ? GTK_WINDOW(dialog) : NULL;
+    GtkWidget *msg = gtk_message_dialog_new(parent,
+                                            GTK_DIALOG_MODAL |
+                                                GTK_DIALOG_DESTROY_WITH_PARENT,
+                                            type,
+                                            GTK_BUTTONS_OK,
+                                            "%s",
+                                            primary ? primary : "");
+    if (secondary && *secondary)
+    {
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(msg),
+                                                 "%s",
+                                                 secondary);
+    }
+    gtk_dialog_run(GTK_DIALOG(msg));
+    gtk_widget_destroy(msg);
+}
+
+static gboolean socket_send_all(GSocket *sock, const gchar *data, gsize len,
+                                GError **error)
+{
+    gsize offset = 0;
+
+    while (offset < len)
+    {
+        gssize sent = g_socket_send(sock, data + offset, len - offset, NULL,
+                                    error);
+        if (sent < 0)
+            return FALSE;
+        offset += (gsize)sent;
+    }
+
+    return TRUE;
+}
+
+static gboolean socket_read_reply(GSocket *sock, gchar *buffer, gsize size,
+                                  gint timeout_ms, GError **error)
+{
+    gsize offset = 0;
+
+    g_socket_set_blocking(sock, FALSE);
+    if (!g_socket_condition_timed_wait(sock, G_IO_IN,
+                                       (gint64) timeout_ms * 1000,
+                                       NULL, error))
+    {
+        if (error && *error &&
+            g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+        {
+            g_clear_error(error);
+            g_set_error(error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                        "Timed out waiting for reply");
+        }
+        return FALSE;
+    }
+
+    while (offset < size - 1)
+    {
+        gssize n = g_socket_receive(sock, buffer + offset,
+                                    size - 1 - offset, NULL, error);
+        if (n > 0)
+        {
+            offset += (gsize)n;
+            continue;
+        }
+
+        if (n == 0)
+            break;
+
+        if (error && *error &&
+            g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+        {
+            g_clear_error(error);
+            break;
+        }
+        return FALSE;
+    }
+
+    buffer[offset] = '\0';
+    return offset > 0;
+}
+
+static gboolean rotctld_test_query(const gchar *host, gint port,
+                                   gchar **reply_out, gchar **error_out)
+{
+    GSocketClient *client = NULL;
+    GSocketConnection *conn = NULL;
+    GSocket *sock = NULL;
+    GError *error = NULL;
+    gchar buffer[256];
+    gboolean ok = FALSE;
+    const gchar *cmd = "p\n";
+
+    if (reply_out)
+        *reply_out = NULL;
+    if (error_out)
+        *error_out = NULL;
+
+    if (host == NULL || *host == '\0' || port <= 0)
+    {
+        if (error_out)
+            *error_out = g_strdup("Missing host or port");
+        return FALSE;
+    }
+
+    client = g_socket_client_new();
+    g_socket_client_set_timeout(client, 3);
+    conn = g_socket_client_connect_to_host(client, host, port, NULL, &error);
+    if (conn == NULL)
+    {
+        if (error_out)
+            *error_out = g_strdup(error ? error->message : "Connect failed");
+        g_clear_error(&error);
+        g_object_unref(client);
+        return FALSE;
+    }
+
+    sock = g_socket_connection_get_socket(conn);
+    g_socket_set_blocking(sock, TRUE);
+    if (!socket_send_all(sock, cmd, strlen(cmd), &error))
+    {
+        if (error_out)
+            *error_out = g_strdup(error ? error->message : "Send failed");
+        g_clear_error(&error);
+        g_object_unref(conn);
+        g_object_unref(client);
+        return FALSE;
+    }
+
+    if (!socket_read_reply(sock, buffer, sizeof(buffer), 1500, &error))
+    {
+        if (error_out)
+            *error_out = g_strdup(error ? error->message : "No reply");
+        g_clear_error(&error);
+        g_object_unref(conn);
+        g_object_unref(client);
+        return FALSE;
+    }
+
+    g_strchomp(buffer);
+    if (reply_out)
+        *reply_out = g_strdup(buffer);
+
+    if (g_str_has_prefix(buffer, "RPRT"))
+        ok = FALSE;
+    else
+        ok = TRUE;
+
+    g_object_unref(conn);
+    g_object_unref(client);
+    return ok;
+}
+
+static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
+{
+    const gchar *host_text = gtk_entry_get_text(GTK_ENTRY(host));
+    gint port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
+    gchar *reply = NULL;
+    gchar *err = NULL;
+    gchar *detail = NULL;
+    gboolean ok;
+
+    (void)button;
+    (void)data;
+
+    ok = rotctld_test_query(host_text, port_val, &reply, &err);
+    if (ok)
+    {
+        detail = g_strdup_printf("Host: %s\nPort: %d\nReply: %s",
+                                 host_text, port_val,
+                                 reply ? reply : "(none)");
+        rot_pref_show_dialog(GTK_MESSAGE_INFO,
+                             _("rotctld connection OK"),
+                             detail);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rotctld test ok host=%s port=%d reply=%s",
+                    host_text, port_val, reply ? reply : "(none)");
+    }
+    else
+    {
+        detail = g_strdup_printf("Host: %s\nPort: %d\nError: %s\nReply: %s",
+                                 host_text, port_val,
+                                 err ? err : "unknown",
+                                 reply ? reply : "(none)");
+        rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+                             _("rotctld connection failed"),
+                             detail);
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "rotctld test failed host=%s port=%d error=%s reply=%s",
+                    host_text, port_val,
+                    err ? err : "unknown",
+                    reply ? reply : "(none)");
+    }
+
+    g_free(detail);
+    g_free(reply);
+    g_free(err);
+}
 
 /* Update widgets from the currently selected row in the treeview */
 static void update_widgets(rotor_conf_t * conf)
@@ -55,7 +265,7 @@ static void update_widgets(rotor_conf_t * conf)
         gtk_entry_set_text(GTK_ENTRY(host), conf->host);
 
     /* port */
-    if (conf->port > 1023)
+    if (conf->port > 0 && conf->port <= 65535)
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), conf->port);
     else
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4533); /* hamlib default? */
@@ -68,13 +278,19 @@ static void update_widgets(rotor_conf_t * conf)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minel), conf->minel);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), conf->maxel);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), conf->azstoppos);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), conf->axis_mode);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_az), conf->invert_az);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_el), conf->invert_el);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(use_offset), conf->use_offset);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), conf->az_offset);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), conf->el_offset);
 }
 
 /* called when the user clicks on the CLEAR button */
 static void clear_widgets()
 {
     gtk_entry_set_text(GTK_ENTRY(name), "");
-    gtk_entry_set_text(GTK_ENTRY(host), "localhost");
+    gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4533);     /* hamlib default? */
     gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), ROT_AZ_TYPE_360);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0);
@@ -82,6 +298,12 @@ static void clear_widgets()
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minel), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), 90);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_az), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_el), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(use_offset), FALSE);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), 0.0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), 0.0);
 }
 
 /*
@@ -161,6 +383,7 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
 {
     GtkWidget      *table;
     GtkWidget      *label;
+    GtkWidget      *test_button;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -192,13 +415,13 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
 
     host = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(host), 50);
-    gtk_entry_set_text(GTK_ENTRY(host), "localhost");
+    gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
     gtk_widget_set_tooltip_text(host,
                                 _("Enter the host where rotctld is running. "
                                   "You can use both host name and IP address, "
                                   "e.g. 192.168.1.100\n\n"
                                   "If gpredict and rotctld are running on the "
-                                  "same computer, use localhost"));
+                                  "same computer, use 127.0.0.1"));
     gtk_grid_attach(GTK_GRID(table), host, 1, 1, 3, 1); 
 
     /* port */
@@ -213,6 +436,13 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
                                 _("Enter the port number where rotctld is "
                                   "listening. Default is 4533."));
     gtk_grid_attach(GTK_GRID(table), port, 1, 2, 1, 1); 
+
+    test_button = gtk_button_new_with_label(_("Test connection"));
+    gtk_widget_set_tooltip_text(test_button,
+                                _("Connect to rotctld and query the current position."));
+    gtk_grid_attach(GTK_GRID(table), test_button, 2, 2, 2, 1);
+    g_signal_connect(test_button, "clicked",
+                     G_CALLBACK(rotctld_test_connection_cb), NULL);
 
     gtk_grid_attach(GTK_GRID(table),
                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
@@ -292,6 +522,61 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
                                   "\342\206\222 +180\302\260 rotor is -180\302\260."));
     gtk_grid_attach(GTK_GRID(table), azstoppos, 3, 7, 1, 1);
 
+    /* Axis mode */
+    label = gtk_label_new(_("Axis mode"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 8, 1, 1);
+
+    axismode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
+                                   _("Azimuth + Elevation"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
+                                   _("Azimuth only"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
+    gtk_widget_set_tooltip_text(axismode,
+                                _("Select whether this rotor supports both azimuth and elevation."));
+    gtk_grid_attach(GTK_GRID(table), axismode, 1, 8, 2, 1);
+
+    /* Axis inversion */
+    label = gtk_label_new(_("Invert"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 9, 1, 1);
+
+    invert_az = gtk_check_button_new_with_label(_("Az"));
+    gtk_grid_attach(GTK_GRID(table), invert_az, 1, 9, 1, 1);
+    invert_el = gtk_check_button_new_with_label(_("El"));
+    gtk_grid_attach(GTK_GRID(table), invert_el, 2, 9, 1, 1);
+
+    /* Offsets */
+    label = gtk_label_new(_("Offsets"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 10, 1, 1);
+
+    use_offset = gtk_check_button_new_with_label(_("Enable"));
+    gtk_grid_attach(GTK_GRID(table), use_offset, 1, 10, 1, 1);
+
+    label = gtk_label_new(_(" Az offset"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
+    az_offset = gtk_spin_button_new_with_range(-360, 360, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(az_offset), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), 0.0);
+    gtk_grid_attach(GTK_GRID(table), az_offset, 1, 11, 1, 1);
+    label = gtk_label_new(_("deg"));
+    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 11, 1, 1);
+
+    label = gtk_label_new(_(" El offset"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+    el_offset = gtk_spin_button_new_with_range(-90, 90, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_offset), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), 0.0);
+    gtk_grid_attach(GTK_GRID(table), el_offset, 1, 12, 1, 1);
+    label = gtk_label_new(_("deg"));
+    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 12, 1, 1);
+
     if (conf->name != NULL)
         update_widgets(conf);
 
@@ -329,6 +614,18 @@ static gboolean apply_changes(rotor_conf_t * conf)
 
     /* az stop position */
     conf->azstoppos = gtk_spin_button_get_value(GTK_SPIN_BUTTON(azstoppos));
+
+    /* axis mode */
+    conf->axis_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(axismode));
+
+    /* axis inversion */
+    conf->invert_az = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(invert_az));
+    conf->invert_el = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(invert_el));
+
+    /* offsets */
+    conf->use_offset = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(use_offset));
+    conf->az_offset = gtk_spin_button_get_value(GTK_SPIN_BUTTON(az_offset));
+    conf->el_offset = gtk_spin_button_get_value(GTK_SPIN_BUTTON(el_offset));
 
     return TRUE;
 }

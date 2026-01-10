@@ -58,6 +58,12 @@ static void add_cb(GtkWidget * button, gpointer data)
         .maxel = 90,
         .aztype = ROT_AZ_TYPE_360,
         .azstoppos = 0,
+        .axis_mode = ROT_AXIS_MODE_AZ_EL,
+        .use_offset = FALSE,
+        .az_offset = 0.0,
+        .el_offset = 0.0,
+        .invert_az = FALSE,
+        .invert_el = FALSE,
     };
 
     /* run rot conf editor */
@@ -78,7 +84,14 @@ static void add_cb(GtkWidget * button, gpointer data)
                            ROT_LIST_COL_MINEL, conf.minel,
                            ROT_LIST_COL_MAXEL, conf.maxel,
                            ROT_LIST_COL_AZTYPE, conf.aztype,
-                           ROT_LIST_COL_AZSTOPPOS, conf.azstoppos, -1);
+                           ROT_LIST_COL_AZSTOPPOS, conf.azstoppos,
+                           ROT_LIST_COL_AXIS_MODE, conf.axis_mode,
+                           ROT_LIST_COL_USE_OFFSET, conf.use_offset,
+                           ROT_LIST_COL_AZ_OFFSET, conf.az_offset,
+                           ROT_LIST_COL_EL_OFFSET, conf.el_offset,
+                           ROT_LIST_COL_AZ_INVERT, conf.invert_az,
+                           ROT_LIST_COL_EL_INVERT, conf.invert_el,
+                           -1);
 
         g_free(conf.name);
 
@@ -107,6 +120,12 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .maxel = 90,
         .aztype = ROT_AZ_TYPE_360,
         .azstoppos = 0,         //used in the "new rotator" dialog
+        .axis_mode = ROT_AXIS_MODE_AZ_EL,
+        .use_offset = FALSE,
+        .az_offset = 0.0,
+        .el_offset = 0.0,
+        .invert_az = FALSE,
+        .invert_el = FALSE,
     };
 
     /* If there are no entries, we have a bug since the button should 
@@ -137,7 +156,14 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            ROT_LIST_COL_MINEL, &conf.minel,
                            ROT_LIST_COL_MAXEL, &conf.maxel,
                            ROT_LIST_COL_AZTYPE, &conf.aztype,
-                           ROT_LIST_COL_AZSTOPPOS, &conf.azstoppos, -1);
+                           ROT_LIST_COL_AZSTOPPOS, &conf.azstoppos,
+                           ROT_LIST_COL_AXIS_MODE, &conf.axis_mode,
+                           ROT_LIST_COL_USE_OFFSET, &conf.use_offset,
+                           ROT_LIST_COL_AZ_OFFSET, &conf.az_offset,
+                           ROT_LIST_COL_EL_OFFSET, &conf.el_offset,
+                           ROT_LIST_COL_AZ_INVERT, &conf.invert_az,
+                           ROT_LIST_COL_EL_INVERT, &conf.invert_el,
+                           -1);
     }
     else
     {
@@ -172,7 +198,14 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            ROT_LIST_COL_MINEL, conf.minel,
                            ROT_LIST_COL_MAXEL, conf.maxel,
                            ROT_LIST_COL_AZTYPE, conf.aztype,
-                           ROT_LIST_COL_AZSTOPPOS, conf.azstoppos, -1);
+                           ROT_LIST_COL_AZSTOPPOS, conf.azstoppos,
+                           ROT_LIST_COL_AXIS_MODE, conf.axis_mode,
+                           ROT_LIST_COL_USE_OFFSET, conf.use_offset,
+                           ROT_LIST_COL_AZ_OFFSET, conf.az_offset,
+                           ROT_LIST_COL_EL_OFFSET, conf.el_offset,
+                           ROT_LIST_COL_AZ_INVERT, conf.invert_az,
+                           ROT_LIST_COL_EL_INVERT, conf.invert_el,
+                           -1);
     }
 
     /* clean up memory */
@@ -258,7 +291,13 @@ static GtkTreeModel *create_and_fill_model()
                                    G_TYPE_DOUBLE,       // Min El
                                    G_TYPE_DOUBLE,       // Max El
                                    G_TYPE_INT,  // Az type
-                                   G_TYPE_DOUBLE        // Az Stop Position
+                                   G_TYPE_DOUBLE,       // Az Stop Position
+                                   G_TYPE_INT,          // Axis mode
+                                   G_TYPE_BOOLEAN,      // Use offset
+                                   G_TYPE_DOUBLE,       // Az offset
+                                   G_TYPE_DOUBLE,       // El offset
+                                   G_TYPE_BOOLEAN,      // Az invert
+                                   G_TYPE_BOOLEAN       // El invert
         );
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
                                          ROT_LIST_COL_NAME,
@@ -291,6 +330,12 @@ static GtkTreeModel *create_and_fill_model()
                                        ROT_LIST_COL_MAXEL, conf.maxel,
                                        ROT_LIST_COL_AZTYPE, conf.aztype,
                                        ROT_LIST_COL_AZSTOPPOS, conf.azstoppos,
+                                       ROT_LIST_COL_AXIS_MODE, conf.axis_mode,
+                                       ROT_LIST_COL_USE_OFFSET, conf.use_offset,
+                                       ROT_LIST_COL_AZ_OFFSET, conf.az_offset,
+                                       ROT_LIST_COL_EL_OFFSET, conf.el_offset,
+                                       ROT_LIST_COL_AZ_INVERT, conf.invert_az,
+                                       ROT_LIST_COL_EL_INVERT, conf.invert_el,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -575,6 +620,12 @@ void sat_pref_rot_ok()
         .maxel = 90,
         .aztype = ROT_AZ_TYPE_360,
         .azstoppos = 0,
+        .axis_mode = ROT_AXIS_MODE_AZ_EL,
+        .use_offset = FALSE,
+        .az_offset = 0.0,
+        .el_offset = 0.0,
+        .invert_az = FALSE,
+        .invert_el = FALSE,
     };
 
 
@@ -621,7 +672,14 @@ void sat_pref_rot_ok()
                                ROT_LIST_COL_MINEL, &conf.minel,
                                ROT_LIST_COL_MAXEL, &conf.maxel,
                                ROT_LIST_COL_AZTYPE, &conf.aztype,
-                               ROT_LIST_COL_AZSTOPPOS, &conf.azstoppos, -1);
+                               ROT_LIST_COL_AZSTOPPOS, &conf.azstoppos,
+                               ROT_LIST_COL_AXIS_MODE, &conf.axis_mode,
+                               ROT_LIST_COL_USE_OFFSET, &conf.use_offset,
+                               ROT_LIST_COL_AZ_OFFSET, &conf.az_offset,
+                               ROT_LIST_COL_EL_OFFSET, &conf.el_offset,
+                               ROT_LIST_COL_AZ_INVERT, &conf.invert_az,
+                               ROT_LIST_COL_EL_INVERT, &conf.invert_el,
+                               -1);
             rotor_conf_save(&conf);
 
             /* free conf buffer */

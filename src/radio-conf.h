@@ -49,6 +49,19 @@ typedef enum {
 } ptt_type_t;
 
 typedef enum {
+    RADIO_MODEL_OTHER = 0,
+    RADIO_MODEL_IC9700,
+    RADIO_MODEL_IC705,
+    RADIO_MODEL_IC905
+} radio_model_t;
+
+typedef enum {
+    RADIO_MODE_SIMPLEX = 0,
+    RADIO_MODE_SPLIT,
+    RADIO_MODE_FULL_DUPLEX_MAIN_SUB
+} radio_mode_t;
+
+typedef enum {
     VFO_NONE = 0,
     VFO_A,
     VFO_B,
@@ -66,9 +79,11 @@ typedef struct {
                                    compatibility with rest of code). Downlink. */
     gdouble         loup;       /*!< local oscillator freq in Hz for uplink. */
     rig_type_t      type;       /*!< Radio type */
+    radio_model_t   radio_model; /*!< Radio model selection */
+    radio_mode_t    radio_mode;  /*!< Radio mode selection */
     ptt_type_t      ptt;        /*!< PTT type (needed for RX, TX, and TRX) */
-    vfo_t           vfoDown;    /*!< Downlink VFO for full-duplex radios */
-    vfo_t           vfoUp;      /*!< Uplink VFO for full-duplex radios */
+    vfo_t           downlink_vfo;    /*!< Downlink VFO for full-duplex radios */
+    vfo_t           uplink_vfo;      /*!< Uplink VFO for full-duplex radios */
 
     gboolean        signal_aos; /*!< Send AOS notification to RIG */
     gboolean        signal_los; /*!< Send LOS notification to RIG */
@@ -92,6 +107,11 @@ typedef struct {
 
 gboolean        radio_conf_read(radio_conf_t * conf);
 void            radio_conf_save(radio_conf_t * conf);
+gboolean        radio_mode_allowed_for_model(radio_model_t model,
+                                             radio_mode_t mode);
+gchar          *radio_mode_allowed_string(radio_model_t model);
+const gchar    *radio_model_to_string(radio_model_t model);
+const gchar    *radio_mode_to_string(radio_mode_t mode);
 
 
 #endif

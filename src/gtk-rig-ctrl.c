@@ -66,6 +66,7 @@
 #include "gpredict-utils.h"
 #include "gtk-freq-knob.h"
 #include "gtk-rig-ctrl.h"
+#include "rig-mode-dispatch.h"
 #include "predict-tools.h"
 #include "radio-conf.h"
 #include "rigctld_mgr.h"
@@ -97,6 +98,7 @@ static void     exec_tx_cycle(GtkRigCtrl * ctrl);
 static void     exec_trx_cycle(GtkRigCtrl * ctrl);
 static void     exec_toggle_cycle(GtkRigCtrl * ctrl);
 static void     exec_toggle_tx_cycle(GtkRigCtrl * ctrl);
+static void     exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl);
 static void     exec_duplex_cycle(GtkRigCtrl * ctrl);
 static void     exec_duplex_tx_cycle(GtkRigCtrl * ctrl);
 static void     exec_dual_rig_cycle(GtkRigCtrl * ctrl);
@@ -142,14 +144,20 @@ static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
 static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
 static void     rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply);
 static void     rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
-                                      gint code);
+                                      const gchar *reply, gint code);
+static void     rigctrl_schedule_status(GtkRigCtrl *ctrl,
+                                        const gchar *text,
+                                        gboolean is_error);
 static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out);
 static const gchar *rig_rprt_error_string(gint code);
 static void     rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
                                const gchar *line, gpointer user_data);
-static gboolean is_ic9700_satmode_configured(const radio_conf_t *conf);
-static gboolean is_ic9700_satmode_active(const GtkRigCtrl *ctrl);
+static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
+static gboolean is_full_duplex_main_sub_active(const GtkRigCtrl *ctrl);
 static const gchar *vfo_name(vfo_t vfo);
+static void     rigctrl_log_config(GtkRigCtrl *ctrl,
+                                   const radio_conf_t *conf,
+                                   const gchar *role);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
 static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
                                       gint64 now_us);
@@ -347,25 +355,32 @@ static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out)
 }
 
 static void rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
-                                  gint code)
+                                  const gchar *reply, gint code)
 {
-    gchar *trim;
+    gchar *trim_cmd;
+    gchar *trim_reply;
 
     if (ctrl == NULL || cmd == NULL)
         return;
 
-    trim = g_strdup(cmd);
-    g_strchomp(trim);
-    g_strstrip(trim);
-    if (*trim == '\0')
+    trim_cmd = g_strdup(cmd);
+    g_strchomp(trim_cmd);
+    g_strstrip(trim_cmd);
+    if (*trim_cmd == '\0')
     {
-        g_free(trim);
+        g_free(trim_cmd);
         return;
     }
 
-    rig_term_log(ctrl, "gpredict:err", "%s failed: %s (%d)",
-                 trim, rig_rprt_error_string(code), code);
-    g_free(trim);
+    trim_reply = g_strdup(reply ? reply : "");
+    g_strchomp(trim_reply);
+    g_strstrip(trim_reply);
+    rig_term_log(ctrl, "gpredict:err", "cmd=%s reply=%s (%s %d)",
+                 trim_cmd,
+                 *trim_reply ? trim_reply : "(empty)",
+                 rig_rprt_error_string(code), code);
+    g_free(trim_cmd);
+    g_free(trim_reply);
 }
 
 static void rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
@@ -391,6 +406,54 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 
     visible = gtk_toggle_button_get_active(button);
     gp_term_view_set_visible(ctrl->term_view, visible);
+}
+
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *text;
+    gboolean    is_error;
+} RigStatusInfo;
+
+static gboolean rig_status_idle(gpointer data)
+{
+    RigStatusInfo *info = data;
+    GtkRigCtrl *ctrl;
+    const gchar *label_text;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    ctrl = info->ctrl;
+    if (ctrl != NULL && ctrl->status_label != NULL)
+    {
+        label_text = info->text ? info->text :
+            (info->is_error ? _("Error") : _("OK"));
+        gtk_label_set_text(GTK_LABEL(ctrl->status_label), label_text);
+        ctrl->cmd_error = info->is_error;
+    }
+
+    g_free(info->text);
+    g_free(info);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_schedule_status(GtkRigCtrl *ctrl,
+                                    const gchar *text,
+                                    gboolean is_error)
+{
+    RigStatusInfo *info;
+
+    if (ctrl == NULL || ctrl->status_label == NULL)
+        return;
+
+    if (!is_error && !ctrl->cmd_error)
+        return;
+
+    info = g_new0(RigStatusInfo, 1);
+    info->ctrl = ctrl;
+    info->text = g_strdup(text);
+    info->is_error = is_error;
+    g_idle_add(rig_status_idle, info);
 }
 
 static void rig_show_conn_error(GtkRigCtrl *ctrl,
@@ -568,6 +631,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_mgr2 = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
+    ctrl->status_label = NULL;
+    ctrl->cmd_error = FALSE;
     g_mutex_init(&(ctrl->busy));
     ctrl->engaged = FALSE;
     ctrl->delay = 1000;
@@ -1195,11 +1260,12 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     ctrl->tracking = gtk_toggle_button_get_active(button);
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE: tracking %s",
                 ctrl->tracking ? "on" : "off");
-    if (is_ic9700_satmode_configured(ctrl->conf))
+    if (is_full_duplex_main_sub_configured(ctrl->conf))
     {
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "SATMODE IC-9700: downlink -> %s, uplink -> %s",
-                    vfo_name(VFO_MAIN), vfo_name(VFO_SUB));
+                    "FULL-DUPLEX MAIN/SUB: downlink -> %s, uplink -> %s",
+                    vfo_name(ctrl->conf->downlink_vfo),
+                    vfo_name(ctrl->conf->uplink_vfo));
     }
 
     /* invalidate sync with radio */
@@ -1319,11 +1385,11 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
         gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
     if (!g_strcmp0(name1, name2))
     {
-        if (is_ic9700_satmode_configured(ctrl->conf))
+        if (is_full_duplex_main_sub_configured(ctrl->conf))
         {
             /* Allow same rig: IC-9700 uses dual VFOs in SAT mode. */
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: using primary rig for uplink (dual VFO)");
+                        "FULL-DUPLEX MAIN/SUB: using primary rig for uplink (dual VFO)");
             g_free(name1);
             g_free(name2);
             if (ctrl->conf != NULL)
@@ -1425,6 +1491,19 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     }
     else
     {
+        if (!rigctrl_validate_mode(ctrl, ctrl->conf, _("receiver")))
+        {
+            gtk_toggle_button_set_active(button, FALSE);
+            return;
+        }
+
+        if (ctrl->conf2 != NULL &&
+            !rigctrl_validate_mode(ctrl, ctrl->conf2, _("uplink")))
+        {
+            gtk_toggle_button_set_active(button, FALSE);
+            return;
+        }
+
         /* Engage: start worker thread */
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         gtk_widget_set_sensitive(ctrl->DevSel2, FALSE);
@@ -1601,7 +1680,7 @@ static gboolean is_rig_tx_capable(const gchar * confname)
     conf->name = g_strdup(confname);
     if (radio_conf_read(conf))
     {
-        cantx = (conf->type == RIG_TYPE_RX) ? conf->supports_full_duplex : TRUE;
+        cantx = (conf->type == RIG_TYPE_RX) ? FALSE : TRUE;
     }
     else
     {
@@ -1789,6 +1868,15 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 2, 3, 1, 1);
 
+    /* status */
+    label = gtk_label_new(_("Status:"));
+    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+
+    ctrl->status_label = gtk_label_new(_("OK"));
+    g_object_set(ctrl->status_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), ctrl->status_label, 1, 4, 2, 1);
+
     frame = gtk_frame_new(_("Settings"));
     gtk_container_add(GTK_CONTAINER(frame), table);
 
@@ -1841,6 +1929,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     gint            written;
     gint            size;
     gint            rprt = 0;
+    gboolean        rprt_error = FALSE;
 
     size = strlen(buff);
 
@@ -1857,10 +1946,15 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     }
     if (written == -1)
     {
+        gchar *trim_cmd = g_strdup(buff);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rigctld port closed"), __func__);
         rig_term_log(ctrl, "gpredict:err",
-                     "send failed (%s)", strerror(errno));
+                     "send failed (%s) cmd=%s",
+                     strerror(errno),
+                     trim_cmd ? g_strchomp(trim_cmd) : "(null)");
+        g_free(trim_cmd);
+        rigctrl_schedule_status(ctrl, _("Command send failed"), TRUE);
         rigctrl_handle_socket_error(ctrl, sock, "send");
         return FALSE;
     }
@@ -1868,14 +1962,20 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     size = recv(sock, buffout, sizeout - 1, 0);
     if (size == -1)
     {
+        gchar *trim_cmd = g_strdup(buff);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rigctld port closed"), __func__);
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             rig_term_log(ctrl, "gpredict:err",
-                         "timeout waiting for rigctld reply");
+                         "timeout waiting for rigctld reply cmd=%s",
+                         trim_cmd ? g_strchomp(trim_cmd) : "(null)");
         else
             rig_term_log(ctrl, "gpredict:err",
-                         "recv failed (%s)", strerror(errno));
+                         "recv failed (%s) cmd=%s",
+                         strerror(errno),
+                         trim_cmd ? g_strchomp(trim_cmd) : "(null)");
+        g_free(trim_cmd);
+        rigctrl_schedule_status(ctrl, _("Command receive failed"), TRUE);
         rigctrl_handle_socket_error(ctrl, sock, "recv");
         return FALSE;
     }
@@ -1883,10 +1983,14 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     buffout[size] = '\0';
     if (size == 0)
     {
+        gchar *trim_cmd = g_strdup(buff);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s:%s: Got 0 bytes from rigctld"), __FILE__, __func__);
         rig_term_log(ctrl, "gpredict:err",
-                     "rigctld closed connection");
+                     "rigctld closed connection cmd=%s",
+                     trim_cmd ? g_strchomp(trim_cmd) : "(null)");
+        g_free(trim_cmd);
+        rigctrl_schedule_status(ctrl, _("Rigctld closed connection"), TRUE);
         rigctrl_handle_socket_error(ctrl, sock, "recv");
         return FALSE;
     }
@@ -1900,7 +2004,40 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
 
     rig_term_log_rx(ctrl, buffout);
     if (rig_parse_rprt_code(buffout, &rprt) && rprt != 0)
-        rig_term_log_err_rprt(ctrl, buff, rprt);
+    {
+        gchar *trim_cmd = g_strdup(buff);
+        gchar *trim_reply = g_strdup(buffout);
+        char status_msg[64];
+
+        rprt_error = TRUE;
+        rig_term_log_err_rprt(ctrl, buff, buffout, rprt);
+
+        if (trim_cmd)
+        {
+            g_strchomp(trim_cmd);
+            g_strstrip(trim_cmd);
+        }
+        if (trim_reply)
+        {
+            g_strchomp(trim_reply);
+            g_strstrip(trim_reply);
+        }
+
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("rigctld command failed: cmd=\"%s\" reply=\"%s\""),
+                    (trim_cmd && *trim_cmd) ? trim_cmd : "(empty)",
+                    (trim_reply && *trim_reply) ? trim_reply : "(empty)");
+
+        g_snprintf(status_msg, sizeof(status_msg),
+                   _("Command rejected (RPRT %d)"), rprt);
+        rigctrl_schedule_status(ctrl, status_msg, TRUE);
+
+        g_free(trim_cmd);
+        g_free(trim_reply);
+    }
+
+    if (!rprt_error)
+        rigctrl_schedule_status(ctrl, _("OK"), FALSE);
 
     return TRUE;
 }
@@ -1974,6 +2111,70 @@ static const gchar *vfo_name(vfo_t vfo)
     }
 }
 
+static void rigctrl_log_config(GtkRigCtrl *ctrl,
+                               const radio_conf_t *conf,
+                               const gchar *role)
+{
+    const gchar *host;
+    gint port;
+    const gchar *label = (role != NULL) ? role : _("rig");
+
+    if (ctrl == NULL || conf == NULL)
+        return;
+
+    host = conf->host ? conf->host : "(null)";
+    port = conf->port;
+
+    rig_term_log(ctrl, "gpredict",
+                 "rig config (%s): model=%s mode=%s host=%s port=%d downlink_vfo=%s uplink_vfo=%s",
+                 label,
+                 radio_model_to_string(conf->radio_model),
+                 radio_mode_to_string(conf->radio_mode),
+                 host, port,
+                 vfo_name(conf->downlink_vfo),
+                 vfo_name(conf->uplink_vfo));
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: rig config (%s) model=%s mode=%s host=%s port=%d"),
+                __func__, label,
+                radio_model_to_string(conf->radio_model),
+                radio_mode_to_string(conf->radio_mode),
+                host, port);
+}
+
+static gboolean rigctrl_validate_mode(GtkRigCtrl *ctrl,
+                                      const radio_conf_t *conf,
+                                      const gchar *role)
+{
+    gchar *allowed = NULL;
+    gchar *body = NULL;
+    const gchar *label = role ? role : _("rig");
+
+    if (ctrl == NULL || conf == NULL)
+        return TRUE;
+
+    if (radio_mode_allowed_for_model(conf->radio_model, conf->radio_mode))
+        return TRUE;
+
+    allowed = radio_mode_allowed_string(conf->radio_model);
+    body = g_strdup_printf(_("Rig: %s\nModel: %s\nMode: %s\nAllowed: %s"),
+                           conf->name ? conf->name : label,
+                           radio_model_to_string(conf->radio_model),
+                           radio_mode_to_string(conf->radio_mode),
+                           allowed ? allowed : _("none"));
+    rig_show_error_dialog(ctrl, _("Unsupported radio mode"), body);
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                "%s: unsupported radio mode rig=%s model=%s mode=%s allowed=%s",
+                __func__,
+                conf->name ? conf->name : label,
+                radio_model_to_string(conf->radio_model),
+                radio_mode_to_string(conf->radio_mode),
+                allowed ? allowed : "none");
+    g_free(body);
+    g_free(allowed);
+
+    return FALSE;
+}
+
 typedef enum {
     VFO_ROLE_DOWNLINK = 0,
     VFO_ROLE_UPLINK
@@ -1992,28 +2193,26 @@ static const gchar *vfo_role_name(vfo_role_t role)
     }
 }
 
-static gboolean is_ic9700_satmode_configured(const radio_conf_t *conf)
+static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf)
 {
     return (conf != NULL) &&
-        (conf->type == RIG_TYPE_DUPLEX) &&
-        conf->supports_dual_vfo_sat;
+        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
 }
 
-static gboolean is_ic9700_satmode_active(const GtkRigCtrl *ctrl)
+static gboolean is_full_duplex_main_sub_active(const GtkRigCtrl *ctrl)
 {
     return (ctrl != NULL) &&
         ctrl->tracking &&
-        is_ic9700_satmode_configured(ctrl->conf);
+        is_full_duplex_main_sub_configured(ctrl->conf);
 }
 
 static gboolean satmode_vfo_for_role(const radio_conf_t *conf,
                                      vfo_role_t role, vfo_t *vfo)
 {
-    if (!is_ic9700_satmode_configured(conf) || vfo == NULL)
+    if (!is_full_duplex_main_sub_configured(conf) || vfo == NULL)
         return FALSE;
 
-    /* IC-9700 SAT mode expects Main/Sub and explicit VFO commands; avoid VFO switching. */
-    *vfo = (role == VFO_ROLE_DOWNLINK) ? VFO_MAIN : VFO_SUB;
+    *vfo = (role == VFO_ROLE_DOWNLINK) ? conf->downlink_vfo : conf->uplink_vfo;
     return TRUE;
 }
 
@@ -2028,17 +2227,17 @@ static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
     if (!satmode_vfo_for_role(ctrl->conf, role, &vfo))
         return TRUE;
 
-    sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE IC-9700: %s -> %s",
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "FULL-DUPLEX MAIN/SUB: %s -> %s",
                 vfo_role_name(role), vfo_name(vfo));
     if (action != NULL)
     {
         if (log_freq)
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: using %s for %s %.0f",
+                        "FULL-DUPLEX MAIN/SUB: using %s for %s %.0f",
                         vfo_name(vfo), action, freq);
         else
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "SATMODE IC-9700: using %s for %s",
+                        "FULL-DUPLEX MAIN/SUB: using %s for %s",
                         vfo_name(vfo), action);
     }
 
@@ -2055,14 +2254,14 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     if (!ctrl->conf->vfo_opt)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "SATMODE IC-9700: vfo_opt disabled; sending explicit VFO");
+                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; sending explicit VFO");
     }
 
     buff = g_strdup_printf("F %s %10.0f\x0a", vfo_name(vfo), freq);
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "SATMODE IC-9700: set %s %.0f -> %s",
+                "FULL-DUPLEX MAIN/SUB: set %s %.0f -> %s",
                 vfo_name(vfo), freq, buffback);
     g_free(buff);
 
@@ -2081,7 +2280,7 @@ static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     if (!ctrl->conf->vfo_opt)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "SATMODE IC-9700: vfo_opt disabled; requesting explicit VFO");
+                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; requesting explicit VFO");
     }
 
     buff = g_strdup_printf("f %s\x0a", vfo_name(vfo));
@@ -2089,7 +2288,7 @@ static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "SATMODE IC-9700: get %s -> %s",
+                "FULL-DUPLEX MAIN/SUB: get %s -> %s",
                 vfo_name(vfo), buffback);
     if (retcode)
     {
@@ -2119,14 +2318,14 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     if (!ctrl->conf->vfo_opt)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "SATMODE IC-9700: vfo_opt disabled; sending explicit VFO");
+                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; sending explicit VFO");
     }
 
     buff = g_strdup_printf("I %s %10.0f\x0a", vfo_name(vfo), freq);
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "SATMODE IC-9700: set %s (toggle) %.0f -> %s",
+                "FULL-DUPLEX MAIN/SUB: set %s (toggle) %.0f -> %s",
                 vfo_name(vfo), freq, buffback);
     g_free(buff);
 
@@ -2152,7 +2351,7 @@ static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     if (!ctrl->conf->vfo_opt)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "SATMODE IC-9700: vfo_opt disabled; requesting explicit VFO");
+                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; requesting explicit VFO");
     }
 
     buff = g_strdup_printf("i %s\x0a", vfo_name(vfo));
@@ -2160,7 +2359,7 @@ static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "SATMODE IC-9700: get %s (toggle) -> %s",
+                "FULL-DUPLEX MAIN/SUB: get %s (toggle) -> %s",
                 vfo_name(vfo), buffback);
     if (retcode)
     {
@@ -2185,7 +2384,7 @@ static int get_vfos(GtkRigCtrl * ctrl, char *rx, char *tx)
 {
     // fill rx/tx with vfo name plus space if not empty
     rx = tx = "";
-    switch (ctrl->conf->vfoUp)
+    switch (ctrl->conf->uplink_vfo)
     {
     case VFO_A:
         if (ctrl->conf->vfo_opt)
@@ -2210,7 +2409,7 @@ static int get_vfos(GtkRigCtrl * ctrl, char *rx, char *tx)
     default:
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s called but TX VFO is %d and we don't know how to handle it."), __func__,
-                    ctrl->conf->vfoUp);
+                    ctrl->conf->uplink_vfo);
         return 1;
     }
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "rx=%x, tx=%s\n", rx, tx);
@@ -2227,7 +2426,7 @@ static gboolean setup_split(GtkRigCtrl * ctrl)
     vfo_t           vfo_up;
 
     get_vfos(ctrl, rx, tx);
-    vfo_up = ctrl->conf->vfoUp;
+    vfo_up = ctrl->conf->uplink_vfo;
     satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &vfo_up);
     switch (vfo_up)
     {
@@ -2262,7 +2461,7 @@ static gboolean setup_split(GtkRigCtrl * ctrl)
     default:
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s called but TX VFO is %d."), __func__,
-                    ctrl->conf->vfoUp);
+                    ctrl->conf->uplink_vfo);
         return FALSE;
     }
 
@@ -2314,7 +2513,7 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     if (ctrl->engaged && ctrl->conf->ptt)
         ptt = get_ptt(ctrl, ctrl->sock);
 
-    if (is_ic9700_satmode_active(ctrl))
+    if (is_full_duplex_main_sub_active(ctrl))
         use_rit_xit = FALSE;
 
     /* Dial feedback:
@@ -2497,7 +2696,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
         ptt = get_ptt(ctrl, ctrl->sock);
     }
 
-    if (is_ic9700_satmode_active(ctrl))
+    if (is_full_duplex_main_sub_active(ctrl))
         use_rit_xit = FALSE;
 
     /* Dial feedback:
@@ -2736,6 +2935,138 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
 
 }
 
+static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
+{
+    rig_mode_dispatch_t plan;
+    gdouble         satfreqd;
+    gdouble         satfrequ;
+    gdouble         rigfreqd;
+    gdouble         rigfrequ;
+    gdouble         doppler_down = 0.0;
+    gdouble         doppler_up = 0.0;
+    gdouble         readback = 0.0;
+    gboolean        set_ok;
+    gboolean        read_ok;
+
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return;
+
+    rig_mode_dispatch(ctrl->conf->radio_mode,
+                      ctrl->conf->downlink_vfo,
+                      ctrl->conf->uplink_vfo,
+                      &plan);
+    if (!plan.send_downlink && !plan.send_uplink)
+        return;
+
+    satfreqd = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
+    satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
+
+    if (ctrl->tracking)
+    {
+        rigfreqd = satfreqd + ctrl->dd - ctrl->conf->lo;
+        rigfrequ = satfrequ + ctrl->du - ctrl->conf->loup;
+        doppler_down = ctrl->dd;
+        doppler_up = ctrl->du;
+    }
+    else
+    {
+        rigfreqd = satfreqd - ctrl->conf->lo;
+        rigfrequ = satfrequ - ctrl->conf->loup;
+    }
+
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), rigfreqd);
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), rigfrequ);
+
+    if (!ctrl->engaged)
+        return;
+
+    if (plan.send_downlink)
+    {
+        if (plan.downlink_vfo == VFO_NONE)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        "FULL-DUPLEX MAIN/SUB: invalid downlink VFO");
+            ctrl->errcnt++;
+        }
+        else
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
+                        rigfreqd - doppler_down,
+                        doppler_down,
+                        rigfreqd,
+                        vfo_name(plan.downlink_vfo));
+
+            set_ok = set_freq_simplex_vfo(ctrl, ctrl->sock,
+                                          rigfreqd, plan.downlink_vfo);
+            if (set_ok)
+            {
+                g_usleep(WR_DEL);
+                read_ok = get_freq_simplex_vfo(ctrl, ctrl->sock,
+                                               &readback,
+                                               plan.downlink_vfo);
+                if (read_ok && fabs(readback - rigfreqd) <= 100.0)
+                {
+                    ctrl->errcnt = 0;
+                    ctrl->lastrxf = readback;
+                }
+                else
+                {
+                    ctrl->errcnt++;
+                    ctrl->lastrxf = 0.0;
+                }
+            }
+            else
+            {
+                ctrl->errcnt++;
+            }
+        }
+    }
+
+    if (plan.send_uplink)
+    {
+        if (plan.uplink_vfo == VFO_NONE)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        "FULL-DUPLEX MAIN/SUB: invalid uplink VFO");
+            ctrl->errcnt++;
+        }
+        else
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
+                        rigfrequ - doppler_up,
+                        doppler_up,
+                        rigfrequ,
+                        vfo_name(plan.uplink_vfo));
+
+            set_ok = set_freq_simplex_vfo(ctrl, ctrl->sock,
+                                          rigfrequ, plan.uplink_vfo);
+            if (set_ok)
+            {
+                g_usleep(WR_DEL);
+                read_ok = get_freq_simplex_vfo(ctrl, ctrl->sock,
+                                               &readback,
+                                               plan.uplink_vfo);
+                if (read_ok && fabs(readback - rigfrequ) <= 100.0)
+                {
+                    ctrl->errcnt = 0;
+                    ctrl->lasttxf = readback;
+                }
+                else
+                {
+                    ctrl->errcnt++;
+                    ctrl->lasttxf = 0.0;
+                }
+            }
+            else
+            {
+                ctrl->errcnt++;
+            }
+        }
+    }
+}
+
 static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
 {
     gdouble         readfreq = 0.0, tmpfreq, satfreqd, satfrequ;
@@ -2749,7 +3080,7 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     gdouble         doppler_hz = 0.0;
     gdouble         sent_freq = 0.0;
 
-    if (is_ic9700_satmode_active(ctrl))
+    if (is_full_duplex_main_sub_active(ctrl))
         use_rit_xit = FALSE;
 
     /* Dial feedback:
@@ -3346,7 +3677,7 @@ static void update_rit_xit_offsets(GtkRigCtrl * ctrl)
     if (ctrl->engaged == FALSE)
         return;
 
-    if (is_ic9700_satmode_active(ctrl))
+    if (is_full_duplex_main_sub_active(ctrl))
         return;
 
     if (!rx_support && !tx_support)
@@ -3454,10 +3785,7 @@ static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble freq)
                 __func__, ctrl->conf->vfo_opt, freq);
     if (ctrl->conf->vfo_opt)
     {
-        if (is_ic9700_satmode_configured(ctrl->conf))
-            buff = g_strdup_printf("I currVFO %10.0f\x0a", freq);
-        else
-            buff = g_strdup_printf("I VFOA %10.0f\x0a", freq);
+        buff = g_strdup_printf("I VFOA %10.0f\x0a", freq);
     }
     else
         buff = g_strdup_printf("I %10.0f\x0a", freq);
@@ -3481,9 +3809,9 @@ static gboolean set_toggle(GtkRigCtrl * ctrl, gint sock)
     gboolean        retcode;
 
     if (ctrl->conf->vfo_opt)
-    buff = g_strdup_printf("S %s 1 %d\x0a", ctrl->conf->vfoDown==VFO_A?"VFOA":"VFOB", ctrl->conf->vfoDown);
+    buff = g_strdup_printf("S %s 1 %d\x0a", ctrl->conf->downlink_vfo==VFO_A?"VFOA":"VFOB", ctrl->conf->downlink_vfo);
     else
-    buff = g_strdup_printf("S 1 %d\x0a", ctrl->conf->vfoDown);
+    buff = g_strdup_printf("S 1 %d\x0a", ctrl->conf->downlink_vfo);
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
 
@@ -3503,9 +3831,9 @@ static gboolean unset_toggle(GtkRigCtrl * ctrl, gint sock)
 
     /* send command */
     if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("S VFOA 0 %d\x0a", ctrl->conf->vfoDown);
+        buff = g_strdup_printf("S VFOA 0 %d\x0a", ctrl->conf->downlink_vfo);
     else
-        buff = g_strdup_printf("S 0 %d\x0a", ctrl->conf->vfoDown);
+        buff = g_strdup_printf("S 0 %d\x0a", ctrl->conf->downlink_vfo);
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
 
@@ -4337,6 +4665,7 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     if (ctrl->sock < 0)
     {
         ctrl->wrops = 0;
+        rigctrl_log_config(ctrl, ctrl->conf, _("receiver"));
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: opening receiver rig %s:%d"), __func__,
                     ctrl->conf ? ctrl->conf->host : "(null)",
@@ -4379,6 +4708,7 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     /* set initial frequency */
     if (ctrl->conf2 != NULL && ctrl->sock2 < 0)
     {
+        rigctrl_log_config(ctrl, ctrl->conf2, _("uplink"));
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: opening uplink rig %s:%d"), __func__,
                     ctrl->conf2 ? ctrl->conf2->host : "(null)",
@@ -4431,39 +4761,46 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         }
         else
         {
-            switch (ctrl->conf->type)
+            if (is_full_duplex_main_sub_configured(ctrl->conf))
             {
+                exec_full_duplex_main_sub_cycle(ctrl);
+            }
+            else
+            {
+                switch (ctrl->conf->type)
+                {
 
-            case RIG_TYPE_RX:
-                exec_rx_cycle(ctrl);
-                break;
+                case RIG_TYPE_RX:
+                    exec_rx_cycle(ctrl);
+                    break;
 
-            case RIG_TYPE_TX:
-                exec_tx_cycle(ctrl);
-                break;
+                case RIG_TYPE_TX:
+                    exec_tx_cycle(ctrl);
+                    break;
 
-            case RIG_TYPE_TRX:
-                exec_trx_cycle(ctrl);
-                break;
+                case RIG_TYPE_TRX:
+                    exec_trx_cycle(ctrl);
+                    break;
 
-            case RIG_TYPE_DUPLEX:
-                /* set rig into SAT mode (hamlib needs it even if rig already in SAT) */
-                setup_split(ctrl);
-                exec_duplex_cycle(ctrl);
-                break;
+                case RIG_TYPE_DUPLEX:
+                    /* set rig into SAT mode (hamlib needs it even if rig already in SAT) */
+                    setup_split(ctrl);
+                    exec_duplex_cycle(ctrl);
+                    break;
 
-            case RIG_TYPE_TOGGLE_AUTO:
-            case RIG_TYPE_TOGGLE_MAN:
-                set_toggle(ctrl, ctrl->sock);
-                ctrl->last_toggle_tx = -1;
-                exec_toggle_cycle(ctrl);
-                break;
+                case RIG_TYPE_TOGGLE_AUTO:
+                case RIG_TYPE_TOGGLE_MAN:
+                    set_toggle(ctrl, ctrl->sock);
+                    ctrl->last_toggle_tx = -1;
+                    exec_toggle_cycle(ctrl);
+                    break;
 
-            default:
-                /* this is an error! */
-                ctrl->conf->type = RIG_TYPE_RX;
-                exec_rx_cycle(ctrl);
-                break;
+                default:
+                    /* this is an error! */
+                    ctrl->conf->type = RIG_TYPE_RX;
+                    exec_rx_cycle(ctrl);
+                    break;
+                }
             }
         }
 
@@ -4572,38 +4909,45 @@ gpointer rigctl_run(gpointer data)
         }
         else
         {
-            /* Execute controller cycle depending on primary radio type */
-            switch (t_ctrl->conf->type)
+            if (is_full_duplex_main_sub_configured(t_ctrl->conf))
             {
+                exec_full_duplex_main_sub_cycle(t_ctrl);
+            }
+            else
+            {
+                /* Execute controller cycle depending on primary radio type */
+                switch (t_ctrl->conf->type)
+                {
 
-            case RIG_TYPE_RX:
-                exec_rx_cycle(t_ctrl);
-                break;
+                case RIG_TYPE_RX:
+                    exec_rx_cycle(t_ctrl);
+                    break;
 
-            case RIG_TYPE_TX:
-                exec_tx_cycle(t_ctrl);
-                break;
+                case RIG_TYPE_TX:
+                    exec_tx_cycle(t_ctrl);
+                    break;
 
-            case RIG_TYPE_TRX:
-                exec_trx_cycle(t_ctrl);
-                break;
+                case RIG_TYPE_TRX:
+                    exec_trx_cycle(t_ctrl);
+                    break;
 
-            case RIG_TYPE_DUPLEX:
-                exec_duplex_cycle(t_ctrl);
-                break;
+                case RIG_TYPE_DUPLEX:
+                    exec_duplex_cycle(t_ctrl);
+                    break;
 
-            case RIG_TYPE_TOGGLE_AUTO:
-            case RIG_TYPE_TOGGLE_MAN:
-                exec_toggle_cycle(t_ctrl);
-                break;
+                case RIG_TYPE_TOGGLE_AUTO:
+                case RIG_TYPE_TOGGLE_MAN:
+                    exec_toggle_cycle(t_ctrl);
+                    break;
 
-            default:
-                /* invalid mode */
-                sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _("%s:%s: Invalid radio type %d. Setting type to "
-                              "RIG_TYPE_RX"), __FILE__, __func__,
-                            t_ctrl->conf->type);
-                t_ctrl->conf->type = RIG_TYPE_RX;
+                default:
+                    /* invalid mode */
+                    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                _("%s:%s: Invalid radio type %d. Setting type to "
+                                  "RIG_TYPE_RX"), __FILE__, __func__,
+                                t_ctrl->conf->type);
+                    t_ctrl->conf->type = RIG_TYPE_RX;
+                }
             }
         }
 

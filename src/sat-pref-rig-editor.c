@@ -21,8 +21,10 @@
 #endif
 #include <glib/gi18n.h>
 #include <glib/gstdio.h>
+#include <gio/gio.h>
 #include <gtk/gtk.h>
 #include <math.h>
+#include <string.h>
 
 #include "gpredict-utils.h"
 #include "radio-conf.h"
@@ -37,13 +39,14 @@ static GtkWidget *name;         /* config name */
 static GtkWidget *host;         /* host */
 static GtkWidget *port;         /* port number */
 static GtkWidget *type;         /* rig type */
+static GtkWidget *radio_model;  /* radio model */
+static GtkWidget *radio_mode;   /* radio mode */
 static GtkWidget *ptt;          /* PTT */
 static GtkWidget *vfo;          /* VFO Up/Down selector */
 static GtkWidget *lo;           /* local oscillator of downconverter */
 static GtkWidget *loup;         /* local oscillator of upconverter */
 static GtkWidget *sigaos;       /* AOS signalling */
 static GtkWidget *siglos;       /* LOS signalling */
-static GtkWidget *ic9700_satmode; /* IC-9700 SAT mode override */
 static GtkWidget *autostart;    /* auto-start rigctld */
 static GtkWidget *rigctld_auto_power_on; /* rigctld auto power-on */
 static GtkWidget *rigctld_path; /* rigctld path */
@@ -64,6 +67,208 @@ static void update_autostart_sensitivity(gboolean enabled)
     gtk_widget_set_sensitive(rigctld_extra_args, enabled);
 }
 
+static void rig_pref_show_dialog(GtkMessageType type,
+                                 const gchar *primary,
+                                 const gchar *secondary)
+{
+    GtkWindow *parent = dialog ? GTK_WINDOW(dialog) : NULL;
+    GtkWidget *msg = gtk_message_dialog_new(parent,
+                                            GTK_DIALOG_MODAL |
+                                                GTK_DIALOG_DESTROY_WITH_PARENT,
+                                            type,
+                                            GTK_BUTTONS_OK,
+                                            "%s",
+                                            primary ? primary : "");
+    if (secondary && *secondary)
+    {
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(msg),
+                                                 "%s",
+                                                 secondary);
+    }
+    gtk_dialog_run(GTK_DIALOG(msg));
+    gtk_widget_destroy(msg);
+}
+
+static gboolean socket_send_all(GSocket *sock, const gchar *data, gsize len,
+                                GError **error)
+{
+    gsize offset = 0;
+
+    while (offset < len)
+    {
+        gssize sent = g_socket_send(sock, data + offset, len - offset, NULL,
+                                    error);
+        if (sent < 0)
+            return FALSE;
+        offset += (gsize)sent;
+    }
+
+    return TRUE;
+}
+
+static gboolean socket_read_reply(GSocket *sock, gchar *buffer, gsize size,
+                                  gint timeout_ms, GError **error)
+{
+    gsize offset = 0;
+
+    g_socket_set_blocking(sock, FALSE);
+    if (!g_socket_condition_timed_wait(sock, G_IO_IN,
+                                       (gint64) timeout_ms * 1000,
+                                       NULL, error))
+    {
+        if (error && *error &&
+            g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+        {
+            g_clear_error(error);
+            g_set_error(error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                        "Timed out waiting for reply");
+        }
+        return FALSE;
+    }
+
+    while (offset < size - 1)
+    {
+        gssize n = g_socket_receive(sock, buffer + offset,
+                                    size - 1 - offset, NULL, error);
+        if (n > 0)
+        {
+            offset += (gsize)n;
+            continue;
+        }
+
+        if (n == 0)
+            break;
+
+        if (error && *error &&
+            g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+        {
+            g_clear_error(error);
+            break;
+        }
+        return FALSE;
+    }
+
+    buffer[offset] = '\0';
+    return offset > 0;
+}
+
+static gboolean rigctld_test_query(const gchar *host, gint port,
+                                   gchar **reply_out, gchar **error_out)
+{
+    GSocketClient *client = NULL;
+    GSocketConnection *conn = NULL;
+    GSocket *sock = NULL;
+    GError *error = NULL;
+    gchar buffer[256];
+    gboolean ok = FALSE;
+    const gchar *cmd = "f\n";
+
+    if (reply_out)
+        *reply_out = NULL;
+    if (error_out)
+        *error_out = NULL;
+
+    if (host == NULL || *host == '\0' || port <= 0)
+    {
+        if (error_out)
+            *error_out = g_strdup("Missing host or port");
+        return FALSE;
+    }
+
+    client = g_socket_client_new();
+    g_socket_client_set_timeout(client, 3);
+    conn = g_socket_client_connect_to_host(client, host, port, NULL, &error);
+    if (conn == NULL)
+    {
+        if (error_out)
+            *error_out = g_strdup(error ? error->message : "Connect failed");
+        g_clear_error(&error);
+        g_object_unref(client);
+        return FALSE;
+    }
+
+    sock = g_socket_connection_get_socket(conn);
+    g_socket_set_blocking(sock, TRUE);
+    if (!socket_send_all(sock, cmd, strlen(cmd), &error))
+    {
+        if (error_out)
+            *error_out = g_strdup(error ? error->message : "Send failed");
+        g_clear_error(&error);
+        g_object_unref(conn);
+        g_object_unref(client);
+        return FALSE;
+    }
+
+    if (!socket_read_reply(sock, buffer, sizeof(buffer), 1500, &error))
+    {
+        if (error_out)
+            *error_out = g_strdup(error ? error->message : "No reply");
+        g_clear_error(&error);
+        g_object_unref(conn);
+        g_object_unref(client);
+        return FALSE;
+    }
+
+    g_strchomp(buffer);
+    if (reply_out)
+        *reply_out = g_strdup(buffer);
+
+    if (g_str_has_prefix(buffer, "RPRT"))
+        ok = FALSE;
+    else
+        ok = TRUE;
+
+    g_object_unref(conn);
+    g_object_unref(client);
+    return ok;
+}
+
+static void rigctld_test_connection_cb(GtkButton *button, gpointer data)
+{
+    const gchar *host_text = gtk_entry_get_text(GTK_ENTRY(host));
+    gint port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
+    gchar *reply = NULL;
+    gchar *err = NULL;
+    gchar *detail = NULL;
+    gboolean ok;
+
+    (void)button;
+    (void)data;
+
+    ok = rigctld_test_query(host_text, port_val, &reply, &err);
+    if (ok)
+    {
+        detail = g_strdup_printf("Host: %s\nPort: %d\nReply: %s",
+                                 host_text, port_val,
+                                 reply ? reply : "(none)");
+        rig_pref_show_dialog(GTK_MESSAGE_INFO,
+                             _("rigctld connection OK"),
+                             detail);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rigctld test ok host=%s port=%d reply=%s",
+                    host_text, port_val, reply ? reply : "(none)");
+    }
+    else
+    {
+        detail = g_strdup_printf("Host: %s\nPort: %d\nError: %s\nReply: %s",
+                                 host_text, port_val,
+                                 err ? err : "unknown",
+                                 reply ? reply : "(none)");
+        rig_pref_show_dialog(GTK_MESSAGE_ERROR,
+                             _("rigctld connection failed"),
+                             detail);
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "rigctld test failed host=%s port=%d error=%s reply=%s",
+                    host_text, port_val,
+                    err ? err : "unknown",
+                    reply ? reply : "(none)");
+    }
+
+    g_free(detail);
+    g_free(reply);
+    g_free(err);
+}
+
 
 static void clear_widgets()
 {
@@ -73,12 +278,13 @@ static void clear_widgets()
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(lo), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(loup), 0);
     gtk_combo_box_set_active(GTK_COMBO_BOX(type), RIG_TYPE_RX);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_model), RADIO_MODEL_OTHER);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_mode), RADIO_MODE_SIMPLEX);
     gtk_combo_box_set_active(GTK_COMBO_BOX(ptt), PTT_TYPE_NONE);
     gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ptt), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sigaos), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(siglos), FALSE);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ic9700_satmode), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(rigctld_auto_power_on),
                                  FALSE);
@@ -109,21 +315,26 @@ static void update_widgets(radio_conf_t * conf)
     /* radio type */
     gtk_combo_box_set_active(GTK_COMBO_BOX(type), conf->type);
 
+    /* radio model */
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_model), conf->radio_model);
+
+    /* radio mode */
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_mode), conf->radio_mode);
+
     /* ptt */
     gtk_combo_box_set_active(GTK_COMBO_BOX(ptt), conf->ptt);
 
     /* vfo up/down */
-    if (conf->type == RIG_TYPE_DUPLEX)
-    {
-        if (conf->vfoUp == VFO_MAIN)
-            gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 1);
-        else if (conf->vfoUp == VFO_SUB)
-            gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 2);
-        else if (conf->vfoUp == VFO_A)
-            gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 3);
-        else
-            gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 4);
-    }
+    if (conf->uplink_vfo == VFO_MAIN && conf->downlink_vfo == VFO_SUB)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 1);
+    else if (conf->uplink_vfo == VFO_SUB && conf->downlink_vfo == VFO_MAIN)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 2);
+    else if (conf->uplink_vfo == VFO_A && conf->downlink_vfo == VFO_B)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 3);
+    else if (conf->uplink_vfo == VFO_B && conf->downlink_vfo == VFO_A)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 4);
+    else
+        gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 0);
 
     /* lo down in MHz */
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(lo), conf->lo / 1000000.0);
@@ -134,8 +345,6 @@ static void update_widgets(radio_conf_t * conf)
     /* AOS / LOS signalling */
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sigaos), conf->signal_aos);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(siglos), conf->signal_los);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ic9700_satmode),
-                                 conf->supports_dual_vfo_sat);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart),
                                  conf->rigctld_autostart);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(rigctld_auto_power_on),
@@ -171,11 +380,9 @@ static void vfo_changed(GtkWidget * widget, gpointer data)
     (void)data;
 
     if (gtk_combo_box_get_active(GTK_COMBO_BOX(widget)) == 0 &&
-        gtk_combo_box_get_active(GTK_COMBO_BOX(type)) == RIG_TYPE_DUPLEX)
-    {
-        /* not good, we need to have proper VFO combi for this type */
+        gtk_combo_box_get_active(GTK_COMBO_BOX(radio_mode)) !=
+        RADIO_MODE_SIMPLEX)
         gtk_combo_box_set_active(GTK_COMBO_BOX(widget), 1);
-    }
 }
 
 /*
@@ -272,12 +479,20 @@ static void type_changed(GtkWidget * widget, gpointer data)
     }
 
 
-    /* VFO consistency */
-    if (gtk_combo_box_get_active(GTK_COMBO_BOX(widget)) == RIG_TYPE_DUPLEX &&
-        gtk_combo_box_get_active(GTK_COMBO_BOX(vfo)) == 0)
-    {
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(vfo)) == 0 &&
+        gtk_combo_box_get_active(GTK_COMBO_BOX(radio_mode)) !=
+        RADIO_MODE_SIMPLEX)
         gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 1);
-    }
+}
+
+static void radio_mode_changed(GtkWidget * widget, gpointer data)
+{
+    (void)data;
+
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(widget)) !=
+        RADIO_MODE_SIMPLEX &&
+        gtk_combo_box_get_active(GTK_COMBO_BOX(vfo)) == 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 1);
 }
 
 static void autostart_toggled(GtkToggleButton *button, gpointer data)
@@ -290,6 +505,7 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
 {
     GtkWidget      *table;
     GtkWidget      *label;
+    GtkWidget      *test_button;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -341,6 +557,13 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Enter the port number where rigctld is "
                                   "listening"));
     gtk_grid_attach(GTK_GRID(table), port, 1, 2, 1, 1);
+
+    test_button = gtk_button_new_with_label(_("Test connection"));
+    gtk_widget_set_tooltip_text(test_button,
+                                _("Connect to rigctld and query the current frequency."));
+    gtk_grid_attach(GTK_GRID(table), test_button, 2, 2, 2, 1);
+    g_signal_connect(test_button, "clicked",
+                     G_CALLBACK(rigctld_test_connection_cb), NULL);
 
     /* radio type */
     label = gtk_label_new(_("Radio type"));
@@ -397,10 +620,44 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                     " switching to TX."));
     gtk_grid_attach(GTK_GRID(table), type, 1, 3, 2, 1);
 
+    /* radio model */
+    label = gtk_label_new(_("Radio model"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+
+    radio_model = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_model), _("Other"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_model), _("IC-9700"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_model), _("IC-705"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_model), _("IC-905"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_model), RADIO_MODEL_OTHER);
+    gtk_widget_set_tooltip_text(radio_model,
+                                _("Select the radio model used for mode-specific behavior.\n"
+                                  "No automatic guessing is performed."));
+    gtk_grid_attach(GTK_GRID(table), radio_model, 1, 4, 2, 1);
+
+    /* radio mode */
+    label = gtk_label_new(_("Radio mode"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 5, 1, 1);
+
+    radio_mode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_mode), _("Simplex"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_mode), _("Split"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_mode),
+                                   _("Full-duplex MAIN/SUB"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_mode), RADIO_MODE_SIMPLEX);
+    g_signal_connect(radio_mode, "changed",
+                     G_CALLBACK(radio_mode_changed), NULL);
+    gtk_widget_set_tooltip_text(radio_mode,
+                                _("Simplex uses one VFO; Split uses rigctld split.\n"
+                                  "Full-duplex MAIN/SUB always updates both VFOs each cycle."));
+    gtk_grid_attach(GTK_GRID(table), radio_mode, 1, 5, 2, 1);
+
     /* ptt */
     label = gtk_label_new(_("PTT status"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
 
     ptt = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ptt), _("None"));
@@ -417,12 +674,12 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                     "This can be used if your radio does not support the read_ptt "
                                     "CAT command and you have a special interface that can "
                                     "read squelch status and send it via CTS."));
-    gtk_grid_attach(GTK_GRID(table), ptt, 1, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ptt, 1, 6, 2, 1);
 
     /* VFO Up/Down */
     label = gtk_label_new(_("VFO Up/Down"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
 
     vfo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(vfo), _("Not applicable"));
@@ -438,28 +695,18 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     g_signal_connect(vfo, "changed", G_CALLBACK(vfo_changed), NULL);
     gtk_widget_set_tooltip_markup(vfo,
                                   _
-                                  ("Select which VFO to use for uplink and downlink. "
-                                   "This setting is used for full-duplex radios only, "
-                                   "such as the IC-910H, FT-847 and the TS-2000.\n\n"
-                                   "<b>IC-910H:</b> MAIN\342\206\221 / SUB\342\206\223\n"
-                                   "<b>FT-847:</b> SUB\342\206\221 / MAIN\342\206\223\n"
-                                   "<b>TS-2000:</b> B\342\206\221 / A\342\206\223"));
-    gtk_grid_attach(GTK_GRID(table), vfo, 1, 5, 2, 1);
-
-    /* IC-9700 SAT mode */
-    label = gtk_label_new(_("IC-9700 SAT mode"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
-
-    ic9700_satmode = gtk_check_button_new_with_label(_("Enable"));
-    gtk_grid_attach(GTK_GRID(table), ic9700_satmode, 1, 6, 1, 1);
-    gtk_widget_set_tooltip_text(ic9700_satmode,
-                                _("Force Main/Sub VFO use in satellite mode."));
+                                   ("Select which VFO to use for uplink and downlink. "
+                                    "This setting is used for full-duplex radios only, "
+                                    "such as the IC-910H, FT-847 and the TS-2000.\n\n"
+                                    "<b>IC-910H:</b> MAIN\342\206\221 / SUB\342\206\223\n"
+                                    "<b>FT-847:</b> SUB\342\206\221 / MAIN\342\206\223\n"
+                                    "<b>TS-2000:</b> B\342\206\221 / A\342\206\223"));
+    gtk_grid_attach(GTK_GRID(table), vfo, 1, 7, 2, 1);
 
     /* Downconverter LO frequency */
     label = gtk_label_new(_("LO Down"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 8, 1, 1);
 
     lo = gtk_spin_button_new_with_range(-10000, 10000, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(lo), 0);
@@ -468,16 +715,16 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _
                                 ("Enter the frequency of the local oscillator "
                                  " of the downconverter, if any."));
-    gtk_grid_attach(GTK_GRID(table), lo, 1, 7, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), lo, 1, 8, 2, 1);
 
     label = gtk_label_new(_("MHz"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 3, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 3, 8, 1, 1);
 
     /* Upconverter LO frequency */
     label = gtk_label_new(_("LO Up"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 9, 1, 1);
 
     loup = gtk_spin_button_new_with_range(-10000, 10000, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(loup), 0);
@@ -486,34 +733,34 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _
                                 ("Enter the frequency of the local oscillator "
                                  "of the upconverter, if any."));
-    gtk_grid_attach(GTK_GRID(table), loup, 1, 8, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), loup, 1, 9, 2, 1);
 
     label = gtk_label_new(_("MHz"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 3, 8, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 3, 9, 1, 1);
 
     /* AOS / LOS signalling */
     label = gtk_label_new(_("Signalling"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 9, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 10, 1, 1);
 
     sigaos = gtk_check_button_new_with_label(_("AOS"));
-    gtk_grid_attach(GTK_GRID(table), sigaos, 1, 9, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), sigaos, 1, 10, 1, 1);
     gtk_widget_set_tooltip_text(sigaos,
                                 _("Enable AOS signalling for this radio."));
 
     siglos = gtk_check_button_new_with_label(_("LOS"));
-    gtk_grid_attach(GTK_GRID(table), siglos, 2, 9, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), siglos, 2, 10, 1, 1);
     gtk_widget_set_tooltip_text(siglos,
                                 _("Enable LOS signalling for this radio."));
 
     /* Auto-start rigctld */
     label = gtk_label_new(_("Auto-start rigctld"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 10, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
 
     autostart = gtk_check_button_new_with_label(_("Enable"));
-    gtk_grid_attach(GTK_GRID(table), autostart, 1, 10, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), autostart, 1, 11, 1, 1);
     gtk_widget_set_tooltip_text(autostart,
                                 _("Start rigctld automatically when engaging "
                                   "if it is not already running."));
@@ -522,28 +769,28 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     /* rigctld auto power-on */
     label = gtk_label_new(_("Auto power-on"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
 
     rigctld_auto_power_on = gtk_check_button_new_with_label(_("Enable"));
-    gtk_grid_attach(GTK_GRID(table), rigctld_auto_power_on, 1, 11, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_auto_power_on, 1, 12, 1, 1);
     gtk_widget_set_tooltip_text(rigctld_auto_power_on,
                                 _("Enable rigctld auto power-on if supported."));
 
     /* rigctld path */
     label = gtk_label_new(_("rigctld path"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
 
     rigctld_path = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_path), 200);
     gtk_widget_set_tooltip_text(rigctld_path,
                                 _("Path to rigctld binary (leave empty to use PATH)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_path, 1, 12, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_path, 1, 13, 3, 1);
 
     /* rigctld model */
     label = gtk_label_new(_("Rig model"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
 
     rigctld_model = gtk_spin_button_new_with_range(0, 99999, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_model), 0);
@@ -551,51 +798,51 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Hamlib rig model number (e.g. 3081).\n"
                                   "Find your model id with: rigctl -l | "
                                   "grep -i 'IC-705'."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 14, 1, 1);
 
     /* rigctld device */
     label = gtk_label_new(_("Serial device"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
 
     rigctld_device = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
     gtk_widget_set_tooltip_text(rigctld_device,
                                 _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 14, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 15, 3, 1);
 
     /* rigctld baud */
     label = gtk_label_new(_("Baud"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 16, 1, 1);
 
     rigctld_baud = gtk_spin_button_new_with_range(0, 1000000, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_baud), 0);
     gtk_widget_set_tooltip_text(rigctld_baud,
                                 _("Serial baud rate for rigctld (e.g. 19200)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_baud, 1, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_baud, 1, 16, 1, 1);
 
     /* rigctld CI-V address */
     label = gtk_label_new(_("CI-V addr"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 16, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
 
     rigctld_civaddr = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_civaddr), 16);
     gtk_widget_set_tooltip_text(rigctld_civaddr,
                                 _("Optional CI-V address (e.g. 0xA2)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_civaddr, 1, 16, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_civaddr, 1, 17, 2, 1);
 
     /* rigctld extra args */
     label = gtk_label_new(_("Extra args"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 18, 1, 1);
 
     rigctld_extra_args = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_extra_args), 200);
     gtk_widget_set_tooltip_text(rigctld_extra_args,
                                 _("Extra rigctld arguments (optional)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_extra_args, 1, 17, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_extra_args, 1, 18, 3, 1);
 
     if (conf->name != NULL)
         update_widgets(conf);
@@ -610,6 +857,34 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
 /* Apply changes. Returns TRUE if things are ok, FALSE otherwise */
 static gboolean apply_changes(radio_conf_t * conf)
 {
+    radio_model_t selected_model;
+    radio_mode_t selected_mode;
+    gchar *allowed = NULL;
+    gchar *detail = NULL;
+
+    selected_model = gtk_combo_box_get_active(GTK_COMBO_BOX(radio_model));
+    selected_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(radio_mode));
+
+    if (!radio_mode_allowed_for_model(selected_model, selected_mode))
+    {
+        allowed = radio_mode_allowed_string(selected_model);
+        detail = g_strdup_printf("Model: %s\nMode: %s\nAllowed: %s",
+                                 radio_model_to_string(selected_model),
+                                 radio_mode_to_string(selected_mode),
+                                 allowed ? allowed : "none");
+        rig_pref_show_dialog(GTK_MESSAGE_ERROR,
+                             _("Unsupported radio mode"),
+                             detail);
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "invalid radio mode model=%s mode=%s allowed=%s",
+                    radio_model_to_string(selected_model),
+                    radio_mode_to_string(selected_mode),
+                    allowed ? allowed : "none");
+        g_free(detail);
+        g_free(allowed);
+        return FALSE;
+    }
+
     /* name */
     if (conf->name)
         g_free(conf->name);
@@ -634,47 +909,53 @@ static gboolean apply_changes(radio_conf_t * conf)
     /* rig type */
     conf->type = gtk_combo_box_get_active(GTK_COMBO_BOX(type));
 
+    /* radio model */
+    conf->radio_model = selected_model;
+
+    /* radio mode */
+    conf->radio_mode = selected_mode;
+
     /* ptt */
     conf->ptt = gtk_combo_box_get_active(GTK_COMBO_BOX(ptt));
 
     /* vfo up/down */
-    if (conf->type == RIG_TYPE_DUPLEX)
+    switch (gtk_combo_box_get_active(GTK_COMBO_BOX(vfo)))
     {
-        switch (gtk_combo_box_get_active(GTK_COMBO_BOX(vfo)))
+    case 1:
+        conf->uplink_vfo = VFO_MAIN;
+        conf->downlink_vfo = VFO_SUB;
+        break;
+    case 2:
+        conf->uplink_vfo = VFO_SUB;
+        conf->downlink_vfo = VFO_MAIN;
+        break;
+    case 3:
+        conf->uplink_vfo = VFO_A;
+        conf->downlink_vfo = VFO_B;
+        break;
+    case 4:
+        conf->uplink_vfo = VFO_B;
+        conf->downlink_vfo = VFO_A;
+        break;
+    default:
+        if (conf->radio_mode == RADIO_MODE_SIMPLEX)
         {
-
-        case 1:
-            conf->vfoUp = VFO_MAIN;
-            conf->vfoDown = VFO_SUB;
-            break;
-
-        case 2:
-            conf->vfoUp = VFO_SUB;
-            conf->vfoDown = VFO_MAIN;
-            break;
-
-        case 3:
-            conf->vfoUp = VFO_A;
-            conf->vfoDown = VFO_B;
-            break;
-
-        case 4:
-            conf->vfoUp = VFO_B;
-            conf->vfoDown = VFO_A;
-            break;
-
-        default:
-            conf->vfoUp = VFO_MAIN;
-            conf->vfoDown = VFO_SUB;
-            break;
+            conf->uplink_vfo = VFO_SUB;
+            conf->downlink_vfo = VFO_MAIN;
         }
+        else
+        {
+            conf->uplink_vfo = VFO_MAIN;
+            conf->downlink_vfo = VFO_SUB;
+        }
+        break;
     }
 
     /* AOS / LOS signalling */
     conf->signal_aos = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sigaos));
     conf->signal_los = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(siglos));
     conf->supports_dual_vfo_sat =
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ic9700_satmode));
+        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
 
     /* rigctld auto-start */
     conf->rigctld_autostart =

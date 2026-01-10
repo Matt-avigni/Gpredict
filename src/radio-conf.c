@@ -40,9 +40,13 @@
 #define KEY_LO          "LO"
 #define KEY_LOUP        "LO_UP"
 #define KEY_TYPE        "Type"
+#define KEY_RADIO_MODEL "RADIO_MODEL"
+#define KEY_RADIO_MODE  "RADIO_MODE"
 #define KEY_PTT         "PTT"
 #define KEY_VFO_DOWN    "VFO_DOWN"
 #define KEY_VFO_UP      "VFO_UP"
+#define KEY_DOWNLINK_VFO "DOWNLINK_VFO"
+#define KEY_UPLINK_VFO  "UPLINK_VFO"
 #define KEY_SIG_AOS     "SIGNAL_AOS"
 #define KEY_SIG_LOS     "SIGNAL_LOS"
 #define KEY_RIGCTLD_AUTOSTART   "RIGCTLD_AUTOSTART"
@@ -57,36 +61,115 @@
 
 #define DEFAULT_CYCLE_MS    1000
 
-static gboolean radio_name_matches_ic9700(const gchar *name)
+static gboolean radio_model_valid(gint model)
 {
-    gboolean        match = FALSE;
-    gchar          *lower;
+    return model >= RADIO_MODEL_OTHER && model <= RADIO_MODEL_IC905;
+}
 
-    if (name == NULL)
+static gboolean radio_mode_valid(gint mode)
+{
+    return mode >= RADIO_MODE_SIMPLEX && mode <= RADIO_MODE_FULL_DUPLEX_MAIN_SUB;
+}
+
+static gboolean radio_vfo_valid(gint vfo)
+{
+    return vfo == VFO_NONE || vfo == VFO_A || vfo == VFO_B ||
+        vfo == VFO_MAIN || vfo == VFO_SUB;
+}
+
+typedef struct {
+    radio_model_t model;
+    guint allowed_modes;
+} radio_mode_profile_t;
+
+#define RADIO_MODE_MASK_SIMPLEX (1u << RADIO_MODE_SIMPLEX)
+#define RADIO_MODE_MASK_SPLIT (1u << RADIO_MODE_SPLIT)
+#define RADIO_MODE_MASK_FULL_DUPLEX_MAIN_SUB (1u << RADIO_MODE_FULL_DUPLEX_MAIN_SUB)
+#define RADIO_MODE_MASK_ALL (RADIO_MODE_MASK_SIMPLEX | RADIO_MODE_MASK_SPLIT | \
+                             RADIO_MODE_MASK_FULL_DUPLEX_MAIN_SUB)
+
+static const radio_mode_profile_t radio_mode_profiles[] = {
+    { RADIO_MODEL_OTHER, RADIO_MODE_MASK_ALL },
+    { RADIO_MODEL_IC9700, RADIO_MODE_MASK_ALL },
+    { RADIO_MODEL_IC705, RADIO_MODE_MASK_SIMPLEX | RADIO_MODE_MASK_SPLIT },
+    /* IC-905 full-duplex MAIN/SUB is not validated by current hamlib usage. */
+    { RADIO_MODEL_IC905, RADIO_MODE_MASK_SIMPLEX | RADIO_MODE_MASK_SPLIT }
+};
+
+static guint radio_mode_mask_for_model(radio_model_t model)
+{
+    for (gsize i = 0; i < G_N_ELEMENTS(radio_mode_profiles); i++)
+    {
+        if (radio_mode_profiles[i].model == model)
+            return radio_mode_profiles[i].allowed_modes;
+    }
+
+    return RADIO_MODE_MASK_ALL;
+}
+
+gboolean radio_mode_allowed_for_model(radio_model_t model, radio_mode_t mode)
+{
+    if (!radio_mode_valid(mode))
         return FALSE;
 
-    /* Simple name match is sufficient for now; extend as new rigs are added */
-    lower = g_ascii_strdown(name, -1);
-    match = (g_strrstr(lower, "ic-9700") != NULL) ||
-        (g_strrstr(lower, "ic9700") != NULL);
-    g_free(lower);
-
-    return match;
+    return (radio_mode_mask_for_model(model) & (1u << mode)) != 0;
 }
 
-static gboolean radio_supports_rit_xit(const gchar *name)
+gchar *radio_mode_allowed_string(radio_model_t model)
 {
-    return radio_name_matches_ic9700(name);
+    guint mask = radio_mode_mask_for_model(model);
+    GString *out = g_string_new(NULL);
+    radio_mode_t modes[] = {
+        RADIO_MODE_SIMPLEX,
+        RADIO_MODE_SPLIT,
+        RADIO_MODE_FULL_DUPLEX_MAIN_SUB
+    };
+
+    for (gsize i = 0; i < G_N_ELEMENTS(modes); i++)
+    {
+        if ((mask & (1u << modes[i])) == 0)
+            continue;
+
+        if (out->len > 0)
+            g_string_append(out, ", ");
+        g_string_append(out, radio_mode_to_string(modes[i]));
+    }
+
+    if (out->len == 0)
+        g_string_assign(out, "none");
+
+    return g_string_free(out, FALSE);
 }
 
-static gboolean radio_supports_full_duplex(const gchar *name)
+const gchar *radio_model_to_string(radio_model_t model)
 {
-    return radio_name_matches_ic9700(name);
+    switch (model)
+    {
+    case RADIO_MODEL_IC9700:
+        return "IC-9700";
+    case RADIO_MODEL_IC705:
+        return "IC-705";
+    case RADIO_MODEL_IC905:
+        return "IC-905";
+    case RADIO_MODEL_OTHER:
+    default:
+        return "OTHER";
+    }
 }
 
-static gboolean radio_supports_dual_vfo_sat(const gchar *name)
+const gchar *radio_mode_to_string(radio_mode_t mode)
 {
-    return radio_name_matches_ic9700(name);
+    switch (mode)
+    {
+    case RADIO_MODE_SIMPLEX:
+        return "SIMPLEX";
+    case RADIO_MODE_SPLIT:
+        return "SPLIT";
+    case RADIO_MODE_FULL_DUPLEX_MAIN_SUB:
+        return "FULL_DUPLEX_MAIN_SUB";
+    default:
+        return "UNKNOWN";
+    }
 }
 
 /**
@@ -119,9 +202,13 @@ gboolean radio_conf_read(radio_conf_t * conf)
     fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rig", NULL);
     g_free(confdir);
 
-    conf->supports_rit_xit = radio_supports_rit_xit(conf->name);
-    conf->supports_full_duplex = radio_supports_full_duplex(conf->name);
-    conf->supports_dual_vfo_sat = radio_supports_dual_vfo_sat(conf->name);
+    conf->radio_model = RADIO_MODEL_OTHER;
+    conf->radio_mode = RADIO_MODE_SIMPLEX;
+    conf->downlink_vfo = VFO_MAIN;
+    conf->uplink_vfo = VFO_SUB;
+    conf->supports_rit_xit = FALSE;
+    conf->supports_full_duplex = FALSE;
+    conf->supports_dual_vfo_sat = FALSE;
     conf->rigctld_autostart = TRUE;
     conf->rigctld_auto_power_on = FALSE;
     conf->rigctld_path = NULL;
@@ -252,37 +339,117 @@ gboolean radio_conf_read(radio_conf_t * conf)
         return FALSE;
     }
 
-    /* VFO up and down, only if radio is full-duplex */
-    if (conf->type == RIG_TYPE_DUPLEX)
+    if (g_key_file_has_key(cfg, GROUP, KEY_RADIO_MODEL, NULL))
     {
-        /* downlink */
-        if (g_key_file_has_key(cfg, GROUP, KEY_VFO_DOWN, NULL))
+        gint model = g_key_file_get_integer(cfg, GROUP, KEY_RADIO_MODEL, &error);
+        if (error != NULL)
         {
-            conf->vfoDown =
-                g_key_file_get_integer(cfg, GROUP, KEY_VFO_DOWN, &error);
-            if (error != NULL)
-            {
-                sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _("%s: Error reading radio conf from %s (%s)."),
-                            __func__, conf->name, error->message);
-                g_clear_error(&error);
-                conf->vfoDown = VFO_SUB;
-            }
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Error reading radio conf from %s (%s)."),
+                        __func__, conf->name, error->message);
+            g_clear_error(&error);
         }
-
-        /* uplink */
-        if (g_key_file_has_key(cfg, GROUP, KEY_VFO_UP, NULL))
+        else if (radio_model_valid(model))
         {
-            conf->vfoUp =
-                g_key_file_get_integer(cfg, GROUP, KEY_VFO_UP, &error);
-            if (error != NULL)
-            {
-                sat_log_log(SAT_LOG_LEVEL_ERROR,
-                            _("%s: Error reading radio conf from %s (%s)."),
-                            __func__, conf->name, error->message);
-                g_clear_error(&error);
-                conf->vfoUp = VFO_MAIN;
-            }
+            conf->radio_model = (radio_model_t) model;
+        }
+    }
+
+    if (g_key_file_has_key(cfg, GROUP, KEY_RADIO_MODE, NULL))
+    {
+        gint mode = g_key_file_get_integer(cfg, GROUP, KEY_RADIO_MODE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Error reading radio conf from %s (%s)."),
+                        __func__, conf->name, error->message);
+            g_clear_error(&error);
+        }
+        else if (radio_mode_valid(mode))
+        {
+            conf->radio_mode = (radio_mode_t) mode;
+        }
+    }
+
+    if (g_key_file_has_key(cfg, GROUP, KEY_IC9700_SATMODE, NULL))
+    {
+        gboolean ic9700_satmode =
+            g_key_file_get_boolean(cfg, GROUP, KEY_IC9700_SATMODE, NULL);
+        if (ic9700_satmode)
+        {
+            if (!g_key_file_has_key(cfg, GROUP, KEY_RADIO_MODE, NULL))
+                conf->radio_mode = RADIO_MODE_FULL_DUPLEX_MAIN_SUB;
+            if (!g_key_file_has_key(cfg, GROUP, KEY_RADIO_MODEL, NULL))
+                conf->radio_model = RADIO_MODEL_IC9700;
+        }
+    }
+
+    if (!g_key_file_has_key(cfg, GROUP, KEY_RADIO_MODE, NULL) &&
+        conf->radio_mode == RADIO_MODE_SIMPLEX)
+    {
+        if (conf->type == RIG_TYPE_DUPLEX)
+            conf->radio_mode = RADIO_MODE_SPLIT;
+    }
+
+    if (g_key_file_has_key(cfg, GROUP, KEY_DOWNLINK_VFO, NULL))
+    {
+        gint vfo = g_key_file_get_integer(cfg, GROUP, KEY_DOWNLINK_VFO, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Error reading radio conf from %s (%s)."),
+                        __func__, conf->name, error->message);
+            g_clear_error(&error);
+        }
+        else if (radio_vfo_valid(vfo))
+        {
+            conf->downlink_vfo = (vfo_t) vfo;
+        }
+    }
+    else if (g_key_file_has_key(cfg, GROUP, KEY_VFO_DOWN, NULL))
+    {
+        gint vfo = g_key_file_get_integer(cfg, GROUP, KEY_VFO_DOWN, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Error reading radio conf from %s (%s)."),
+                        __func__, conf->name, error->message);
+            g_clear_error(&error);
+        }
+        else if (radio_vfo_valid(vfo))
+        {
+            conf->downlink_vfo = (vfo_t) vfo;
+        }
+    }
+
+    if (g_key_file_has_key(cfg, GROUP, KEY_UPLINK_VFO, NULL))
+    {
+        gint vfo = g_key_file_get_integer(cfg, GROUP, KEY_UPLINK_VFO, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Error reading radio conf from %s (%s)."),
+                        __func__, conf->name, error->message);
+            g_clear_error(&error);
+        }
+        else if (radio_vfo_valid(vfo))
+        {
+            conf->uplink_vfo = (vfo_t) vfo;
+        }
+    }
+    else if (g_key_file_has_key(cfg, GROUP, KEY_VFO_UP, NULL))
+    {
+        gint vfo = g_key_file_get_integer(cfg, GROUP, KEY_VFO_UP, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Error reading radio conf from %s (%s)."),
+                        __func__, conf->name, error->message);
+            g_clear_error(&error);
+        }
+        else if (radio_vfo_valid(vfo))
+        {
+            conf->uplink_vfo = (vfo_t) vfo;
         }
     }
 
@@ -315,9 +482,13 @@ gboolean radio_conf_read(radio_conf_t * conf)
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL))
         conf->rigctld_extra_args =
             g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL);
-    if (g_key_file_has_key(cfg, GROUP, KEY_IC9700_SATMODE, NULL))
-        conf->supports_dual_vfo_sat =
-            g_key_file_get_boolean(cfg, GROUP, KEY_IC9700_SATMODE, NULL);
+
+    conf->supports_dual_vfo_sat =
+        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
+    conf->supports_full_duplex =
+        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB) ||
+        (conf->radio_mode == RADIO_MODE_SPLIT);
+    conf->supports_rit_xit = (conf->radio_model == RADIO_MODEL_IC9700);
 
     g_key_file_free(cfg);
     sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -355,6 +526,8 @@ void radio_conf_save(radio_conf_t * conf)
     g_key_file_set_double(cfg, GROUP, KEY_LO, conf->lo);
     g_key_file_set_double(cfg, GROUP, KEY_LOUP, conf->loup);
     g_key_file_set_integer(cfg, GROUP, KEY_TYPE, conf->type);
+    g_key_file_set_integer(cfg, GROUP, KEY_RADIO_MODEL, conf->radio_model);
+    g_key_file_set_integer(cfg, GROUP, KEY_RADIO_MODE, conf->radio_mode);
     g_key_file_set_integer(cfg, GROUP, KEY_PTT, conf->ptt);
 
     if (conf->cycle == DEFAULT_CYCLE_MS)
@@ -362,16 +535,18 @@ void radio_conf_save(radio_conf_t * conf)
     else
         g_key_file_set_integer(cfg, GROUP, KEY_CYCLE, conf->cycle);
 
+    g_key_file_set_integer(cfg, GROUP, KEY_UPLINK_VFO, conf->uplink_vfo);
+    g_key_file_set_integer(cfg, GROUP, KEY_DOWNLINK_VFO, conf->downlink_vfo);
     if (conf->type == RIG_TYPE_DUPLEX)
     {
-        g_key_file_set_integer(cfg, GROUP, KEY_VFO_UP, conf->vfoUp);
-        g_key_file_set_integer(cfg, GROUP, KEY_VFO_DOWN, conf->vfoDown);
+        g_key_file_set_integer(cfg, GROUP, KEY_VFO_UP, conf->uplink_vfo);
+        g_key_file_set_integer(cfg, GROUP, KEY_VFO_DOWN, conf->downlink_vfo);
     }
 
     g_key_file_set_boolean(cfg, GROUP, KEY_SIG_AOS, conf->signal_aos);
     g_key_file_set_boolean(cfg, GROUP, KEY_SIG_LOS, conf->signal_los);
     g_key_file_set_boolean(cfg, GROUP, KEY_IC9700_SATMODE,
-                           conf->supports_dual_vfo_sat);
+                           conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
     g_key_file_set_boolean(cfg, GROUP, KEY_RIGCTLD_AUTOSTART,
                            conf->rigctld_autostart);
     g_key_file_set_boolean(cfg, GROUP, KEY_RIGCTLD_AUTO_POWER_ON,

@@ -111,6 +111,8 @@ struct _gtk_rig_ctrl {
 
     GpTermView     *term_view;          /*!< Embedded radio debug terminal */
     GtkWidget      *log_toggle;         /*!< Logs toggle button */
+    GtkWidget      *status_label;       /*!< Command/status indicator */
+    gboolean        cmd_error;          /*!< Last command status */
 };
 
 struct _GtkRigCtrlClass {

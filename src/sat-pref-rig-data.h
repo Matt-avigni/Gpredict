@@ -33,9 +33,11 @@ typedef enum {
     RIG_LIST_COL_HOST,          /*!< Hostname, e.g. 127.0.0.1 */
     RIG_LIST_COL_PORT,          /*!< Port number */
     RIG_LIST_COL_TYPE,          /*!< Radio type */
+    RIG_LIST_COL_RADIO_MODEL,   /*!< Radio model */
+    RIG_LIST_COL_RADIO_MODE,    /*!< Radio mode */
     RIG_LIST_COL_PTT,           /*!< PTT */
-    RIG_LIST_COL_VFOUP,         /*!< VFO Up */
-    RIG_LIST_COL_VFODOWN,       /*!< VFO down */
+    RIG_LIST_COL_UPLINK_VFO,    /*!< Uplink VFO */
+    RIG_LIST_COL_DOWNLINK_VFO,  /*!< Downlink VFO */
     RIG_LIST_COL_LO,            /*!< Local oscillator freq (downlink) */
     RIG_LIST_COL_LOUP,          /*!< Local oscillato freq (uplink) */
     RIG_LIST_COL_SIGAOS,        /*!< Signal AOS */
@@ -48,7 +50,6 @@ typedef enum {
     RIG_LIST_COL_RIGCTLD_BAUD,  /*!< rigctld baud */
     RIG_LIST_COL_RIGCTLD_CIVADDR, /*!< rigctld CI-V address */
     RIG_LIST_COL_RIGCTLD_EXTRA_ARGS, /*!< rigctld extra args */
-    RIG_LIST_COL_IC9700_SATMODE, /*!< IC-9700 SAT mode */
     RIG_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rig_list_col_t;
 

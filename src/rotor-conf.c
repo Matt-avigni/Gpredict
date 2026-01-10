@@ -45,6 +45,12 @@
 #define KEY_MAXEL       "MaxEl"
 #define KEY_AZSTOPPOS   "AzStopPos"
 #define KEY_THLD        "Threshold"
+#define KEY_AXIS_MODE   "AxisMode"
+#define KEY_USE_OFFSET  "UseOffset"
+#define KEY_AZ_OFFSET   "AzOffset"
+#define KEY_EL_OFFSET   "ElOffset"
+#define KEY_AZ_INVERT   "AzInvert"
+#define KEY_EL_INVERT   "ElInvert"
 
 #define DEFAULT_CYCLE_MS    1000
 #define DEFAULT_THLD_DEG    5.0
@@ -216,6 +222,99 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
         conf->azstoppos = conf->minaz;
     }
 
+    conf->axis_mode = ROT_AXIS_MODE_AZ_EL;
+    if (g_key_file_has_key(cfg, GROUP, KEY_AXIS_MODE, NULL))
+    {
+        conf->axis_mode = g_key_file_get_integer(cfg, GROUP, KEY_AXIS_MODE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: AxisMode not defined for %s. Assuming AZ/EL."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->axis_mode = ROT_AXIS_MODE_AZ_EL;
+        }
+    }
+
+    if (conf->axis_mode != ROT_AXIS_MODE_AZ_EL &&
+        conf->axis_mode != ROT_AXIS_MODE_AZ_ONLY)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: Invalid AxisMode for %s. Assuming AZ/EL."),
+                    __func__, conf->name);
+        conf->axis_mode = ROT_AXIS_MODE_AZ_EL;
+    }
+
+    conf->use_offset = FALSE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_USE_OFFSET, NULL))
+    {
+        conf->use_offset = g_key_file_get_boolean(cfg, GROUP, KEY_USE_OFFSET, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: UseOffset not defined for %s. Assuming disabled."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->use_offset = FALSE;
+        }
+    }
+
+    conf->az_offset = 0.0;
+    if (g_key_file_has_key(cfg, GROUP, KEY_AZ_OFFSET, NULL))
+    {
+        conf->az_offset = g_key_file_get_double(cfg, GROUP, KEY_AZ_OFFSET, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: AzOffset not defined for %s. Assuming 0."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->az_offset = 0.0;
+        }
+    }
+
+    conf->el_offset = 0.0;
+    if (g_key_file_has_key(cfg, GROUP, KEY_EL_OFFSET, NULL))
+    {
+        conf->el_offset = g_key_file_get_double(cfg, GROUP, KEY_EL_OFFSET, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: ElOffset not defined for %s. Assuming 0."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->el_offset = 0.0;
+        }
+    }
+
+    conf->invert_az = FALSE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_AZ_INVERT, NULL))
+    {
+        conf->invert_az = g_key_file_get_boolean(cfg, GROUP, KEY_AZ_INVERT, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: AzInvert not defined for %s. Assuming false."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->invert_az = FALSE;
+        }
+    }
+
+    conf->invert_el = FALSE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_EL_INVERT, NULL))
+    {
+        conf->invert_el = g_key_file_get_boolean(cfg, GROUP, KEY_EL_INVERT, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: ElInvert not defined for %s. Assuming false."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->invert_el = FALSE;
+        }
+    }
+
     g_key_file_free(cfg);
 
     return TRUE;
@@ -249,6 +348,12 @@ void rotor_conf_save(rotor_conf_t * conf)
     g_key_file_set_double(cfg, GROUP, KEY_MINEL, conf->minel);
     g_key_file_set_double(cfg, GROUP, KEY_MAXEL, conf->maxel);
     g_key_file_set_double(cfg, GROUP, KEY_AZSTOPPOS, conf->azstoppos);
+    g_key_file_set_integer(cfg, GROUP, KEY_AXIS_MODE, conf->axis_mode);
+    g_key_file_set_boolean(cfg, GROUP, KEY_USE_OFFSET, conf->use_offset);
+    g_key_file_set_double(cfg, GROUP, KEY_AZ_OFFSET, conf->az_offset);
+    g_key_file_set_double(cfg, GROUP, KEY_EL_OFFSET, conf->el_offset);
+    g_key_file_set_boolean(cfg, GROUP, KEY_AZ_INVERT, conf->invert_az);
+    g_key_file_set_boolean(cfg, GROUP, KEY_EL_INVERT, conf->invert_el);
 
     if (conf->cycle == DEFAULT_CYCLE_MS)
         g_key_file_remove_key(cfg, GROUP, KEY_CYCLE, NULL);

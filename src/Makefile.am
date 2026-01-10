@@ -47,6 +47,7 @@ gpredict_SOURCES = \
     gtk-polar-view.c gtk-polar-view.h \
     gtk-polar-view-popup.c gtk-polar-view-popup.h \
     gtk-rig-ctrl.c gtk-rig-ctrl.h \
+    rig-mode-dispatch.c rig-mode-dispatch.h \
     rigctld_mgr.c rigctld_mgr.h \
     gtk-rot-ctrl.c gtk-rot-ctrl.h \
     gtk-rot-knob.c gtk-rot-knob.h \
@@ -82,6 +83,7 @@ gpredict_SOURCES = \
     qth-editor.c qth-editor.h \
     radio-conf.c radio-conf.h \
     rotor-conf.c rotor-conf.h \
+    rotor-cmd-map.c rotor-cmd-map.h \
     rotor-trajectory-planner.c rotor-trajectory-planner.h \
     trsp-conf.c trsp-conf.h \
     trsp-update.c trsp-update.h \
@@ -127,3 +129,18 @@ gpredict_SOURCES = \
 gpredict_LDADD = @PACKAGE_LIBS@
 
 ## $(INTLLIBS)
+
+check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test
+TESTS = rotor-cmd-map-test rig-mode-dispatch-test
+
+rotor_cmd_map_test_SOURCES = \
+    rotor-cmd-map-test.c \
+    rotor-cmd-map.c \
+    rotor-trajectory-planner.c
+rotor_cmd_map_test_LDADD = @PACKAGE_LIBS@
+
+rig_mode_dispatch_test_SOURCES = \
+    rig-mode-dispatch-test.c \
+    rig-mode-dispatch.c \
+    rig-mode-dispatch.h
+rig_mode_dispatch_test_LDADD = @PACKAGE_LIBS@

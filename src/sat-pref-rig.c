@@ -53,13 +53,15 @@ static GtkTreeModel *create_and_fill_model()
     /* create a new list store */
     liststore = gtk_list_store_new(RIG_LIST_COL_NUM, G_TYPE_STRING,     // name
                                    G_TYPE_STRING,       // host
-                                   G_TYPE_INT,  // port
-                                   G_TYPE_INT,  // type
-                                   G_TYPE_INT,  // PTT
-                                   G_TYPE_INT,  // VFO Up
-                                   G_TYPE_INT,  // VFO Down
+                                   G_TYPE_INT,          // port
+                                   G_TYPE_INT,          // type
+                                   G_TYPE_INT,          // radio model
+                                   G_TYPE_INT,          // radio mode
+                                   G_TYPE_INT,          // PTT
+                                   G_TYPE_INT,          // uplink VFO
+                                   G_TYPE_INT,          // downlink VFO
                                    G_TYPE_DOUBLE,       // LO DOWN
-                                   G_TYPE_DOUBLE,       // LO UO
+                                   G_TYPE_DOUBLE,       // LO UP
                                    G_TYPE_BOOLEAN,      // AOS signalling
                                    G_TYPE_BOOLEAN,      // LOS signalling
                                    G_TYPE_BOOLEAN,      // rigctld autostart
@@ -70,7 +72,6 @@ static GtkTreeModel *create_and_fill_model()
                                    G_TYPE_INT,          // rigctld baud
                                    G_TYPE_STRING,       // rigctld CI-V addr
                                    G_TYPE_STRING,       // rigctld extra args
-                                   G_TYPE_BOOLEAN       // IC-9700 SAT mode
         );
 
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
@@ -100,9 +101,15 @@ static GtkTreeModel *create_and_fill_model()
                                        RIG_LIST_COL_HOST, conf.host,
                                        RIG_LIST_COL_PORT, conf.port,
                                        RIG_LIST_COL_TYPE, conf.type,
+                                       RIG_LIST_COL_RADIO_MODEL,
+                                       conf.radio_model,
+                                       RIG_LIST_COL_RADIO_MODE,
+                                       conf.radio_mode,
                                        RIG_LIST_COL_PTT, conf.ptt,
-                                       RIG_LIST_COL_VFOUP, conf.vfoUp,
-                                       RIG_LIST_COL_VFODOWN, conf.vfoDown,
+                                       RIG_LIST_COL_UPLINK_VFO,
+                                       conf.uplink_vfo,
+                                       RIG_LIST_COL_DOWNLINK_VFO,
+                                       conf.downlink_vfo,
                                        RIG_LIST_COL_LO, conf.lo,
                                        RIG_LIST_COL_LOUP, conf.loup,
                                        RIG_LIST_COL_SIGAOS, conf.signal_aos,
@@ -123,8 +130,6 @@ static GtkTreeModel *create_and_fill_model()
                                        conf.rigctld_civaddr,
                                        RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                                        conf.rigctld_extra_args,
-                                       RIG_LIST_COL_IC9700_SATMODE,
-                                       conf.supports_dual_vfo_sat,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -427,9 +432,11 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .host = NULL,
         .port = 4532,
         .type = RIG_TYPE_RX,
+        .radio_model = RADIO_MODEL_OTHER,
+        .radio_mode = RADIO_MODE_SIMPLEX,
         .ptt = 0,
-        .vfoUp = 0,
-        .vfoDown = 0,
+        .uplink_vfo = VFO_SUB,
+        .downlink_vfo = VFO_MAIN,
         .lo = 0.0,
         .loup = 0.0,
         .signal_aos = FALSE,
@@ -470,9 +477,11 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_HOST, &conf.host,
                            RIG_LIST_COL_PORT, &conf.port,
                            RIG_LIST_COL_TYPE, &conf.type,
+                           RIG_LIST_COL_RADIO_MODEL, &conf.radio_model,
+                           RIG_LIST_COL_RADIO_MODE, &conf.radio_mode,
                            RIG_LIST_COL_PTT, &conf.ptt,
-                           RIG_LIST_COL_VFOUP, &conf.vfoUp,
-                           RIG_LIST_COL_VFODOWN, &conf.vfoDown,
+                           RIG_LIST_COL_UPLINK_VFO, &conf.uplink_vfo,
+                           RIG_LIST_COL_DOWNLINK_VFO, &conf.downlink_vfo,
                            RIG_LIST_COL_LO, &conf.lo,
                            RIG_LIST_COL_LOUP, &conf.loup,
                            RIG_LIST_COL_SIGAOS, &conf.signal_aos,
@@ -493,8 +502,6 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            &conf.rigctld_civaddr,
                            RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                            &conf.rigctld_extra_args,
-                           RIG_LIST_COL_IC9700_SATMODE,
-                           &conf.supports_dual_vfo_sat,
                            -1);
     }
     else
@@ -525,9 +532,11 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_HOST, conf.host,
                            RIG_LIST_COL_PORT, conf.port,
                            RIG_LIST_COL_TYPE, conf.type,
+                           RIG_LIST_COL_RADIO_MODEL, conf.radio_model,
+                           RIG_LIST_COL_RADIO_MODE, conf.radio_mode,
                            RIG_LIST_COL_PTT, conf.ptt,
-                           RIG_LIST_COL_VFOUP, conf.vfoUp,
-                           RIG_LIST_COL_VFODOWN, conf.vfoDown,
+                           RIG_LIST_COL_UPLINK_VFO, conf.uplink_vfo,
+                           RIG_LIST_COL_DOWNLINK_VFO, conf.downlink_vfo,
                            RIG_LIST_COL_LO, conf.lo,
                            RIG_LIST_COL_LOUP, conf.loup,
                            RIG_LIST_COL_SIGAOS, conf.signal_aos,
@@ -543,8 +552,6 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
                            RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                            conf.rigctld_extra_args,
-                           RIG_LIST_COL_IC9700_SATMODE,
-                           conf.supports_dual_vfo_sat,
                            -1);
     }
 
@@ -643,22 +650,22 @@ static void create_rig_list()
     renderer = gtk_cell_renderer_text_new();
     column = gtk_tree_view_column_new_with_attributes(_("VFO Up"), renderer,
                                                       "text",
-                                                      RIG_LIST_COL_VFOUP,
+                                                      RIG_LIST_COL_UPLINK_VFO,
                                                       NULL);
     gtk_tree_view_column_set_cell_data_func(column, renderer, render_vfo,
                                             GUINT_TO_POINTER
-                                            (RIG_LIST_COL_VFOUP), NULL);
+                                            (RIG_LIST_COL_UPLINK_VFO), NULL);
     gtk_tree_view_insert_column(GTK_TREE_VIEW(riglist), column, -1);
 
     /* VFO Down */
     renderer = gtk_cell_renderer_text_new();
     column = gtk_tree_view_column_new_with_attributes(_("VFO Down"), renderer,
                                                       "text",
-                                                      RIG_LIST_COL_VFODOWN,
+                                                      RIG_LIST_COL_DOWNLINK_VFO,
                                                       NULL);
     gtk_tree_view_column_set_cell_data_func(column, renderer, render_vfo,
                                             GUINT_TO_POINTER
-                                            (RIG_LIST_COL_VFODOWN), NULL);
+                                            (RIG_LIST_COL_DOWNLINK_VFO), NULL);
     gtk_tree_view_insert_column(GTK_TREE_VIEW(riglist), column, -1);
 
     /* transverter down */
@@ -778,9 +785,11 @@ static void add_cb(GtkWidget * button, gpointer data)
         .host = NULL,
         .port = 4532,
         .type = RIG_TYPE_RX,
+        .radio_model = RADIO_MODEL_OTHER,
+        .radio_mode = RADIO_MODE_SIMPLEX,
         .ptt = 0,
-        .vfoUp = 0,
-        .vfoDown = 0,
+        .uplink_vfo = VFO_SUB,
+        .downlink_vfo = VFO_MAIN,
         .lo = 0.0,
         .loup = 0.0,
         .signal_aos = FALSE,
@@ -812,9 +821,11 @@ static void add_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_HOST, conf.host,
                            RIG_LIST_COL_PORT, conf.port,
                            RIG_LIST_COL_TYPE, conf.type,
+                           RIG_LIST_COL_RADIO_MODEL, conf.radio_model,
+                           RIG_LIST_COL_RADIO_MODE, conf.radio_mode,
                            RIG_LIST_COL_PTT, conf.ptt,
-                           RIG_LIST_COL_VFOUP, conf.vfoUp,
-                           RIG_LIST_COL_VFODOWN, conf.vfoDown,
+                           RIG_LIST_COL_UPLINK_VFO, conf.uplink_vfo,
+                           RIG_LIST_COL_DOWNLINK_VFO, conf.downlink_vfo,
                            RIG_LIST_COL_LO, conf.lo,
                            RIG_LIST_COL_LOUP, conf.loup,
                            RIG_LIST_COL_SIGAOS, conf.signal_aos,
@@ -830,8 +841,6 @@ static void add_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
                            RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                            conf.rigctld_extra_args,
-                           RIG_LIST_COL_IC9700_SATMODE,
-                           conf.supports_dual_vfo_sat,
                            -1);
 
         g_free(conf.name);
@@ -939,9 +948,11 @@ void sat_pref_rig_ok()
         .host = NULL,
         .port = 4532,
         .type = RIG_TYPE_RX,
+        .radio_model = RADIO_MODEL_OTHER,
+        .radio_mode = RADIO_MODE_SIMPLEX,
         .ptt = 0,
-        .vfoUp = 0,
-        .vfoDown = 0,
+        .uplink_vfo = VFO_SUB,
+        .downlink_vfo = VFO_MAIN,
         .lo = 0.0,
         .loup = 0.0,
         .signal_aos = FALSE,
@@ -996,9 +1007,11 @@ void sat_pref_rig_ok()
                                RIG_LIST_COL_HOST, &conf.host,
                                RIG_LIST_COL_PORT, &conf.port,
                                RIG_LIST_COL_TYPE, &conf.type,
+                               RIG_LIST_COL_RADIO_MODEL, &conf.radio_model,
+                               RIG_LIST_COL_RADIO_MODE, &conf.radio_mode,
                                RIG_LIST_COL_PTT, &conf.ptt,
-                               RIG_LIST_COL_VFOUP, &conf.vfoUp,
-                               RIG_LIST_COL_VFODOWN, &conf.vfoDown,
+                               RIG_LIST_COL_UPLINK_VFO, &conf.uplink_vfo,
+                               RIG_LIST_COL_DOWNLINK_VFO, &conf.downlink_vfo,
                                RIG_LIST_COL_LO, &conf.lo,
                                RIG_LIST_COL_LOUP, &conf.loup,
                                RIG_LIST_COL_SIGAOS, &conf.signal_aos,
@@ -1019,8 +1032,6 @@ void sat_pref_rig_ok()
                                &conf.rigctld_civaddr,
                                RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                                &conf.rigctld_extra_args,
-                               RIG_LIST_COL_IC9700_SATMODE,
-                               &conf.supports_dual_vfo_sat,
                                -1);
             radio_conf_save(&conf);
 

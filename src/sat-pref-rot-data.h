@@ -40,6 +40,12 @@ typedef enum {
     ROT_LIST_COL_AZSTOPPOS,     /*!< Position of the azimuth rotation stops.
                                    Should default to MINAZ, unless specified
                                    otherwise */
+    ROT_LIST_COL_AXIS_MODE,     /*!< Axis mode (AZ only vs AZ/EL). */
+    ROT_LIST_COL_USE_OFFSET,    /*!< Apply configured offsets. */
+    ROT_LIST_COL_AZ_OFFSET,     /*!< Az offset. */
+    ROT_LIST_COL_EL_OFFSET,     /*!< El offset. */
+    ROT_LIST_COL_AZ_INVERT,     /*!< Invert azimuth. */
+    ROT_LIST_COL_EL_INVERT,     /*!< Invert elevation. */
     ROT_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rotor_list_col_t;
 
