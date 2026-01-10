@@ -4068,12 +4068,14 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                      G_CALLBACK(rot_verbose_cb), ctrl);
     gtk_grid_attach(GTK_GRID(main_table), verbose_check, 1, 5, 1, 1);
 
-    /* Logs button */
-    ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Logs"));
+    /* Logs toggle */
+    ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Show log"));
     gtk_widget_set_tooltip_text(ctrl->log_toggle,
-                                _("Show or hide the rotor control logs"));
+                                _("Show or hide the rotor control log"));
     g_signal_connect(ctrl->log_toggle, "toggled",
                      G_CALLBACK(rot_logs_toggle_cb), ctrl);
+    if (ctrl->term_view != NULL)
+        gp_term_view_set_visible(ctrl->term_view, FALSE);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->log_toggle, 2, 1, 1, 1);
 
     /* Offsets UI in a compact secondary column */

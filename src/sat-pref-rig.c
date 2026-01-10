@@ -71,8 +71,8 @@ static GtkTreeModel *create_and_fill_model()
                                    G_TYPE_STRING,       // rigctld device
                                    G_TYPE_INT,          // rigctld baud
                                    G_TYPE_STRING,       // rigctld CI-V addr
-                                   G_TYPE_STRING,       // rigctld extra args
-        );
+                                   G_TYPE_STRING        // rigctld extra args
+                                   );
 
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
                                          RIG_LIST_COL_NAME,

@@ -158,6 +158,9 @@ static const gchar *vfo_name(vfo_t vfo);
 static void     rigctrl_log_config(GtkRigCtrl *ctrl,
                                    const radio_conf_t *conf,
                                    const gchar *role);
+static gboolean rigctrl_validate_mode(GtkRigCtrl *ctrl,
+                                      const radio_conf_t *conf,
+                                      const gchar *role);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
 static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
                                       gint64 now_us);
@@ -1834,12 +1837,14 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel2, 1, 1, 1, 1);
 
-    /* Logs button */
-    ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Logs"));
+    /* Logs toggle */
+    ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Show log"));
     gtk_widget_set_tooltip_text(ctrl->log_toggle,
-                                _("Show or hide the radio control logs"));
+                                _("Show or hide the radio control log"));
     g_signal_connect(ctrl->log_toggle, "toggled",
                      G_CALLBACK(rig_logs_toggle_cb), ctrl);
+    if (ctrl->term_view != NULL)
+        gp_term_view_set_visible(ctrl->term_view, FALSE);
     gtk_grid_attach(GTK_GRID(table), ctrl->log_toggle, 2, 1, 1, 1);
 
     /* Engage button */
