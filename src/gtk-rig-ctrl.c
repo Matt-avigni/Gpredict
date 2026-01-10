@@ -168,6 +168,17 @@ static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                                            const gchar *role);
 static void     rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
                                             const gchar *context);
+static gchar   *rigctrl_combo_get_active_id(GtkComboBox *box,
+                                            gboolean allow_none);
+static void     rigctrl_combo_set_active_blocked(GtkComboBox *box, gint index,
+                                                 GCallback cb, gpointer data);
+static void     rigctrl_set_selection_id(GtkRigCtrl *ctrl,
+                                         const gchar *label,
+                                         gchar **stored_id,
+                                         gchar *new_id,
+                                         gboolean rebuilt);
+static void     rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
+                                                 gboolean rebuilt);
 
 /*  add thread for hamlib communication */
 gpointer        rigctl_run(gpointer data);
@@ -411,6 +422,78 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
     gp_term_view_set_visible(ctrl->term_view, visible);
 }
 
+static const gchar *rigctrl_id_for_log(const gchar *id)
+{
+    return id ? id : "(none)";
+}
+
+static void rigctrl_log_selection_change(const gchar *label,
+                                         const gchar *prev_id,
+                                         const gchar *new_id,
+                                         gboolean rebuilt)
+{
+    if (g_strcmp0(prev_id, new_id) == 0)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "RIGCTRL: %s selection %s -> %s (rebuild=%s)",
+                label ? label : "rig",
+                rigctrl_id_for_log(prev_id),
+                rigctrl_id_for_log(new_id),
+                rebuilt ? "yes" : "no");
+}
+
+static gchar *rigctrl_combo_get_active_id(GtkComboBox *box,
+                                          gboolean allow_none)
+{
+    gint active;
+
+    if (box == NULL)
+        return NULL;
+
+    active = gtk_combo_box_get_active(box);
+    if (active < 0)
+        return NULL;
+
+    if (allow_none && active == 0)
+        return NULL;
+
+    return gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(box));
+}
+
+static void rigctrl_combo_set_active_blocked(GtkComboBox *box, gint index,
+                                             GCallback cb, gpointer data)
+{
+    if (box == NULL)
+        return;
+
+    g_signal_handlers_block_by_func(box, cb, data);
+    gtk_combo_box_set_active(box, index);
+    g_signal_handlers_unblock_by_func(box, cb, data);
+}
+
+static void rigctrl_set_selection_id(GtkRigCtrl *ctrl,
+                                     const gchar *label,
+                                     gchar **stored_id,
+                                     gchar *new_id,
+                                     gboolean rebuilt)
+{
+    const gchar *prev_id;
+
+    (void)ctrl;
+
+    if (stored_id == NULL)
+    {
+        g_free(new_id);
+        return;
+    }
+
+    prev_id = *stored_id;
+    rigctrl_log_selection_change(label, prev_id, new_id, rebuilt);
+    g_free(*stored_id);
+    *stored_id = new_id;
+}
+
 typedef struct {
     GtkRigCtrl *ctrl;
     gchar      *text;
@@ -572,6 +655,10 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->term_view = NULL;
     }
     ctrl->log_toggle = NULL;
+    g_free(ctrl->primary_rig_id);
+    g_free(ctrl->secondary_rig_id);
+    ctrl->primary_rig_id = NULL;
+    ctrl->secondary_rig_id = NULL;
 
     if (ctrl->conf != NULL)
     {
@@ -634,6 +721,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_mgr2 = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
+    ctrl->primary_rig_id = NULL;
+    ctrl->secondary_rig_id = NULL;
     ctrl->status_label = NULL;
     ctrl->cmd_error = FALSE;
     g_mutex_init(&(ctrl->busy));
@@ -1293,10 +1382,15 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gchar          *buff;
+    gchar          *selected_id;
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: Primary device selected: %d"),
                 __FILE__, __func__, gtk_combo_box_get_active(box));
+
+    selected_id = rigctrl_combo_get_active_id(box, FALSE);
+    rigctrl_set_selection_id(ctrl, "primary", &ctrl->primary_rig_id,
+                             selected_id, FALSE);
 
     if (ctrl->conf != NULL)
     {
@@ -1313,7 +1407,7 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
     }
 
     ctrl->conf->name =
-        gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(box));
+        g_strdup(ctrl->primary_rig_id);
     if (radio_conf_read(ctrl->conf))
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -1352,12 +1446,14 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gchar          *buff;
-    gchar          *name1, *name2;
+    gchar          *selected_id;
 
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: Secondary device selected: %d"),
                 __FILE__, __func__, gtk_combo_box_get_active(box));
+
+    selected_id = rigctrl_combo_get_active_id(box, TRUE);
 
     if (ctrl->conf2 != NULL)
     {
@@ -1365,9 +1461,11 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
         ctrl->conf2 = NULL;
     }
 
-    if (gtk_combo_box_get_active(box) == 0)
+    if (selected_id == NULL)
     {
         /* first entry is "None" */
+        rigctrl_set_selection_id(ctrl, "secondary", &ctrl->secondary_rig_id,
+                                 NULL, FALSE);
         rigctrl_reset_reconnect(ctrl, TRUE);
 
         /* reset uplink LO to what's in ctrl->conf */
@@ -1382,19 +1480,16 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
     }
 
     /* ensure that selected secondary rig is not the same as the primary */
-    name1 =
-        gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel));
-    name2 =
-        gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
-    if (!g_strcmp0(name1, name2))
+    if (!g_strcmp0(ctrl->primary_rig_id, selected_id))
     {
         if (is_full_duplex_main_sub_configured(ctrl->conf))
         {
             /* Allow same rig: IC-9700 uses dual VFOs in SAT mode. */
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "FULL-DUPLEX MAIN/SUB: using primary rig for uplink (dual VFO)");
-            g_free(name1);
-            g_free(name2);
+            rigctrl_set_selection_id(ctrl, "secondary",
+                                     &ctrl->secondary_rig_id,
+                                     selected_id, FALSE);
             if (ctrl->conf != NULL)
             {
                 buff = g_strdup_printf(_("%.0f MHz"), ctrl->conf->loup / 1.0e6);
@@ -1406,21 +1501,24 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
         }
 
         /* selected conf is the same as the primary one */
-        g_free(name1);
-        g_free(name2);
         if (ctrl->conf != NULL)
         {
             buff = g_strdup_printf(_("%.0f MHz"), ctrl->conf->loup / 1.0e6);
             gtk_label_set_text(GTK_LABEL(ctrl->LoUp), buff);
             g_free(buff);
         }
-        gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->DevSel2), 0);
+        rigctrl_combo_set_active_blocked(GTK_COMBO_BOX(ctrl->DevSel2), 0,
+                                         G_CALLBACK(secondary_rig_selected_cb),
+                                         ctrl);
+        rigctrl_set_selection_id(ctrl, "secondary", &ctrl->secondary_rig_id,
+                                 NULL, FALSE);
+        g_free(selected_id);
 
         return;
     }
 
-    g_free(name1);
-    g_free(name2);
+    rigctrl_set_selection_id(ctrl, "secondary", &ctrl->secondary_rig_id,
+                             selected_id, FALSE);
 
     /* else load new device */
     ctrl->conf2 = g_try_new(radio_conf_t, 1);
@@ -1434,7 +1532,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
 
     /* load new configuration */
     ctrl->conf2->name =
-        gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(box));
+        g_strdup(ctrl->secondary_rig_id);
     if (radio_conf_read(ctrl->conf2))
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -1711,16 +1809,179 @@ static gint rig_name_compare(const gchar * a, const gchar * b)
     return (gpredict_strcmp(a, b));
 }
 
+static GSList *rigctrl_collect_rig_names(gboolean tx_only, gboolean sorted)
+{
+    GDir           *dir = NULL;
+    GError         *error = NULL;
+    gchar          *dirname;
+    const gchar    *filename;
+    gchar         **vbuff;
+    GSList         *rigs = NULL;
+
+    dirname = get_hwconf_dir();
+    dir = g_dir_open(dirname, 0, &error);
+    if (dir)
+    {
+        while ((filename = g_dir_read_name(dir)))
+        {
+            if (g_str_has_suffix(filename, ".rig"))
+            {
+                vbuff = g_strsplit(filename, ".rig", 0);
+                if (!tx_only || is_rig_tx_capable(vbuff[0]))
+                {
+                    if (sorted)
+                        rigs = g_slist_insert_sorted(rigs, g_strdup(vbuff[0]),
+                                                     (GCompareFunc) rig_name_compare);
+                    else
+                        rigs = g_slist_append(rigs, g_strdup(vbuff[0]));
+                }
+                g_strfreev(vbuff);
+            }
+        }
+        g_dir_close(dir);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s:%d: Failed to open hwconf dir (%s)"),
+                    __FILE__, __LINE__, error->message);
+        g_clear_error(&error);
+    }
+
+    g_free(dirname);
+
+    return rigs;
+}
+
+static void rigctrl_free_name_list(GSList *names)
+{
+    GSList *iter;
+
+    for (iter = names; iter != NULL; iter = iter->next)
+        g_free(iter->data);
+
+    g_slist_free(names);
+}
+
+static gint rigctrl_combo_find_index(GtkComboBox *box, const gchar *id)
+{
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    gint index = 0;
+
+    if (box == NULL || id == NULL)
+        return -1;
+
+    model = gtk_combo_box_get_model(box);
+    if (model == NULL || !gtk_tree_model_get_iter_first(model, &iter))
+        return -1;
+
+    do
+    {
+        gchar *text = NULL;
+
+        gtk_tree_model_get(model, &iter, 0, &text, -1);
+        if (g_strcmp0(text, id) == 0)
+        {
+            g_free(text);
+            return index;
+        }
+        g_free(text);
+        index++;
+    } while (gtk_tree_model_iter_next(model, &iter));
+
+    return -1;
+}
+
+static void rigctrl_combo_restore_selection(GtkComboBox *box,
+                                            const gchar *id,
+                                            gboolean allow_none,
+                                            GCallback cb,
+                                            gpointer data)
+{
+    GtkTreeModel *model;
+    gint index = -1;
+    gint count = 0;
+
+    if (box == NULL)
+        return;
+
+    if (allow_none && (id == NULL || *id == '\0'))
+        index = 0;
+    else
+        index = rigctrl_combo_find_index(box, id);
+
+    model = gtk_combo_box_get_model(box);
+    if (model != NULL)
+        count = gtk_tree_model_iter_n_children(model, NULL);
+
+    if (count <= 0)
+        index = -1;
+    else if (index < 0)
+        index = 0;
+
+    rigctrl_combo_set_active_blocked(box, index, cb, data);
+}
+
+static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
+                                             gboolean rebuilt)
+{
+    GSList *rigs;
+    GSList *tx_rigs;
+    GSList *iter;
+
+    if (ctrl == NULL || ctrl->DevSel == NULL || ctrl->DevSel2 == NULL)
+        return;
+
+    rigs = rigctrl_collect_rig_names(FALSE, TRUE);
+    tx_rigs = rigctrl_collect_rig_names(TRUE, FALSE);
+
+    g_signal_handlers_block_by_func(ctrl->DevSel,
+                                    G_CALLBACK(primary_rig_selected_cb), ctrl);
+    g_signal_handlers_block_by_func(ctrl->DevSel2,
+                                    G_CALLBACK(secondary_rig_selected_cb), ctrl);
+
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(ctrl->DevSel));
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
+
+    for (iter = rigs; iter != NULL; iter = iter->next)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel),
+                                       iter->data);
+
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2),
+                                   _("None"));
+    for (iter = tx_rigs; iter != NULL; iter = iter->next)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2),
+                                       iter->data);
+
+    rigctrl_combo_restore_selection(GTK_COMBO_BOX(ctrl->DevSel),
+                                    ctrl->primary_rig_id, FALSE,
+                                    G_CALLBACK(primary_rig_selected_cb), ctrl);
+    rigctrl_combo_restore_selection(GTK_COMBO_BOX(ctrl->DevSel2),
+                                    ctrl->secondary_rig_id, TRUE,
+                                    G_CALLBACK(secondary_rig_selected_cb), ctrl);
+
+    g_signal_handlers_unblock_by_func(ctrl->DevSel,
+                                      G_CALLBACK(primary_rig_selected_cb), ctrl);
+    g_signal_handlers_unblock_by_func(ctrl->DevSel2,
+                                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
+
+    rigctrl_set_selection_id(ctrl, "primary", &ctrl->primary_rig_id,
+                             rigctrl_combo_get_active_id(GTK_COMBO_BOX(ctrl->DevSel),
+                                                         FALSE),
+                             rebuilt);
+    rigctrl_set_selection_id(ctrl, "secondary", &ctrl->secondary_rig_id,
+                             rigctrl_combo_get_active_id(GTK_COMBO_BOX(ctrl->DevSel2),
+                                                         TRUE),
+                             rebuilt);
+
+    rigctrl_free_name_list(rigs);
+    rigctrl_free_name_list(tx_rigs);
+}
+
 static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 {
     GtkWidget      *frame, *table, *label;
-    GDir           *dir = NULL; /* directory handle */
-    GError         *error = NULL;       /* error flag and info */
-    gchar          *dirname;    /* directory name */
-    gchar         **vbuff;
-    const gchar    *filename;   /* file name */
-    gchar          *rigname;
-
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -1739,55 +2000,6 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                   "uplink unless you select a secondary device"
                                   " for uplink"));
 
-    /* open configuration directory */
-    dirname = get_hwconf_dir();
-
-    dir = g_dir_open(dirname, 0, &error);
-    if (dir)
-    {
-        /* read each .rig file */
-        GSList         *rigs = NULL;
-        gint            i;
-        gint            n;
-
-        while ((filename = g_dir_read_name(dir)))
-        {
-            if (g_str_has_suffix(filename, ".rig"))
-            {
-                vbuff = g_strsplit(filename, ".rig", 0);
-                rigs = g_slist_insert_sorted(rigs, g_strdup(vbuff[0]),
-                                             (GCompareFunc) rig_name_compare);
-                g_strfreev(vbuff);
-            }
-        }
-        n = g_slist_length(rigs);
-        for (i = 0; i < n; i++)
-        {
-            rigname = g_slist_nth_data(rigs, i);
-            if (rigname)
-            {
-                gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT
-                                               (ctrl->DevSel), rigname);
-                g_free(rigname);
-            }
-        }
-        g_slist_free(rigs);
-    }
-    else
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s:%d: Failed to open hwconf dir (%s)"),
-                    __FILE__, __LINE__, error->message);
-        g_clear_error(&error);
-    }
-
-    g_dir_close(dir);
-
-    gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->DevSel), 0);
-    g_signal_connect(ctrl->DevSel, "changed",
-                     G_CALLBACK(primary_rig_selected_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->DevSel, 1, 0, 1, 1);
-
     /* Secondary device */
     label = gtk_label_new(_("2. Device (TX):"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
@@ -1798,41 +2010,11 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                 _("Select secondary radio device\n"
                                   "This device will be used for uplink"));
 
-    /* load config */
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2),
-                                   _("None"));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->DevSel2), 0);
+    rigctrl_rebuild_device_selectors(ctrl, FALSE);
 
-    dir = g_dir_open(dirname, 0, &error);
-    if (dir)
-    {
-        /* read each .rig file */
-        while ((filename = g_dir_read_name(dir)))
-        {
-            if (g_str_has_suffix(filename, ".rig"))
-            {
-                /* only add TX capable rigs */
-                vbuff = g_strsplit(filename, ".rig", 0);
-                if (is_rig_tx_capable(vbuff[0]))
-                {
-                    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT
-                                                   (ctrl->DevSel2), vbuff[0]);
-                }
-                g_strfreev(vbuff);
-            }
-        }
-    }
-    else
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s:%d: Failed to open hwconf dir (%s)"),
-                    __FILE__, __LINE__, error->message);
-        g_clear_error(&error);
-    }
-
-    g_free(dirname);
-    g_dir_close(dir);
-
+    g_signal_connect(ctrl->DevSel, "changed",
+                     G_CALLBACK(primary_rig_selected_cb), ctrl);
+    gtk_grid_attach(GTK_GRID(table), ctrl->DevSel, 1, 0, 1, 1);
     g_signal_connect(ctrl->DevSel2, "changed",
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel2, 1, 1, 1, 1);
