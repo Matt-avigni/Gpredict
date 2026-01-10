@@ -91,6 +91,10 @@ struct _gtk_rig_ctrl {
     gint64          reconnect_next_us2;     /*!< Next reconnect time (monotonic us, secondary). */
     gboolean        rx_conn_error_reported; /*!< Avoid repeated connect error popups (primary). */
     gboolean        tx_conn_error_reported; /*!< Avoid repeated connect error popups (secondary). */
+    gboolean        edit_primary;           /*!< Suppress reconnect while editing primary config. */
+    gboolean        edit_secondary;         /*!< Suppress reconnect while editing secondary config. */
+    GHashTable     *autostart_error_reported; /*!< Deduplicate autostart error dialogs. */
+    GHashTable     *missing_model_reported;   /*!< Deduplicate missing model dialogs. */
 
     /* debug related */
     guint           wrops;

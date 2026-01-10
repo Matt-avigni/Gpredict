@@ -98,7 +98,8 @@ void about_dialog_create()
     dialog = gtk_about_dialog_new();
     gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(app));
     gtk_about_dialog_set_program_name(GTK_ABOUT_DIALOG(dialog), _("Gpredict"));
-    gtk_about_dialog_set_version(GTK_ABOUT_DIALOG(dialog), VERSION);
+    gtk_about_dialog_set_version(GTK_ABOUT_DIALOG(dialog),
+                                 GPREDICT_FULL_VERSION);
     gtk_about_dialog_set_copyright(GTK_ABOUT_DIALOG(dialog),
                                    _("Copyright (C) 2001-2019 Alexandru Csete OZ9AEC and contributors"));
     gtk_about_dialog_set_website(GTK_ABOUT_DIALOG(dialog),

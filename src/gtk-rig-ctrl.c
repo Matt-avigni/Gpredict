@@ -72,6 +72,7 @@
 #include "rigctld_mgr.h"
 #include "sat-log.h"
 #include "sat-cfg.h"
+#include "sat-pref-rig-editor.h"
 #include "trsp-conf.h"
 
 #ifndef G_SUBPROCESS_FLAGS_STDIN_DEV_NULL
@@ -91,6 +92,10 @@
 #define MAX_ERROR_COUNT 5
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
+#define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
+#define RIGCTRL_RECONNECT_BACKOFF_MAX_MS 10000
+#define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
+#define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
 
 /* radio control functions */
 static void     exec_rx_cycle(GtkRigCtrl * ctrl);
@@ -135,8 +140,11 @@ static gboolean open_rigctld_socket_host(const gchar *host, gint port,
 static void     schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                         const gchar *role);
 static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
+                                             const radio_conf_t *conf,
                                              const gchar *role,
                                              const gchar *detail);
+static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
+                                                  const radio_conf_t *conf);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
@@ -168,6 +176,28 @@ static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                                            const gchar *role);
 static void     rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
                                             const gchar *context);
+static gboolean rigctrl_should_show_dialog(GHashTable **table_ptr,
+                                           const gchar *rig_id);
+static gboolean rigctrl_autostart_error_allowed(GtkRigCtrl *ctrl,
+                                                const radio_conf_t *conf);
+static gboolean rigctrl_missing_model_dialog_allowed(GtkRigCtrl *ctrl,
+                                                     const radio_conf_t *conf);
+static void     rigctrl_clear_autostart_error_reported(GtkRigCtrl *ctrl,
+                                                       const radio_conf_t *conf);
+static void     rigctrl_set_editing(GtkRigCtrl *ctrl,
+                                    const gchar *rig_id,
+                                    gboolean editing);
+static gboolean rigctrl_editing_for_role(GtkRigCtrl *ctrl, gboolean secondary);
+static radio_conf_t *rigctrl_load_conf(const gchar *rig_id);
+static void     rigctrl_apply_conf_update(radio_conf_t *dst,
+                                          const radio_conf_t *src);
+static void     rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
+                                              const gchar *rig_id,
+                                              const radio_conf_t *updated);
+static void     rigctrl_open_radio_config(GtkRigCtrl *ctrl,
+                                          const gchar *rig_id);
+static void     rigctrl_disable_autostart(GtkRigCtrl *ctrl,
+                                          const gchar *rig_id);
 static gchar   *rigctrl_combo_get_active_id(GtkComboBox *box,
                                             gboolean allow_none);
 static void     rigctrl_combo_set_active_blocked(GtkComboBox *box, gint index,
@@ -238,6 +268,254 @@ static void free_radio_conf(radio_conf_t *conf)
     g_free(conf->rigctld_civaddr);
     g_free(conf->rigctld_extra_args);
     g_free(conf);
+}
+
+static gboolean rigctrl_should_show_dialog(GHashTable **table_ptr,
+                                           const gchar *rig_id)
+{
+    if (rig_id == NULL || *rig_id == '\0')
+        return TRUE;
+
+    if (*table_ptr == NULL)
+        *table_ptr = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    if (g_hash_table_lookup(*table_ptr, rig_id) != NULL)
+        return FALSE;
+
+    g_hash_table_add(*table_ptr, g_strdup(rig_id));
+    return TRUE;
+}
+
+static gboolean rigctrl_autostart_error_allowed(GtkRigCtrl *ctrl,
+                                                const radio_conf_t *conf)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    return rigctrl_should_show_dialog(&ctrl->autostart_error_reported,
+                                      conf ? conf->name : NULL);
+}
+
+static gboolean rigctrl_missing_model_dialog_allowed(GtkRigCtrl *ctrl,
+                                                     const radio_conf_t *conf)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    return rigctrl_should_show_dialog(&ctrl->missing_model_reported,
+                                      conf ? conf->name : NULL);
+}
+
+static void rigctrl_clear_autostart_error_reported(GtkRigCtrl *ctrl,
+                                                   const radio_conf_t *conf)
+{
+    if (ctrl == NULL || conf == NULL || conf->name == NULL ||
+        ctrl->autostart_error_reported == NULL)
+        return;
+
+    g_hash_table_remove(ctrl->autostart_error_reported, conf->name);
+}
+
+static void rigctrl_set_editing(GtkRigCtrl *ctrl,
+                                const gchar *rig_id,
+                                gboolean editing)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (!editing)
+    {
+        ctrl->edit_primary = FALSE;
+        ctrl->edit_secondary = FALSE;
+        return;
+    }
+
+    if (rig_id == NULL || *rig_id == '\0')
+        return;
+
+    if (ctrl->conf && g_strcmp0(ctrl->conf->name, rig_id) == 0)
+        ctrl->edit_primary = editing;
+
+    if (ctrl->conf2 && g_strcmp0(ctrl->conf2->name, rig_id) == 0)
+        ctrl->edit_secondary = editing;
+}
+
+static gboolean rigctrl_editing_for_role(GtkRigCtrl *ctrl, gboolean secondary)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    return secondary ? ctrl->edit_secondary : ctrl->edit_primary;
+}
+
+static radio_conf_t *rigctrl_load_conf(const gchar *rig_id)
+{
+    radio_conf_t *conf;
+
+    if (rig_id == NULL || *rig_id == '\0')
+        return NULL;
+
+    conf = g_try_new0(radio_conf_t, 1);
+    if (conf == NULL)
+        return NULL;
+
+    conf->name = g_strdup(rig_id);
+    if (!radio_conf_read(conf))
+    {
+        free_radio_conf(conf);
+        return NULL;
+    }
+
+    return conf;
+}
+
+static void rigctrl_apply_conf_update(radio_conf_t *dst,
+                                      const radio_conf_t *src)
+{
+    if (dst == NULL || src == NULL)
+        return;
+
+    if (g_strcmp0(dst->name, src->name) != 0)
+    {
+        g_free(dst->name);
+        dst->name = g_strdup(src->name);
+    }
+
+    g_free(dst->host);
+    dst->host = g_strdup(src->host);
+    dst->port = src->port;
+    dst->cycle = src->cycle;
+    dst->lo = src->lo;
+    dst->loup = src->loup;
+    dst->type = src->type;
+    dst->radio_model = src->radio_model;
+    dst->radio_mode = src->radio_mode;
+    dst->ptt = src->ptt;
+    dst->uplink_vfo = src->uplink_vfo;
+    dst->downlink_vfo = src->downlink_vfo;
+    dst->signal_aos = src->signal_aos;
+    dst->signal_los = src->signal_los;
+    dst->supports_rit_xit = src->supports_rit_xit;
+    dst->supports_full_duplex = src->supports_full_duplex;
+    dst->supports_dual_vfo_sat = src->supports_dual_vfo_sat;
+    dst->rigctld_autostart = src->rigctld_autostart;
+    dst->rigctld_auto_power_on = src->rigctld_auto_power_on;
+    g_free(dst->rigctld_path);
+    dst->rigctld_path = g_strdup(src->rigctld_path);
+    dst->rigctld_model = src->rigctld_model;
+    g_free(dst->rigctld_device);
+    dst->rigctld_device = g_strdup(src->rigctld_device);
+    dst->rigctld_baud = src->rigctld_baud;
+    g_free(dst->rigctld_civaddr);
+    dst->rigctld_civaddr = g_strdup(src->rigctld_civaddr);
+    g_free(dst->rigctld_extra_args);
+    dst->rigctld_extra_args = g_strdup(src->rigctld_extra_args);
+}
+
+static void rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
+                                          const gchar *rig_id,
+                                          const radio_conf_t *updated)
+{
+    gboolean renamed = FALSE;
+
+    if (ctrl == NULL || rig_id == NULL || updated == NULL)
+        return;
+
+    if (ctrl->conf && g_strcmp0(ctrl->conf->name, rig_id) == 0)
+    {
+        rigctrl_apply_conf_update(ctrl->conf, updated);
+        if (g_strcmp0(rig_id, ctrl->conf->name) != 0)
+            renamed = TRUE;
+    }
+
+    if (ctrl->conf2 && g_strcmp0(ctrl->conf2->name, rig_id) == 0)
+    {
+        rigctrl_apply_conf_update(ctrl->conf2, updated);
+        if (g_strcmp0(rig_id, ctrl->conf2->name) != 0)
+            renamed = TRUE;
+    }
+
+    if (renamed && updated->name != NULL)
+    {
+        if (ctrl->primary_rig_id &&
+            g_strcmp0(ctrl->primary_rig_id, rig_id) == 0)
+        {
+            g_free(ctrl->primary_rig_id);
+            ctrl->primary_rig_id = g_strdup(updated->name);
+        }
+        if (ctrl->secondary_rig_id &&
+            g_strcmp0(ctrl->secondary_rig_id, rig_id) == 0)
+        {
+            g_free(ctrl->secondary_rig_id);
+            ctrl->secondary_rig_id = g_strdup(updated->name);
+        }
+        rigctrl_rebuild_device_selectors(ctrl, TRUE);
+    }
+}
+
+static void rigctrl_open_radio_config(GtkRigCtrl *ctrl, const gchar *rig_id)
+{
+    radio_conf_t *conf;
+
+    if (ctrl == NULL || rig_id == NULL || *rig_id == '\0')
+        return;
+
+    conf = rigctrl_load_conf(rig_id);
+    if (conf == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: Failed to load radio configuration %s"),
+                    __func__, rig_id);
+        rig_term_log(ctrl, "gpredict:err",
+                     "failed to load radio config %s", rig_id);
+        rig_show_error_dialog(ctrl,
+                              _("Unable to open radio configuration"),
+                              _("Radio configuration could not be loaded."));
+        return;
+    }
+
+    rigctrl_set_editing(ctrl, rig_id, TRUE);
+    rig_term_log(ctrl, "gpredict", "edit radio config %s", rig_id);
+    sat_pref_rig_editor_run(conf);
+    rigctrl_set_editing(ctrl, rig_id, FALSE);
+
+    radio_conf_save(conf);
+    rigctrl_update_conf_from_disk(ctrl, rig_id, conf);
+    free_radio_conf(conf);
+}
+
+static void rigctrl_disable_autostart(GtkRigCtrl *ctrl, const gchar *rig_id)
+{
+    radio_conf_t *conf;
+
+    if (ctrl == NULL || rig_id == NULL || *rig_id == '\0')
+        return;
+
+    conf = rigctrl_load_conf(rig_id);
+    if (conf == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: Failed to load radio configuration %s"),
+                    __func__, rig_id);
+        rig_term_log(ctrl, "gpredict:err",
+                     "failed to load radio config %s", rig_id);
+        rig_show_error_dialog(ctrl,
+                              _("Unable to update radio configuration"),
+                              _("Radio configuration could not be loaded."));
+        return;
+    }
+
+    conf->rigctld_autostart = FALSE;
+    radio_conf_save(conf);
+    rigctrl_update_conf_from_disk(ctrl, rig_id, conf);
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: Disabled rigctld autostart for %s"),
+                __func__, rig_id);
+    rig_term_log(ctrl, "gpredict",
+                 "disabled rigctld auto-start for %s", rig_id);
+
+    free_radio_conf(conf);
 }
 
 static gchar *rig_term_format_timestamp(void)
@@ -570,12 +848,14 @@ static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
         ctrl->reconnect_backoff_ms2 = 0;
         ctrl->reconnect_next_us2 = 0;
         ctrl->tx_conn_error_reported = FALSE;
+        rigctrl_clear_autostart_error_reported(ctrl, ctrl->conf2);
     }
     else
     {
         ctrl->reconnect_backoff_ms = 0;
         ctrl->reconnect_next_us = 0;
         ctrl->rx_conn_error_reported = FALSE;
+        rigctrl_clear_autostart_error_reported(ctrl, ctrl->conf);
     }
 }
 
@@ -585,6 +865,9 @@ static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
     gint64 next_us;
 
     if (ctrl == NULL)
+        return FALSE;
+
+    if (rigctrl_editing_for_role(ctrl, secondary))
         return FALSE;
 
     next_us = secondary ? ctrl->reconnect_next_us2 : ctrl->reconnect_next_us;
@@ -611,9 +894,9 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                          : &ctrl->reconnect_next_us;
 
     if (*backoff_ptr <= 0)
-        backoff = 250;
+        backoff = RIGCTRL_RECONNECT_BACKOFF_MIN_MS;
     else
-        backoff = MIN(*backoff_ptr * 2, 5000);
+        backoff = MIN(*backoff_ptr * 2, RIGCTRL_RECONNECT_BACKOFF_MAX_MS);
 
     *backoff_ptr = backoff;
     now_us = g_get_monotonic_time();
@@ -655,6 +938,16 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->term_view = NULL;
     }
     ctrl->log_toggle = NULL;
+    if (ctrl->autostart_error_reported != NULL)
+    {
+        g_hash_table_destroy(ctrl->autostart_error_reported);
+        ctrl->autostart_error_reported = NULL;
+    }
+    if (ctrl->missing_model_reported != NULL)
+    {
+        g_hash_table_destroy(ctrl->missing_model_reported);
+        ctrl->missing_model_reported = NULL;
+    }
     g_free(ctrl->primary_rig_id);
     g_free(ctrl->secondary_rig_id);
     ctrl->primary_rig_id = NULL;
@@ -717,6 +1010,10 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->reconnect_next_us2 = 0;
     ctrl->rx_conn_error_reported = FALSE;
     ctrl->tx_conn_error_reported = FALSE;
+    ctrl->edit_primary = FALSE;
+    ctrl->edit_secondary = FALSE;
+    ctrl->autostart_error_reported = NULL;
+    ctrl->missing_model_reported = NULL;
     ctrl->rigctld_mgr = NULL;
     ctrl->rigctld_mgr2 = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
@@ -4521,7 +4818,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         detail = g_strdup_printf(
             _("Auto-start is only supported for 127.0.0.1.\nHost: %s"),
             conf->host ? conf->host : _("(missing)"));
-        schedule_rig_autostart_error(ctrl, role, detail);
+        schedule_rig_autostart_error(ctrl, conf, role, detail);
         rig_term_log(ctrl, "gpredict:err",
                      "auto-start only supported for 127.0.0.1 (host=%s)",
                      conf->host ? conf->host : "(missing)");
@@ -4538,6 +4835,18 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         rig_term_log(ctrl, "gpredict",
                      "rigctld reachable at %s:%d", host, conf->port);
         ok = TRUE;
+        goto out;
+    }
+
+    if (conf->rigctld_model <= 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: auto-start blocked; missing Hamlib rig model (%s)"),
+                    __func__, conf->name ? conf->name : "(unknown)");
+        rig_term_log(ctrl, "gpredict:err",
+                     "auto-start blocked; missing Hamlib rig model");
+        schedule_rig_missing_model_dialog(ctrl, conf);
+        reported = TRUE;
         goto out;
     }
 
@@ -4567,7 +4876,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                 detail = g_strdup_printf(
                     _("Failed to spawn rigctld for %s:%d."),
                     host, conf->port);
-            schedule_rig_autostart_error(ctrl, role, detail);
+            schedule_rig_autostart_error(ctrl, conf, role, detail);
             g_free(detail);
             g_free(errmsg);
             reported = TRUE;
@@ -4609,7 +4918,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                 _("rigctld did not start listening on %s:%d."),
                 host, conf->port);
 
-        schedule_rig_autostart_error(ctrl, role, detail);
+        schedule_rig_autostart_error(ctrl, conf, role, detail);
         rigctld_mgr_terminate(mgr);
         g_free(stderr_text);
         g_free(detail);
@@ -4782,17 +5091,103 @@ static gboolean rig_autostart_error_idle(gpointer data)
 }
 
 static void schedule_rig_autostart_error(GtkRigCtrl *ctrl,
+                                         const radio_conf_t *conf,
                                          const gchar *role,
                                          const gchar *detail)
 {
-    RigAutostartErrorInfo *info = g_new0(RigAutostartErrorInfo, 1);
+    RigAutostartErrorInfo *info;
     const gchar *label = (role != NULL) ? role : _("rig");
 
+    if (ctrl == NULL)
+        return;
+
+    if (!rigctrl_autostart_error_allowed(ctrl, conf))
+        return;
+
+    info = g_new0(RigAutostartErrorInfo, 1);
     info->ctrl = ctrl;
     info->title = g_strdup_printf(_("Unable to auto-start rigctld (%s)"), label);
     info->body = g_strdup(detail ? detail : "");
 
     g_idle_add(rig_autostart_error_idle, info);
+}
+
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *rig_id;
+} RigMissingModelInfo;
+
+static gboolean rig_missing_model_idle(gpointer data)
+{
+    RigMissingModelInfo *info = data;
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+    GtkWidget *dialog;
+    gint response;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    if (info->ctrl != NULL)
+    {
+        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(info->ctrl));
+        if (GTK_IS_WINDOW(toplevel))
+            parent = GTK_WINDOW(toplevel);
+    }
+
+    dialog = gtk_message_dialog_new(parent,
+                                    GTK_DIALOG_MODAL |
+                                        GTK_DIALOG_DESTROY_WITH_PARENT,
+                                    GTK_MESSAGE_ERROR,
+                                    GTK_BUTTONS_NONE,
+                                    "%s",
+                                    _("rigctld could not be started because the Hamlib rig model is missing"));
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Open Radio Config"),
+                          RIGCTRL_RESPONSE_OPEN_CONFIG);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Disable Auto-start"),
+                          RIGCTRL_RESPONSE_DISABLE_AUTOSTART);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Dismiss"),
+                          GTK_RESPONSE_CANCEL);
+
+    response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    switch (response)
+    {
+    case RIGCTRL_RESPONSE_OPEN_CONFIG:
+        rigctrl_open_radio_config(info->ctrl, info->rig_id);
+        break;
+    case RIGCTRL_RESPONSE_DISABLE_AUTOSTART:
+        rigctrl_disable_autostart(info->ctrl, info->rig_id);
+        break;
+    default:
+        break;
+    }
+
+    g_free(info->rig_id);
+    g_free(info);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
+                                              const radio_conf_t *conf)
+{
+    RigMissingModelInfo *info;
+
+    if (ctrl == NULL || conf == NULL)
+        return;
+
+    if (!rigctrl_missing_model_dialog_allowed(ctrl, conf))
+        return;
+
+    info = g_new0(RigMissingModelInfo, 1);
+    info->ctrl = ctrl;
+    info->rig_id = g_strdup(conf->name);
+
+    g_idle_add(rig_missing_model_idle, info);
 }
 
 static gboolean rig_disengage_idle(gpointer data)

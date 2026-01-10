@@ -104,6 +104,25 @@ int main(int argc, char *argv[])
     textdomain(PACKAGE);
 #endif
     gtk_init(&argc, &argv);
+    {
+        gchar *datadir = get_data_dir();
+        gchar *prefix = NULL;
+#ifdef G_OS_WIN32
+        prefix = g_win32_get_package_installation_directory_of_module(NULL);
+#else
+        {
+            gchar *parent = g_path_get_dirname(PACKAGE_DATA_DIR);
+            prefix = g_path_get_dirname(parent);
+            g_free(parent);
+        }
+#endif
+        g_message("gpredict: version %s (prefix=%s datadir=%s)",
+                  GPREDICT_FULL_VERSION,
+                  prefix ? prefix : "(unknown)",
+                  datadir ? datadir : "(unknown)");
+        g_free(prefix);
+        g_free(datadir);
+    }
 
     context = g_option_context_new("");
     g_option_context_add_main_entries(context, entries, GETTEXT_PACKAGE);
