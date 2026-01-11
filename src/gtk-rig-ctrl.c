@@ -178,6 +178,8 @@ static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
 static void     rigctrl_reset_error_gates(GtkRigCtrl *ctrl);
 static void     rigctrl_fail_engage(GtkRigCtrl *ctrl);
 static void     rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl);
+static gboolean rigctrl_resize_idle(gpointer data);
+static void     rigctrl_schedule_resize(GtkRigCtrl *ctrl);
 static void     rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
                                             const gchar *context);
 static gboolean rigctrl_should_show_dialog(GHashTable **table_ptr,
@@ -692,7 +694,7 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 
     visible = gtk_toggle_button_get_active(button);
     gp_term_view_set_visible(ctrl->term_view, visible);
-    rigctrl_force_toplevel_resize(ctrl);
+    rigctrl_schedule_resize(ctrl);
 }
 
 static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
@@ -709,6 +711,30 @@ static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
     gtk_widget_set_size_request(toplevel, -1, -1);
     gtk_widget_queue_resize(toplevel);
     gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
+}
+
+static gboolean rigctrl_resize_idle(gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    if (ctrl == NULL)
+        return G_SOURCE_REMOVE;
+
+    ctrl->resize_idle_id = 0;
+    rigctrl_force_toplevel_resize(ctrl);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_schedule_resize(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->resize_idle_id != 0)
+        return;
+
+    ctrl->resize_idle_id =
+        g_idle_add_full(G_PRIORITY_LOW, rigctrl_resize_idle, ctrl, NULL);
 }
 
 static const gchar *rigctrl_id_for_log(const gchar *id)
@@ -963,6 +989,11 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->term_view = NULL;
     }
     ctrl->log_toggle = NULL;
+    if (ctrl->resize_idle_id != 0)
+    {
+        g_source_remove(ctrl->resize_idle_id);
+        ctrl->resize_idle_id = 0;
+    }
     if (ctrl->autostart_error_reported != NULL)
     {
         g_hash_table_destroy(ctrl->autostart_error_reported);
@@ -1043,6 +1074,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_mgr2 = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
+    ctrl->resize_idle_id = 0;
     ctrl->primary_rig_id = NULL;
     ctrl->secondary_rig_id = NULL;
     ctrl->status_label = NULL;

@@ -166,6 +166,7 @@ struct _GtkRotCtrl {
 
     GpTermView     *term_view;
     GtkWidget      *log_toggle;
+    guint           resize_idle_id;
     GSubprocess    *rotctld_proc;
     GThread        *rotctld_out_thread;
     GThread        *rotctld_err_thread;
@@ -202,6 +203,8 @@ static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data);
 static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl);
+static gboolean rotctrl_resize_idle(gpointer data);
+static void rotctrl_schedule_resize(GtkRotCtrl *ctrl);
 static void rot_schedule_wrong_daemon(GtkRotCtrl *ctrl,
                                       const gchar *host, gint port);
 static void rot_schedule_cmd_reject(GtkRotCtrl *ctrl, const gchar *reason);
@@ -3627,7 +3630,7 @@ static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 
     gp_term_view_set_visible(ctrl->term_view,
                              gtk_toggle_button_get_active(button));
-    rotctrl_force_toplevel_resize(ctrl);
+    rotctrl_schedule_resize(ctrl);
 }
 
 static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
@@ -3644,6 +3647,30 @@ static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
     gtk_widget_set_size_request(toplevel, -1, -1);
     gtk_widget_queue_resize(toplevel);
     gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
+}
+
+static gboolean rotctrl_resize_idle(gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    if (ctrl == NULL)
+        return G_SOURCE_REMOVE;
+
+    ctrl->resize_idle_id = 0;
+    rotctrl_force_toplevel_resize(ctrl);
+    return G_SOURCE_REMOVE;
+}
+
+static void rotctrl_schedule_resize(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->resize_idle_id != 0)
+        return;
+
+    ctrl->resize_idle_id =
+        g_idle_add_full(G_PRIORITY_LOW, rotctrl_resize_idle, ctrl, NULL);
 }
 
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data)
@@ -4475,6 +4502,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->conf = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
+    ctrl->resize_idle_id = 0;
     ctrl->rotctld_proc = NULL;
     ctrl->rotctld_out_thread = NULL;
     ctrl->rotctld_err_thread = NULL;
@@ -4560,6 +4588,11 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         ctrl->term_view = NULL;
     }
     ctrl->log_toggle = NULL;
+    if (ctrl->resize_idle_id != 0)
+    {
+        g_source_remove(ctrl->resize_idle_id);
+        ctrl->resize_idle_id = 0;
+    }
 
     rot_plan_reset(&ctrl->trajectory_plan);
 
