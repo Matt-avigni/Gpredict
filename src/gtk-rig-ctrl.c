@@ -146,6 +146,7 @@ static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
 static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
                                                   const radio_conf_t *conf);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
+static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
                              const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
@@ -174,6 +175,9 @@ static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
                                       gint64 now_us);
 static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                                            const gchar *role);
+static void     rigctrl_reset_error_gates(GtkRigCtrl *ctrl);
+static void     rigctrl_fail_engage(GtkRigCtrl *ctrl);
+static void     rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl);
 static void     rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
                                             const gchar *context);
 static gboolean rigctrl_should_show_dialog(GHashTable **table_ptr,
@@ -182,8 +186,6 @@ static gboolean rigctrl_autostart_error_allowed(GtkRigCtrl *ctrl,
                                                 const radio_conf_t *conf);
 static gboolean rigctrl_missing_model_dialog_allowed(GtkRigCtrl *ctrl,
                                                      const radio_conf_t *conf);
-static void     rigctrl_clear_autostart_error_reported(GtkRigCtrl *ctrl,
-                                                       const radio_conf_t *conf);
 static void     rigctrl_set_editing(GtkRigCtrl *ctrl,
                                     const gchar *rig_id,
                                     gboolean editing);
@@ -273,6 +275,7 @@ static void free_radio_conf(radio_conf_t *conf)
 static gboolean rigctrl_should_show_dialog(GHashTable **table_ptr,
                                            const gchar *rig_id)
 {
+    /* Track per-radio dialogs so retry loops don't spam popups. */
     if (rig_id == NULL || *rig_id == '\0')
         return TRUE;
 
@@ -282,7 +285,7 @@ static gboolean rigctrl_should_show_dialog(GHashTable **table_ptr,
     if (g_hash_table_lookup(*table_ptr, rig_id) != NULL)
         return FALSE;
 
-    g_hash_table_add(*table_ptr, g_strdup(rig_id));
+    g_hash_table_insert(*table_ptr, g_strdup(rig_id), GINT_TO_POINTER(1));
     return TRUE;
 }
 
@@ -304,16 +307,6 @@ static gboolean rigctrl_missing_model_dialog_allowed(GtkRigCtrl *ctrl,
 
     return rigctrl_should_show_dialog(&ctrl->missing_model_reported,
                                       conf ? conf->name : NULL);
-}
-
-static void rigctrl_clear_autostart_error_reported(GtkRigCtrl *ctrl,
-                                                   const radio_conf_t *conf)
-{
-    if (ctrl == NULL || conf == NULL || conf->name == NULL ||
-        ctrl->autostart_error_reported == NULL)
-        return;
-
-    g_hash_table_remove(ctrl->autostart_error_reported, conf->name);
 }
 
 static void rigctrl_set_editing(GtkRigCtrl *ctrl,
@@ -403,6 +396,7 @@ static void rigctrl_apply_conf_update(radio_conf_t *dst,
     g_free(dst->rigctld_path);
     dst->rigctld_path = g_strdup(src->rigctld_path);
     dst->rigctld_model = src->rigctld_model;
+    dst->rigctld_conn = src->rigctld_conn;
     g_free(dst->rigctld_device);
     dst->rigctld_device = g_strdup(src->rigctld_device);
     dst->rigctld_baud = src->rigctld_baud;
@@ -698,6 +692,23 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 
     visible = gtk_toggle_button_get_active(button);
     gp_term_view_set_visible(ctrl->term_view, visible);
+    rigctrl_force_toplevel_resize(ctrl);
+}
+
+static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
+{
+    GtkWidget *toplevel;
+
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_widget_set_size_request(toplevel, -1, -1);
+    gtk_widget_queue_resize(toplevel);
+    gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
 }
 
 static const gchar *rigctrl_id_for_log(const gchar *id)
@@ -848,15 +859,28 @@ static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
         ctrl->reconnect_backoff_ms2 = 0;
         ctrl->reconnect_next_us2 = 0;
         ctrl->tx_conn_error_reported = FALSE;
-        rigctrl_clear_autostart_error_reported(ctrl, ctrl->conf2);
     }
     else
     {
         ctrl->reconnect_backoff_ms = 0;
         ctrl->reconnect_next_us = 0;
         ctrl->rx_conn_error_reported = FALSE;
-        rigctrl_clear_autostart_error_reported(ctrl, ctrl->conf);
     }
+}
+
+static void rigctrl_reset_error_gates(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    /* Reset retry/error gating only when the user engages again. */
+    rigctrl_reset_reconnect(ctrl, FALSE);
+    rigctrl_reset_reconnect(ctrl, TRUE);
+
+    if (ctrl->autostart_error_reported != NULL)
+        g_hash_table_remove_all(ctrl->autostart_error_reported);
+    if (ctrl->missing_model_reported != NULL)
+        g_hash_table_remove_all(ctrl->missing_model_reported);
 }
 
 static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
@@ -867,6 +891,7 @@ static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
     if (ctrl == NULL)
         return FALSE;
 
+    /* Pause retry attempts while the config editor is open. */
     if (rigctrl_editing_for_role(ctrl, secondary))
         return FALSE;
 
@@ -1024,6 +1049,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->cmd_error = FALSE;
     g_mutex_init(&(ctrl->busy));
     ctrl->engaged = FALSE;
+    ctrl->engage_pending = FALSE;
     ctrl->delay = 1000;
     ctrl->timerid = 0;
     ctrl->errcnt = 0;
@@ -1857,31 +1883,18 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
 
-    if (ctrl->conf == NULL)
-    {
-        /* We don't have a working configuration – inform the user and
-         * immediately revert the toggle.
-         */
-        rig_show_error_dialog(
-            ctrl,
-            _("Unable to engage radio"),
-            _("No valid radio configuration is selected.\n"
-              "Please create or select a radio configuration in\n"
-              "Interfaces → Radios before engaging radio control."));
-        gtk_toggle_button_set_active(button, FALSE);
-        return;
-    }
-
     if (!gtk_toggle_button_get_active(button))
     {
         /* Disengage: close socket / stop worker thread */
         gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
         gtk_widget_set_sensitive(ctrl->DevSel2, TRUE);
         ctrl->engaged = FALSE;
+        ctrl->engage_pending = FALSE;
         rig_term_log(ctrl, "gpredict", "disengage");
 
         /* Notify worker thread about the new configuration/state */
-        setconfig(ctrl);
+        if (ctrl->rigctlq != NULL)
+            setconfig(ctrl);
         /* The worker thread will clean up and exit; we just clear the
          * handle so a new thread can be started on the next engage.
          */
@@ -1889,16 +1902,35 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     }
     else
     {
+        /* User-initiated engage: clear error gating for a fresh attempt. */
+        rigctrl_reset_error_gates(ctrl);
+        ctrl->engage_pending = TRUE;
+
+        if (ctrl->conf == NULL)
+        {
+            /* We don't have a working configuration – inform the user and
+             * immediately revert the toggle.
+             */
+            rig_show_error_dialog(
+                ctrl,
+                _("Unable to engage radio"),
+                _("No valid radio configuration is selected.\n"
+                  "Please create or select a radio configuration in\n"
+                  "Interfaces → Radios before engaging radio control."));
+            rigctrl_fail_engage(ctrl);
+            return;
+        }
+
         if (!rigctrl_validate_mode(ctrl, ctrl->conf, _("receiver")))
         {
-            gtk_toggle_button_set_active(button, FALSE);
+            rigctrl_fail_engage(ctrl);
             return;
         }
 
         if (ctrl->conf2 != NULL &&
             !rigctrl_validate_mode(ctrl, ctrl->conf2, _("uplink")))
         {
-            gtk_toggle_button_set_active(button, FALSE);
+            rigctrl_fail_engage(ctrl);
             return;
         }
 
@@ -4838,7 +4870,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         goto out;
     }
 
-    if (conf->rigctld_model <= 0)
+    if (conf->rigctld_model <= 0 &&
+        radio_model_to_hamlib_model(conf->radio_model) <= 0)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: auto-start blocked; missing Hamlib rig model (%s)"),
@@ -5193,13 +5226,40 @@ static void schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
 static gboolean rig_disengage_idle(gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+
+    if (ctrl != NULL)
+    {
+        if (ctrl->DevSel != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
+        if (ctrl->DevSel2 != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel2, TRUE);
+        if (ctrl->LockBut != NULL)
+        {
+            g_signal_handlers_block_by_func(ctrl->LockBut,
+                                            rig_engaged_cb, ctrl);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+            g_signal_handlers_unblock_by_func(ctrl->LockBut,
+                                              rig_engaged_cb, ctrl);
+            rig_engaged_cb(GTK_TOGGLE_BUTTON(ctrl->LockBut), ctrl);
+        }
+    }
+
     return G_SOURCE_REMOVE;
 }
 
 static void schedule_rig_disengage(GtkRigCtrl *ctrl)
 {
     g_idle_add(rig_disengage_idle, ctrl);
+}
+
+static void rigctrl_fail_engage(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL || !ctrl->engage_pending)
+        return;
+
+    ctrl->engage_pending = FALSE;
+    ctrl->engaged = FALSE;
+    schedule_rig_disengage(ctrl);
 }
 
 static void rigctrl_close(GtkRigCtrl * data)
@@ -5273,6 +5333,7 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
                     schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
                     ctrl->rx_conn_error_reported = TRUE;
                 }
+                rigctrl_fail_engage(ctrl);
                 return FALSE;
             }
         }
@@ -5332,7 +5393,12 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     }
 
     if (ctrl->sock < 0)
+    {
+        rigctrl_fail_engage(ctrl);
         return FALSE;
+    }
+
+    ctrl->engage_pending = FALSE;
 
     if ((rx_opened || tx_opened))
     {
@@ -5427,8 +5493,9 @@ gpointer rigctl_run(gpointer data)
                         sat_log_log(SAT_LOG_LEVEL_ERROR,
                                     _("%s: failed to open receiver rig"),
                                     __func__);
-                        rigctrl_schedule_reconnect(t_ctrl, FALSE,
-                                                   _("receiver"));
+                        if (t_ctrl->engaged)
+                            rigctrl_schedule_reconnect(t_ctrl, FALSE,
+                                                       _("receiver"));
                     }
                 }
                 if (t_ctrl->sock < 0)
@@ -5452,7 +5519,10 @@ gpointer rigctl_run(gpointer data)
                     }
                 }
                 if (attempted_tx && t_ctrl->sock2 < 0)
-                    rigctrl_schedule_reconnect(t_ctrl, TRUE, _("uplink"));
+                {
+                    if (t_ctrl->engaged)
+                        rigctrl_schedule_reconnect(t_ctrl, TRUE, _("uplink"));
+                }
             }
 
             if (!t_ctrl->timerid)

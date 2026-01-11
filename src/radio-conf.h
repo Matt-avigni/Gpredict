@@ -62,6 +62,11 @@ typedef enum {
 } radio_mode_t;
 
 typedef enum {
+    RIGCTLD_CONN_SERIAL = 0,
+    RIGCTLD_CONN_TCP
+} rigctld_conn_t;
+
+typedef enum {
     VFO_NONE = 0,
     VFO_A,
     VFO_B,
@@ -98,7 +103,8 @@ typedef struct {
     gboolean        rigctld_auto_power_on; /*!< Auto power-on rig during rigctld start */
     gchar          *rigctld_path; /*!< rigctld binary path (empty uses PATH) */
     gint            rigctld_model; /*!< rigctld model number */
-    gchar          *rigctld_device; /*!< rigctld serial device path */
+    rigctld_conn_t  rigctld_conn; /*!< Connection type for rigctld */
+    gchar          *rigctld_device; /*!< rigctld device path or host:port */
     gint            rigctld_baud; /*!< rigctld baud rate */
     gchar          *rigctld_civaddr; /*!< Optional CI-V address string */
     gchar          *rigctld_extra_args; /*!< Optional extra rigctld args */
@@ -112,6 +118,7 @@ gboolean        radio_mode_allowed_for_model(radio_model_t model,
 gchar          *radio_mode_allowed_string(radio_model_t model);
 const gchar    *radio_model_to_string(radio_model_t model);
 const gchar    *radio_mode_to_string(radio_mode_t mode);
+gint            radio_model_to_hamlib_model(radio_model_t model);
 
 
 #endif

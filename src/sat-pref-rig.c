@@ -68,6 +68,7 @@ static GtkTreeModel *create_and_fill_model()
                                    G_TYPE_BOOLEAN,      // rigctld auto power-on
                                    G_TYPE_STRING,       // rigctld path
                                    G_TYPE_INT,          // rigctld model
+                                   G_TYPE_INT,          // rigctld connection type
                                    G_TYPE_STRING,       // rigctld device
                                    G_TYPE_INT,          // rigctld baud
                                    G_TYPE_STRING,       // rigctld CI-V addr
@@ -122,6 +123,8 @@ static GtkTreeModel *create_and_fill_model()
                                        conf.rigctld_path,
                                        RIG_LIST_COL_RIGCTLD_MODEL,
                                        conf.rigctld_model,
+                                       RIG_LIST_COL_RIGCTLD_CONN_TYPE,
+                                       conf.rigctld_conn,
                                        RIG_LIST_COL_RIGCTLD_DEVICE,
                                        conf.rigctld_device,
                                        RIG_LIST_COL_RIGCTLD_BAUD,
@@ -448,6 +451,7 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .rigctld_auto_power_on = FALSE,
         .rigctld_path = NULL,
         .rigctld_model = 0,
+        .rigctld_conn = RIGCTLD_CONN_SERIAL,
         .rigctld_device = NULL,
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
@@ -494,6 +498,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            &conf.rigctld_path,
                            RIG_LIST_COL_RIGCTLD_MODEL,
                            &conf.rigctld_model,
+                           RIG_LIST_COL_RIGCTLD_CONN_TYPE,
+                           &conf.rigctld_conn,
                            RIG_LIST_COL_RIGCTLD_DEVICE,
                            &conf.rigctld_device,
                            RIG_LIST_COL_RIGCTLD_BAUD,
@@ -547,6 +553,7 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            conf.rigctld_auto_power_on,
                            RIG_LIST_COL_RIGCTLD_PATH, conf.rigctld_path,
                            RIG_LIST_COL_RIGCTLD_MODEL, conf.rigctld_model,
+                           RIG_LIST_COL_RIGCTLD_CONN_TYPE, conf.rigctld_conn,
                            RIG_LIST_COL_RIGCTLD_DEVICE, conf.rigctld_device,
                            RIG_LIST_COL_RIGCTLD_BAUD, conf.rigctld_baud,
                            RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
@@ -801,6 +808,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .rigctld_auto_power_on = FALSE,
         .rigctld_path = NULL,
         .rigctld_model = 0,
+        .rigctld_conn = RIGCTLD_CONN_SERIAL,
         .rigctld_device = NULL,
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
@@ -836,6 +844,7 @@ static void add_cb(GtkWidget * button, gpointer data)
                            conf.rigctld_auto_power_on,
                            RIG_LIST_COL_RIGCTLD_PATH, conf.rigctld_path,
                            RIG_LIST_COL_RIGCTLD_MODEL, conf.rigctld_model,
+                           RIG_LIST_COL_RIGCTLD_CONN_TYPE, conf.rigctld_conn,
                            RIG_LIST_COL_RIGCTLD_DEVICE, conf.rigctld_device,
                            RIG_LIST_COL_RIGCTLD_BAUD, conf.rigctld_baud,
                            RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
@@ -964,6 +973,7 @@ void sat_pref_rig_ok()
         .rigctld_auto_power_on = FALSE,
         .rigctld_path = NULL,
         .rigctld_model = 0,
+        .rigctld_conn = RIGCTLD_CONN_SERIAL,
         .rigctld_device = NULL,
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
@@ -1024,6 +1034,8 @@ void sat_pref_rig_ok()
                                &conf.rigctld_path,
                                RIG_LIST_COL_RIGCTLD_MODEL,
                                &conf.rigctld_model,
+                               RIG_LIST_COL_RIGCTLD_CONN_TYPE,
+                               &conf.rigctld_conn,
                                RIG_LIST_COL_RIGCTLD_DEVICE,
                                &conf.rigctld_device,
                                RIG_LIST_COL_RIGCTLD_BAUD,

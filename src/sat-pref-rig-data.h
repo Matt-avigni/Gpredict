@@ -46,6 +46,7 @@ typedef enum {
     RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON, /*!< rigctld auto power-on */
     RIG_LIST_COL_RIGCTLD_PATH,  /*!< rigctld path */
     RIG_LIST_COL_RIGCTLD_MODEL, /*!< rigctld model */
+    RIG_LIST_COL_RIGCTLD_CONN_TYPE, /*!< rigctld connection type */
     RIG_LIST_COL_RIGCTLD_DEVICE, /*!< rigctld device */
     RIG_LIST_COL_RIGCTLD_BAUD,  /*!< rigctld baud */
     RIG_LIST_COL_RIGCTLD_CIVADDR, /*!< rigctld CI-V address */

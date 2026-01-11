@@ -48,23 +48,94 @@ static GtkWidget *loup;         /* local oscillator of upconverter */
 static GtkWidget *sigaos;       /* AOS signalling */
 static GtkWidget *siglos;       /* LOS signalling */
 static GtkWidget *autostart;    /* auto-start rigctld */
+static GtkWidget *rigctld_conn_type; /* rigctld connection type */
 static GtkWidget *rigctld_auto_power_on; /* rigctld auto power-on */
 static GtkWidget *rigctld_path; /* rigctld path */
 static GtkWidget *rigctld_model; /* rigctld model */
+static GtkWidget *rigctld_device_label; /* rigctld device label */
 static GtkWidget *rigctld_device; /* rigctld device */
+static GtkWidget *rigctld_baud_label; /* rigctld baud label */
 static GtkWidget *rigctld_baud; /* rigctld baud */
 static GtkWidget *rigctld_civaddr; /* rigctld CI-V address */
 static GtkWidget *rigctld_extra_args; /* rigctld extra args */
+static gint rigctld_model_custom = 0; /* remember custom rig model */
+static radio_model_t last_radio_model = RADIO_MODEL_OTHER;
+
+static gboolean rigctld_conn_is_tcp(void)
+{
+    if (rigctld_conn_type == NULL)
+        return FALSE;
+
+    return gtk_combo_box_get_active(GTK_COMBO_BOX(rigctld_conn_type)) ==
+        RIGCTLD_CONN_TCP;
+}
+
+static gboolean radio_model_has_preset(void)
+{
+    if (radio_model == NULL)
+        return FALSE;
+
+    return radio_model_to_hamlib_model(
+        gtk_combo_box_get_active(GTK_COMBO_BOX(radio_model))) > 0;
+}
+
+static void update_rigctld_model_sensitivity(gboolean enabled)
+{
+    gboolean allow_edit = enabled && !radio_model_has_preset();
+
+    if (rigctld_model != NULL)
+        gtk_widget_set_sensitive(rigctld_model, allow_edit);
+}
+
+static void update_rigctld_connection_ui(gboolean enabled)
+{
+    gboolean is_tcp = rigctld_conn_is_tcp();
+
+    if (rigctld_device_label != NULL)
+    {
+        gtk_label_set_text(GTK_LABEL(rigctld_device_label),
+                           is_tcp ? _("Rig address") : _("Serial device"));
+    }
+
+    if (rigctld_device != NULL)
+    {
+        gtk_widget_set_tooltip_text(
+            rigctld_device,
+            is_tcp ? _("Rig TCP address for rigctld (host:port).")
+                   : _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
+    }
+
+    if (rigctld_baud_label != NULL)
+        gtk_widget_set_sensitive(rigctld_baud_label, enabled && !is_tcp);
+    if (rigctld_baud != NULL)
+        gtk_widget_set_sensitive(rigctld_baud, enabled && !is_tcp);
+}
 
 static void update_autostart_sensitivity(gboolean enabled)
 {
+    gtk_widget_set_sensitive(rigctld_conn_type, enabled);
     gtk_widget_set_sensitive(rigctld_auto_power_on, enabled);
     gtk_widget_set_sensitive(rigctld_path, enabled);
-    gtk_widget_set_sensitive(rigctld_model, enabled);
+    update_rigctld_model_sensitivity(enabled);
     gtk_widget_set_sensitive(rigctld_device, enabled);
-    gtk_widget_set_sensitive(rigctld_baud, enabled);
     gtk_widget_set_sensitive(rigctld_civaddr, enabled);
     gtk_widget_set_sensitive(rigctld_extra_args, enabled);
+    update_rigctld_connection_ui(enabled);
+}
+
+static void rigctld_model_changed(GtkSpinButton *spin, gpointer data)
+{
+    (void)data;
+
+    if (radio_model == NULL || spin == NULL)
+        return;
+
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(radio_model)) ==
+        RADIO_MODEL_OTHER)
+    {
+        rigctld_model_custom =
+            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin));
+    }
 }
 
 static void rig_pref_show_dialog(GtkMessageType type,
@@ -279,6 +350,8 @@ static void clear_widgets()
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(loup), 0);
     gtk_combo_box_set_active(GTK_COMBO_BOX(type), RIG_TYPE_RX);
     gtk_combo_box_set_active(GTK_COMBO_BOX(radio_model), RADIO_MODEL_OTHER);
+    rigctld_model_custom = 0;
+    last_radio_model = RADIO_MODEL_OTHER;
     gtk_combo_box_set_active(GTK_COMBO_BOX(radio_mode), RADIO_MODE_SIMPLEX);
     gtk_combo_box_set_active(GTK_COMBO_BOX(ptt), PTT_TYPE_NONE);
     gtk_combo_box_set_active(GTK_COMBO_BOX(vfo), 0);
@@ -290,6 +363,8 @@ static void clear_widgets()
                                  FALSE);
     gtk_entry_set_text(GTK_ENTRY(rigctld_path), "");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model), 0);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(rigctld_conn_type),
+                             RIGCTLD_CONN_SERIAL);
     gtk_entry_set_text(GTK_ENTRY(rigctld_device), "");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_baud), 0);
     gtk_entry_set_text(GTK_ENTRY(rigctld_civaddr), "");
@@ -317,6 +392,11 @@ static void update_widgets(radio_conf_t * conf)
 
     /* radio model */
     gtk_combo_box_set_active(GTK_COMBO_BOX(radio_model), conf->radio_model);
+    last_radio_model = conf->radio_model;
+    if (conf->radio_model == RADIO_MODEL_OTHER)
+        rigctld_model_custom = conf->rigctld_model;
+    else
+        rigctld_model_custom = 0;
 
     /* radio mode */
     gtk_combo_box_set_active(GTK_COMBO_BOX(radio_mode), conf->radio_mode);
@@ -354,6 +434,16 @@ static void update_widgets(radio_conf_t * conf)
         gtk_entry_set_text(GTK_ENTRY(rigctld_path), conf->rigctld_path);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model),
                               conf->rigctld_model);
+    if (conf->rigctld_model <= 0)
+    {
+        gint preset = radio_model_to_hamlib_model(conf->radio_model);
+
+        /* Prefer preset model ids when config lacks an explicit rig model. */
+        if (preset > 0)
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model), preset);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(rigctld_conn_type),
+                             conf->rigctld_conn);
     gtk_entry_set_text(GTK_ENTRY(rigctld_device), "");
     if (conf->rigctld_device)
         gtk_entry_set_text(GTK_ENTRY(rigctld_device), conf->rigctld_device);
@@ -501,11 +591,92 @@ static void autostart_toggled(GtkToggleButton *button, gpointer data)
     update_autostart_sensitivity(gtk_toggle_button_get_active(button));
 }
 
+static void rigctld_conn_changed(GtkComboBox *box, gpointer data)
+{
+    gboolean enabled;
+
+    (void)box;
+    (void)data;
+
+    enabled = autostart != NULL &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
+    update_rigctld_connection_ui(enabled);
+}
+
+static void radio_model_changed(GtkComboBox *box, gpointer data)
+{
+    radio_model_t model;
+    gint preset;
+    gboolean enabled;
+
+    (void)data;
+
+    model = gtk_combo_box_get_active(GTK_COMBO_BOX(box));
+    preset = radio_model_to_hamlib_model(model);
+    if (rigctld_model != NULL)
+    {
+        if (last_radio_model == RADIO_MODEL_OTHER)
+        {
+            rigctld_model_custom =
+                gtk_spin_button_get_value_as_int(
+                    GTK_SPIN_BUTTON(rigctld_model));
+        }
+
+        if (preset > 0)
+        {
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model), preset);
+        }
+        else if (rigctld_model_custom > 0)
+        {
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_model),
+                                      rigctld_model_custom);
+        }
+    }
+
+    last_radio_model = model;
+    enabled = autostart != NULL &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
+    update_rigctld_model_sensitivity(enabled);
+}
+
+static void rig_pref_force_toplevel_resize(GtkWidget *widget)
+{
+    GtkWidget *toplevel;
+
+    if (widget == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(widget);
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_widget_set_size_request(toplevel, -1, -1);
+    gtk_widget_queue_resize(toplevel);
+    gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
+}
+
+static void advanced_expander_notify(GObject *obj, GParamSpec *pspec,
+                                     gpointer data)
+{
+    GtkExpander *expander = GTK_EXPANDER(obj);
+
+    (void)pspec;
+    (void)data;
+
+    if (!gtk_expander_get_expanded(expander))
+        rig_pref_force_toplevel_resize(GTK_WIDGET(expander));
+}
+
 static GtkWidget *create_editor_widgets(radio_conf_t * conf)
 {
     GtkWidget      *table;
+    GtkWidget      *advanced_table;
     GtkWidget      *label;
     GtkWidget      *test_button;
+    GtkWidget      *vbox;
+    GtkWidget      *advanced_expander;
+
+    vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -635,6 +806,8 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Select the radio model used for mode-specific behavior.\n"
                                   "No automatic guessing is performed."));
     gtk_grid_attach(GTK_GRID(table), radio_model, 1, 4, 2, 1);
+    g_signal_connect(radio_model, "changed",
+                     G_CALLBACK(radio_model_changed), NULL);
 
     /* radio mode */
     label = gtk_label_new(_("Radio mode"));
@@ -766,31 +939,28 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                   "if it is not already running."));
     g_signal_connect(autostart, "toggled", G_CALLBACK(autostart_toggled), NULL);
 
-    /* rigctld auto power-on */
-    label = gtk_label_new(_("Auto power-on"));
+    /* rigctld connection type */
+    label = gtk_label_new(_("Connection type"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
 
-    rigctld_auto_power_on = gtk_check_button_new_with_label(_("Enable"));
-    gtk_grid_attach(GTK_GRID(table), rigctld_auto_power_on, 1, 12, 1, 1);
-    gtk_widget_set_tooltip_text(rigctld_auto_power_on,
-                                _("Enable rigctld auto power-on if supported."));
-
-    /* rigctld path */
-    label = gtk_label_new(_("rigctld path"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
-
-    rigctld_path = gtk_entry_new();
-    gtk_entry_set_max_length(GTK_ENTRY(rigctld_path), 200);
-    gtk_widget_set_tooltip_text(rigctld_path,
-                                _("Path to rigctld binary (leave empty to use PATH)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_path, 1, 13, 3, 1);
+    rigctld_conn_type = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(rigctld_conn_type),
+                                   _("Serial (USB)"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(rigctld_conn_type),
+                                   _("TCP (LAN)"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(rigctld_conn_type),
+                             RIGCTLD_CONN_SERIAL);
+    gtk_widget_set_tooltip_text(rigctld_conn_type,
+                                _("Select how rigctld connects to the radio."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_conn_type, 1, 12, 2, 1);
+    g_signal_connect(rigctld_conn_type, "changed",
+                     G_CALLBACK(rigctld_conn_changed), NULL);
 
     /* rigctld model */
     label = gtk_label_new(_("Rig model"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
 
     rigctld_model = gtk_spin_button_new_with_range(0, 99999, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_model), 0);
@@ -798,12 +968,14 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Hamlib rig model number (e.g. 3081).\n"
                                   "Find your model id with: rigctl -l | "
                                   "grep -i 'IC-705'."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_model, 1, 13, 1, 1);
+    g_signal_connect(rigctld_model, "value-changed",
+                     G_CALLBACK(rigctld_model_changed), NULL);
 
     /* rigctld device */
-    label = gtk_label_new(_("Serial device"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
+    rigctld_device_label = gtk_label_new(_("Serial device"));
+    g_object_set(rigctld_device_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), rigctld_device_label, 0, 15, 1, 1);
 
     rigctld_device = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
@@ -812,9 +984,9 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 15, 3, 1);
 
     /* rigctld baud */
-    label = gtk_label_new(_("Baud"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 16, 1, 1);
+    rigctld_baud_label = gtk_label_new(_("Baud"));
+    g_object_set(rigctld_baud_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), rigctld_baud_label, 0, 16, 1, 1);
 
     rigctld_baud = gtk_spin_button_new_with_range(0, 1000000, 1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(rigctld_baud), 0);
@@ -822,36 +994,70 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Serial baud rate for rigctld (e.g. 19200)."));
     gtk_grid_attach(GTK_GRID(table), rigctld_baud, 1, 16, 1, 1);
 
+    /* Advanced rigctld options */
+    advanced_table = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(advanced_table), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(advanced_table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(advanced_table), 5);
+
+    /* rigctld auto power-on */
+    label = gtk_label_new(_("Auto power-on"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(advanced_table), label, 0, 0, 1, 1);
+
+    rigctld_auto_power_on = gtk_check_button_new_with_label(_("Enable"));
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_auto_power_on, 1, 0, 1, 1);
+    gtk_widget_set_tooltip_text(rigctld_auto_power_on,
+                                _("Enable rigctld auto power-on if supported."));
+
+    /* rigctld path */
+    label = gtk_label_new(_("rigctld path"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(advanced_table), label, 0, 1, 1, 1);
+
+    rigctld_path = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(rigctld_path), 200);
+    gtk_widget_set_tooltip_text(rigctld_path,
+                                _("Path to rigctld binary (leave empty to use bundled rigctld or PATH)."));
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_path, 1, 1, 3, 1);
+
     /* rigctld CI-V address */
     label = gtk_label_new(_("CI-V addr"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), label, 0, 2, 1, 1);
 
     rigctld_civaddr = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_civaddr), 16);
     gtk_widget_set_tooltip_text(rigctld_civaddr,
                                 _("Optional CI-V address (e.g. 0xA2)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_civaddr, 1, 17, 2, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_civaddr, 1, 2, 2, 1);
 
     /* rigctld extra args */
     label = gtk_label_new(_("Extra args"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 18, 1, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), label, 0, 3, 1, 1);
 
     rigctld_extra_args = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_extra_args), 200);
     gtk_widget_set_tooltip_text(rigctld_extra_args,
                                 _("Extra rigctld arguments (optional)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_extra_args, 1, 18, 3, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_extra_args, 1, 3, 3, 1);
+
+    advanced_expander = gtk_expander_new(_("Advanced..."));
+    gtk_container_add(GTK_CONTAINER(advanced_expander), advanced_table);
+    g_signal_connect(advanced_expander, "notify::expanded",
+                     G_CALLBACK(advanced_expander_notify), NULL);
 
     if (conf->name != NULL)
         update_widgets(conf);
     else
         update_autostart_sensitivity(TRUE);
 
-    gtk_widget_show_all(table);
+    gtk_box_pack_start(GTK_BOX(vbox), table, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), advanced_expander, FALSE, FALSE, 0);
+    gtk_widget_show_all(vbox);
 
-    return table;
+    return vbox;
 }
 
 /* Apply changes. Returns TRUE if things are ok, FALSE otherwise */
@@ -970,6 +1176,17 @@ static gboolean apply_changes(radio_conf_t * conf)
 
     conf->rigctld_model =
         gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(rigctld_model));
+    if (conf->rigctld_model <= 0)
+    {
+        gint preset = radio_model_to_hamlib_model(conf->radio_model);
+
+        /* Avoid saving an empty rig model when a preset exists. */
+        if (preset > 0)
+            conf->rigctld_model = preset;
+    }
+
+    conf->rigctld_conn =
+        gtk_combo_box_get_active(GTK_COMBO_BOX(rigctld_conn_type));
 
     if (conf->rigctld_device)
         g_free(conf->rigctld_device);

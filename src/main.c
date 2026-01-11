@@ -38,6 +38,18 @@
 #include "sat-cfg.h"
 #include "sat-log.h"
 
+#ifndef GPREDICT_FULL_VERSION
+#if defined(PACKAGE_STRING)
+#define GPREDICT_FULL_VERSION PACKAGE_STRING
+#elif defined(PACKAGE_VERSION)
+#define GPREDICT_FULL_VERSION PACKAGE_VERSION
+#elif defined(VERSION)
+#define GPREDICT_FULL_VERSION VERSION
+#else
+#define GPREDICT_FULL_VERSION "unknown"
+#endif
+#endif
+
 
 /* Main application widget. */
 GtkWidget      *app;

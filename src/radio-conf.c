@@ -53,6 +53,7 @@
 #define KEY_RIGCTLD_AUTO_POWER_ON "RIGCTLD_AUTO_POWER_ON"
 #define KEY_RIGCTLD_PATH        "RIGCTLD_PATH"
 #define KEY_RIGCTLD_MODEL       "RIGCTLD_MODEL"
+#define KEY_RIGCTLD_CONN_TYPE   "RIGCTLD_CONN_TYPE"
 #define KEY_RIGCTLD_DEVICE      "RIGCTLD_DEVICE"
 #define KEY_RIGCTLD_BAUD        "RIGCTLD_BAUD"
 #define KEY_RIGCTLD_CIVADDR     "RIGCTLD_CIVADDR"
@@ -75,6 +76,29 @@ static gboolean radio_vfo_valid(gint vfo)
 {
     return vfo == VFO_NONE || vfo == VFO_A || vfo == VFO_B ||
         vfo == VFO_MAIN || vfo == VFO_SUB;
+}
+
+static gboolean rigctld_device_looks_like_hostport(const gchar *device)
+{
+    const gchar *colon;
+    const gchar *port;
+
+    if (device == NULL || *device == '\0')
+        return FALSE;
+
+    colon = strchr(device, ':');
+    if (colon == NULL || colon == device || *(colon + 1) == '\0')
+        return FALSE;
+
+    port = colon + 1;
+    while (*port)
+    {
+        if (!g_ascii_isdigit(*port))
+            return FALSE;
+        port++;
+    }
+
+    return TRUE;
 }
 
 typedef struct {
@@ -157,6 +181,22 @@ const gchar *radio_model_to_string(radio_model_t model)
     }
 }
 
+gint radio_model_to_hamlib_model(radio_model_t model)
+{
+    switch (model)
+    {
+    case RADIO_MODEL_IC9700:
+        return 3081;
+    case RADIO_MODEL_IC705:
+        return 3085;
+    case RADIO_MODEL_IC905:
+        return 3090;
+    case RADIO_MODEL_OTHER:
+    default:
+        return 0;
+    }
+}
+
 const gchar *radio_mode_to_string(radio_mode_t mode)
 {
     switch (mode)
@@ -213,6 +253,7 @@ gboolean radio_conf_read(radio_conf_t * conf)
     conf->rigctld_auto_power_on = FALSE;
     conf->rigctld_path = NULL;
     conf->rigctld_model = 0;
+    conf->rigctld_conn = RIGCTLD_CONN_SERIAL;
     conf->rigctld_device = NULL;
     conf->rigctld_baud = 0;
     conf->rigctld_civaddr = NULL;
@@ -470,9 +511,18 @@ gboolean radio_conf_read(radio_conf_t * conf)
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_MODEL, NULL))
         conf->rigctld_model =
             g_key_file_get_integer(cfg, GROUP, KEY_RIGCTLD_MODEL, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_CONN_TYPE, NULL))
+        conf->rigctld_conn =
+            g_key_file_get_integer(cfg, GROUP, KEY_RIGCTLD_CONN_TYPE, NULL);
+    if (conf->rigctld_conn != RIGCTLD_CONN_SERIAL &&
+        conf->rigctld_conn != RIGCTLD_CONN_TCP)
+        conf->rigctld_conn = RIGCTLD_CONN_SERIAL;
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_DEVICE, NULL))
         conf->rigctld_device =
             g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_DEVICE, NULL);
+    if (!g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_CONN_TYPE, NULL) &&
+        rigctld_device_looks_like_hostport(conf->rigctld_device))
+        conf->rigctld_conn = RIGCTLD_CONN_TCP;
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_BAUD, NULL))
         conf->rigctld_baud =
             g_key_file_get_integer(cfg, GROUP, KEY_RIGCTLD_BAUD, NULL);
@@ -561,6 +611,8 @@ void radio_conf_save(radio_conf_t * conf)
                                conf->rigctld_model);
     else
         g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_MODEL, NULL);
+    g_key_file_set_integer(cfg, GROUP, KEY_RIGCTLD_CONN_TYPE,
+                           conf->rigctld_conn);
     if (conf->rigctld_device && *conf->rigctld_device)
         g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_DEVICE,
                               conf->rigctld_device);

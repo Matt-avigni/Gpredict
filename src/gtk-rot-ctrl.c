@@ -201,6 +201,7 @@ static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data);
+static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl);
 static void rot_schedule_wrong_daemon(GtkRotCtrl *ctrl,
                                       const gchar *host, gint port);
 static void rot_schedule_cmd_reject(GtkRotCtrl *ctrl, const gchar *reason);
@@ -3469,9 +3470,13 @@ static gboolean rot_wrong_daemon_idle(gpointer data)
     if (info->ctrl && info->ctrl->LockBut)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(info->ctrl->LockBut), FALSE);
 
-    status_label = g_object_get_data(G_OBJECT(info->ctrl), "rot-status-label");
-    if (status_label)
-        gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+    if (info->ctrl)
+    {
+        status_label =
+            g_object_get_data(G_OBJECT(info->ctrl), "rot-status-label");
+        if (status_label)
+            gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+    }
 
     g_free(info->host);
     g_free(info);
@@ -3521,12 +3526,20 @@ static void rot_show_cmd_reject_error(GtkRotCtrl *ctrl, const gchar *reason)
 static gboolean rot_cmd_reject_idle(gpointer data)
 {
     RotCmdRejectInfo *info = data;
+    GtkWidget *status_label;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
     if (info->ctrl)
         rot_show_cmd_reject_error(info->ctrl, info->reason);
+
+    if (info->ctrl && info->ctrl->LockBut)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(info->ctrl->LockBut), FALSE);
+
+    status_label = g_object_get_data(G_OBJECT(info->ctrl), "rot-status-label");
+    if (status_label)
+        gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
 
     g_free(info->reason);
     g_free(info);
@@ -3614,6 +3627,23 @@ static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 
     gp_term_view_set_visible(ctrl->term_view,
                              gtk_toggle_button_get_active(button));
+    rotctrl_force_toplevel_resize(ctrl);
+}
+
+static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
+{
+    GtkWidget *toplevel;
+
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_widget_set_size_request(toplevel, -1, -1);
+    gtk_widget_queue_resize(toplevel);
+    gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
 }
 
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data)

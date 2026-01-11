@@ -2,6 +2,15 @@
 
 #include <gio/gio.h>
 #include <string.h>
+#include <limits.h>
+
+#ifdef G_OS_UNIX
+#include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #ifdef G_OS_UNIX
 #include <signal.h>
@@ -37,6 +46,63 @@ typedef struct {
     GDataInputStream *stream;
     const gchar *prefix;
 } RigctldLogReader;
+
+static gchar *rigctld_mgr_find_bundled_rigctld(void)
+{
+    gchar *exe_path = NULL;
+    gchar *dir = NULL;
+    gchar *candidate = NULL;
+
+#ifdef __APPLE__
+    {
+        uint32_t size = PATH_MAX;
+        char buf[PATH_MAX];
+
+        if (_NSGetExecutablePath(buf, &size) == 0)
+            exe_path = g_strdup(buf);
+        else
+        {
+            char *dyn = g_malloc(size);
+            if (_NSGetExecutablePath(dyn, &size) == 0)
+                exe_path = g_strdup(dyn);
+            g_free(dyn);
+        }
+    }
+#elif defined(G_OS_UNIX)
+    {
+        char buf[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0)
+        {
+            buf[len] = '\0';
+            exe_path = g_strdup(buf);
+        }
+    }
+#endif
+
+    if (exe_path == NULL)
+        exe_path = g_find_program_in_path(g_get_prgname());
+
+    if (exe_path == NULL)
+        return NULL;
+
+    dir = g_path_get_dirname(exe_path);
+#ifdef G_OS_WIN32
+    candidate = g_build_filename(dir, "rigctld.exe", NULL);
+#else
+    candidate = g_build_filename(dir, "rigctld", NULL);
+#endif
+
+    if (!g_file_test(candidate, G_FILE_TEST_IS_EXECUTABLE))
+    {
+        g_free(candidate);
+        candidate = NULL;
+    }
+
+    g_free(dir);
+    g_free(exe_path);
+    return candidate;
+}
 
 static void rigctld_mgr_emit_log(RigctldMgr *mgr, const gchar *prefix,
                                  const gchar *line)
@@ -330,17 +396,24 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         return NULL;
     }
 
-    if (conf->rigctld_model <= 0)
     {
-        if (error_out)
-            *error_out = g_strdup("Missing rigctld model number.");
-        return NULL;
+        gint model_id = conf->rigctld_model;
+
+        if (model_id <= 0)
+            model_id = radio_model_to_hamlib_model(conf->radio_model);
+
+        if (model_id <= 0)
+        {
+            if (error_out)
+                *error_out = g_strdup("Missing rigctld model number.");
+            return NULL;
+        }
     }
 
     if (conf->rigctld_device == NULL || *conf->rigctld_device == '\0')
     {
         if (error_out)
-            *error_out = g_strdup("Missing rigctld device path.");
+            *error_out = g_strdup("Missing rigctld device/address.");
         return NULL;
     }
 
@@ -354,12 +427,16 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     if (conf->rigctld_path && *conf->rigctld_path)
         path = g_strdup(conf->rigctld_path);
     else
-        path = g_find_program_in_path("rigctld");
+    {
+        path = rigctld_mgr_find_bundled_rigctld();
+        if (path == NULL)
+            path = g_find_program_in_path("rigctld");
+    }
 
     if (path == NULL)
     {
         if (error_out)
-            *error_out = g_strdup("rigctld not found in PATH.");
+            *error_out = g_strdup("rigctld not found (bundle or PATH).");
         return NULL;
     }
 
@@ -370,11 +447,19 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         g_ptr_array_add(argv, g_strdup("-b"));
         g_ptr_array_add(argv, g_strdup(bind_host));
     }
-    g_ptr_array_add(argv, g_strdup("-m"));
-    g_ptr_array_add(argv, g_strdup_printf("%d", conf->rigctld_model));
+    {
+        gint model_id = conf->rigctld_model;
+
+        if (model_id <= 0)
+            model_id = radio_model_to_hamlib_model(conf->radio_model);
+
+        g_ptr_array_add(argv, g_strdup("-m"));
+        g_ptr_array_add(argv, g_strdup_printf("%d", model_id));
+    }
     g_ptr_array_add(argv, g_strdup("-r"));
     g_ptr_array_add(argv, g_strdup(conf->rigctld_device));
-    if (conf->rigctld_baud > 0)
+    if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+        conf->rigctld_baud > 0)
     {
         g_ptr_array_add(argv, g_strdup("-s"));
         g_ptr_array_add(argv, g_strdup_printf("%d", conf->rigctld_baud));
