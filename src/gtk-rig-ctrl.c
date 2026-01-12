@@ -103,6 +103,7 @@
 #define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
 
 static GHashTable *rigctld_device_cache = NULL;
+static GHashTable *rig_freq_cache = NULL;
 
 /* radio control functions */
 static void     exec_rx_cycle(GtkRigCtrl * ctrl);
@@ -117,10 +118,14 @@ static void     exec_dual_rig_cycle(GtkRigCtrl * ctrl);
 static gboolean check_aos_los(GtkRigCtrl * ctrl);
 static gboolean set_freq_simplex(GtkRigCtrl * ctrl, gint sock, gdouble freq);
 static gboolean get_freq_simplex(GtkRigCtrl * ctrl, gint sock, gdouble * freq);
+static gboolean get_freq_simplex_strict(GtkRigCtrl * ctrl, gint sock,
+                                        gdouble * freq);
 static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble freq);
 static gboolean set_toggle(GtkRigCtrl * ctrl, gint sock);
 static gboolean unset_toggle(GtkRigCtrl * ctrl, gint sock);
 static gboolean get_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble * freq);
+static gboolean get_freq_toggle_strict(GtkRigCtrl * ctrl, gint sock,
+                                       gdouble * freq);
 static gboolean get_ptt(GtkRigCtrl * ctrl, gint sock);
 static gboolean set_ptt(GtkRigCtrl * ctrl, gint sock, gboolean ptt);
 static gboolean set_rit(GtkRigCtrl * ctrl, gint sock, gdouble hz);
@@ -2806,6 +2811,55 @@ static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
     return TRUE;
 }
 
+static void rigctrl_cache_freq_key(gint sock, const gchar *tag,
+                                   gint vfo_key, gchar *buf, gsize size)
+{
+    const gchar *tag_str = tag ? tag : "";
+
+    g_snprintf(buf, size, "%d:%s:%d", sock, tag_str, vfo_key);
+}
+
+static void rigctrl_cache_freq(gint sock, const gchar *tag,
+                               gint vfo_key, gdouble freq)
+{
+    gchar *key = NULL;
+    gdouble *value = NULL;
+
+    if (sock < 0 || freq <= 0.0)
+        return;
+
+    if (rig_freq_cache == NULL)
+    {
+        rig_freq_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                               g_free, g_free);
+    }
+
+    key = g_strdup_printf("%d:%s:%d", sock, tag ? tag : "", vfo_key);
+    value = g_new(gdouble, 1);
+    *value = freq;
+    g_hash_table_replace(rig_freq_cache, key, value);
+}
+
+static gboolean rigctrl_get_cached_freq(gint sock, const gchar *tag,
+                                        gint vfo_key, gdouble *freq_out)
+{
+    gchar key[64];
+    gdouble *value = NULL;
+
+    if (rig_freq_cache == NULL || sock < 0)
+        return FALSE;
+
+    rigctrl_cache_freq_key(sock, tag, vfo_key, key, sizeof(key));
+    value = g_hash_table_lookup(rig_freq_cache, key);
+    if (value == NULL)
+        return FALSE;
+
+    if (freq_out)
+        *freq_out = *value;
+
+    return TRUE;
+}
+
 static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
                                      gdouble freq, vfo_t vfo)
 {
@@ -2830,8 +2884,9 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     return check_set_response(buffback, retcode, __func__);
 }
 
-static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
-                                     gdouble *freq, vfo_t vfo)
+static gboolean get_freq_simplex_vfo_internal(GtkRigCtrl *ctrl, gint sock,
+                                              gdouble *freq, vfo_t vfo,
+                                              gboolean allow_cache)
 {
     gchar          *buff;
     gchar           buffback[128];
@@ -2867,7 +2922,36 @@ static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     }
 
     g_free(buff);
-    return retval;
+    if (retval)
+    {
+        rigctrl_cache_freq(sock, "f", (gint) vfo, *freq);
+        return TRUE;
+    }
+
+    if (allow_cache && rigctrl_get_cached_freq(sock, "f", (gint) vfo, freq))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: get %s failed; using cached %.0f",
+                    vfo_name(vfo), *freq);
+        return TRUE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "FULL-DUPLEX MAIN/SUB: get %s failed",
+                vfo_name(vfo));
+    return FALSE;
+}
+
+static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
+                                     gdouble *freq, vfo_t vfo)
+{
+    return get_freq_simplex_vfo_internal(ctrl, sock, freq, vfo, TRUE);
+}
+
+static gboolean get_freq_simplex_vfo_strict(GtkRigCtrl *ctrl, gint sock,
+                                            gdouble *freq, vfo_t vfo)
+{
+    return get_freq_simplex_vfo_internal(ctrl, sock, freq, vfo, FALSE);
 }
 
 static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
@@ -2894,8 +2978,9 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     return check_set_response(buffback, retcode, __func__);
 }
 
-static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
-                                    gdouble *freq, vfo_t vfo)
+static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
+                                             gdouble *freq, vfo_t vfo,
+                                             gboolean allow_cache)
 {
     gchar          *buff;
     gchar           buffback[128];
@@ -2939,7 +3024,36 @@ static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     }
 
     g_free(buff);
-    return retval;
+    if (retval)
+    {
+        rigctrl_cache_freq(sock, "i", (gint) vfo, *freq);
+        return TRUE;
+    }
+
+    if (allow_cache && rigctrl_get_cached_freq(sock, "i", (gint) vfo, freq))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: get %s (toggle) failed; using cached %.0f",
+                    vfo_name(vfo), *freq);
+        return TRUE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "FULL-DUPLEX MAIN/SUB: get %s (toggle) failed",
+                vfo_name(vfo));
+    return FALSE;
+}
+
+static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
+                                    gdouble *freq, vfo_t vfo)
+{
+    return get_freq_toggle_vfo_internal(ctrl, sock, freq, vfo, TRUE);
+}
+
+static gboolean get_freq_toggle_vfo_strict(GtkRigCtrl *ctrl, gint sock,
+                                           gdouble *freq, vfo_t vfo)
+{
+    return get_freq_toggle_vfo_internal(ctrl, sock, freq, vfo, FALSE);
 }
 
 static int get_vfos(GtkRigCtrl * ctrl, char *rx, char *tx)
@@ -3094,12 +3208,12 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
         if (use_sat_vfo)
         {
             if (!get_freq_simplex_vfo(ctrl, ctrl->sock, &readfreq, sat_vfo))
-                ctrl->errcnt++;
+                readfreq = ctrl->lastrxf;
         }
         else if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
-            ctrl->errcnt++;
+            readfreq = ctrl->lastrxf;
         }
         else if (fabs(readfreq - ctrl->lastrxf) >= 1.0)
         {
@@ -3197,13 +3311,18 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                    smallest tuning step of 10 Hz). Therefore we read back the actual
                    frequency from the rig. */
                 read_ok = use_sat_vfo ?
-                    get_freq_simplex_vfo(ctrl, ctrl->sock, &readback, sat_vfo) :
-                    get_freq_simplex(ctrl, ctrl->sock, &readback);
+                    get_freq_simplex_vfo_strict(ctrl, ctrl->sock, &readback, sat_vfo) :
+                    get_freq_simplex_strict(ctrl, ctrl->sock, &readback);
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=RX readback=%.0f ok=%d",
                             readback, read_ok ? 1 : 0);
 
-                if (read_ok && fabs(readback - sent_freq) <= 100.0)
+                if (!read_ok)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: side=RX readback failed; keeping last");
+                }
+                else if (fabs(readback - sent_freq) <= 100.0)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lastrxf = readback;
@@ -3274,7 +3393,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
         if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
-            ctrl->errcnt++;
+            readfreq = ctrl->lasttxf;
         }
         else if (fabs(readfreq - ctrl->lasttxf) >= 1.0)
         {
@@ -3364,12 +3483,17 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                    the tuning step is larger than what we work with (e.g. FT-817 has a
                    smallest tuning step of 10 Hz). Therefore we read back the actual
                    frequency from the rig. */
-                read_ok = get_freq_simplex(ctrl, ctrl->sock, &readback);
+                read_ok = get_freq_simplex_strict(ctrl, ctrl->sock, &readback);
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=TX readback=%.0f ok=%d",
                             readback, read_ok ? 1 : 0);
 
-                if (read_ok && fabs(readback - sent_freq) <= 100.0)
+                if (!read_ok)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: side=TX readback failed; keeping last");
+                }
+                else if (fabs(readback - sent_freq) <= 100.0)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
@@ -3564,10 +3688,15 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
             if (set_ok)
             {
                 g_usleep(WR_DEL);
-                read_ok = get_freq_simplex_vfo(ctrl, ctrl->sock,
-                                               &readback,
-                                               plan.downlink_vfo);
-                if (read_ok && fabs(readback - rigfreqd) <= 100.0)
+                read_ok = get_freq_simplex_vfo_strict(ctrl, ctrl->sock,
+                                                      &readback,
+                                                      plan.downlink_vfo);
+                if (!read_ok)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX readback failed; keeping last");
+                }
+                else if (fabs(readback - rigfreqd) <= 100.0)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lastrxf = readback;
@@ -3607,10 +3736,15 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
             if (set_ok)
             {
                 g_usleep(WR_DEL);
-                read_ok = get_freq_simplex_vfo(ctrl, ctrl->sock,
-                                               &readback,
-                                               plan.uplink_vfo);
-                if (read_ok && fabs(readback - rigfrequ) <= 100.0)
+                read_ok = get_freq_simplex_vfo_strict(ctrl, ctrl->sock,
+                                                      &readback,
+                                                      plan.uplink_vfo);
+                if (!read_ok)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX readback failed; keeping last");
+                }
+                else if (fabs(readback - rigfrequ) <= 100.0)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
@@ -3661,13 +3795,12 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
         if (use_sat_vfo)
         {
             if (!get_freq_toggle_vfo(ctrl, ctrl->sock, &readfreq, sat_vfo))
-                ctrl->errcnt++;
+                readfreq = ctrl->lasttxf;
         }
         else if (!get_freq_toggle(ctrl, ctrl->sock, &readfreq))
         {
             /* error => use a passive value */
             readfreq = ctrl->lasttxf;
-            ctrl->errcnt++;
         }
 
         if (fabs(readfreq - ctrl->lasttxf) >= 1.0)
@@ -3771,13 +3904,18 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                    smallest tuning step of 10 Hz). Therefore we read back the actual
                    frequency from the rig. */
                 read_ok = use_sat_vfo ?
-                    get_freq_toggle_vfo(ctrl, ctrl->sock, &readback, sat_vfo) :
-                    get_freq_toggle(ctrl, ctrl->sock, &readback);
+                    get_freq_toggle_vfo_strict(ctrl, ctrl->sock, &readback, sat_vfo) :
+                    get_freq_toggle_strict(ctrl, ctrl->sock, &readback);
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=TX readback=%.0f ok=%d",
                             readback, read_ok ? 1 : 0);
 
-                if (read_ok && fabs(readback - sent_freq) <= 100.0)
+                if (!read_ok)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: side=TX readback failed; keeping last");
+                }
+                else if (fabs(readback - sent_freq) <= 100.0)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
@@ -3822,7 +3960,6 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
         {
             /* error => use a passive value */
             readfreq = ctrl->lastrxf;
-            ctrl->errcnt++;
         }
 
         if (fabs(readfreq - ctrl->lastrxf) >= 1.0)
@@ -3886,8 +4023,11 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                 g_usleep(WR_DEL);
 
                 /* The actual frequency migh be different from what we have set */
-                get_freq_simplex(ctrl, ctrl->sock2, &tmpfreq);
-                ctrl->lasttxf = tmpfreq;
+                if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
+                    ctrl->lasttxf = tmpfreq;
+                else
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: side=TX readback failed; keeping last");
             }
             else
             {
@@ -3928,8 +4068,11 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                 g_usleep(WR_DEL);
 
                 /* The actual frequency migh be different from what we have set */
-                get_freq_simplex(ctrl, ctrl->sock, &tmpfreq);
-                ctrl->lastrxf = tmpfreq;
+                if (get_freq_simplex_strict(ctrl, ctrl->sock, &tmpfreq))
+                    ctrl->lastrxf = tmpfreq;
+                else
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rig update: side=RX readback failed; keeping last");
             }
             else
             {
@@ -3946,7 +4089,6 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
             {
                 /* error => use a passive value */
                 readfreq = ctrl->lasttxf;
-                ctrl->errcnt++;
             }
 
             if (fabs(readfreq - ctrl->lasttxf) >= 1.0)
@@ -4013,8 +4155,11 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                     g_usleep(WR_DEL);
 
                     /* The actual frequency migh be different from what we have set */
-                    get_freq_simplex(ctrl, ctrl->sock, &tmpfreq);
-                    ctrl->lastrxf = tmpfreq;
+                    if (get_freq_simplex_strict(ctrl, ctrl->sock, &tmpfreq))
+                        ctrl->lastrxf = tmpfreq;
+                    else
+                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                    "rig update: side=RX readback failed; keeping last");
                 }
                 else
                 {
@@ -4054,8 +4199,11 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                     g_usleep(WR_DEL);
 
                     /* The actual frequency might be different from what we have set. */
-                    get_freq_simplex(ctrl, ctrl->sock2, &tmpfreq);
-                    ctrl->lasttxf = tmpfreq;
+                    if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
+                        ctrl->lasttxf = tmpfreq;
+                    else
+                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                    "rig update: side=TX readback failed; keeping last");
                 }
                 else
                 {
@@ -4407,12 +4555,15 @@ static gboolean unset_toggle(GtkRigCtrl * ctrl, gint sock)
  *
  * Returns TRUE if the operation was successful, FALSE otherwise
  */
-static gboolean get_freq_simplex(GtkRigCtrl * ctrl, gint sock, gdouble * freq)
+static gboolean get_freq_simplex_internal(GtkRigCtrl * ctrl, gint sock,
+                                          gdouble * freq, gboolean allow_cache)
 {
     gchar          *buff, **vbuff;
     gchar           buffback[128];
     gboolean        retcode;
     gboolean        retval = TRUE;
+    const gchar    *label = ctrl->conf->vfo_opt ? "currVFO" : "default";
+    const gint      cache_key = -1;
 
     if (ctrl->conf->vfo_opt)
         buff = g_strdup_printf("f currVFO\x0a");
@@ -4435,7 +4586,35 @@ static gboolean get_freq_simplex(GtkRigCtrl * ctrl, gint sock, gdouble * freq)
     }
 
     g_free(buff);
-    return retval;
+    if (retval)
+    {
+        rigctrl_cache_freq(sock, "f", cache_key, *freq);
+        return TRUE;
+    }
+
+    if (allow_cache && rigctrl_get_cached_freq(sock, "f", cache_key, freq))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "get %s failed; using cached %.0f",
+                    label, *freq);
+        return TRUE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "get %s failed",
+                label);
+    return FALSE;
+}
+
+static gboolean get_freq_simplex(GtkRigCtrl * ctrl, gint sock, gdouble * freq)
+{
+    return get_freq_simplex_internal(ctrl, sock, freq, TRUE);
+}
+
+static gboolean get_freq_simplex_strict(GtkRigCtrl * ctrl, gint sock,
+                                        gdouble * freq)
+{
+    return get_freq_simplex_internal(ctrl, sock, freq, FALSE);
 }
 
 /*
@@ -4476,12 +4655,15 @@ static gboolean get_vfo_opt(GtkRigCtrl * ctrl, gint sock)
  *
  * Returns TRUE if the operation was successful, FALSE otherwise
  */
-static gboolean get_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble * freq)
+static gboolean get_freq_toggle_internal(GtkRigCtrl * ctrl, gint sock,
+                                         gdouble * freq, gboolean allow_cache)
 {
     gchar          *buff, **vbuff;
     gchar           buffback[128];
     gboolean        retcode;
     gboolean        retval = TRUE;
+    const gchar    *label = ctrl->conf->vfo_opt ? "currVFO" : "default";
+    const gint      cache_key = -2;
 
     if (freq == NULL)
     {
@@ -4513,7 +4695,35 @@ static gboolean get_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble * freq)
     }
 
     g_free(buff);
-    return retval;
+    if (retval)
+    {
+        rigctrl_cache_freq(sock, "i", cache_key, *freq);
+        return TRUE;
+    }
+
+    if (allow_cache && rigctrl_get_cached_freq(sock, "i", cache_key, freq))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "get %s (toggle) failed; using cached %.0f",
+                    label, *freq);
+        return TRUE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "get %s (toggle) failed",
+                label);
+    return FALSE;
+}
+
+static gboolean get_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble * freq)
+{
+    return get_freq_toggle_internal(ctrl, sock, freq, TRUE);
+}
+
+static gboolean get_freq_toggle_strict(GtkRigCtrl * ctrl, gint sock,
+                                       gdouble * freq)
+{
+    return get_freq_toggle_internal(ctrl, sock, freq, FALSE);
 }
 
 /*
