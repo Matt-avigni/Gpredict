@@ -5126,6 +5126,24 @@ static gboolean rigctld_probe_simple(const gchar *host, gint port,
     return TRUE;
 }
 
+static gboolean rigctld_wait_for_ready(const gchar *host, gint port,
+                                       gint timeout_ms)
+{
+    gint waited_ms = 0;
+    const gint interval_ms = 200;
+
+    while (waited_ms < timeout_ms)
+    {
+        if (rigctld_probe_simple(host, port, RIGCTLD_AUTODETECT_PROBE_MS, NULL))
+            return TRUE;
+
+        g_usleep(interval_ms * 1000);
+        waited_ms += interval_ms;
+    }
+
+    return FALSE;
+}
+
 static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                                           radio_conf_t *conf,
                                           const gchar *role,
@@ -5461,9 +5479,23 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
 
     if (rigctld_mgr_port_is_open(host, conf->port, 200))
     {
-        rig_term_log(ctrl, "gpredict",
-                     "rigctld reachable at %s:%d", host, conf->port);
-        ok = TRUE;
+        if (rigctld_wait_for_ready(host, conf->port, 1000))
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "rigctld reachable at %s:%d", host, conf->port);
+            ok = TRUE;
+            goto out;
+        }
+
+        detail = g_strdup_printf(
+            _("rigctld at %s:%d is reachable but did not respond to probes."),
+            host, conf->port);
+        schedule_rig_autostart_error(ctrl, conf, role, detail);
+        rig_term_log(ctrl, "gpredict:err",
+                     "rigctld reachable but not responding at %s:%d",
+                     host, conf->port);
+        g_free(detail);
+        reported = TRUE;
         goto out;
     }
 
@@ -5554,6 +5586,37 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         else
             detail = g_strdup_printf(
                 _("rigctld did not start listening on %s:%d."),
+                host, conf->port);
+
+        schedule_rig_autostart_error(ctrl, conf, role, detail);
+        rigctld_mgr_terminate(mgr);
+        g_free(stderr_text);
+        g_free(detail);
+        reported = TRUE;
+        goto out;
+    }
+
+    if (!rigctld_wait_for_ready(host, conf->port, 2000))
+    {
+        gchar *stderr_text = NULL;
+
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: auto-start failed; rigctld not responding on %s:%d"),
+                    __func__, host, conf->port);
+        rig_term_log(ctrl, "gpredict:err",
+                     "rigctld not responding on %s:%d",
+                     host, conf->port);
+
+        if (mgr)
+            stderr_text = rigctld_mgr_get_log_tail(*mgr);
+
+        if (stderr_text && *stderr_text)
+            detail = g_strdup_printf(
+                _("rigctld did not respond to probes on %s:%d.\n%s"),
+                host, conf->port, stderr_text);
+        else
+            detail = g_strdup_printf(
+                _("rigctld did not respond to probes on %s:%d."),
                 host, conf->port);
 
         schedule_rig_autostart_error(ctrl, conf, role, detail);

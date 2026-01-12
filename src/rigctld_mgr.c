@@ -49,6 +49,7 @@ typedef struct {
     const gchar *prefix;
 } RigctldLogReader;
 
+#ifndef __APPLE__
 static gchar *rigctld_mgr_find_bundled_rigctld(void)
 {
     gchar *exe_path = NULL;
@@ -104,6 +105,47 @@ static gchar *rigctld_mgr_find_bundled_rigctld(void)
     g_free(dir);
     g_free(exe_path);
     return candidate;
+}
+#endif
+
+static gchar *rigctld_mgr_preferred_rigctld_path(void)
+{
+#ifdef __APPLE__
+    const gchar *home = g_get_home_dir();
+    gchar *candidate = NULL;
+
+    if (home == NULL || *home == '\0')
+        return NULL;
+
+    candidate = g_build_filename(home, "hamlib-local", "bin", "rigctld", NULL);
+    if (g_file_test(candidate, G_FILE_TEST_IS_EXECUTABLE))
+        return candidate;
+
+    g_free(candidate);
+    return NULL;
+#else
+    return NULL;
+#endif
+}
+
+static gchar *rigctld_mgr_preferred_hamlib_libdir(void)
+{
+#ifdef __APPLE__
+    const gchar *home = g_get_home_dir();
+    gchar *candidate = NULL;
+
+    if (home == NULL || *home == '\0')
+        return NULL;
+
+    candidate = g_build_filename(home, "hamlib-local", "lib", NULL);
+    if (g_file_test(candidate, G_FILE_TEST_IS_DIR))
+        return candidate;
+
+    g_free(candidate);
+    return NULL;
+#else
+    return NULL;
+#endif
 }
 
 static void rigctld_mgr_emit_log(RigctldMgr *mgr, const gchar *prefix,
@@ -390,6 +432,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     GPtrArray     *argv = NULL;
     GError        *error = NULL;
     gchar         *path = NULL;
+    gchar         *libdir = NULL;
 
     if (conf == NULL)
     {
@@ -429,16 +472,28 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     if (conf->rigctld_path && *conf->rigctld_path)
         path = g_strdup(conf->rigctld_path);
     else
+        path = rigctld_mgr_preferred_rigctld_path();
+
+#ifdef __APPLE__
+    if (path == NULL)
     {
-        path = rigctld_mgr_find_bundled_rigctld();
-        if (path == NULL)
-            path = g_find_program_in_path("rigctld");
+        if (error_out)
+            *error_out = g_strdup("rigctld not found at $HOME/hamlib-local/bin/rigctld.");
+        return NULL;
     }
+#else
+    if (path == NULL)
+        path = rigctld_mgr_find_bundled_rigctld();
+    if (path == NULL)
+        path = g_find_program_in_path("rigctld");
+#endif
 
     if (path == NULL)
     {
         if (error_out)
+        {
             *error_out = g_strdup("rigctld not found (bundle or PATH).");
+        }
         return NULL;
     }
 
@@ -451,6 +506,9 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     }
     {
         gint model_id = conf->rigctld_model;
+
+        if (conf->rigctld_conn == RIGCTLD_CONN_TCP && model_id <= 0)
+            model_id = 2;
 
         if (model_id <= 0)
             model_id = radio_model_to_hamlib_model(conf->radio_model);
@@ -515,6 +573,15 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_DEV_NULL |
                                          G_SUBPROCESS_FLAGS_STDOUT_PIPE |
                                          G_SUBPROCESS_FLAGS_STDERR_PIPE);
+    libdir = rigctld_mgr_preferred_hamlib_libdir();
+    if (libdir != NULL)
+    {
+        g_subprocess_launcher_setenv(launcher, "DYLD_LIBRARY_PATH",
+                                     libdir, TRUE);
+        g_subprocess_launcher_setenv(launcher,
+                                     "DYLD_FALLBACK_LIBRARY_PATH",
+                                     libdir, TRUE);
+    }
     proc = g_subprocess_launcher_spawnv(launcher,
                                         (const gchar * const *) argv->pdata,
                                         &error);
@@ -525,6 +592,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
             *error_out = g_strdup(error->message);
         g_clear_error(&error);
         g_ptr_array_free(argv, TRUE);
+        g_free(libdir);
         g_free(path);
         return NULL;
     }
@@ -570,6 +638,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         g_thread_new("rigctld-exit", rigctld_mgr_wait_thread, mgr);
 
     g_ptr_array_free(argv, TRUE);
+    g_free(libdir);
     g_free(path);
     return mgr;
 }
