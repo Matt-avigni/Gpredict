@@ -148,6 +148,33 @@ static gchar *rigctld_mgr_preferred_hamlib_libdir(void)
 #endif
 }
 
+static gchar *prepend_path_env_if_missing(const gchar *existing,
+                                          const gchar *path)
+{
+    gchar **parts = NULL;
+    gchar *updated = NULL;
+
+    if (path == NULL || *path == '\0')
+        return NULL;
+
+    if (existing == NULL || *existing == '\0')
+        return g_strdup(path);
+
+    parts = g_strsplit(existing, ":", -1);
+    for (gint i = 0; parts != NULL && parts[i] != NULL; i++)
+    {
+        if (g_strcmp0(parts[i], path) == 0)
+        {
+            g_strfreev(parts);
+            return NULL;
+        }
+    }
+    g_strfreev(parts);
+
+    updated = g_strdup_printf("%s:%s", path, existing);
+    return updated;
+}
+
 static void rigctld_mgr_emit_log(RigctldMgr *mgr, const gchar *prefix,
                                  const gchar *line)
 {
@@ -320,14 +347,67 @@ gboolean rigctld_mgr_host_is_local(const gchar *host)
     return FALSE;
 }
 
-gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
-                                  gint timeout_ms)
+static gboolean rigctld_mgr_dump_state_has_id(const gchar *text)
+{
+    if (text == NULL || *text == '\0')
+        return FALSE;
+
+    if (g_strstr_len(text, -1, "Rig model") != NULL)
+        return TRUE;
+    if (g_strstr_len(text, -1, "Model name") != NULL)
+        return TRUE;
+    if (g_strstr_len(text, -1, "Hamlib") != NULL)
+        return TRUE;
+
+    return FALSE;
+}
+
+static gboolean rigctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
+{
+    const gchar *cmd = "\\dump_state\n";
+    gchar buffer[1024];
+    GError *error = NULL;
+    gssize size;
+    gint timeout_s;
+
+    if (sock == NULL)
+        return FALSE;
+
+    timeout_s = MAX(1, (timeout_ms + 999) / 1000);
+    g_socket_set_blocking(sock, TRUE);
+    g_socket_set_timeout(sock, timeout_s);
+
+    size = g_socket_send(sock, cmd, strlen(cmd), NULL, &error);
+    if (size < 0)
+    {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    size = g_socket_receive(sock, buffer, sizeof(buffer) - 1, NULL, &error);
+    if (size <= 0)
+    {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    buffer[size] = '\0';
+    return rigctld_mgr_dump_state_has_id(buffer);
+}
+
+static gboolean rigctld_mgr_port_is_ready(const gchar *host, gint port,
+                                          gint timeout_ms,
+                                          gboolean *unresponsive)
 {
     gboolean        ok = FALSE;
     GResolver      *resolver = NULL;
     GList          *addrs = NULL;
     GError         *error = NULL;
     gint64          timeout_us;
+    gint            probe_timeout_ms;
+
+    if (unresponsive != NULL)
+        *unresponsive = FALSE;
 
     if (host == NULL || *host == '\0' || port <= 0)
         return FALSE;
@@ -342,11 +422,18 @@ gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
     }
 
     timeout_us = (gint64) timeout_ms * 1000;
+    probe_timeout_ms = timeout_ms;
+    if (probe_timeout_ms < 1000)
+        probe_timeout_ms = 1000;
+    else if (probe_timeout_ms > 2000)
+        probe_timeout_ms = 2000;
+
     for (GList *iter = addrs; iter != NULL; iter = iter->next)
     {
         GInetAddress   *addr = G_INET_ADDRESS(iter->data);
         GSocket        *sock = NULL;
         GSocketAddress *sockaddr = NULL;
+        gboolean        connected = FALSE;
 
         sock = g_socket_new(g_inet_address_get_family(addr),
                             G_SOCKET_TYPE_STREAM,
@@ -362,7 +449,7 @@ gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
 
         if (g_socket_connect(sock, sockaddr, NULL, &error))
         {
-            ok = TRUE;
+            connected = TRUE;
         }
         else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
         {
@@ -371,7 +458,7 @@ gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
                                               &error))
             {
                 if (g_socket_check_connect_result(sock, &error))
-                    ok = TRUE;
+                    connected = TRUE;
                 else
                     g_clear_error(&error);
             }
@@ -383,6 +470,14 @@ gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
         else
         {
             g_clear_error(&error);
+        }
+
+        if (connected)
+        {
+            if (rigctld_mgr_probe_dump_state(sock, probe_timeout_ms))
+                ok = TRUE;
+            else if (unresponsive != NULL)
+                *unresponsive = TRUE;
         }
 
         g_object_unref(sockaddr);
@@ -398,11 +493,18 @@ gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
     return ok;
 }
 
+gboolean rigctld_mgr_port_is_open(const gchar *host, gint port,
+                                  gint timeout_ms)
+{
+    return rigctld_mgr_port_is_ready(host, port, timeout_ms, NULL);
+}
+
 gboolean rigctld_mgr_wait_for_port(const gchar *host, gint port,
                                    gint timeout_ms)
 {
     gint    waited_ms = 0;
     gint    interval_ms = 50;
+    gboolean unresponsive = FALSE;
 
     while (waited_ms < timeout_ms)
     {
@@ -411,7 +513,7 @@ gboolean rigctld_mgr_wait_for_port(const gchar *host, gint port,
         if (slice > (timeout_ms - waited_ms))
             slice = timeout_ms - waited_ms;
 
-        if (rigctld_mgr_port_is_open(host, port, slice))
+        if (rigctld_mgr_port_is_ready(host, port, slice, &unresponsive))
             return TRUE;
 
         waited_ms += slice;
@@ -419,6 +521,11 @@ gboolean rigctld_mgr_wait_for_port(const gchar *host, gint port,
             interval_ms = MIN(interval_ms * 2, 500);
     }
 
+    if (unresponsive)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "rigctld port open but not responding to \\dump_state");
+    }
     return FALSE;
 }
 
@@ -469,33 +576,58 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         return NULL;
     }
 
-    if (conf->rigctld_path && *conf->rigctld_path)
-        path = g_strdup(conf->rigctld_path);
-    else
-        path = rigctld_mgr_preferred_rigctld_path();
-
 #ifdef __APPLE__
-    if (path == NULL)
+    if (conf->rigctld_path && *conf->rigctld_path)
+    {
+        if (!g_path_is_absolute(conf->rigctld_path))
+        {
+            if (error_out)
+                *error_out = g_strdup_printf(
+                    "rigctld path must be absolute: %s",
+                    conf->rigctld_path);
+            return NULL;
+        }
+        path = g_strdup(conf->rigctld_path);
+    }
+    else
+    {
+        path = rigctld_mgr_preferred_rigctld_path();
+        if (path == NULL)
+        {
+            if (error_out)
+                *error_out = g_strdup(
+                    "rigctld not found at $HOME/hamlib-local/bin/rigctld.");
+            return NULL;
+        }
+    }
+
+    if (path == NULL || !g_path_is_absolute(path) ||
+        !g_file_test(path, G_FILE_TEST_IS_EXECUTABLE))
     {
         if (error_out)
-            *error_out = g_strdup("rigctld not found at $HOME/hamlib-local/bin/rigctld.");
+            *error_out = g_strdup_printf(
+                "rigctld path is not executable: %s",
+                path ? path : "(null)");
+        g_free(path);
         return NULL;
     }
 #else
-    if (path == NULL)
+    if (conf->rigctld_path && *conf->rigctld_path)
+        path = g_strdup(conf->rigctld_path);
+    else
+    {
         path = rigctld_mgr_find_bundled_rigctld();
-    if (path == NULL)
-        path = g_find_program_in_path("rigctld");
-#endif
+        if (path == NULL)
+            path = g_find_program_in_path("rigctld");
+    }
 
     if (path == NULL)
     {
         if (error_out)
-        {
             *error_out = g_strdup("rigctld not found (bundle or PATH).");
-        }
         return NULL;
     }
+#endif
 
     argv = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(argv, g_strdup(path));
@@ -574,13 +706,52 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
                                          G_SUBPROCESS_FLAGS_STDOUT_PIPE |
                                          G_SUBPROCESS_FLAGS_STDERR_PIPE);
     libdir = rigctld_mgr_preferred_hamlib_libdir();
-    if (libdir != NULL)
     {
-        g_subprocess_launcher_setenv(launcher, "DYLD_LIBRARY_PATH",
-                                     libdir, TRUE);
-        g_subprocess_launcher_setenv(launcher,
-                                     "DYLD_FALLBACK_LIBRARY_PATH",
-                                     libdir, TRUE);
+        const gchar *dyld_existing =
+            g_getenv("DYLD_LIBRARY_PATH");
+        const gchar *fallback_existing =
+            g_getenv("DYLD_FALLBACK_LIBRARY_PATH");
+        const gchar *dyld_final = dyld_existing;
+        const gchar *fallback_final = fallback_existing;
+        gchar *dyld_updated = NULL;
+        gchar *fallback_updated = NULL;
+
+        if (libdir != NULL)
+        {
+            dyld_updated = prepend_path_env_if_missing(dyld_existing, libdir);
+            if (dyld_updated != NULL)
+            {
+                g_subprocess_launcher_setenv(launcher, "DYLD_LIBRARY_PATH",
+                                             dyld_updated, TRUE);
+                dyld_final = dyld_updated;
+            }
+
+            fallback_updated =
+                prepend_path_env_if_missing(fallback_existing, libdir);
+            if (fallback_updated != NULL)
+            {
+                g_subprocess_launcher_setenv(launcher,
+                                             "DYLD_FALLBACK_LIBRARY_PATH",
+                                             fallback_updated, TRUE);
+                fallback_final = fallback_updated;
+            }
+        }
+
+        {
+            gchar *cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rigctld spawn detail: path=%s argv=%s "
+                        "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
+                        path ? path : "(null)",
+                        cmdline ? cmdline : "(null)",
+                        (dyld_final && *dyld_final) ? dyld_final : "(unset)",
+                        (fallback_final && *fallback_final) ? fallback_final
+                                                           : "(unset)");
+            g_free(cmdline);
+        }
+
+        g_free(dyld_updated);
+        g_free(fallback_updated);
     }
     proc = g_subprocess_launcher_spawnv(launcher,
                                         (const gchar * const *) argv->pdata,

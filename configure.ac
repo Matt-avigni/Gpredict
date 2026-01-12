@@ -13,6 +13,7 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 # check for programs
 AC_PROG_CC
 AC_SEARCH_LIBS([strerror],[cposix])
+AC_CANONICAL_HOST
 
 IT_PROG_INTLTOOL([0.21])
 LT_INIT
@@ -30,6 +31,22 @@ PKG_PROG_PKG_CONFIG
 if test "x$PKG_CONFIG" = x; then
     AC_MSG_ERROR(Gpredict requires pkg-config)
 fi
+
+case "$host_os" in
+    darwin*)
+        HAMLIB_LOCAL_PREFIX="$HOME/hamlib-local"
+        HAMLIB_PKGCONFIG_DIR="$HAMLIB_LOCAL_PREFIX/lib/pkgconfig"
+        if test -d "$HAMLIB_PKGCONFIG_DIR"; then
+            case ":$PKG_CONFIG_PATH:" in
+                *":$HAMLIB_PKGCONFIG_DIR:"*) ;;
+                *)
+                    PKG_CONFIG_PATH="$HAMLIB_PKGCONFIG_DIR${PKG_CONFIG_PATH+:$PKG_CONFIG_PATH}"
+                    export PKG_CONFIG_PATH
+                    ;;
+            esac
+        fi
+        ;;
+esac
 
 # check for libcurl
 if $PKG_CONFIG --atleast-version=7.19 libcurl; then
@@ -71,6 +88,30 @@ if $PKG_CONFIG --atleast-version=2.90 libgps; then
 else
     havelibgps=false;
 fi
+
+# check for hamlib
+if $PKG_CONFIG --exists hamlib; then
+    HAMLIB_CFLAGS=`$PKG_CONFIG --cflags hamlib`
+    HAMLIB_LIBS=`$PKG_CONFIG --libs hamlib`
+else
+    AC_MSG_ERROR(Gpredict requires hamlib via pkg-config)
+fi
+
+case "$host_os" in
+    darwin*)
+        case "$HAMLIB_CFLAGS $HAMLIB_LIBS" in
+    *"/opt/homebrew/"*|*"/usr/local/"*)
+        AC_MSG_ERROR([Refusing to link against Homebrew hamlib; expected /hamlib-local])
+        ;;
+ esac
+        if test -d "$HAMLIB_LOCAL_PREFIX/lib"; then
+            LDFLAGS="$LDFLAGS -Wl,-rpath,$HAMLIB_LOCAL_PREFIX/lib"
+        fi
+        ;;
+esac
+
+PACKAGE_CFLAGS="$PACKAGE_CFLAGS $HAMLIB_CFLAGS"
+PACKAGE_LIBS="$PACKAGE_LIBS $HAMLIB_LIBS"
 
 AC_SUBST(PACKAGE_CFLAGS)
 AC_SUBST(PACKAGE_LIBS)
