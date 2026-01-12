@@ -20,6 +20,7 @@ GSList *gp_serial_list_candidates_darwin(void)
     GDir   *dir = NULL;
     GSList *preferred = NULL;
     GSList *others = NULL;
+    GSList *tty_list = NULL;
     const gchar *name = NULL;
 
     dir = g_dir_open("/dev", 0, NULL);
@@ -30,25 +31,33 @@ GSList *gp_serial_list_candidates_darwin(void)
     {
         gchar *path = NULL;
 
-        if (!g_str_has_prefix(name, "cu."))
+        if (!g_str_has_prefix(name, "cu.") &&
+            !g_str_has_prefix(name, "tty."))
             continue;
 
         if (g_strrstr(name, "Bluetooth") != NULL)
             continue;
 
         path = g_build_filename("/dev", name, NULL);
-        if (is_preferred_cu_name(name))
-            preferred = g_slist_append(preferred, path);
+        if (g_str_has_prefix(name, "cu."))
+        {
+            if (is_preferred_cu_name(name))
+                preferred = g_slist_append(preferred, path);
+            else
+                others = g_slist_append(others, path);
+        }
         else
-            others = g_slist_append(others, path);
+        {
+            tty_list = g_slist_append(tty_list, path);
+        }
     }
 
     g_dir_close(dir);
 
     if (preferred == NULL)
-        return others;
+        return g_slist_concat(others, tty_list);
 
-    return g_slist_concat(preferred, others);
+    return g_slist_concat(g_slist_concat(preferred, others), tty_list);
 }
 
 #endif

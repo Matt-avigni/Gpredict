@@ -197,6 +197,45 @@ gint radio_model_to_hamlib_model(radio_model_t model)
     }
 }
 
+gboolean radio_model_get_rigctld_defaults(radio_model_t model,
+                                          rigctld_preset_defaults_t *out)
+{
+    rigctld_preset_defaults_t preset;
+
+    switch (model)
+    {
+    case RADIO_MODEL_IC9700:
+        preset.host = "127.0.0.1";
+        preset.port = 4532;
+        preset.conn = RIGCTLD_CONN_SERIAL;
+        preset.baud = 115200;
+        preset.civaddr = "0xA2";
+        break;
+    case RADIO_MODEL_IC705:
+        preset.host = "127.0.0.1";
+        preset.port = 4532;
+        preset.conn = RIGCTLD_CONN_SERIAL;
+        preset.baud = 115200;
+        preset.civaddr = "0xA4";
+        break;
+    case RADIO_MODEL_IC905:
+        preset.host = "127.0.0.1";
+        preset.port = 4532;
+        preset.conn = RIGCTLD_CONN_SERIAL;
+        preset.baud = 115200;
+        preset.civaddr = "0xAC";
+        break;
+    case RADIO_MODEL_OTHER:
+    default:
+        return FALSE;
+    }
+
+    if (out)
+        *out = preset;
+
+    return TRUE;
+}
+
 const gchar *radio_mode_to_string(radio_mode_t mode)
 {
     switch (mode)

@@ -111,6 +111,53 @@ static void update_rigctld_connection_ui(gboolean enabled)
         gtk_widget_set_sensitive(rigctld_baud, enabled && !is_tcp);
 }
 
+static void apply_preset_rigctld_defaults(radio_model_t model,
+                                          gboolean force)
+{
+    rigctld_preset_defaults_t preset;
+
+    if (!radio_model_get_rigctld_defaults(model, &preset))
+        return;
+
+    if (host != NULL)
+    {
+        const gchar *current = gtk_entry_get_text(GTK_ENTRY(host));
+        if (force || current == NULL || *current == '\0')
+            gtk_entry_set_text(GTK_ENTRY(host),
+                               preset.host ? preset.host : "");
+    }
+
+    if (port != NULL)
+    {
+        gint value = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
+        if (force || value <= 0)
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), preset.port);
+    }
+
+    if (rigctld_conn_type != NULL && force)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(rigctld_conn_type), preset.conn);
+
+    if (rigctld_device != NULL && force)
+        gtk_entry_set_text(GTK_ENTRY(rigctld_device), "");
+
+    if (rigctld_baud != NULL)
+    {
+        gint value =
+            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(rigctld_baud));
+        if (force || value <= 0)
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(rigctld_baud),
+                                      preset.baud);
+    }
+
+    if (rigctld_civaddr != NULL)
+    {
+        const gchar *current = gtk_entry_get_text(GTK_ENTRY(rigctld_civaddr));
+        if (force || current == NULL || *current == '\0')
+            gtk_entry_set_text(GTK_ENTRY(rigctld_civaddr),
+                               preset.civaddr ? preset.civaddr : "");
+    }
+}
+
 static void update_autostart_sensitivity(gboolean enabled)
 {
     gtk_widget_set_sensitive(rigctld_conn_type, enabled);
@@ -456,6 +503,7 @@ static void update_widgets(radio_conf_t * conf)
     if (conf->rigctld_extra_args)
         gtk_entry_set_text(GTK_ENTRY(rigctld_extra_args),
                            conf->rigctld_extra_args);
+    apply_preset_rigctld_defaults(conf->radio_model, FALSE);
     update_autostart_sensitivity(conf->rigctld_autostart);
 }
 
@@ -634,6 +682,8 @@ static void radio_model_changed(GtkComboBox *box, gpointer data)
     }
 
     last_radio_model = model;
+    if (preset > 0)
+        apply_preset_rigctld_defaults(model, TRUE);
     enabled = autostart != NULL &&
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
     update_rigctld_model_sensitivity(enabled);

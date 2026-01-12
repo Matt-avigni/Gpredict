@@ -110,6 +110,14 @@ typedef struct {
     gchar          *rigctld_extra_args; /*!< Optional extra rigctld args */
 } radio_conf_t;
 
+typedef struct {
+    const gchar    *host;
+    gint            port;
+    rigctld_conn_t  conn;
+    gint            baud;
+    const gchar    *civaddr;
+} rigctld_preset_defaults_t;
+
 
 gboolean        radio_conf_read(radio_conf_t * conf);
 void            radio_conf_save(radio_conf_t * conf);
@@ -119,6 +127,8 @@ gchar          *radio_mode_allowed_string(radio_model_t model);
 const gchar    *radio_model_to_string(radio_model_t model);
 const gchar    *radio_mode_to_string(radio_mode_t mode);
 gint            radio_model_to_hamlib_model(radio_model_t model);
+gboolean        radio_model_get_rigctld_defaults(radio_model_t model,
+                                                 rigctld_preset_defaults_t *out);
 
 
 #endif

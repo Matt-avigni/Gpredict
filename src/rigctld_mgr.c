@@ -1,4 +1,5 @@
 #include "rigctld_mgr.h"
+#include "sat-log.h"
 
 #include <gio/gio.h>
 #include <string.h>
@@ -501,6 +502,15 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     }
 
     g_ptr_array_add(argv, NULL);
+
+    {
+        gchar *cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("rigctld spawn argv: %s"),
+                    cmdline ? cmdline : "(null)");
+        g_free(cmdline);
+    }
+
     launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_DEV_NULL |
                                          G_SUBPROCESS_FLAGS_STDOUT_PIPE |
                                          G_SUBPROCESS_FLAGS_STDERR_PIPE);

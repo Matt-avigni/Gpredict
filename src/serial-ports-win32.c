@@ -55,10 +55,25 @@ GSList *gp_serial_list_candidates_win32(void)
                 data[data_len] = '\0';
 
             port = g_strdup((const gchar *) data);
-            if (port != NULL && *port != '\0' && !list_has_port(list, port))
-                list = g_slist_append(list, port);
-            else
-                g_free(port);
+            if (port != NULL && *port != '\0')
+            {
+                gchar *normalized = NULL;
+                gint   number = 0;
+
+                if (g_ascii_strncasecmp(port, "COM", 3) == 0)
+                    number = (gint) g_ascii_strtoll(port + 3, NULL, 10);
+
+                if (number >= 10)
+                    normalized = g_strdup_printf("\\\\.\\%s", port);
+                else
+                    normalized = g_strdup(port);
+
+                if (!list_has_port(list, normalized))
+                    list = g_slist_append(list, normalized);
+                else
+                    g_free(normalized);
+            }
+            g_free(port);
         }
         index++;
     }
