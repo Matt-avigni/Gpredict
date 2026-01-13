@@ -52,6 +52,12 @@ static void add_cb(GtkWidget * button, gpointer data)
         .name = NULL,
         .host = NULL,
         .port = 4533,
+        .protocol = ROT_PROTOCOL_GS232B,
+        .baud = 0,
+        .device = NULL,
+        .device_manual = NULL,
+        .device_autopick = TRUE,
+        .autostart = TRUE,
         .minaz = 0,
         .maxaz = 360,
         .minel = 0,
@@ -66,6 +72,8 @@ static void add_cb(GtkWidget * button, gpointer data)
         .invert_el = FALSE,
     };
 
+    conf.baud = rot_protocol_default_baud(conf.protocol);
+
     /* run rot conf editor */
     sat_pref_rot_editor_run(&conf);
 
@@ -79,6 +87,12 @@ static void add_cb(GtkWidget * button, gpointer data)
                            ROT_LIST_COL_NAME, conf.name,
                            ROT_LIST_COL_HOST, conf.host,
                            ROT_LIST_COL_PORT, conf.port,
+                           ROT_LIST_COL_PROTOCOL, conf.protocol,
+                           ROT_LIST_COL_BAUD, conf.baud,
+                           ROT_LIST_COL_DEVICE, conf.device,
+                           ROT_LIST_COL_DEVICE_MANUAL, conf.device_manual,
+                           ROT_LIST_COL_DEVICE_AUTOPICK, conf.device_autopick,
+                           ROT_LIST_COL_AUTOSTART, conf.autostart,
                            ROT_LIST_COL_MINAZ, conf.minaz,
                            ROT_LIST_COL_MAXAZ, conf.maxaz,
                            ROT_LIST_COL_MINEL, conf.minel,
@@ -97,6 +111,10 @@ static void add_cb(GtkWidget * button, gpointer data)
 
         if (conf.host != NULL)
             g_free(conf.host);
+        if (conf.device != NULL)
+            g_free(conf.device);
+        if (conf.device_manual != NULL)
+            g_free(conf.device_manual);
     }
 }
 
@@ -114,6 +132,12 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .name = NULL,
         .host = NULL,
         .port = 4533,
+        .protocol = ROT_PROTOCOL_GS232B,
+        .baud = 0,
+        .device = NULL,
+        .device_manual = NULL,
+        .device_autopick = TRUE,
+        .autostart = TRUE,
         .minaz = 0,
         .maxaz = 360,
         .minel = 0,
@@ -127,6 +151,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .invert_az = FALSE,
         .invert_el = FALSE,
     };
+
+    conf.baud = rot_protocol_default_baud(conf.protocol);
 
     /* If there are no entries, we have a bug since the button should 
        have been disabled. */
@@ -151,6 +177,12 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            ROT_LIST_COL_NAME, &conf.name,
                            ROT_LIST_COL_HOST, &conf.host,
                            ROT_LIST_COL_PORT, &conf.port,
+                           ROT_LIST_COL_PROTOCOL, &conf.protocol,
+                           ROT_LIST_COL_BAUD, &conf.baud,
+                           ROT_LIST_COL_DEVICE, &conf.device,
+                           ROT_LIST_COL_DEVICE_MANUAL, &conf.device_manual,
+                           ROT_LIST_COL_DEVICE_AUTOPICK, &conf.device_autopick,
+                           ROT_LIST_COL_AUTOSTART, &conf.autostart,
                            ROT_LIST_COL_MINAZ, &conf.minaz,
                            ROT_LIST_COL_MAXAZ, &conf.maxaz,
                            ROT_LIST_COL_MINEL, &conf.minel,
@@ -193,6 +225,12 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            ROT_LIST_COL_NAME, conf.name,
                            ROT_LIST_COL_HOST, conf.host,
                            ROT_LIST_COL_PORT, conf.port,
+                           ROT_LIST_COL_PROTOCOL, conf.protocol,
+                           ROT_LIST_COL_BAUD, conf.baud,
+                           ROT_LIST_COL_DEVICE, conf.device,
+                           ROT_LIST_COL_DEVICE_MANUAL, conf.device_manual,
+                           ROT_LIST_COL_DEVICE_AUTOPICK, conf.device_autopick,
+                           ROT_LIST_COL_AUTOSTART, conf.autostart,
                            ROT_LIST_COL_MINAZ, conf.minaz,
                            ROT_LIST_COL_MAXAZ, conf.maxaz,
                            ROT_LIST_COL_MINEL, conf.minel,
@@ -214,6 +252,10 @@ static void edit_cb(GtkWidget * button, gpointer data)
 
     if (conf.host != NULL)
         g_free(conf.host);
+    if (conf.device != NULL)
+        g_free(conf.device);
+    if (conf.device_manual != NULL)
+        g_free(conf.device_manual);
 }
 
 static void delete_cb(GtkWidget * button, gpointer data)
@@ -286,6 +328,12 @@ static GtkTreeModel *create_and_fill_model()
     liststore = gtk_list_store_new(ROT_LIST_COL_NUM, G_TYPE_STRING,     // name
                                    G_TYPE_STRING,       // host
                                    G_TYPE_INT,  // port
+                                   G_TYPE_INT,          // protocol
+                                   G_TYPE_INT,          // baud
+                                   G_TYPE_STRING,       // device
+                                   G_TYPE_STRING,       // manual device
+                                   G_TYPE_BOOLEAN,      // device autopick
+                                   G_TYPE_BOOLEAN,      // autostart
                                    G_TYPE_DOUBLE,       // Min Az
                                    G_TYPE_DOUBLE,       // Max Az
                                    G_TYPE_DOUBLE,       // Min El
@@ -324,6 +372,12 @@ static GtkTreeModel *create_and_fill_model()
                                        ROT_LIST_COL_NAME, conf.name,
                                        ROT_LIST_COL_HOST, conf.host,
                                        ROT_LIST_COL_PORT, conf.port,
+                                       ROT_LIST_COL_PROTOCOL, conf.protocol,
+                                       ROT_LIST_COL_BAUD, conf.baud,
+                                       ROT_LIST_COL_DEVICE, conf.device,
+                                       ROT_LIST_COL_DEVICE_MANUAL, conf.device_manual,
+                                       ROT_LIST_COL_DEVICE_AUTOPICK, conf.device_autopick,
+                                       ROT_LIST_COL_AUTOSTART, conf.autostart,
                                        ROT_LIST_COL_MINAZ, conf.minaz,
                                        ROT_LIST_COL_MAXAZ, conf.maxaz,
                                        ROT_LIST_COL_MINEL, conf.minel,
@@ -347,6 +401,10 @@ static GtkTreeModel *create_and_fill_model()
 
                     if (conf.host)
                         g_free(conf.host);
+                    if (conf.device)
+                        g_free(conf.device);
+                    if (conf.device_manual)
+                        g_free(conf.device_manual);
                 }
                 else
                 {
@@ -614,6 +672,12 @@ void sat_pref_rot_ok()
         .name = NULL,
         .host = NULL,
         .port = 4533,
+        .protocol = ROT_PROTOCOL_GS232B,
+        .baud = 0,
+        .device = NULL,
+        .device_manual = NULL,
+        .device_autopick = TRUE,
+        .autostart = TRUE,
         .minaz = 0,
         .maxaz = 360,
         .minel = 0,
@@ -627,6 +691,8 @@ void sat_pref_rot_ok()
         .invert_az = FALSE,
         .invert_el = FALSE,
     };
+
+    conf.baud = rot_protocol_default_baud(conf.protocol);
 
 
     /* delete all .rot files */
@@ -667,6 +733,12 @@ void sat_pref_rot_ok()
                                ROT_LIST_COL_NAME, &conf.name,
                                ROT_LIST_COL_HOST, &conf.host,
                                ROT_LIST_COL_PORT, &conf.port,
+                               ROT_LIST_COL_PROTOCOL, &conf.protocol,
+                               ROT_LIST_COL_BAUD, &conf.baud,
+                               ROT_LIST_COL_DEVICE, &conf.device,
+                               ROT_LIST_COL_DEVICE_MANUAL, &conf.device_manual,
+                               ROT_LIST_COL_DEVICE_AUTOPICK, &conf.device_autopick,
+                               ROT_LIST_COL_AUTOSTART, &conf.autostart,
                                ROT_LIST_COL_MINAZ, &conf.minaz,
                                ROT_LIST_COL_MAXAZ, &conf.maxaz,
                                ROT_LIST_COL_MINEL, &conf.minel,
@@ -688,6 +760,10 @@ void sat_pref_rot_ok()
 
             if (conf.host)
                 g_free(conf.host);
+            if (conf.device)
+                g_free(conf.device);
+            if (conf.device_manual)
+                g_free(conf.device_manual);
 
         }
         else

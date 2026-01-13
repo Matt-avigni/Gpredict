@@ -43,11 +43,23 @@ typedef enum {
     ROT_AXIS_MODE_AZ_ONLY = 1
 } rot_axis_mode_t;
 
+typedef enum {
+    ROT_PROTOCOL_GS232B = 0,
+    ROT_PROTOCOL_SPID_ROT1PROG = 1,
+    ROT_PROTOCOL_SPID_ROT2PROG = 2
+} rot_protocol_t;
+
 /** \brief Rotator configuration. */
 typedef struct {
     gchar          *name;       /*!< Configuration file name, less .rot */
     gchar          *host;       /*!< hostname */
     gint            port;       /*!< port number */
+    rot_protocol_t  protocol;   /*!< Rotator protocol selection */
+    gint            baud;       /*!< Serial baud rate */
+    gchar          *device;     /*!< Selected serial device */
+    gchar          *device_manual; /*!< Manual device override */
+    gboolean        device_autopick; /*!< Auto-pick best serial device */
+    gboolean        autostart;  /*!< Auto-start rotctld */
     gint            cycle;      /*!< cycle period in msec */
     rot_az_type_t   aztype;     /*!< Az type */
     /* Developer note: we do not infer rotor axis mode; config is source of truth. */
@@ -68,5 +80,7 @@ typedef struct {
 
 gboolean        rotor_conf_read(rotor_conf_t * conf);
 void            rotor_conf_save(rotor_conf_t * conf);
+gint            rot_protocol_to_hamlib_model(rot_protocol_t protocol);
+gint            rot_protocol_default_baud(rot_protocol_t protocol);
 
 #endif

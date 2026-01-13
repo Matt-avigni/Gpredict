@@ -49,6 +49,7 @@ gpredict_SOURCES = \
     gtk-rig-ctrl.c gtk-rig-ctrl.h \
     rig-mode-dispatch.c rig-mode-dispatch.h \
     rigctld_mgr.c rigctld_mgr.h \
+    rotctld_mgr.c rotctld_mgr.h \
     serial-ports.c serial-ports.h \
     serial-ports-darwin.c \
     serial-ports-win32.c \

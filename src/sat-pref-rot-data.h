@@ -32,6 +32,12 @@ typedef enum {
     ROT_LIST_COL_NAME = 0,      /*!< File name. */
     ROT_LIST_COL_HOST,          /*!< Hostname */
     ROT_LIST_COL_PORT,          /*!< Port number */
+    ROT_LIST_COL_PROTOCOL,      /*!< Rotator protocol */
+    ROT_LIST_COL_BAUD,          /*!< Baud rate */
+    ROT_LIST_COL_DEVICE,        /*!< Serial device */
+    ROT_LIST_COL_DEVICE_MANUAL, /*!< Manual device override */
+    ROT_LIST_COL_DEVICE_AUTOPICK, /*!< Auto-pick device */
+    ROT_LIST_COL_AUTOSTART,     /*!< Auto-start rotctld */
     ROT_LIST_COL_MINAZ,         /*!< Lower Az limit. */
     ROT_LIST_COL_MAXAZ,         /*!< Upper Az limit. */
     ROT_LIST_COL_MINEL,         /*!< Lower El limit. */

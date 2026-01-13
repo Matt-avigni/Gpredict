@@ -37,6 +37,12 @@
 #define GROUP           "Rotator"
 #define KEY_HOST        "Host"
 #define KEY_PORT        "Port"
+#define KEY_PROTOCOL    "Protocol"
+#define KEY_BAUD        "Baud"
+#define KEY_DEVICE      "Device"
+#define KEY_DEVICE_MANUAL "DeviceManual"
+#define KEY_DEVICE_AUTOPICK "DeviceAutopick"
+#define KEY_AUTOSTART   "Autostart"
 #define KEY_CYCLE       "Cycle"
 #define KEY_AZTYPE      "AzType"
 #define KEY_MINAZ       "MinAz"
@@ -54,6 +60,37 @@
 
 #define DEFAULT_CYCLE_MS    1000
 #define DEFAULT_THLD_DEG    5.0
+#define DEFAULT_PROTOCOL    ROT_PROTOCOL_GS232B
+#define DEFAULT_AUTOSTART   TRUE
+#define DEFAULT_DEVICE_AUTOPICK TRUE
+
+/* Hamlib rotator model IDs (verify model id if hamlib changes).
+ * Derived from hamlib's rotlist.h (ROT_MAKE_MODEL uses 100*a+b).
+ */
+#define ROT_HAMLIB_MODEL_GS232B    603
+#define ROT_HAMLIB_MODEL_SPID_ROT2 901
+#define ROT_HAMLIB_MODEL_SPID_ROT1 902
+
+gint rot_protocol_to_hamlib_model(rot_protocol_t protocol)
+{
+    switch (protocol)
+    {
+    case ROT_PROTOCOL_GS232B:
+        return ROT_HAMLIB_MODEL_GS232B;
+    case ROT_PROTOCOL_SPID_ROT2PROG:
+        return ROT_HAMLIB_MODEL_SPID_ROT2;
+    case ROT_PROTOCOL_SPID_ROT1PROG:
+        return ROT_HAMLIB_MODEL_SPID_ROT1;
+    default:
+        return ROT_HAMLIB_MODEL_GS232B;
+    }
+}
+
+gint rot_protocol_default_baud(rot_protocol_t protocol)
+{
+    (void) protocol;
+    return 9600;
+}
 
 /**
  * \brief Read rotator configuration.
@@ -118,6 +155,102 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
         g_clear_error(&error);
         g_key_file_free(cfg);
         return FALSE;
+    }
+
+    conf->protocol = DEFAULT_PROTOCOL;
+    if (g_key_file_has_key(cfg, GROUP, KEY_PROTOCOL, NULL))
+    {
+        conf->protocol = g_key_file_get_integer(cfg, GROUP, KEY_PROTOCOL, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Protocol not defined for %s. Assuming GS-232B."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->protocol = DEFAULT_PROTOCOL;
+        }
+    }
+
+    if (conf->protocol < ROT_PROTOCOL_GS232B ||
+        conf->protocol > ROT_PROTOCOL_SPID_ROT2PROG)
+    {
+        conf->protocol = DEFAULT_PROTOCOL;
+    }
+
+    conf->baud = 0;
+    if (g_key_file_has_key(cfg, GROUP, KEY_BAUD, NULL))
+    {
+        conf->baud = g_key_file_get_integer(cfg, GROUP, KEY_BAUD, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Baud not defined for %s. Using protocol default."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->baud = 0;
+        }
+    }
+
+    if (conf->baud <= 0)
+        conf->baud = rot_protocol_default_baud(conf->protocol);
+
+    conf->device = NULL;
+    if (g_key_file_has_key(cfg, GROUP, KEY_DEVICE, NULL))
+    {
+        conf->device = g_key_file_get_string(cfg, GROUP, KEY_DEVICE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Device not defined for %s."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->device = NULL;
+        }
+    }
+
+    conf->device_manual = NULL;
+    if (g_key_file_has_key(cfg, GROUP, KEY_DEVICE_MANUAL, NULL))
+    {
+        conf->device_manual =
+            g_key_file_get_string(cfg, GROUP, KEY_DEVICE_MANUAL, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Manual device not defined for %s."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->device_manual = NULL;
+        }
+    }
+
+    conf->device_autopick = DEFAULT_DEVICE_AUTOPICK;
+    if (g_key_file_has_key(cfg, GROUP, KEY_DEVICE_AUTOPICK, NULL))
+    {
+        conf->device_autopick =
+            g_key_file_get_boolean(cfg, GROUP, KEY_DEVICE_AUTOPICK, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Device autopick not defined for %s. Assuming true."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->device_autopick = DEFAULT_DEVICE_AUTOPICK;
+        }
+    }
+
+    conf->autostart = DEFAULT_AUTOSTART;
+    if (g_key_file_has_key(cfg, GROUP, KEY_AUTOSTART, NULL))
+    {
+        conf->autostart =
+            g_key_file_get_boolean(cfg, GROUP, KEY_AUTOSTART, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: Autostart not defined for %s. Assuming true."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->autostart = DEFAULT_AUTOSTART;
+        }
     }
 
     /* cycle period and threshold are only saved if not default */
@@ -342,6 +475,11 @@ void rotor_conf_save(rotor_conf_t * conf)
 
     g_key_file_set_string(cfg, GROUP, KEY_HOST, conf->host);
     g_key_file_set_integer(cfg, GROUP, KEY_PORT, conf->port);
+    g_key_file_set_integer(cfg, GROUP, KEY_PROTOCOL, conf->protocol);
+    g_key_file_set_integer(cfg, GROUP, KEY_BAUD, conf->baud);
+    g_key_file_set_boolean(cfg, GROUP, KEY_DEVICE_AUTOPICK,
+                           conf->device_autopick);
+    g_key_file_set_boolean(cfg, GROUP, KEY_AUTOSTART, conf->autostart);
     g_key_file_set_integer(cfg, GROUP, KEY_AZTYPE, conf->aztype);
     g_key_file_set_double(cfg, GROUP, KEY_MINAZ, conf->minaz);
     g_key_file_set_double(cfg, GROUP, KEY_MAXAZ, conf->maxaz);
@@ -354,6 +492,16 @@ void rotor_conf_save(rotor_conf_t * conf)
     g_key_file_set_double(cfg, GROUP, KEY_EL_OFFSET, conf->el_offset);
     g_key_file_set_boolean(cfg, GROUP, KEY_AZ_INVERT, conf->invert_az);
     g_key_file_set_boolean(cfg, GROUP, KEY_EL_INVERT, conf->invert_el);
+
+    if (conf->device && *conf->device)
+        g_key_file_set_string(cfg, GROUP, KEY_DEVICE, conf->device);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_DEVICE, NULL);
+
+    if (conf->device_manual && *conf->device_manual)
+        g_key_file_set_string(cfg, GROUP, KEY_DEVICE_MANUAL, conf->device_manual);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_DEVICE_MANUAL, NULL);
 
     if (conf->cycle == DEFAULT_CYCLE_MS)
         g_key_file_remove_key(cfg, GROUP, KEY_CYCLE, NULL);
