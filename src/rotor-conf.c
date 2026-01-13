@@ -28,6 +28,7 @@
 */
 #include <gtk/gtk.h>
 #include <glib/gi18n.h>
+#include <hamlib/rotlist.h>
 #include "sat-log.h"
 #include "compat.h"
 
@@ -64,12 +65,44 @@
 #define DEFAULT_AUTOSTART   TRUE
 #define DEFAULT_DEVICE_AUTOPICK TRUE
 
-/* Hamlib rotator model IDs (verify model id if hamlib changes).
- * Derived from hamlib's rotlist.h (ROT_MAKE_MODEL uses 100*a+b).
- */
-#define ROT_HAMLIB_MODEL_GS232B    603
-#define ROT_HAMLIB_MODEL_SPID_ROT2 901
-#define ROT_HAMLIB_MODEL_SPID_ROT1 902
+/* Hamlib rotator model IDs from hamlib/rotlist.h. */
+#define ROT_HAMLIB_MODEL_GS232B    ROT_MODEL_GS232B
+#define ROT_HAMLIB_MODEL_SPID_ROT2 ROT_MODEL_SPID_ROT2PROG
+#define ROT_HAMLIB_MODEL_SPID_ROT1 ROT_MODEL_SPID_ROT1PROG
+
+gboolean rot_protocol_is_valid(rot_protocol_t protocol)
+{
+    return protocol >= ROT_PROTOCOL_GS232B &&
+           protocol <= ROT_PROTOCOL_SPID_ROT2PROG;
+}
+
+const gchar *rot_protocol_name(rot_protocol_t protocol)
+{
+    switch (protocol)
+    {
+    case ROT_PROTOCOL_SPID_ROT1PROG:
+        return "rot1prog";
+    case ROT_PROTOCOL_SPID_ROT2PROG:
+        return "rot2prog";
+    case ROT_PROTOCOL_GS232B:
+    default:
+        return "gs232b";
+    }
+}
+
+const gchar *rot_protocol_model_name(rot_protocol_t protocol)
+{
+    switch (protocol)
+    {
+    case ROT_PROTOCOL_SPID_ROT1PROG:
+        return "ROT_MODEL_SPID_ROT1PROG";
+    case ROT_PROTOCOL_SPID_ROT2PROG:
+        return "ROT_MODEL_SPID_ROT2PROG";
+    case ROT_PROTOCOL_GS232B:
+    default:
+        return "ROT_MODEL_GS232B";
+    }
+}
 
 gint rot_protocol_to_hamlib_model(rot_protocol_t protocol)
 {

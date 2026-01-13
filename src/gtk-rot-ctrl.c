@@ -2954,6 +2954,59 @@ static gchar **rotctld_append_verbosity(GtkRotCtrl *ctrl, gchar **argv)
     return out;
 }
 
+static gchar **rotctld_force_model(gchar **argv, gint model)
+{
+    gchar *model_str = NULL;
+    gint len;
+
+    if (argv == NULL || model <= 0)
+        return argv;
+
+    model_str = g_strdup_printf("%d", model);
+    len = g_strv_length(argv);
+
+    for (gint i = 0; i < len; i++)
+    {
+        if (g_strcmp0(argv[i], "-m") == 0)
+        {
+            if (i + 1 < len && argv[i + 1] && argv[i + 1][0] != '-')
+            {
+                g_free(argv[i + 1]);
+                argv[i + 1] = g_strdup(model_str);
+                g_free(model_str);
+                return argv;
+            }
+            else
+            {
+                gchar **out = g_new0(gchar *, len + 2);
+
+                for (gint j = 0; j <= i; j++)
+                    out[j] = g_strdup(argv[j]);
+                out[i + 1] = g_strdup(model_str);
+                for (gint j = i + 1; j < len; j++)
+                    out[j + 1] = g_strdup(argv[j]);
+                out[len + 1] = NULL;
+                g_strfreev(argv);
+                g_free(model_str);
+                return out;
+            }
+        }
+    }
+
+    {
+        gchar **out = g_new0(gchar *, len + 3);
+
+        for (gint i = 0; i < len; i++)
+            out[i] = g_strdup(argv[i]);
+        out[len] = g_strdup("-m");
+        out[len + 1] = g_strdup(model_str);
+        out[len + 2] = NULL;
+        g_strfreev(argv);
+        g_free(model_str);
+        return out;
+    }
+}
+
 static gchar **rotctld_build_argv_from_command(GtkRotCtrl *ctrl,
                                                const gchar *cmdline)
 {
@@ -2975,6 +3028,10 @@ static gchar **rotctld_build_argv_from_command(GtkRotCtrl *ctrl,
     }
 
     argv = rotctld_append_verbosity(ctrl, argv);
+    if (ctrl && ctrl->conf)
+        argv = rotctld_force_model(argv,
+                                   rot_protocol_to_hamlib_model(
+                                       ctrl->conf->protocol));
     return argv;
 }
 
@@ -3151,6 +3208,16 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
         return FALSE;
     }
 
+    if (!rot_protocol_is_valid(ctrl->conf->protocol))
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: invalid rotator protocol %d"),
+                    __func__, ctrl->conf->protocol);
+        rot_term_log(ctrl, "gpredict:err",
+                     "Invalid rotator protocol; cannot start rotctld.");
+        return FALSE;
+    }
+
     /* Step 2: build a command to start rotctld. Prefer the environment
      * variable if present on non-macOS, otherwise use the configured
      * protocol/device settings.
@@ -3167,6 +3234,10 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
 
     if (argv != NULL)
     {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld spawn: protocol=%s model=%s",
+                    rot_protocol_name(ctrl->conf->protocol),
+                    rot_protocol_model_name(ctrl->conf->protocol));
         if (!rotctld_spawn_process(ctrl, argv))
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -3188,15 +3259,7 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
                                          : rot_protocol_default_baud(
                                              ctrl->conf->protocol);
         const gchar *env_device = g_getenv("GPREDICT_ROT_SERIAL");
-        const gchar *env_model = g_getenv("GPREDICT_ROT_MODEL");
         const gchar *env_baud = g_getenv("GPREDICT_ROT_BAUD");
-
-        if (env_model && *env_model)
-        {
-            glong tmp = g_ascii_strtoll(env_model, NULL, 10);
-            if (tmp > 0)
-                model = (gint) tmp;
-        }
 
         if (env_baud && *env_baud)
         {
@@ -3228,6 +3291,10 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
         if (ctrl->rotctld_mgr)
             rotctld_process_stop(ctrl);
 
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld spawn: protocol=%s model=%s",
+                    rot_protocol_name(ctrl->conf->protocol),
+                    rot_protocol_model_name(ctrl->conf->protocol));
         ctrl->rotctld_mgr =
             rotctld_mgr_spawn(ctrl->conf->host,
                               ctrl->conf->port,

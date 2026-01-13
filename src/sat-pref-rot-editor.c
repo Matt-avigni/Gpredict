@@ -159,6 +159,39 @@ static gchar *rot_pref_pick_best_device(GSList *list, const gchar *current)
     return g_strdup(list->data);
 }
 
+static const gchar *rot_protocol_id(rot_protocol_t protocol)
+{
+    switch (protocol)
+    {
+    case ROT_PROTOCOL_SPID_ROT1PROG:
+        return "rot1prog";
+    case ROT_PROTOCOL_SPID_ROT2PROG:
+        return "rot2prog";
+    case ROT_PROTOCOL_GS232B:
+    default:
+        return "gs232b";
+    }
+}
+
+static rot_protocol_t rot_protocol_from_id(const gchar *id)
+{
+    if (g_strcmp0(id, "rot1prog") == 0)
+        return ROT_PROTOCOL_SPID_ROT1PROG;
+    if (g_strcmp0(id, "rot2prog") == 0)
+        return ROT_PROTOCOL_SPID_ROT2PROG;
+    return ROT_PROTOCOL_GS232B;
+}
+
+static rot_protocol_t rot_protocol_from_combo(GtkComboBox *combo)
+{
+    const gchar *id = NULL;
+
+    if (combo != NULL)
+        id = gtk_combo_box_get_active_id(combo);
+
+    return rot_protocol_from_id(id);
+}
+
 static void rot_pref_update_device_status(GSList *list)
 {
     if (device_status == NULL)
@@ -348,15 +381,32 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
     if (rotctld_mgr_host_is_local(host_text) && device && *device &&
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart)))
     {
-        gint model = rot_protocol_to_hamlib_model(
-            gtk_combo_box_get_active(GTK_COMBO_BOX(protocol)));
+        rot_protocol_t proto =
+            rot_protocol_from_combo(GTK_COMBO_BOX(protocol));
+        if (!rot_protocol_is_valid(proto))
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        "rotctld test: invalid rotator protocol %d",
+                        proto);
+            rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+                                 _("rotctld connection failed"),
+                                 _("Invalid rotator protocol."));
+            g_free(device);
+            g_free(device_note);
+            return;
+        }
+
+        gint model = rot_protocol_to_hamlib_model(proto);
         gint baud_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(baud));
         gchar *error = NULL;
 
         if (baud_val <= 0)
-            baud_val = rot_protocol_default_baud(
-                gtk_combo_box_get_active(GTK_COMBO_BOX(protocol)));
+            baud_val = rot_protocol_default_baud(proto);
 
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld spawn: protocol=%s model=%s",
+                    rot_protocol_name(proto),
+                    rot_protocol_model_name(proto));
         mgr = rotctld_mgr_spawn(host_text, port_val, model, device, baud_val,
                                 TRUE, &error);
         if (mgr == NULL)
@@ -441,7 +491,8 @@ static void update_widgets(rotor_conf_t * conf)
 
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart),
                                  conf->autostart);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(protocol), conf->protocol);
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(protocol),
+                                rot_protocol_id(conf->protocol));
     if (conf->baud > 0)
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud), conf->baud);
     else
@@ -477,7 +528,8 @@ static void clear_widgets()
     gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4533);     /* hamlib default? */
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), TRUE);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(protocol), ROT_PROTOCOL_GS232B);
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(protocol),
+                                rot_protocol_id(ROT_PROTOCOL_GS232B));
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud),
                               rot_protocol_default_baud(ROT_PROTOCOL_GS232B));
     gtk_entry_set_text(GTK_ENTRY(device_manual), "");
@@ -545,7 +597,7 @@ static void name_changed(GtkWidget * widget, gpointer data)
 
 static void protocol_changed_cb(GtkComboBox * box, gpointer data)
 {
-    gint proto = gtk_combo_box_get_active(box);
+    rot_protocol_t proto = rot_protocol_from_combo(box);
 
     (void)data;
 
@@ -686,17 +738,19 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     /* Protocol */
     label = gtk_label_new(_("Protocol"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
 
     protocol = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(protocol),
-                                   _("Yaesu GS-232B"));
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(protocol),
-                                   _("SPID Rot1Prog"));
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(protocol),
-                                   _("SPID Rot2Prog"));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(protocol), ROT_PROTOCOL_GS232B);
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(protocol),
+                              "gs232b", _("Yaesu GS-232B"));
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(protocol),
+                              "rot1prog", _("SPID Rot1Prog"));
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(protocol),
+                              "rot2prog", _("SPID Rot2Prog"));
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(protocol),
+                                rot_protocol_id(ROT_PROTOCOL_GS232B));
     gtk_grid_attach(GTK_GRID(table), protocol, 1, 4, 2, 1);
+    g_message("rot-editor: protocol selector added");
     g_signal_connect(G_OBJECT(protocol), "changed",
                      G_CALLBACK(protocol_changed_cb), NULL);
 
@@ -754,7 +808,7 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     /* Az-type */
     label = gtk_label_new(_("Az type"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
 
     aztype = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
@@ -909,7 +963,7 @@ static gboolean apply_changes(rotor_conf_t * conf)
     conf->port = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
 
     conf->autostart = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
-    conf->protocol = gtk_combo_box_get_active(GTK_COMBO_BOX(protocol));
+    conf->protocol = rot_protocol_from_combo(GTK_COMBO_BOX(protocol));
     conf->baud = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(baud));
     if (conf->baud <= 0)
         conf->baud = rot_protocol_default_baud(conf->protocol);

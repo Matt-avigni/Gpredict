@@ -80,6 +80,9 @@ typedef struct {
 
 gboolean        rotor_conf_read(rotor_conf_t * conf);
 void            rotor_conf_save(rotor_conf_t * conf);
+gboolean        rot_protocol_is_valid(rot_protocol_t protocol);
+const gchar    *rot_protocol_name(rot_protocol_t protocol);
+const gchar    *rot_protocol_model_name(rot_protocol_t protocol);
 gint            rot_protocol_to_hamlib_model(rot_protocol_t protocol);
 gint            rot_protocol_default_baud(rot_protocol_t protocol);
 
