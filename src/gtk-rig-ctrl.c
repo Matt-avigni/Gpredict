@@ -70,6 +70,7 @@
 #include "predict-tools.h"
 #include "radio-conf.h"
 #include "rigctld_mgr.h"
+#include "rotctld-parse.h"
 #include "serial-ports.h"
 #include "sat-log.h"
 #include "sat-cfg.h"
@@ -104,6 +105,12 @@
 
 static GHashTable *rigctld_device_cache = NULL;
 static GHashTable *rig_freq_cache = NULL;
+
+typedef enum {
+    RIGCTLD_PROBE_OK = 0,
+    RIGCTLD_PROBE_NOT_READY,
+    RIGCTLD_PROBE_MISMATCH
+} rigctld_probe_result_t;
 
 /* radio control functions */
 static void     exec_rx_cycle(GtkRigCtrl * ctrl);
@@ -5054,6 +5061,67 @@ static gboolean open_rigctld_socket_host(const gchar *host, gint port,
     return FALSE;
 }
 
+static gint rigctld_expected_model(const radio_conf_t *conf)
+{
+    gint model = 0;
+
+    if (conf == NULL)
+        return 0;
+
+    model = conf->rigctld_model;
+    if (model <= 0)
+        model = radio_model_to_hamlib_model(conf->radio_model);
+
+    return model;
+}
+
+static void rigctld_extract_first_lines(const gchar *text,
+                                        gchar **line1_out,
+                                        gchar **line2_out)
+{
+    gchar *line1 = NULL;
+    gchar *line2 = NULL;
+
+    if (line1_out)
+        *line1_out = NULL;
+    if (line2_out)
+        *line2_out = NULL;
+
+    if (text == NULL || *text == '\0')
+        return;
+
+    gchar **lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *line = g_strstrip(lines[i]);
+
+        if (line[0] == '\0')
+            continue;
+
+        if (line1 == NULL)
+        {
+            line1 = g_strdup(line);
+            continue;
+        }
+        if (line2 == NULL)
+        {
+            line2 = g_strdup(line);
+            break;
+        }
+    }
+    g_strfreev(lines);
+
+    if (line1_out)
+        *line1_out = line1;
+    else
+        g_free(line1);
+
+    if (line2_out)
+        *line2_out = line2;
+    else
+        g_free(line2);
+}
+
 static gboolean close_rigctld_socket(gint * sock)
 {
     gint            written;
@@ -5081,19 +5149,28 @@ static gboolean close_rigctld_socket(gint * sock)
     return TRUE;
 }
 
-static gboolean rigctld_probe_simple(const gchar *host, gint port,
-                                     gint timeout_ms, gchar **reply_out)
+static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
+                                                   gint timeout_ms,
+                                                   gint expected_model,
+                                                   gint *model_out,
+                                                   gchar **reply_out)
 {
     gint  sock = -1;
-    gchar buffer[128];
-    const gchar *cmd = "f\x0a";
+    gchar buffer[1024];
+    const gchar *cmd = "\\dump_state\n";
     gint  size;
+    gchar *line1 = NULL;
+    gchar *line2 = NULL;
+    gint model = 0;
+    gboolean parsed = FALSE;
 
     if (reply_out)
         *reply_out = NULL;
+    if (model_out)
+        *model_out = 0;
 
     if (!rigctld_connect_addrinfo(host, port, &sock))
-        return FALSE;
+        return RIGCTLD_PROBE_NOT_READY;
 
     rigctld_apply_socket_timeouts_ms(sock, timeout_ms);
 
@@ -5101,47 +5178,84 @@ static gboolean rigctld_probe_simple(const gchar *host, gint port,
     if (send(sock, cmd, size, 0) != size)
     {
         rigctld_close_fd(sock);
-        return FALSE;
+        return RIGCTLD_PROBE_NOT_READY;
     }
 
     size = (gint) recv(sock, buffer, sizeof(buffer) - 1, 0);
     if (size <= 0)
     {
         rigctld_close_fd(sock);
-        return FALSE;
+        return RIGCTLD_PROBE_NOT_READY;
     }
 
     buffer[size] = '\0';
     if (reply_out)
         *reply_out = g_strdup(buffer);
 
-    if (g_str_has_prefix(buffer, "RPRT") &&
-        !g_str_has_prefix(buffer, "RPRT 0"))
+    rigctld_extract_first_lines(buffer, &line1, &line2);
+    parsed = parse_dump_state_model_id(buffer, &model);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rigctld dump_state: line1=%s line2=%s model=%d",
+                line1 ? line1 : "(none)",
+                line2 ? line2 : "(none)",
+                model);
+
+    if (!parsed)
     {
+        g_free(line1);
+        g_free(line2);
         rigctld_close_fd(sock);
-        return FALSE;
+        return RIGCTLD_PROBE_NOT_READY;
     }
 
+    if (model_out)
+        *model_out = model;
+
+    if (expected_model > 0 && model > 0 && model != expected_model)
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "rigctld model mismatch expected=%d got=%d line1=%s line2=%s",
+                    expected_model, model,
+                    line1 ? line1 : "(none)",
+                    line2 ? line2 : "(none)");
+        g_free(line1);
+        g_free(line2);
+        rigctld_close_fd(sock);
+        return RIGCTLD_PROBE_MISMATCH;
+    }
+
+    g_free(line1);
+    g_free(line2);
     rigctld_close_fd(sock);
-    return TRUE;
+
+    return RIGCTLD_PROBE_OK;
 }
 
-static gboolean rigctld_wait_for_ready(const gchar *host, gint port,
-                                       gint timeout_ms)
+static rigctld_probe_result_t rigctld_wait_for_ready(const gchar *host,
+                                                     gint port,
+                                                     gint timeout_ms,
+                                                     gint expected_model,
+                                                     gint *model_out)
 {
     gint waited_ms = 0;
     const gint interval_ms = 200;
+    rigctld_probe_result_t result = RIGCTLD_PROBE_NOT_READY;
 
     while (waited_ms < timeout_ms)
     {
-        if (rigctld_probe_simple(host, port, RIGCTLD_AUTODETECT_PROBE_MS, NULL))
-            return TRUE;
+        result = rigctld_probe_simple(host, port,
+                                      RIGCTLD_AUTODETECT_PROBE_MS,
+                                      expected_model,
+                                      model_out,
+                                      NULL);
+        if (result != RIGCTLD_PROBE_NOT_READY)
+            return result;
 
         g_usleep(interval_ms * 1000);
         waited_ms += interval_ms;
     }
 
-    return FALSE;
+    return result;
 }
 
 static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
@@ -5196,6 +5310,14 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
         host = g_strdup("127.0.0.1");
 
     candidates = gp_serial_list_candidates();
+    {
+        guint count = g_slist_length(candidates);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-detect candidates=%u"),
+                    __func__, count);
+        rig_term_log(ctrl, "gpredict",
+                     "auto-detect candidates=%u", count);
+    }
     cached = rigctld_cached_device(conf->radio_model);
     if (cached != NULL)
     {
@@ -5273,31 +5395,46 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
             continue;
         }
 
-        if (rigctld_probe_simple(host, conf->port,
-                                 RIGCTLD_AUTODETECT_PROBE_MS,
-                                 &reply))
         {
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        _("%s: auto-detect succeeded for %s (reply: %s)"),
+            gint expected_model = rigctld_expected_model(conf);
+            rigctld_probe_result_t probe =
+                rigctld_probe_simple(host, conf->port,
+                                     RIGCTLD_AUTODETECT_PROBE_MS,
+                                     expected_model,
+                                     NULL,
+                                     &reply);
+            if (probe == RIGCTLD_PROBE_MISMATCH)
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: auto-detect model mismatch for %s"),
+                            __func__, candidate);
+            }
+
+            if (probe == RIGCTLD_PROBE_OK)
+            {
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            _("%s: auto-detect succeeded for %s (reply: %s)"),
+                            __func__, candidate,
+                            reply ? reply : "(none)");
+                rig_term_log(ctrl, "gpredict",
+                             "auto-detect selected %s (first response)",
+                             candidate);
+                g_free(conf->rigctld_device);
+                conf->rigctld_device = g_strdup(candidate);
+                rigctld_cache_device(conf->radio_model, candidate);
+                success = TRUE;
+                g_free(reply);
+                rigctld_mgr_terminate(&probe_mgr);
+                break;
+            }
+
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        _("%s: auto-detect probe failed for %s (reply: %s)"),
                         __func__, candidate,
                         reply ? reply : "(none)");
-            rig_term_log(ctrl, "gpredict",
-                         "auto-detect selected %s (first response)", candidate);
-            g_free(conf->rigctld_device);
-            conf->rigctld_device = g_strdup(candidate);
-            rigctld_cache_device(conf->radio_model, candidate);
-            success = TRUE;
             g_free(reply);
             rigctld_mgr_terminate(&probe_mgr);
-            break;
         }
-
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    _("%s: auto-detect probe failed for %s (reply: %s)"),
-                    __func__, candidate,
-                    reply ? reply : "(none)");
-        g_free(reply);
-        rigctld_mgr_terminate(&probe_mgr);
     }
 
     gp_serial_free_candidates(candidates);
@@ -5439,6 +5576,20 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         goto out;
     }
 
+    {
+        gint expected_model = rigctld_expected_model(conf);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rigctld ensure: host=%s port=%d autostart=%d "
+                    "conn=%d model=%d baud=%d device=%s",
+                    conf->host ? conf->host : "(null)",
+                    conf->port,
+                    conf->rigctld_autostart ? 1 : 0,
+                    conf->rigctld_conn,
+                    expected_model,
+                    conf->rigctld_baud,
+                    conf->rigctld_device ? conf->rigctld_device : "(none)");
+    }
+
     if (conf->rigctld_autostart &&
         conf->host &&
         g_ascii_strcasecmp(conf->host, "localhost") == 0)
@@ -5479,11 +5630,32 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
 
     if (rigctld_mgr_port_is_open(host, conf->port, 200))
     {
-        if (rigctld_wait_for_ready(host, conf->port, 1000))
+        gint detected_model = 0;
+        gint expected_model = rigctld_expected_model(conf);
+        rigctld_probe_result_t probe =
+            rigctld_wait_for_ready(host, conf->port, 1000,
+                                   expected_model, &detected_model);
+
+        if (probe == RIGCTLD_PROBE_OK)
         {
             rig_term_log(ctrl, "gpredict",
                          "rigctld reachable at %s:%d", host, conf->port);
             ok = TRUE;
+            goto out;
+        }
+
+        if (probe == RIGCTLD_PROBE_MISMATCH)
+        {
+            rig_term_log(ctrl, "gpredict:err",
+                         "rigctld model mismatch expected=%d got=%d at %s:%d",
+                         expected_model, detected_model,
+                         host, conf->port);
+            detail = g_strdup_printf(
+                _("rigctld model mismatch at %s:%d.\nExpected %d, got %d."),
+                host, conf->port, expected_model, detected_model);
+            schedule_rig_autostart_error(ctrl, conf, role, detail);
+            g_free(detail);
+            reported = TRUE;
             goto out;
         }
 
@@ -5500,6 +5672,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     }
 
     if (conf->rigctld_autostart &&
+        conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
         (conf->rigctld_device == NULL || *conf->rigctld_device == '\0') &&
         radio_model_to_hamlib_model(conf->radio_model) > 0)
     {
@@ -5596,35 +5769,70 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         goto out;
     }
 
-    if (!rigctld_wait_for_ready(host, conf->port, 2000))
     {
-        gchar *stderr_text = NULL;
+        gint detected_model = 0;
+        gint expected_model = rigctld_expected_model(conf);
+        rigctld_probe_result_t probe =
+            rigctld_wait_for_ready(host, conf->port, 2000,
+                                   expected_model, &detected_model);
+        if (probe != RIGCTLD_PROBE_OK)
+        {
+            gchar *stderr_text = NULL;
 
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: auto-start failed; rigctld not responding on %s:%d"),
-                    __func__, host, conf->port);
-        rig_term_log(ctrl, "gpredict:err",
-                     "rigctld not responding on %s:%d",
-                     host, conf->port);
+            if (probe == RIGCTLD_PROBE_MISMATCH)
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: auto-start failed; rigctld model mismatch on %s:%d"),
+                            __func__, host, conf->port);
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld model mismatch expected=%d got=%d at %s:%d",
+                             expected_model, detected_model,
+                             host, conf->port);
+            }
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: auto-start failed; rigctld not responding on %s:%d"),
+                            __func__, host, conf->port);
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld not responding on %s:%d",
+                             host, conf->port);
+            }
 
-        if (mgr)
-            stderr_text = rigctld_mgr_get_log_tail(*mgr);
+            if (mgr)
+                stderr_text = rigctld_mgr_get_log_tail(*mgr);
 
-        if (stderr_text && *stderr_text)
-            detail = g_strdup_printf(
-                _("rigctld did not respond to probes on %s:%d.\n%s"),
-                host, conf->port, stderr_text);
-        else
-            detail = g_strdup_printf(
-                _("rigctld did not respond to probes on %s:%d."),
-                host, conf->port);
+            if (probe == RIGCTLD_PROBE_MISMATCH)
+            {
+                if (stderr_text && *stderr_text)
+                    detail = g_strdup_printf(
+                        _("rigctld model mismatch at %s:%d.\nExpected %d, got %d.\n%s"),
+                        host, conf->port, expected_model, detected_model,
+                        stderr_text);
+                else
+                    detail = g_strdup_printf(
+                        _("rigctld model mismatch at %s:%d.\nExpected %d, got %d."),
+                        host, conf->port, expected_model, detected_model);
+            }
+            else
+            {
+                if (stderr_text && *stderr_text)
+                    detail = g_strdup_printf(
+                        _("rigctld did not respond to probes on %s:%d.\n%s"),
+                        host, conf->port, stderr_text);
+                else
+                    detail = g_strdup_printf(
+                        _("rigctld did not respond to probes on %s:%d."),
+                        host, conf->port);
+            }
 
-        schedule_rig_autostart_error(ctrl, conf, role, detail);
-        rigctld_mgr_terminate(mgr);
-        g_free(stderr_text);
-        g_free(detail);
-        reported = TRUE;
-        goto out;
+            schedule_rig_autostart_error(ctrl, conf, role, detail);
+            rigctld_mgr_terminate(mgr);
+            g_free(stderr_text);
+            g_free(detail);
+            reported = TRUE;
+            goto out;
+        }
     }
 
     ok = TRUE;
@@ -5692,11 +5900,28 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
 static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
                               const gchar *label)
 {
-    gchar           buffback[128];
+    gchar           buffback[1024];
+    gchar          *line1 = NULL;
+    gchar          *line2 = NULL;
+    gint            model = 0;
+    gint            expected_model = 0;
     gboolean        ok;
     const gchar    *role = (label != NULL) ? label : _("rig");
+    const radio_conf_t *conf = NULL;
 
-    ok = send_rigctld_command(ctrl, sock, "f\x0a", buffback, 128);
+    if (ctrl != NULL)
+    {
+        if (sock == ctrl->sock)
+            conf = ctrl->conf;
+        else if (sock == ctrl->sock2)
+            conf = ctrl->conf2;
+        else
+            conf = ctrl->conf;
+    }
+    expected_model = rigctld_expected_model(conf);
+
+    ok = send_rigctld_command(ctrl, sock, "\\dump_state\n", buffback,
+                              (gint) sizeof(buffback));
     if (!ok)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -5705,23 +5930,47 @@ static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
         return FALSE;
     }
 
-    if (g_str_has_prefix(buffback, "RPRT"))
+    rigctld_extract_first_lines(buffback, &line1, &line2);
+    ok = parse_dump_state_model_id(buffback, &model);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rigctld dump_state: line1=%s line2=%s model=%d",
+                line1 ? line1 : "(none)",
+                line2 ? line2 : "(none)",
+                model);
+
+    if (!ok)
     {
-        if (g_str_has_prefix(buffback, "RPRT 0"))
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        _("%s: probe got RPRT 0 from %s"), __func__, role);
-            return TRUE;
-        }
         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: probe got error reply from %s: %s"),
-                    __func__, role, buffback);
+                    _("%s: probe got invalid dump_state from %s"),
+                    __func__, role);
+        g_free(line1);
+        g_free(line2);
         return FALSE;
     }
 
+    if (expected_model > 0 && model > 0 && model != expected_model)
+    {
+        rig_term_log(ctrl, "gpredict:err",
+                     "rigctld model mismatch expected=%d got=%d line1=%s line2=%s",
+                     expected_model, model,
+                     line1 ? line1 : "(none)",
+                     line2 ? line2 : "(none)");
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rigctld model mismatch expected=%d got=%d line1=%s line2=%s (%s)"),
+                    __func__, expected_model, model,
+                    line1 ? line1 : "(none)",
+                    line2 ? line2 : "(none)",
+                    role);
+        g_free(line1);
+        g_free(line2);
+        return FALSE;
+    }
+
+    g_free(line1);
+    g_free(line2);
     sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: probe succeeded for %s (reply: %s)"),
-                __func__, role, buffback);
+                _("%s: probe succeeded for %s (model=%d)"),
+                __func__, role, model);
     return TRUE;
 }
 
@@ -5740,12 +5989,12 @@ static gboolean rig_conn_error_idle(gpointer data)
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
-    body = g_strdup_printf(_("Unable to connect to rigctld (%s)\nHost: %s\nPort: %d"),
+    body = g_strdup_printf(_("Rigctld not reachable (%s)\nHost: %s\nPort: %d"),
                            info->role ? info->role : _("rig"),
                            info->host ? info->host : "(null) - missing",
                            info->port);
     rig_show_error_dialog(info->ctrl,
-                          _("Unable to connect to rigctld"),
+                          _("Rigctld not reachable"),
                           body);
     g_free(body);
     g_free(info->host);

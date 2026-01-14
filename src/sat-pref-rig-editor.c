@@ -31,6 +31,7 @@
 #include "sat-cfg.h"
 #include "sat-log.h"
 #include "sat-pref-rig-editor.h"
+#include "serial-ports.h"
 
 
 extern GtkWidget *window;       /* dialog window defined in sat-pref.c */
@@ -54,12 +55,17 @@ static GtkWidget *rigctld_path; /* rigctld path */
 static GtkWidget *rigctld_model; /* rigctld model */
 static GtkWidget *rigctld_device_label; /* rigctld device label */
 static GtkWidget *rigctld_device; /* rigctld device */
+static GtkWidget *rigctld_device_find; /* rigctld device finder */
 static GtkWidget *rigctld_baud_label; /* rigctld baud label */
 static GtkWidget *rigctld_baud; /* rigctld baud */
 static GtkWidget *rigctld_civaddr; /* rigctld CI-V address */
 static GtkWidget *rigctld_extra_args; /* rigctld extra args */
 static gint rigctld_model_custom = 0; /* remember custom rig model */
 static radio_model_t last_radio_model = RADIO_MODEL_OTHER;
+
+static void rig_pref_show_dialog(GtkMessageType type,
+                                 const gchar *primary,
+                                 const gchar *secondary);
 
 static gboolean rigctld_conn_is_tcp(void)
 {
@@ -104,11 +110,132 @@ static void update_rigctld_connection_ui(gboolean enabled)
             is_tcp ? _("Rig TCP address for rigctld (host:port).")
                    : _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
     }
+    if (rigctld_device_find != NULL)
+        gtk_widget_set_sensitive(rigctld_device_find, enabled && !is_tcp);
 
     if (rigctld_baud_label != NULL)
         gtk_widget_set_sensitive(rigctld_baud_label, enabled && !is_tcp);
     if (rigctld_baud != NULL)
         gtk_widget_set_sensitive(rigctld_baud, enabled && !is_tcp);
+}
+
+static gboolean rig_pref_is_preferred_device(const gchar *path)
+{
+    gboolean match = FALSE;
+    gchar *lower = NULL;
+
+    if (path == NULL)
+        return FALSE;
+
+    lower = g_ascii_strdown(path, -1);
+    if (lower)
+    {
+        match = (g_strrstr(lower, "usbserial") != NULL) ||
+                (g_strrstr(lower, "usbmodem") != NULL) ||
+                (g_strrstr(lower, "slab") != NULL) ||
+                (g_strrstr(lower, "wch") != NULL) ||
+                (g_strrstr(lower, "ftdi") != NULL);
+    }
+    g_free(lower);
+    return match;
+}
+
+static gboolean rig_pref_list_contains(GSList *list, const gchar *item)
+{
+    if (item == NULL)
+        return FALSE;
+
+    for (GSList *iter = list; iter != NULL; iter = iter->next)
+    {
+        if (g_strcmp0(iter->data, item) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gchar *rig_pref_pick_best_device(GSList *list, const gchar *current)
+{
+    if (list == NULL)
+        return NULL;
+
+    if (list->next == NULL)
+        return g_strdup(list->data);
+
+    if (current && rig_pref_list_contains(list, current))
+    {
+        gboolean current_preferred = rig_pref_is_preferred_device(current);
+        gboolean have_preferred = FALSE;
+
+        for (GSList *iter = list; iter != NULL; iter = iter->next)
+        {
+            if (rig_pref_is_preferred_device(iter->data))
+            {
+                have_preferred = TRUE;
+                break;
+            }
+        }
+
+        if (!have_preferred || current_preferred)
+            return g_strdup(current);
+    }
+
+    for (GSList *iter = list; iter != NULL; iter = iter->next)
+    {
+        if (rig_pref_is_preferred_device(iter->data))
+            return g_strdup(iter->data);
+    }
+
+    return g_strdup(list->data);
+}
+
+static void rigctld_find_port_cb(GtkButton *button, gpointer data)
+{
+    const gchar *current = NULL;
+    GSList *candidates = NULL;
+    gchar *picked = NULL;
+    guint count = 0;
+
+    (void)button;
+    (void)data;
+
+    if (rigctld_conn_is_tcp())
+    {
+        rig_pref_show_dialog(GTK_MESSAGE_INFO,
+                             _("Find port is only available for serial rigs."),
+                             NULL);
+        return;
+    }
+
+    if (rigctld_device)
+        current = gtk_entry_get_text(GTK_ENTRY(rigctld_device));
+
+    candidates = gp_serial_list_candidates();
+    count = g_slist_length(candidates);
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rigctld find port: candidates=%u", count);
+
+    if (candidates == NULL)
+    {
+        rig_pref_show_dialog(GTK_MESSAGE_WARNING,
+                             _("No serial ports found."),
+                             NULL);
+        return;
+    }
+
+    picked = rig_pref_pick_best_device(candidates, current);
+    if (picked)
+    {
+        gtk_entry_set_text(GTK_ENTRY(rigctld_device), picked);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rigctld find port selected=%s", picked);
+    }
+    else
+        rig_pref_show_dialog(GTK_MESSAGE_WARNING,
+                             _("No serial ports found."),
+                             NULL);
+
+    g_free(picked);
+    gp_serial_free_candidates(candidates);
 }
 
 static void apply_preset_rigctld_defaults(radio_model_t model,
@@ -978,7 +1105,7 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Enable LOS signalling for this radio."));
 
     /* Auto-start rigctld */
-    label = gtk_label_new(_("Auto-start rigctld"));
+    label = gtk_label_new(_("Auto-start local rigctld"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
 
@@ -1031,7 +1158,14 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
     gtk_widget_set_tooltip_text(rigctld_device,
                                 _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 15, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 15, 2, 1);
+
+    rigctld_device_find = gtk_button_new_with_label(_("Find port"));
+    gtk_widget_set_tooltip_text(rigctld_device_find,
+                                _("Scan serial ports and select a likely match."));
+    gtk_grid_attach(GTK_GRID(table), rigctld_device_find, 3, 15, 1, 1);
+    g_signal_connect(rigctld_device_find, "clicked",
+                     G_CALLBACK(rigctld_find_port_cb), NULL);
 
     /* rigctld baud */
     rigctld_baud_label = gtk_label_new(_("Baud"));

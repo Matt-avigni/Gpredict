@@ -50,6 +50,7 @@ gpredict_SOURCES = \
     rig-mode-dispatch.c rig-mode-dispatch.h \
     rigctld_mgr.c rigctld_mgr.h \
     rotctld_mgr.c rotctld_mgr.h \
+    rotctld-parse.c rotctld-parse.h \
     serial-ports.c serial-ports.h \
     serial-ports-darwin.c \
     serial-ports-win32.c \
@@ -134,8 +135,8 @@ gpredict_LDADD = @PACKAGE_LIBS@
 
 ## $(INTLLIBS)
 
-check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test
-TESTS = rotor-cmd-map-test rig-mode-dispatch-test
+check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test rotctld-parse-test
+TESTS = rotor-cmd-map-test rig-mode-dispatch-test rotctld-parse-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -148,3 +149,9 @@ rig_mode_dispatch_test_SOURCES = \
     rig-mode-dispatch.c \
     rig-mode-dispatch.h
 rig_mode_dispatch_test_LDADD = @PACKAGE_LIBS@
+
+rotctld_parse_test_SOURCES = \
+    rotctld-parse-test.c \
+    rotctld-parse.c \
+    rotctld-parse.h
+rotctld_parse_test_LDADD = @PACKAGE_LIBS@

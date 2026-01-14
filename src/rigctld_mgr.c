@@ -1,4 +1,5 @@
 #include "rigctld_mgr.h"
+#include "rotctld-parse.h"
 #include "sat-log.h"
 
 #include <gio/gio.h>
@@ -37,6 +38,7 @@ struct _RigctldMgr {
     GString     *log;
     RigctldMgrLogFunc log_cb;
     gpointer     log_cb_data;
+    gboolean     proc_exited;
     gboolean     exit_ready;
     gboolean     exit_reported;
     gint         exit_status;
@@ -225,26 +227,50 @@ static void rigctld_mgr_emit_exit_if_ready(RigctldMgr *mgr)
     }
 }
 
+static gboolean rigctld_mgr_proc_exited(RigctldMgr *mgr)
+{
+    gboolean exited = TRUE;
+
+    if (mgr == NULL)
+        return TRUE;
+
+    g_mutex_lock(&mgr->log_lock);
+    exited = mgr->proc_exited;
+    g_mutex_unlock(&mgr->log_lock);
+
+    return exited;
+}
+
 static gpointer rigctld_mgr_wait_thread(gpointer data)
 {
     RigctldMgr *mgr = data;
     gint status = -1;
     gint sig = 0;
+    GError *error = NULL;
+    gboolean waited_ok = FALSE;
 
     if (mgr == NULL || mgr->proc == NULL)
         return NULL;
 
-    g_subprocess_wait(mgr->proc, NULL, NULL);
+    waited_ok = g_subprocess_wait(mgr->proc, NULL, &error);
+    if (!waited_ok)
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctld_mgr: wait failed: %s",
+                    error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
 
-    if (g_subprocess_get_if_exited(mgr->proc))
+    if (waited_ok && g_subprocess_get_if_exited(mgr->proc))
         status = g_subprocess_get_exit_status(mgr->proc);
 
 #if GLIB_CHECK_VERSION(2, 40, 0)
-    if (g_subprocess_get_if_signaled(mgr->proc))
+    if (waited_ok && g_subprocess_get_if_signaled(mgr->proc))
         sig = g_subprocess_get_term_sig(mgr->proc);
 #endif
 
     g_mutex_lock(&mgr->log_lock);
+    mgr->proc_exited = TRUE;
     mgr->exit_ready = TRUE;
     mgr->exit_status = status;
     mgr->exit_signal = sig;
@@ -347,19 +373,71 @@ gboolean rigctld_mgr_host_is_local(const gchar *host)
     return FALSE;
 }
 
-static gboolean rigctld_mgr_dump_state_has_id(const gchar *text)
+static gboolean rigctld_mgr_dump_state_parse(const gchar *text,
+                                             gint *model_out,
+                                             gchar **line1_out,
+                                             gchar **line2_out)
 {
+    gchar *line1 = NULL;
+    gchar *line2 = NULL;
+    gboolean ok = FALSE;
+
+    if (model_out)
+        *model_out = 0;
+    if (line1_out)
+        *line1_out = NULL;
+    if (line2_out)
+        *line2_out = NULL;
+
     if (text == NULL || *text == '\0')
         return FALSE;
 
     if (g_strstr_len(text, -1, "Rig model") != NULL)
-        return TRUE;
+        ok = TRUE;
     if (g_strstr_len(text, -1, "Model name") != NULL)
-        return TRUE;
+        ok = TRUE;
     if (g_strstr_len(text, -1, "Hamlib") != NULL)
-        return TRUE;
+        ok = TRUE;
 
-    return FALSE;
+    if (!ok)
+        ok = parse_dump_state_model_id(text, model_out);
+    else
+        (void) parse_dump_state_model_id(text, model_out);
+
+    {
+        gchar **lines = g_strsplit(text, "\n", -1);
+        for (gint i = 0; lines[i] != NULL; i++)
+        {
+            gchar *line = g_strstrip(lines[i]);
+
+            if (line[0] == '\0')
+                continue;
+
+            if (line1 == NULL)
+            {
+                line1 = g_strdup(line);
+                continue;
+            }
+            if (line2 == NULL)
+            {
+                line2 = g_strdup(line);
+                break;
+            }
+        }
+        g_strfreev(lines);
+    }
+
+    if (line1_out)
+        *line1_out = line1;
+    else
+        g_free(line1);
+
+    if (line2_out)
+        *line2_out = line2;
+    else
+        g_free(line2);
+
+    return ok;
 }
 
 static gboolean rigctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
@@ -369,6 +447,10 @@ static gboolean rigctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
     GError *error = NULL;
     gssize size;
     gint timeout_s;
+    gchar *line1 = NULL;
+    gchar *line2 = NULL;
+    gint model = 0;
+    gboolean ok = FALSE;
 
     if (sock == NULL)
         return FALSE;
@@ -392,7 +474,17 @@ static gboolean rigctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
     }
 
     buffer[size] = '\0';
-    return rigctld_mgr_dump_state_has_id(buffer);
+
+    ok = rigctld_mgr_dump_state_parse(buffer, &model, &line1, &line2);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rigctld dump_state: line1=%s line2=%s model=%d",
+                line1 ? line1 : "(none)",
+                line2 ? line2 : "(none)",
+                model);
+    g_free(line1);
+    g_free(line2);
+
+    return ok;
 }
 
 static gboolean rigctld_mgr_port_is_ready(const gchar *host, gint port,
@@ -772,6 +864,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     mgr->proc = proc;
     g_mutex_init(&mgr->log_lock);
     mgr->log = g_string_new(NULL);
+    mgr->proc_exited = FALSE;
     mgr->exit_ready = FALSE;
     mgr->exit_reported = FALSE;
     mgr->exit_status = -1;
@@ -819,7 +912,7 @@ gboolean rigctld_mgr_is_running(const RigctldMgr *mgr)
     if (mgr == NULL || mgr->proc == NULL)
         return FALSE;
 
-    return !g_subprocess_get_if_exited(mgr->proc);
+    return !rigctld_mgr_proc_exited((RigctldMgr *)mgr);
 }
 
 const gchar *rigctld_mgr_get_identifier(const RigctldMgr *mgr)
@@ -860,13 +953,16 @@ void rigctld_mgr_set_log_callback(RigctldMgr *mgr,
     rigctld_mgr_emit_exit_if_ready(mgr);
 }
 
-static void rigctld_mgr_wait_exit(GSubprocess *proc, gint timeout_ms)
+static void rigctld_mgr_wait_exit(RigctldMgr *mgr, gint timeout_ms)
 {
     gint waited_ms = 0;
 
+    if (mgr == NULL)
+        return;
+
     while (waited_ms < timeout_ms)
     {
-        if (g_subprocess_get_if_exited(proc))
+        if (rigctld_mgr_proc_exited(mgr))
             return;
 
         g_usleep(100 * 1000);
@@ -885,13 +981,13 @@ void rigctld_mgr_terminate(RigctldMgr **mgr_ptr)
 
     if (mgr->proc != NULL)
     {
-        if (!g_subprocess_get_if_exited(mgr->proc))
+        if (!rigctld_mgr_proc_exited(mgr))
         {
 #if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
             g_subprocess_send_signal(mgr->proc, SIGTERM);
-            rigctld_mgr_wait_exit(mgr->proc, 1500);
+            rigctld_mgr_wait_exit(mgr, 1500);
 #endif
-            if (!g_subprocess_get_if_exited(mgr->proc))
+            if (!rigctld_mgr_proc_exited(mgr))
                 g_subprocess_force_exit(mgr->proc);
         }
 

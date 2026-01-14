@@ -48,25 +48,6 @@ static gchar *rotctld_mgr_argv_to_shell_string(const gchar * const *argv)
     return g_string_free(buf, FALSE);
 }
 
-static gboolean subprocess_is_running(GSubprocess *proc)
-{
-    if (proc == NULL)
-        return FALSE;
-
-#if GLIB_CHECK_VERSION(2, 40, 0)
-    return !g_subprocess_get_if_exited(proc);
-#else
-    {
-        gint status = g_subprocess_get_status(proc);
-        if (status != 0)
-            return FALSE;
-        if (g_subprocess_get_successful(proc))
-            return FALSE;
-        return TRUE;
-    }
-#endif
-}
-
 struct _RotctldMgr {
     GSubprocess *proc;
     GThread     *stdout_thread;
@@ -77,6 +58,7 @@ struct _RotctldMgr {
     GQueue      *stderr_lines;
     RotctldMgrLogFunc log_cb;
     gpointer     log_cb_data;
+    gboolean     proc_exited;
     gboolean     exit_ready;
     gboolean     exit_reported;
     gint         exit_status;
@@ -650,7 +632,8 @@ static void rotctld_mgr_wait_cb(GObject *source, GAsyncResult *res,
         return;
     }
 
-    if (!g_subprocess_wait_finish(proc, res, &error))
+    gboolean waited_ok = g_subprocess_wait_finish(proc, res, &error);
+    if (!waited_ok)
     {
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rotctld_mgr: wait failed: %s",
@@ -658,17 +641,15 @@ static void rotctld_mgr_wait_cb(GObject *source, GAsyncResult *res,
         g_clear_error(&error);
     }
 
-    if (!subprocess_is_running(proc))
-    {
-        if (g_subprocess_get_if_exited(proc))
-            status = g_subprocess_get_exit_status(proc);
+    if (waited_ok && g_subprocess_get_if_exited(proc))
+        status = g_subprocess_get_exit_status(proc);
 #if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
-        if (g_subprocess_get_if_signaled(proc))
-            sig = g_subprocess_get_term_sig(proc);
+    if (waited_ok && g_subprocess_get_if_signaled(proc))
+        sig = g_subprocess_get_term_sig(proc);
 #endif
-    }
 
     g_mutex_lock(&mgr->log_lock);
+    mgr->proc_exited = TRUE;
     mgr->exit_ready = TRUE;
     mgr->exit_status = status;
     mgr->exit_signal = sig;
@@ -854,6 +835,7 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
     g_mutex_init(&mgr->log_lock);
     mgr->stdout_lines = g_queue_new();
     mgr->stderr_lines = g_queue_new();
+    mgr->proc_exited = FALSE;
     mgr->exit_ready = FALSE;
     mgr->exit_reported = FALSE;
     mgr->exit_status = -1;
@@ -1073,7 +1055,7 @@ gboolean rotctld_mgr_is_running(const RotctldMgr *mgr)
     if (mgr == NULL || mgr->proc == NULL)
         return FALSE;
 
-    return subprocess_is_running(mgr->proc);
+    return !mgr->proc_exited;
 }
 
 const gchar *rotctld_mgr_get_identifier(const RotctldMgr *mgr)
@@ -1121,22 +1103,6 @@ gboolean rotctld_mgr_get_exit_info(RotctldMgr *mgr,
     }
     g_mutex_unlock(&mgr->log_lock);
 
-    if (!ready && !subprocess_is_running(mgr->proc))
-    {
-        if (g_subprocess_get_if_exited(mgr->proc))
-            status = g_subprocess_get_exit_status(mgr->proc);
-#if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
-        if (g_subprocess_get_if_signaled(mgr->proc))
-            sig = g_subprocess_get_term_sig(mgr->proc);
-#endif
-        g_mutex_lock(&mgr->log_lock);
-        mgr->exit_ready = TRUE;
-        mgr->exit_status = status;
-        mgr->exit_signal = sig;
-        g_mutex_unlock(&mgr->log_lock);
-        ready = TRUE;
-    }
-
     if (ready)
     {
         if (status_out)
@@ -1164,13 +1130,16 @@ void rotctld_mgr_set_log_callback(RotctldMgr *mgr,
     rotctld_mgr_emit_exit_if_ready(mgr);
 }
 
-static void rotctld_mgr_wait_exit(GSubprocess *proc, gint timeout_ms)
+static void rotctld_mgr_wait_exit(RotctldMgr *mgr, gint timeout_ms)
 {
     gint waited_ms = 0;
 
+    if (mgr == NULL)
+        return;
+
     while (waited_ms < timeout_ms)
     {
-        if (!subprocess_is_running(proc))
+        if (mgr->proc_exited)
             return;
 
         g_usleep(100 * 1000);
@@ -1189,13 +1158,13 @@ void rotctld_mgr_terminate(RotctldMgr **mgr_ptr)
 
     if (mgr->proc != NULL)
     {
-        if (subprocess_is_running(mgr->proc))
+        if (!mgr->proc_exited)
         {
 #if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
             g_subprocess_send_signal(mgr->proc, SIGTERM);
-            rotctld_mgr_wait_exit(mgr->proc, 1500);
+            rotctld_mgr_wait_exit(mgr, 1500);
 #endif
-            if (subprocess_is_running(mgr->proc))
+            if (!mgr->proc_exited)
                 g_subprocess_force_exit(mgr->proc);
         }
 

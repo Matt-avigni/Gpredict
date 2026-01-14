@@ -12,7 +12,8 @@ static gboolean is_preferred_cu_name(const gchar *name)
 {
     return g_str_has_prefix(name, "cu.usb") ||
         g_str_has_prefix(name, "cu.SLAB_") ||
-        g_str_has_prefix(name, "cu.wchusbserial");
+        g_str_has_prefix(name, "cu.wchusbserial") ||
+        (g_strrstr(name, "ftdi") != NULL);
 }
 
 GSList *gp_serial_list_candidates_darwin(void)
@@ -36,6 +37,8 @@ GSList *gp_serial_list_candidates_darwin(void)
             continue;
 
         if (g_strrstr(name, "Bluetooth") != NULL)
+            continue;
+        if (g_strrstr(name, "debug-console") != NULL)
             continue;
 
         path = g_build_filename("/dev", name, NULL);
