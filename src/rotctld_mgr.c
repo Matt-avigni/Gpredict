@@ -48,6 +48,25 @@ static gchar *rotctld_mgr_argv_to_shell_string(const gchar * const *argv)
     return g_string_free(buf, FALSE);
 }
 
+static gboolean subprocess_is_running(GSubprocess *proc)
+{
+    if (proc == NULL)
+        return FALSE;
+
+#if GLIB_CHECK_VERSION(2, 40, 0)
+    return !g_subprocess_get_if_exited(proc);
+#else
+    {
+        gint status = g_subprocess_get_status(proc);
+        if (status != 0)
+            return FALSE;
+        if (g_subprocess_get_successful(proc))
+            return FALSE;
+        return TRUE;
+    }
+#endif
+}
+
 struct _RotctldMgr {
     GSubprocess *proc;
     GThread     *stdout_thread;
@@ -70,6 +89,11 @@ typedef struct {
     const gchar *prefix;
     GQueue      *queue;
 } RotctldLogReader;
+
+typedef struct {
+    RotctldMgr  *mgr;
+    GMainLoop   *loop;
+} RotctldMgrWaitCtx;
 
 #ifndef __APPLE__
 static gchar *rotctld_mgr_find_bundled_rotctld(void)
@@ -299,9 +323,10 @@ static gboolean rotctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
     return rotctld_mgr_dump_state_has_id(buffer);
 }
 
-static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
-                                          gint timeout_ms,
-                                          gboolean *unresponsive)
+static gboolean rotctld_mgr_port_probe(const gchar *host, gint port,
+                                       gint timeout_ms,
+                                       gboolean require_dump_state,
+                                       gboolean *unresponsive)
 {
     gboolean        ok = FALSE;
     gboolean        resolved = FALSE;
@@ -416,10 +441,18 @@ static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
 
         if (connected)
         {
-            if (rotctld_mgr_probe_dump_state(sock, probe_timeout_ms))
+            if (!require_dump_state)
+            {
                 ok = TRUE;
+            }
+            else if (rotctld_mgr_probe_dump_state(sock, probe_timeout_ms))
+            {
+                ok = TRUE;
+            }
             else if (unresponsive != NULL)
+            {
                 *unresponsive = TRUE;
+            }
         }
 
         g_object_unref(sockaddr);
@@ -470,7 +503,7 @@ gboolean rotctld_mgr_wait_for_port(const gchar *host, gint port,
         if (slice <= 0)
             slice = 1;
 
-        if (rotctld_mgr_port_is_ready(host, port, slice, &unresponsive))
+        if (rotctld_mgr_port_probe(host, port, slice, TRUE, &unresponsive))
             return TRUE;
 
         {
@@ -490,6 +523,53 @@ gboolean rotctld_mgr_wait_for_port(const gchar *host, gint port,
     if (unresponsive)
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     "rotctld_mgr: port open but not responding to \\dump_state");
+    return FALSE;
+}
+
+gboolean rotctld_mgr_wait_for_listen(const gchar *host, gint port,
+                                     gint timeout_ms)
+{
+    gint interval_ms = 100;
+    gint64 start_us = 0;
+    gint64 deadline_us = 0;
+
+    if (timeout_ms <= 0)
+        return FALSE;
+
+    start_us = g_get_monotonic_time();
+    deadline_us = start_us + ((gint64) timeout_ms * 1000);
+
+    while (g_get_monotonic_time() < deadline_us)
+    {
+        gint64 loop_start_us = g_get_monotonic_time();
+        gint64 remaining_us = deadline_us - loop_start_us;
+        gint slice = interval_ms;
+
+        if (remaining_us <= 0)
+            break;
+
+        if (slice > (remaining_us / 1000))
+            slice = (gint) (remaining_us / 1000);
+        if (slice <= 0)
+            slice = 1;
+
+        if (rotctld_mgr_port_probe(host, port, slice, FALSE, NULL))
+            return TRUE;
+
+        {
+            gint64 loop_end_us = g_get_monotonic_time();
+            gint64 elapsed_us = loop_end_us - loop_start_us;
+            gint64 sleep_us = ((gint64) interval_ms * 1000) - elapsed_us;
+            gint64 remaining_us = deadline_us - loop_end_us;
+
+            if (sleep_us > remaining_us)
+                sleep_us = remaining_us;
+
+            if (sleep_us > 0)
+                g_usleep(sleep_us);
+        }
+    }
+
     return FALSE;
 }
 
@@ -553,23 +633,40 @@ static void rotctld_mgr_emit_exit_if_ready(RotctldMgr *mgr)
     }
 }
 
-static gpointer rotctld_mgr_wait_thread(gpointer data)
+static void rotctld_mgr_wait_cb(GObject *source, GAsyncResult *res,
+                                gpointer data)
 {
-    RotctldMgr *mgr = data;
+    RotctldMgrWaitCtx *ctx = data;
+    RotctldMgr *mgr = ctx ? ctx->mgr : NULL;
+    GSubprocess *proc = G_SUBPROCESS(source);
+    GError *error = NULL;
     gint status = -1;
     gint sig = 0;
 
-    if (mgr == NULL || mgr->proc == NULL)
-        return NULL;
+    if (mgr == NULL || proc == NULL)
+    {
+        if (ctx && ctx->loop)
+            g_main_loop_quit(ctx->loop);
+        return;
+    }
 
-    g_subprocess_wait(mgr->proc, NULL, NULL);
+    if (!g_subprocess_wait_finish(proc, res, &error))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld_mgr: wait failed: %s",
+                    error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
 
-    if (g_subprocess_get_if_exited(mgr->proc))
-        status = g_subprocess_get_exit_status(mgr->proc);
+    if (!subprocess_is_running(proc))
+    {
+        if (g_subprocess_get_if_exited(proc))
+            status = g_subprocess_get_exit_status(proc);
 #if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
-    if (g_subprocess_get_if_signaled(mgr->proc))
-        sig = g_subprocess_get_term_sig(mgr->proc);
+        if (g_subprocess_get_if_signaled(proc))
+            sig = g_subprocess_get_term_sig(proc);
 #endif
+    }
 
     g_mutex_lock(&mgr->log_lock);
     mgr->exit_ready = TRUE;
@@ -578,6 +675,33 @@ static gpointer rotctld_mgr_wait_thread(gpointer data)
     g_mutex_unlock(&mgr->log_lock);
 
     rotctld_mgr_emit_exit_if_ready(mgr);
+
+    if (ctx->loop)
+        g_main_loop_quit(ctx->loop);
+}
+
+static gpointer rotctld_mgr_wait_thread(gpointer data)
+{
+    RotctldMgr *mgr = data;
+    GMainContext *context = NULL;
+    GMainLoop *loop = NULL;
+    RotctldMgrWaitCtx ctx;
+
+    if (mgr == NULL || mgr->proc == NULL)
+        return NULL;
+
+    context = g_main_context_new();
+    loop = g_main_loop_new(context, FALSE);
+    ctx.mgr = mgr;
+    ctx.loop = loop;
+
+    g_main_context_push_thread_default(context);
+    g_subprocess_wait_async(mgr->proc, NULL, rotctld_mgr_wait_cb, &ctx);
+    g_main_loop_run(loop);
+    g_main_context_pop_thread_default(context);
+
+    g_main_loop_unref(loop);
+    g_main_context_unref(context);
     return NULL;
 }
 
@@ -682,7 +806,7 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
             gchar *cmdline =
                 rotctld_mgr_argv_to_shell_string(
                     (const gchar * const *) argv->pdata);
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+            sat_log_log(SAT_LOG_LEVEL_INFO,
                         "rotctld_mgr: spawn detail: path=%s argv=%s "
                         "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
                         path ? path : "(null)",
@@ -719,6 +843,11 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
         g_free(libdir);
         return NULL;
     }
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotctld_mgr: spawn success pid=%s path=%s",
+                g_subprocess_get_identifier(proc),
+                path ? path : "(null)");
 
     mgr = g_new0(RotctldMgr, 1);
     mgr->proc = proc;
@@ -944,7 +1073,7 @@ gboolean rotctld_mgr_is_running(const RotctldMgr *mgr)
     if (mgr == NULL || mgr->proc == NULL)
         return FALSE;
 
-    return !g_subprocess_get_if_exited(mgr->proc);
+    return subprocess_is_running(mgr->proc);
 }
 
 const gchar *rotctld_mgr_get_identifier(const RotctldMgr *mgr)
@@ -972,6 +1101,54 @@ gchar *rotctld_mgr_get_log_tail(RotctldMgr *mgr)
     return copy;
 }
 
+gboolean rotctld_mgr_get_exit_info(RotctldMgr *mgr,
+                                   gint *status_out,
+                                   gint *signal_out)
+{
+    gboolean ready = FALSE;
+    gint status = -1;
+    gint sig = 0;
+
+    if (mgr == NULL || mgr->proc == NULL)
+        return FALSE;
+
+    g_mutex_lock(&mgr->log_lock);
+    ready = mgr->exit_ready;
+    if (ready)
+    {
+        status = mgr->exit_status;
+        sig = mgr->exit_signal;
+    }
+    g_mutex_unlock(&mgr->log_lock);
+
+    if (!ready && !subprocess_is_running(mgr->proc))
+    {
+        if (g_subprocess_get_if_exited(mgr->proc))
+            status = g_subprocess_get_exit_status(mgr->proc);
+#if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
+        if (g_subprocess_get_if_signaled(mgr->proc))
+            sig = g_subprocess_get_term_sig(mgr->proc);
+#endif
+        g_mutex_lock(&mgr->log_lock);
+        mgr->exit_ready = TRUE;
+        mgr->exit_status = status;
+        mgr->exit_signal = sig;
+        g_mutex_unlock(&mgr->log_lock);
+        ready = TRUE;
+    }
+
+    if (ready)
+    {
+        if (status_out)
+            *status_out = status;
+        if (signal_out)
+            *signal_out = sig;
+        rotctld_mgr_emit_exit_if_ready(mgr);
+    }
+
+    return ready;
+}
+
 void rotctld_mgr_set_log_callback(RotctldMgr *mgr,
                                   RotctldMgrLogFunc cb,
                                   gpointer user_data)
@@ -993,7 +1170,7 @@ static void rotctld_mgr_wait_exit(GSubprocess *proc, gint timeout_ms)
 
     while (waited_ms < timeout_ms)
     {
-        if (g_subprocess_get_if_exited(proc))
+        if (!subprocess_is_running(proc))
             return;
 
         g_usleep(100 * 1000);
@@ -1012,13 +1189,13 @@ void rotctld_mgr_terminate(RotctldMgr **mgr_ptr)
 
     if (mgr->proc != NULL)
     {
-        if (!g_subprocess_get_if_exited(mgr->proc))
+        if (subprocess_is_running(mgr->proc))
         {
 #if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
             g_subprocess_send_signal(mgr->proc, SIGTERM);
             rotctld_mgr_wait_exit(mgr->proc, 1500);
 #endif
-            if (!g_subprocess_get_if_exited(mgr->proc))
+            if (subprocess_is_running(mgr->proc))
                 g_subprocess_force_exit(mgr->proc);
         }
 

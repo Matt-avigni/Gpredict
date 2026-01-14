@@ -3307,6 +3307,28 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
     if (ctrl == NULL || ctrl->conf == NULL)
         return FALSE;
 
+    {
+        gint model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+        gint baud = ctrl->conf->baud > 0 ? ctrl->conf->baud
+                                         : rot_protocol_default_baud(
+                                             ctrl->conf->protocol);
+        const gchar *protocol_name = rot_protocol_name(ctrl->conf->protocol);
+        if (protocol_name == NULL)
+            protocol_name = "(unknown)";
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rotctld ensure: host=%s port=%d autostart=%d "
+                    "protocol=%d/%s model=%d baud=%d device=%s device_autopick=%d",
+                    ctrl->conf->host ? ctrl->conf->host : "(null)",
+                    ctrl->conf->port,
+                    ctrl->conf->autostart ? 1 : 0,
+                    ctrl->conf->protocol,
+                    protocol_name,
+                    model,
+                    baud,
+                    ctrl->conf->device ? ctrl->conf->device : "(none)",
+                    ctrl->conf->device_autopick ? 1 : 0);
+    }
+
     if (ctrl->rotctld_mgr != NULL &&
         !rotctld_mgr_is_running(ctrl->rotctld_mgr))
         rotctld_process_stop(ctrl);
@@ -3533,6 +3555,44 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
         g_free(device);
     }
 
+    if (spawned)
+    {
+        gboolean listening = rotctld_mgr_wait_for_listen(ctrl->conf->host,
+                                                         ctrl->conf->port,
+                                                         3000);
+        if (!listening)
+        {
+            rot_term_log(ctrl, "gpredict:err",
+                         "rotctld did not bind port host=%s port=%d argv=%s",
+                         ctrl->conf->host ? ctrl->conf->host : "(null)",
+                         ctrl->conf->port,
+                         spawn_summary ? spawn_summary : "unknown");
+
+            if (ctrl->rotctld_mgr &&
+                !rotctld_mgr_is_running(ctrl->rotctld_mgr))
+            {
+                gint exit_status = -1;
+                gint exit_signal = 0;
+                gboolean have_exit =
+                    rotctld_mgr_get_exit_info(ctrl->rotctld_mgr,
+                                              &exit_status,
+                                              &exit_signal);
+                stderr_tail = rotctld_mgr_get_log_tail(ctrl->rotctld_mgr);
+                if (have_exit)
+                {
+                    rot_term_log(ctrl, "gpredict:err",
+                                 "rotctld exited status=%d signal=%d%s%s",
+                                 exit_status, exit_signal,
+                                 stderr_tail ? " stderr: " : "",
+                                 stderr_tail ? stderr_tail : "");
+                }
+                g_free(stderr_tail);
+                g_free(spawn_summary);
+                return FALSE;
+            }
+        }
+    }
+
     /* Give rotctld a short time to come up, then re-probe with backoff. */
     {
         gboolean connected = FALSE;
@@ -3568,6 +3628,24 @@ static gboolean rotctld_ensure_running(GtkRotCtrl *ctrl,
             stderr_tail = ctrl->rotctld_mgr
                 ? rotctld_mgr_get_log_tail(ctrl->rotctld_mgr)
                 : NULL;
+            if (ctrl->rotctld_mgr &&
+                !rotctld_mgr_is_running(ctrl->rotctld_mgr))
+            {
+                gint exit_status = -1;
+                gint exit_signal = 0;
+                gboolean have_exit =
+                    rotctld_mgr_get_exit_info(ctrl->rotctld_mgr,
+                                              &exit_status,
+                                              &exit_signal);
+                if (have_exit)
+                {
+                    rot_term_log(ctrl, "gpredict:err",
+                                 "rotctld exited status=%d signal=%d%s%s",
+                                 exit_status, exit_signal,
+                                 stderr_tail ? " stderr: " : "",
+                                 stderr_tail ? stderr_tail : "");
+                }
+            }
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         _("%s: rotctld did not become reachable at %s:%d (spawn: %s)"),
                         __func__, ctrl->conf->host, ctrl->conf->port,

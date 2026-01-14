@@ -12,6 +12,11 @@ typedef void (*RotctldMgrLogFunc)(RotctldMgr *mgr,
 gboolean     rotctld_mgr_host_is_local(const gchar *host);
 gboolean     rotctld_mgr_wait_for_port(const gchar *host, gint port,
                                        gint timeout_ms);
+gboolean     rotctld_mgr_wait_for_listen(const gchar *host, gint port,
+                                         gint timeout_ms);
+gboolean     rotctld_mgr_get_exit_info(RotctldMgr *mgr,
+                                       gint *status_out,
+                                       gint *signal_out);
 
 RotctldMgr  *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
                                const gchar *device, gint baud,
