@@ -51,6 +51,7 @@ typedef enum {
     RIG_LIST_COL_RIGCTLD_BAUD,  /*!< rigctld baud */
     RIG_LIST_COL_RIGCTLD_CIVADDR, /*!< rigctld CI-V address */
     RIG_LIST_COL_RIGCTLD_EXTRA_ARGS, /*!< rigctld extra args */
+    RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH, /*!< rig autodetect allowlist */
     RIG_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rig_list_col_t;
 

@@ -623,13 +623,15 @@ gboolean rigctld_mgr_wait_for_port(const gchar *host, gint port,
 
 RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
                               const gchar *bind_host,
-                              gchar **error_out)
+                              gchar **error_out,
+                              gchar **cmdline_out)
 {
     RigctldMgr    *mgr = NULL;
     GSubprocess   *proc = NULL;
     GSubprocessLauncher *launcher = NULL;
     GPtrArray     *argv = NULL;
     GError        *error = NULL;
+    gchar         *cmdline = NULL;
     gchar         *path = NULL;
     gchar         *libdir = NULL;
 
@@ -639,6 +641,9 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
             *error_out = g_strdup("Missing radio configuration.");
         return NULL;
     }
+
+    if (cmdline_out)
+        *cmdline_out = NULL;
 
     {
         gint model_id = conf->rigctld_model;
@@ -725,7 +730,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     g_ptr_array_add(argv, g_strdup(path));
     if (bind_host && *bind_host)
     {
-        g_ptr_array_add(argv, g_strdup("-b"));
+        g_ptr_array_add(argv, g_strdup("-T"));
         g_ptr_array_add(argv, g_strdup(bind_host));
     }
     {
@@ -787,11 +792,15 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     g_ptr_array_add(argv, NULL);
 
     {
-        gchar *cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
+        cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
+        if (cmdline_out)
+            *cmdline_out = g_strdup(cmdline);
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("rigctld spawn argv: %s"),
                     cmdline ? cmdline : "(null)");
-        g_free(cmdline);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctld spawn final argv: %s",
+                    cmdline ? cmdline : "(null)");
     }
 
     launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_DEV_NULL |
@@ -829,18 +838,14 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
             }
         }
 
-        {
-            gchar *cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rigctld spawn detail: path=%s argv=%s "
-                        "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
-                        path ? path : "(null)",
-                        cmdline ? cmdline : "(null)",
-                        (dyld_final && *dyld_final) ? dyld_final : "(unset)",
-                        (fallback_final && *fallback_final) ? fallback_final
-                                                           : "(unset)");
-            g_free(cmdline);
-        }
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctld spawn detail: path=%s argv=%s "
+                    "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
+                    path ? path : "(null)",
+                    cmdline ? cmdline : "(null)",
+                    (dyld_final && *dyld_final) ? dyld_final : "(unset)",
+                    (fallback_final && *fallback_final) ? fallback_final
+                                                       : "(unset)");
 
         g_free(dyld_updated);
         g_free(fallback_updated);
@@ -855,6 +860,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
             *error_out = g_strdup(error->message);
         g_clear_error(&error);
         g_ptr_array_free(argv, TRUE);
+        g_free(cmdline);
         g_free(libdir);
         g_free(path);
         return NULL;
@@ -902,6 +908,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         g_thread_new("rigctld-exit", rigctld_mgr_wait_thread, mgr);
 
     g_ptr_array_free(argv, TRUE);
+    g_free(cmdline);
     g_free(libdir);
     g_free(path);
     return mgr;

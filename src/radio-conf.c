@@ -58,6 +58,7 @@
 #define KEY_RIGCTLD_BAUD        "RIGCTLD_BAUD"
 #define KEY_RIGCTLD_CIVADDR     "RIGCTLD_CIVADDR"
 #define KEY_RIGCTLD_EXTRA_ARGS  "RIGCTLD_EXTRA_ARGS"
+#define KEY_RIGCTLD_AUTODETECT_MATCH "RIGCTLD_AUTODETECT_MATCH"
 #define KEY_IC9700_SATMODE      "IC9700_SATMODE"
 
 #define DEFAULT_CYCLE_MS    1000
@@ -297,6 +298,7 @@ gboolean radio_conf_read(radio_conf_t * conf)
     conf->rigctld_baud = 0;
     conf->rigctld_civaddr = NULL;
     conf->rigctld_extra_args = NULL;
+    conf->rigctld_autodetect_match = NULL;
 
     /* open .rig file */
     cfg = g_key_file_new();
@@ -571,6 +573,9 @@ gboolean radio_conf_read(radio_conf_t * conf)
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL))
         conf->rigctld_extra_args =
             g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH, NULL))
+        conf->rigctld_autodetect_match =
+            g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH, NULL);
 
     conf->supports_dual_vfo_sat =
         (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
@@ -672,6 +677,11 @@ void radio_conf_save(radio_conf_t * conf)
                               conf->rigctld_extra_args);
     else
         g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_EXTRA_ARGS, NULL);
+    if (conf->rigctld_autodetect_match && *conf->rigctld_autodetect_match)
+        g_key_file_set_string(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH,
+                              conf->rigctld_autodetect_match);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH, NULL);
 
     confdir = get_hwconf_dir();
     fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rig", NULL);

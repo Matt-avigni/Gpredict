@@ -108,6 +108,7 @@ typedef struct {
     gint            rigctld_baud; /*!< rigctld baud rate */
     gchar          *rigctld_civaddr; /*!< Optional CI-V address string */
     gchar          *rigctld_extra_args; /*!< Optional extra rigctld args */
+    gchar          *rigctld_autodetect_match; /*!< Optional substring allowlist for rig auto-detect */
 } radio_conf_t;
 
 typedef struct {

@@ -72,7 +72,8 @@ static GtkTreeModel *create_and_fill_model()
                                    G_TYPE_STRING,       // rigctld device
                                    G_TYPE_INT,          // rigctld baud
                                    G_TYPE_STRING,       // rigctld CI-V addr
-                                   G_TYPE_STRING        // rigctld extra args
+                                   G_TYPE_STRING,       // rigctld extra args
+                                   G_TYPE_STRING        // rigctld autodetect match
                                    );
 
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
@@ -133,6 +134,8 @@ static GtkTreeModel *create_and_fill_model()
                                        conf.rigctld_civaddr,
                                        RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                                        conf.rigctld_extra_args,
+                                       RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                                       conf.rigctld_autodetect_match,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -156,6 +159,8 @@ static GtkTreeModel *create_and_fill_model()
 
                     if (conf.rigctld_extra_args)
                         g_free(conf.rigctld_extra_args);
+                    if (conf.rigctld_autodetect_match)
+                        g_free(conf.rigctld_autodetect_match);
                 }
                 else
                 {
@@ -455,7 +460,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .rigctld_device = NULL,
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
-        .rigctld_extra_args = NULL
+        .rigctld_extra_args = NULL,
+        .rigctld_autodetect_match = NULL
     };
 
     /* If there are no entries, we have a bug since the button should 
@@ -508,6 +514,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            &conf.rigctld_civaddr,
                            RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                            &conf.rigctld_extra_args,
+                           RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                           &conf.rigctld_autodetect_match,
                            -1);
     }
     else
@@ -559,6 +567,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
                            RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                            conf.rigctld_extra_args,
+                           RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                           conf.rigctld_autodetect_match,
                            -1);
     }
 
@@ -580,6 +590,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
 
     if (conf.rigctld_extra_args)
         g_free(conf.rigctld_extra_args);
+    if (conf.rigctld_autodetect_match)
+        g_free(conf.rigctld_autodetect_match);
 }
 
 static void row_activated_cb(GtkTreeView * tree_view,
@@ -813,6 +825,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
         .rigctld_extra_args = NULL,
+        .rigctld_autodetect_match = NULL
     };
 
     /* run rig conf editor */
@@ -850,6 +863,8 @@ static void add_cb(GtkWidget * button, gpointer data)
                            RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
                            RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                            conf.rigctld_extra_args,
+                           RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                           conf.rigctld_autodetect_match,
                            -1);
 
         g_free(conf.name);
@@ -868,6 +883,8 @@ static void add_cb(GtkWidget * button, gpointer data)
 
         if (conf.rigctld_extra_args)
             g_free(conf.rigctld_extra_args);
+        if (conf.rigctld_autodetect_match)
+            g_free(conf.rigctld_autodetect_match);
     }
 }
 
@@ -977,7 +994,8 @@ void sat_pref_rig_ok()
         .rigctld_device = NULL,
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
-        .rigctld_extra_args = NULL
+        .rigctld_extra_args = NULL,
+        .rigctld_autodetect_match = NULL
     };
 
     /* delete all .rig files */
@@ -1044,6 +1062,8 @@ void sat_pref_rig_ok()
                                &conf.rigctld_civaddr,
                                RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
                                &conf.rigctld_extra_args,
+                               RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                               &conf.rigctld_autodetect_match,
                                -1);
             radio_conf_save(&conf);
 
@@ -1065,6 +1085,8 @@ void sat_pref_rig_ok()
 
             if (conf.rigctld_extra_args)
                 g_free(conf.rigctld_extra_args);
+            if (conf.rigctld_autodetect_match)
+                g_free(conf.rigctld_autodetect_match);
         }
         else
         {

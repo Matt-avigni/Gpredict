@@ -20,7 +20,8 @@ gboolean     rigctld_mgr_wait_for_port(const gchar *host, gint port,
 
 RigctldMgr  *rigctld_mgr_spawn(const radio_conf_t *conf,
                                const gchar *bind_host,
-                               gchar **error_out);
+                               gchar **error_out,
+                               gchar **cmdline_out);
 gboolean     rigctld_mgr_is_running(const RigctldMgr *mgr);
 const gchar *rigctld_mgr_get_identifier(const RigctldMgr *mgr);
 gchar       *rigctld_mgr_get_log_tail(RigctldMgr *mgr);

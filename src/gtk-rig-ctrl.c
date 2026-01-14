@@ -96,8 +96,9 @@
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 #define RIGCTLD_AUTODETECT_MAX_CANDIDATES 8
 #define RIGCTLD_AUTODETECT_TOTAL_MS 10000
-#define RIGCTLD_AUTODETECT_WAIT_MS 400
-#define RIGCTLD_AUTODETECT_PROBE_MS 300
+#define RIGCTLD_AUTODETECT_WAIT_MS 1500
+#define RIGCTLD_AUTODETECT_PROBE_MS 1500
+#define RIGCTLD_PROBE_SHORT_MS 300
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
 #define RIGCTRL_RECONNECT_BACKOFF_MAX_MS 10000
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
@@ -111,6 +112,21 @@ typedef enum {
     RIGCTLD_PROBE_NOT_READY,
     RIGCTLD_PROBE_MISMATCH
 } rigctld_probe_result_t;
+
+static const gchar *rigctld_probe_result_name(rigctld_probe_result_t result)
+{
+    switch (result)
+    {
+    case RIGCTLD_PROBE_OK:
+        return "OK";
+    case RIGCTLD_PROBE_NOT_READY:
+        return "NOT_READY";
+    case RIGCTLD_PROBE_MISMATCH:
+        return "MISMATCH";
+    default:
+        return "UNKNOWN";
+    }
+}
 
 /* radio control functions */
 static void     exec_rx_cycle(GtkRigCtrl * ctrl);
@@ -297,6 +313,7 @@ static void free_radio_conf(radio_conf_t *conf)
     g_free(conf->rigctld_device);
     g_free(conf->rigctld_civaddr);
     g_free(conf->rigctld_extra_args);
+    g_free(conf->rigctld_autodetect_match);
     g_free(conf);
 }
 
@@ -432,6 +449,8 @@ static void rigctrl_apply_conf_update(radio_conf_t *dst,
     dst->rigctld_civaddr = g_strdup(src->rigctld_civaddr);
     g_free(dst->rigctld_extra_args);
     dst->rigctld_extra_args = g_strdup(src->rigctld_extra_args);
+    g_free(dst->rigctld_autodetect_match);
+    dst->rigctld_autodetect_match = g_strdup(src->rigctld_autodetect_match);
 }
 
 static void rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
@@ -4961,6 +4980,177 @@ static GSList *rigctld_prioritize_candidate(GSList *list,
     return g_slist_prepend(list, g_strdup(candidate));
 }
 
+static gboolean rigctld_candidate_matches_allowlist(const gchar *candidate,
+                                                    const gchar *allowlist_lc)
+{
+    gchar *candidate_lc = NULL;
+    gboolean match = FALSE;
+
+    if (allowlist_lc == NULL || *allowlist_lc == '\0')
+        return TRUE;
+
+    if (candidate == NULL || *candidate == '\0')
+        return FALSE;
+
+    candidate_lc = g_ascii_strdown(candidate, -1);
+    match = (g_strrstr(candidate_lc, allowlist_lc) != NULL);
+    g_free(candidate_lc);
+
+    return match;
+}
+
+static gboolean rigctld_candidate_blocked_default(const gchar *candidate)
+{
+    gchar *candidate_lc = NULL;
+    gboolean blocked = FALSE;
+
+    if (candidate == NULL || *candidate == '\0')
+        return FALSE;
+
+    candidate_lc = g_ascii_strdown(candidate, -1);
+    blocked = (g_strrstr(candidate_lc, "slab_usbtouart") != NULL);
+    g_free(candidate_lc);
+
+    return blocked;
+}
+
+static gint rigctld_autodetect_candidate_score(const gchar *candidate)
+{
+    gchar *candidate_lc = NULL;
+    gint score = 0;
+
+    if (candidate == NULL || *candidate == '\0')
+        return 0;
+
+    candidate_lc = g_ascii_strdown(candidate, -1);
+#ifdef __APPLE__
+    if (g_str_has_prefix(candidate_lc, "/dev/cu.") ||
+        g_str_has_prefix(candidate_lc, "cu."))
+        score += 40;
+    if (g_str_has_prefix(candidate_lc, "/dev/tty.") ||
+        g_str_has_prefix(candidate_lc, "tty."))
+        score -= 10;
+#endif
+    if (g_strrstr(candidate_lc, "usbserial") != NULL)
+        score += 30;
+    if (g_strrstr(candidate_lc, "usbmodem") != NULL)
+        score += 20;
+    if (g_strrstr(candidate_lc, "slab") != NULL)
+        score -= 20;
+    if (g_strrstr(candidate_lc, "ft06hpd7") != NULL)
+        score -= 15;
+
+    g_free(candidate_lc);
+    return score;
+}
+
+static gint rigctld_autodetect_compare_candidates(gconstpointer a,
+                                                  gconstpointer b)
+{
+    const gchar *cand_a = a;
+    const gchar *cand_b = b;
+    gint score_a = rigctld_autodetect_candidate_score(cand_a);
+    gint score_b = rigctld_autodetect_candidate_score(cand_b);
+
+    if (score_a != score_b)
+        return score_b - score_a;
+
+    return g_strcmp0(cand_a, cand_b);
+}
+
+static GSList *rigctld_autodetect_filter_candidates(GSList *candidates,
+                                                    const gchar *allowlist_lc,
+                                                    guint *filtered_out)
+{
+    GSList *filtered = NULL;
+    GSList *item = NULL;
+    guint skipped = 0;
+
+    for (item = candidates; item != NULL; item = item->next)
+    {
+        const gchar *candidate = item->data;
+
+        if (allowlist_lc != NULL && *allowlist_lc != '\0')
+        {
+            if (!rigctld_candidate_matches_allowlist(candidate, allowlist_lc))
+            {
+                skipped++;
+                continue;
+            }
+        }
+        else if (rigctld_candidate_blocked_default(candidate))
+        {
+            skipped++;
+            continue;
+        }
+
+        filtered = g_slist_append(filtered, g_strdup(candidate));
+    }
+
+    gp_serial_free_candidates(candidates);
+    if (filtered_out)
+        *filtered_out = skipped;
+
+    return g_slist_sort(filtered, rigctld_autodetect_compare_candidates);
+}
+
+static gint rigctld_pick_ephemeral_port(gint avoid_port)
+{
+    gint selected = -1;
+
+    for (gint attempt = 0; attempt < 5; attempt++)
+    {
+        GSocket *sock = NULL;
+        GInetAddress *addr = NULL;
+        GSocketAddress *sockaddr = NULL;
+        GSocketAddress *local = NULL;
+        GError *error = NULL;
+        gint port = -1;
+
+        sock = g_socket_new(G_SOCKET_FAMILY_IPV4,
+                            G_SOCKET_TYPE_STREAM,
+                            G_SOCKET_PROTOCOL_TCP,
+                            &error);
+        if (sock == NULL)
+        {
+            g_clear_error(&error);
+            continue;
+        }
+
+        addr = g_inet_address_new_from_string("127.0.0.1");
+        sockaddr = g_inet_socket_address_new(addr, 0);
+        g_object_unref(addr);
+
+        if (!g_socket_bind(sock, sockaddr, FALSE, &error))
+        {
+            g_clear_error(&error);
+            g_object_unref(sockaddr);
+            g_object_unref(sock);
+            continue;
+        }
+
+        local = g_socket_get_local_address(sock, &error);
+        if (local != NULL && G_IS_INET_SOCKET_ADDRESS(local))
+        {
+            port = (gint) g_inet_socket_address_get_port(
+                G_INET_SOCKET_ADDRESS(local));
+        }
+        g_clear_error(&error);
+        g_clear_object(&local);
+        g_object_unref(sockaddr);
+        g_socket_close(sock, NULL);
+        g_object_unref(sock);
+
+        if (port > 0 && port != avoid_port)
+        {
+            selected = port;
+            break;
+        }
+    }
+
+    return selected;
+}
+
 static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
                                          gint *sock)
 {
@@ -5244,7 +5434,7 @@ static rigctld_probe_result_t rigctld_wait_for_ready(const gchar *host,
     while (waited_ms < timeout_ms)
     {
         result = rigctld_probe_simple(host, port,
-                                      RIGCTLD_AUTODETECT_PROBE_MS,
+                                      RIGCTLD_PROBE_SHORT_MS,
                                       expected_model,
                                       model_out,
                                       NULL);
@@ -5272,6 +5462,8 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     gchar  *host = NULL;
     gchar  *detail = NULL;
     gchar  *fatal_err = NULL;
+    gchar  *allowlist_lc = NULL;
+    guint   filtered = 0;
     rigctld_preset_defaults_t preset;
     const gchar *cached = NULL;
 
@@ -5309,31 +5501,67 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     if (host == NULL)
         host = g_strdup("127.0.0.1");
 
+    if (conf->rigctld_autodetect_match &&
+        *conf->rigctld_autodetect_match)
+    {
+        allowlist_lc = g_ascii_strdown(conf->rigctld_autodetect_match, -1);
+    }
+
     candidates = gp_serial_list_candidates();
+    candidates = rigctld_autodetect_filter_candidates(candidates,
+                                                      allowlist_lc,
+                                                      &filtered);
     {
         guint count = g_slist_length(candidates);
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: auto-detect candidates=%u"),
-                    __func__, count);
+                    _("%s: auto-detect candidates=%u filtered=%u allowlist=%s"),
+                    __func__, count, filtered,
+                    (conf->rigctld_autodetect_match &&
+                     *conf->rigctld_autodetect_match) ?
+                        conf->rigctld_autodetect_match : "(none)");
         rig_term_log(ctrl, "gpredict",
-                     "auto-detect candidates=%u", count);
+                     "auto-detect candidates=%u filtered=%u allowlist=%s",
+                     count, filtered,
+                     (conf->rigctld_autodetect_match &&
+                      *conf->rigctld_autodetect_match) ?
+                        conf->rigctld_autodetect_match : "(none)");
     }
     cached = rigctld_cached_device(conf->radio_model);
     if (cached != NULL)
     {
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: auto-detect preferring cached device %s"),
-                    __func__, cached);
-        candidates = rigctld_prioritize_candidate(candidates, cached);
+        if (rigctld_candidate_matches_allowlist(cached, allowlist_lc))
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: auto-detect preferring cached device %s"),
+                        __func__, cached);
+            candidates = rigctld_prioritize_candidate(candidates, cached);
+        }
+        else
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: cached device %s does not match allowlist"),
+                        __func__, cached);
+        }
     }
 
     if (candidates == NULL)
     {
-        detail = g_strdup(_("No serial ports found for auto-detect."));
+        if (conf->rigctld_autodetect_match &&
+            *conf->rigctld_autodetect_match)
+        {
+            detail = g_strdup_printf(
+                _("No serial ports matched auto-detect allowlist (%s)."),
+                conf->rigctld_autodetect_match);
+        }
+        else
+        {
+            detail = g_strdup(_("No serial ports found for auto-detect."));
+        }
         schedule_rig_autodetect_error(ctrl, conf, detail);
         if (error_reported)
             *error_reported = TRUE;
         g_free(detail);
+        g_free(allowlist_lc);
         g_free(host);
         return FALSE;
     }
@@ -5342,12 +5570,17 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     deadline_us = start_us +
         ((gint64) RIGCTLD_AUTODETECT_TOTAL_MS * 1000);
 
+    gint expected_model = rigctld_expected_model(conf);
+
     for (item = candidates; item != NULL; item = item->next)
     {
         gchar *candidate = item->data;
         RigctldMgr *probe_mgr = NULL;
         gchar *errmsg = NULL;
         gchar *reply = NULL;
+        gchar *cmdline = NULL;
+        gint temp_port = -1;
+        gint detected_model = 0;
         radio_conf_t probe_conf;
 
         if (tried >= RIGCTLD_AUTODETECT_MAX_CANDIDATES)
@@ -5360,16 +5593,37 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
             continue;
 
         tried++;
+        temp_port = rigctld_pick_ephemeral_port(conf->port);
+        if (temp_port <= 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        _("%s: auto-detect failed to reserve temp port for %s"),
+                        __func__, candidate);
+            rig_term_log(ctrl, "gpredict:err",
+                         "auto-detect failed to reserve temp port for %s",
+                         candidate);
+            continue;
+        }
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: auto-detect probing %s"),
-                    __func__, candidate);
+                    _("%s: auto-detect probing %s temp_port=%d"),
+                    __func__, candidate, temp_port);
         rig_term_log(ctrl, "gpredict",
-                     "auto-detect probing %s", candidate);
+                     "auto-detect probing %s temp_port=%d",
+                     candidate, temp_port);
 
         probe_conf = *conf;
         probe_conf.rigctld_device = candidate;
+        probe_conf.port = temp_port;
 
-        probe_mgr = rigctld_mgr_spawn(&probe_conf, host, &errmsg);
+        probe_mgr = rigctld_mgr_spawn(&probe_conf, host, &errmsg, &cmdline);
+        if (cmdline != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: auto-detect spawn cmd: %s"),
+                        __func__, cmdline);
+            rig_term_log(ctrl, "gpredict",
+                         "auto-detect spawn cmd: %s", cmdline);
+        }
         if (probe_mgr == NULL)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -5382,62 +5636,92 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
             if (errmsg && *errmsg)
                 fatal_err = g_strdup(errmsg);
             g_free(errmsg);
+            g_free(cmdline);
             break;
         }
 
-        if (!rigctld_mgr_wait_for_port(host, conf->port,
+        if (!rigctld_mgr_wait_for_port(host, temp_port,
                                        RIGCTLD_AUTODETECT_WAIT_MS))
         {
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         _("%s: auto-detect no listen on %s:%d"),
-                        __func__, host, conf->port);
+                        __func__, host, temp_port);
+            rig_term_log(ctrl, "gpredict:err",
+                         "auto-detect no listen on %s:%d",
+                         host, temp_port);
             rigctld_mgr_terminate(&probe_mgr);
+            g_free(cmdline);
             continue;
         }
 
         {
-            gint expected_model = rigctld_expected_model(conf);
             rigctld_probe_result_t probe =
-                rigctld_probe_simple(host, conf->port,
+                rigctld_probe_simple(host, temp_port,
                                      RIGCTLD_AUTODETECT_PROBE_MS,
                                      expected_model,
-                                     NULL,
+                                     &detected_model,
                                      &reply);
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: auto-detect probe result=%s candidate=%s "
+                          "port=%d model=%d reply=%s"),
+                        __func__, rigctld_probe_result_name(probe),
+                        candidate, temp_port, detected_model,
+                        reply ? reply : "(none)");
+            rig_term_log(ctrl, "gpredict",
+                         "auto-detect probe result=%s candidate=%s port=%d model=%d",
+                         rigctld_probe_result_name(probe),
+                         candidate, temp_port, detected_model);
             if (probe == RIGCTLD_PROBE_MISMATCH)
             {
                 sat_log_log(SAT_LOG_LEVEL_WARN,
-                            _("%s: auto-detect model mismatch for %s"),
-                            __func__, candidate);
+                            _("%s: auto-detect model mismatch for %s "
+                              "(expected=%d got=%d)"),
+                            __func__, candidate, expected_model,
+                            detected_model);
             }
 
             if (probe == RIGCTLD_PROBE_OK)
             {
                 sat_log_log(SAT_LOG_LEVEL_INFO,
-                            _("%s: auto-detect succeeded for %s (reply: %s)"),
+                            _("%s: auto-detect succeeded for %s "
+                              "(model=%d reply: %s)"),
                             __func__, candidate,
+                            detected_model,
                             reply ? reply : "(none)");
                 rig_term_log(ctrl, "gpredict",
-                             "auto-detect selected %s (first response)",
-                             candidate);
+                             "auto-detect selected %s model=%d",
+                             candidate, detected_model);
                 g_free(conf->rigctld_device);
                 conf->rigctld_device = g_strdup(candidate);
                 rigctld_cache_device(conf->radio_model, candidate);
                 success = TRUE;
                 g_free(reply);
                 rigctld_mgr_terminate(&probe_mgr);
+                g_free(cmdline);
                 break;
             }
 
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        _("%s: auto-detect probe failed for %s (reply: %s)"),
+                        _("%s: auto-detect probe failed for %s (result=%s reply: %s)"),
                         __func__, candidate,
+                        rigctld_probe_result_name(probe),
                         reply ? reply : "(none)");
+            if (probe == RIGCTLD_PROBE_NOT_READY)
+                rig_term_log(ctrl, "gpredict:err",
+                             "auto-detect probe timeout for %s on %s:%d",
+                             candidate, host, temp_port);
+            else if (probe == RIGCTLD_PROBE_MISMATCH)
+                rig_term_log(ctrl, "gpredict:err",
+                             "auto-detect model mismatch expected=%d got=%d for %s",
+                             expected_model, detected_model, candidate);
             g_free(reply);
             rigctld_mgr_terminate(&probe_mgr);
         }
+        g_free(cmdline);
     }
 
     gp_serial_free_candidates(candidates);
+    g_free(allowlist_lc);
     g_free(host);
 
     if (success)
@@ -5700,7 +5984,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                     __func__, host, conf->port);
         rig_term_log(ctrl, "gpredict",
                      "auto-start rigctld for %s:%d", host, conf->port);
-        *mgr = rigctld_mgr_spawn(conf, host, &errmsg);
+        *mgr = rigctld_mgr_spawn(conf, host, &errmsg, NULL);
         if (*mgr == NULL)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
