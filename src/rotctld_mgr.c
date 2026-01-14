@@ -28,6 +28,26 @@
 
 #define ROTCTLD_LOG_MAX_LINES 50
 
+static gchar *rotctld_mgr_argv_to_shell_string(const gchar * const *argv)
+{
+    GString *buf = NULL;
+
+    if (argv == NULL || argv[0] == NULL)
+        return NULL;
+
+    buf = g_string_new(NULL);
+    for (gint i = 0; argv[i] != NULL; i++)
+    {
+        gchar *quoted = g_shell_quote(argv[i]);
+        if (i > 0)
+            g_string_append_c(buf, ' ');
+        g_string_append(buf, quoted);
+        g_free(quoted);
+    }
+
+    return g_string_free(buf, FALSE);
+}
+
 struct _RotctldMgr {
     GSubprocess *proc;
     GThread     *stdout_thread;
@@ -192,6 +212,17 @@ gboolean rotctld_mgr_host_is_local(const gchar *host)
     return FALSE;
 }
 
+static const gchar *rotctld_mgr_bind_host(const gchar *host)
+{
+    if (host == NULL || *host == '\0')
+        return "127.0.0.1";
+
+    if (rotctld_mgr_host_is_local(host))
+        return "127.0.0.1";
+
+    return host;
+}
+
 static gboolean rotctld_mgr_dump_state_has_id(const gchar *text)
 {
     gchar *lower = NULL;
@@ -219,17 +250,39 @@ static gboolean rotctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
     gchar buffer[1024];
     GError *error = NULL;
     gssize size;
-    gint timeout_s;
+    gint64 timeout_us;
 
     if (sock == NULL)
         return FALSE;
 
-    timeout_s = MAX(1, (timeout_ms + 999) / 1000);
-    g_socket_set_blocking(sock, TRUE);
-    g_socket_set_timeout(sock, timeout_s);
+    if (timeout_ms <= 0)
+        timeout_ms = 100;
+
+    timeout_us = (gint64) timeout_ms * 1000;
+    g_socket_set_blocking(sock, FALSE);
 
     size = g_socket_send(sock, cmd, strlen(cmd), NULL, &error);
     if (size < 0)
+    {
+        if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+        {
+            g_clear_error(&error);
+            if (!g_socket_condition_timed_wait(sock, G_IO_OUT, timeout_us,
+                                               NULL, &error))
+            {
+                g_clear_error(&error);
+                return FALSE;
+            }
+            size = g_socket_send(sock, cmd, strlen(cmd), NULL, &error);
+        }
+    }
+    if (size < 0)
+    {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    if (!g_socket_condition_timed_wait(sock, G_IO_IN, timeout_us, NULL, &error))
     {
         g_clear_error(&error);
         return FALSE;
@@ -251,6 +304,7 @@ static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
                                           gboolean *unresponsive)
 {
     gboolean        ok = FALSE;
+    gboolean        resolved = FALSE;
     GResolver      *resolver = NULL;
     GList          *addrs = NULL;
     GError         *error = NULL;
@@ -263,21 +317,50 @@ static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
     if (host == NULL || *host == '\0' || port <= 0)
         return FALSE;
 
-    resolver = g_resolver_get_default();
-    addrs = g_resolver_lookup_by_name(resolver, host, NULL, &error);
+    if (rotctld_mgr_host_is_local(host))
+    {
+        GInetAddress *ipv4 = g_inet_address_new_from_string("127.0.0.1");
+        GInetAddress *ipv6 = NULL;
+
+        if (g_ascii_strcasecmp(host, "127.0.0.1") != 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rotctld_mgr: host %s treated as local; probing 127.0.0.1 first",
+                        host);
+            ipv6 = g_inet_address_new_from_string("::1");
+        }
+
+        if (ipv4)
+            addrs = g_list_append(addrs, ipv4);
+        if (ipv6)
+            addrs = g_list_append(addrs, ipv6);
+    }
+    else
+    {
+        resolver = g_resolver_get_default();
+        addrs = g_resolver_lookup_by_name(resolver, host, NULL, &error);
+        if (addrs == NULL)
+        {
+            g_clear_error(&error);
+            g_object_unref(resolver);
+            return FALSE;
+        }
+        resolved = TRUE;
+    }
+
     if (addrs == NULL)
     {
-        g_clear_error(&error);
-        g_object_unref(resolver);
+        if (resolver)
+            g_object_unref(resolver);
         return FALSE;
     }
 
     timeout_us = (gint64) timeout_ms * 1000;
     probe_timeout_ms = timeout_ms;
-    if (probe_timeout_ms < 1000)
+    if (probe_timeout_ms < 100)
+        probe_timeout_ms = 100;
+    else if (probe_timeout_ms > 1000)
         probe_timeout_ms = 1000;
-    else if (probe_timeout_ms > 2000)
-        probe_timeout_ms = 2000;
 
     for (GList *iter = addrs; iter != NULL; iter = iter->next)
     {
@@ -285,6 +368,14 @@ static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
         GSocket        *sock = NULL;
         GSocketAddress *sockaddr = NULL;
         gboolean        connected = FALSE;
+        gchar          *addr_text = NULL;
+
+        addr_text = g_inet_address_to_string(addr);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld_mgr: probing %s:%d via %s",
+                    host, port,
+                    addr_text ? addr_text : "(unknown)");
+        g_free(addr_text);
 
         sock = g_socket_new(g_inet_address_get_family(addr),
                             G_SOCKET_TYPE_STREAM,
@@ -338,8 +429,15 @@ static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
             break;
     }
 
-    g_resolver_free_addresses(addrs);
-    g_object_unref(resolver);
+    if (resolved)
+    {
+        g_resolver_free_addresses(addrs);
+        g_object_unref(resolver);
+    }
+    else
+    {
+        g_list_free_full(addrs, g_object_unref);
+    }
 
     return ok;
 }
@@ -347,23 +445,46 @@ static gboolean rotctld_mgr_port_is_ready(const gchar *host, gint port,
 gboolean rotctld_mgr_wait_for_port(const gchar *host, gint port,
                                    gint timeout_ms)
 {
-    gint waited_ms = 0;
-    gint interval_ms = 50;
+    gint interval_ms = 100;
     gboolean unresponsive = FALSE;
+    gint64 start_us = 0;
+    gint64 deadline_us = 0;
 
-    while (waited_ms < timeout_ms)
+    if (timeout_ms <= 0)
+        return FALSE;
+
+    start_us = g_get_monotonic_time();
+    deadline_us = start_us + ((gint64) timeout_ms * 1000);
+
+    while (g_get_monotonic_time() < deadline_us)
     {
+        gint64 loop_start_us = g_get_monotonic_time();
+        gint64 remaining_us = deadline_us - loop_start_us;
         gint slice = interval_ms;
 
-        if (slice > (timeout_ms - waited_ms))
-            slice = timeout_ms - waited_ms;
+        if (remaining_us <= 0)
+            break;
+
+        if (slice > (remaining_us / 1000))
+            slice = (gint) (remaining_us / 1000);
+        if (slice <= 0)
+            slice = 1;
 
         if (rotctld_mgr_port_is_ready(host, port, slice, &unresponsive))
             return TRUE;
 
-        waited_ms += slice;
-        if (interval_ms < 500)
-            interval_ms = MIN(interval_ms * 2, 500);
+        {
+            gint64 loop_end_us = g_get_monotonic_time();
+            gint64 elapsed_us = loop_end_us - loop_start_us;
+            gint64 sleep_us = ((gint64) interval_ms * 1000) - elapsed_us;
+            gint64 remaining_us = deadline_us - loop_end_us;
+
+            if (sleep_us > remaining_us)
+                sleep_us = remaining_us;
+
+            if (sleep_us > 0)
+                g_usleep(sleep_us);
+        }
     }
 
     if (unresponsive)
@@ -558,7 +679,9 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
         }
 
         {
-            gchar *cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
+            gchar *cmdline =
+                rotctld_mgr_argv_to_shell_string(
+                    (const gchar * const *) argv->pdata);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rotctld_mgr: spawn detail: path=%s argv=%s "
                         "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
@@ -581,6 +704,14 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
 
     if (proc == NULL)
     {
+        gchar *cmdline =
+            rotctld_mgr_argv_to_shell_string(
+                (const gchar * const *) argv->pdata);
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "rotctld_mgr: spawn failed: %s (argv=%s)",
+                    error ? error->message : "unknown error",
+                    cmdline ? cmdline : "(null)");
+        g_free(cmdline);
         if (error_out)
             *error_out = g_strdup(error ? error->message
                                         : "Failed to start rotctld.");
@@ -690,7 +821,9 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
     g_ptr_array_add(argv_copy, NULL);
 
     {
-        gchar *cmdline = g_strjoinv(" ", (gchar **) argv_copy->pdata);
+        gchar *cmdline =
+            rotctld_mgr_argv_to_shell_string(
+                (const gchar * const *) argv_copy->pdata);
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("rotctld_mgr: spawn argv: %s"),
                     cmdline ? cmdline : "(null)");
@@ -774,18 +907,26 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
         g_ptr_array_add(argv, g_strdup("-s"));
         g_ptr_array_add(argv, g_strdup_printf("%d", baud));
     }
-    g_ptr_array_add(argv, g_strdup("-T"));
-    if (host && *host)
-        g_ptr_array_add(argv, g_strdup(host));
-    else
-        g_ptr_array_add(argv, g_strdup("127.0.0.1"));
+    {
+        const gchar *bind_host = rotctld_mgr_bind_host(host);
+        if (host && *host && g_strcmp0(host, bind_host) != 0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rotctld_mgr: host %s treated as local; binding to %s",
+                        host, bind_host);
+        }
+        g_ptr_array_add(argv, g_strdup("-T"));
+        g_ptr_array_add(argv, g_strdup(bind_host));
+    }
     g_ptr_array_add(argv, g_strdup("-t"));
     g_ptr_array_add(argv, g_strdup_printf("%d", port));
     g_ptr_array_add(argv, g_strdup(verbose ? "-vvvv" : "-v"));
     g_ptr_array_add(argv, NULL);
 
     {
-        gchar *cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
+        gchar *cmdline =
+            rotctld_mgr_argv_to_shell_string(
+                (const gchar * const *) argv->pdata);
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("rotctld_mgr: spawn argv: %s"),
                     cmdline ? cmdline : "(null)");

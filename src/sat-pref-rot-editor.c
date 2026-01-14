@@ -47,6 +47,7 @@ static GtkWidget *baud;
 static GtkWidget *device_combo;
 static GtkWidget *device_refresh;
 static GtkWidget *device_manual;
+static GtkWidget *device_manual_revealer;
 static GtkWidget *device_autopick;
 static GtkWidget *device_status;
 static GtkWidget *aztype;
@@ -63,6 +64,7 @@ static GtkWidget *az_offset;
 static GtkWidget *el_offset;
 static gboolean device_scan_in_progress = FALSE;
 static GSList *device_cache = NULL;
+static const gchar *ROT_DEVICE_OTHER_ID = "other";
 
 static void rot_pref_show_dialog(GtkMessageType type,
                                  const gchar *primary,
@@ -159,6 +161,42 @@ static gchar *rot_pref_pick_best_device(GSList *list, const gchar *current)
     return g_strdup(list->data);
 }
 
+static gboolean rot_pref_is_other_id(const gchar *id)
+{
+    return g_strcmp0(id, ROT_DEVICE_OTHER_ID) == 0;
+}
+
+static void rot_pref_update_device_ui_state(void)
+{
+    gboolean autopick = FALSE;
+    const gchar *active_id = NULL;
+    gboolean show_manual = FALSE;
+
+    if (device_autopick)
+        autopick = gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(device_autopick));
+
+    if (device_combo)
+        active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(device_combo));
+
+    if (!autopick)
+    {
+        show_manual = rot_pref_is_other_id(active_id);
+        if (!show_manual && active_id == NULL && device_manual)
+            show_manual = gtk_entry_get_text_length(GTK_ENTRY(device_manual)) > 0;
+    }
+
+    if (device_combo)
+        gtk_widget_set_sensitive(device_combo, !autopick);
+
+    if (device_manual)
+        gtk_widget_set_sensitive(device_manual, show_manual);
+
+    if (device_manual_revealer)
+        gtk_revealer_set_reveal_child(
+            GTK_REVEALER(device_manual_revealer), show_manual);
+}
+
 static const gchar *rot_protocol_id(rot_protocol_t protocol)
 {
     switch (protocol)
@@ -192,23 +230,29 @@ static rot_protocol_t rot_protocol_from_combo(GtkComboBox *combo)
     return rot_protocol_from_id(id);
 }
 
-static void rot_pref_update_device_status(GSList *list)
+static void rot_pref_update_device_status(GSList *list, gboolean autopick)
 {
     if (device_status == NULL)
         return;
 
     if (list == NULL)
+    {
         gtk_label_set_text(GTK_LABEL(device_status),
-                           _("No serial devices found."));
+                           autopick
+                           ? _("No USB serial devices found")
+                           : _("No serial devices found."));
+    }
     else
         gtk_label_set_text(GTK_LABEL(device_status), "");
 }
 
 static void rot_pref_update_device_combo(GSList *list,
-                                         const gchar *current,
-                                         gboolean autopick)
+                                         const gchar *current_id,
+                                         gboolean autopick,
+                                         const gchar *manual)
 {
     gchar *selected = NULL;
+    const gchar *current = current_id;
 
     if (device_combo == NULL)
         return;
@@ -222,8 +266,16 @@ static void rot_pref_update_device_combo(GSList *list,
                                   path, path);
     }
 
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(device_combo),
+                              ROT_DEVICE_OTHER_ID, _("Other..."));
+
+    if (rot_pref_is_other_id(current))
+        current = NULL;
+
     if (autopick)
         selected = rot_pref_pick_best_device(list, current);
+    else if ((manual && *manual) || rot_pref_is_other_id(current_id))
+        selected = g_strdup(ROT_DEVICE_OTHER_ID);
     else if (current && rot_pref_list_contains(list, current))
         selected = g_strdup(current);
 
@@ -232,13 +284,15 @@ static void rot_pref_update_device_combo(GSList *list,
     else
         gtk_combo_box_set_active(GTK_COMBO_BOX(device_combo), -1);
 
-    rot_pref_update_device_status(list);
+    rot_pref_update_device_status(list, autopick);
+    rot_pref_update_device_ui_state();
     g_free(selected);
 }
 
 typedef struct {
     GSList  *list;
-    gchar   *current;
+    gchar   *current_id;
+    gchar   *manual;
     gboolean autopick;
 } RotDeviceScanResult;
 
@@ -270,17 +324,20 @@ static gboolean rot_pref_scan_devices_done(gpointer data)
     device_cache = result ? result->list : NULL;
 
     rot_pref_update_device_combo(device_cache,
-                                 result ? result->current : NULL,
-                                 result ? result->autopick : TRUE);
+                                 result ? result->current_id : NULL,
+                                 result ? result->autopick : TRUE,
+                                 result ? result->manual : NULL);
 
-    g_free(result ? result->current : NULL);
+    g_free(result ? result->current_id : NULL);
+    g_free(result ? result->manual : NULL);
     g_free(result);
     return G_SOURCE_REMOVE;
 }
 
-static void rot_pref_scan_devices_async(const gchar *current)
+static void rot_pref_scan_devices_async(const gchar *current_id)
 {
     RotDeviceScanResult *result = NULL;
+    const gchar *manual_text = NULL;
 
     if (device_scan_in_progress)
         return;
@@ -290,9 +347,12 @@ static void rot_pref_scan_devices_async(const gchar *current)
         gtk_widget_set_sensitive(device_refresh, FALSE);
 
     result = g_new0(RotDeviceScanResult, 1);
-    result->current = current ? g_strdup(current) : NULL;
+    result->current_id = current_id ? g_strdup(current_id) : NULL;
     result->autopick = device_autopick ?
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(device_autopick)) : TRUE;
+    if (device_manual)
+        manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
+    result->manual = (manual_text && *manual_text) ? g_strdup(manual_text) : NULL;
 
     GThread *thread = g_thread_new("rot-device-scan",
                                    rot_pref_scan_devices_thread,
@@ -306,21 +366,29 @@ static gchar *rot_pref_resolve_device(const gchar *current,
 {
     GSList *list = NULL;
     gchar *picked = NULL;
+    const gchar *use_current = current;
 
     if (detail)
         *detail = NULL;
+
+    if (rot_pref_is_other_id(use_current))
+        use_current = NULL;
 
     list = device_cache;
     if (list == NULL)
         list = gp_serial_list_candidates();
 
     if (autopick)
-        picked = rot_pref_pick_best_device(list, current);
-    else if (current && rot_pref_list_contains(list, current))
-        picked = g_strdup(current);
+        picked = rot_pref_pick_best_device(list, use_current);
+    else if (use_current && rot_pref_list_contains(list, use_current))
+        picked = g_strdup(use_current);
 
     if (picked == NULL && detail)
-        *detail = g_strdup("No serial devices detected");
+    {
+        *detail = g_strdup(autopick
+                           ? "No USB serial devices found"
+                           : "No serial device selected");
+    }
 
     if (list != device_cache)
         gp_serial_free_candidates(list);
@@ -328,9 +396,39 @@ static gchar *rot_pref_resolve_device(const gchar *current,
     return picked;
 }
 
+static gchar *rot_pref_resolve_device_from_ui(gboolean autopick, gchar **detail)
+{
+    const gchar *active_id = NULL;
+    const gchar *manual_text = NULL;
+    const gchar *current = NULL;
+
+    if (detail)
+        *detail = NULL;
+
+    if (device_combo)
+        active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(device_combo));
+    if (device_manual)
+        manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
+
+    current = active_id;
+    if (autopick)
+        return rot_pref_resolve_device(current, TRUE, detail);
+
+    if (rot_pref_is_other_id(active_id) || active_id == NULL || *active_id == '\0')
+    {
+        if (manual_text && *manual_text)
+            return g_strdup(manual_text);
+        if (detail)
+            *detail = g_strdup("No serial device selected");
+        return NULL;
+    }
+
+    return g_strdup(active_id);
+}
 static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
 {
     const gchar *host_text = gtk_entry_get_text(GTK_ENTRY(host));
+    const gchar *spawn_host = host_text;
     gint port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
     gchar *device = NULL;
     gchar *device_note = NULL;
@@ -359,28 +457,28 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
         return;
     }
 
-    if (device_manual &&
-        gtk_entry_get_text_length(GTK_ENTRY(device_manual)) > 0)
-    {
-        device = g_strdup(gtk_entry_get_text(GTK_ENTRY(device_manual)));
-    }
-    else if (device_combo)
-    {
-        device = gtk_combo_box_text_get_active_text(
-            GTK_COMBO_BOX_TEXT(device_combo));
-    }
+    if (rotctld_mgr_host_is_local(host_text))
+        spawn_host = "127.0.0.1";
 
-    if (device_autopick &&
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(device_autopick)) &&
-        (device == NULL || *device == '\0'))
-    {
-        g_free(device);
-        device = rot_pref_resolve_device(NULL, TRUE, &device_note);
-    }
-
-    if (rotctld_mgr_host_is_local(host_text) && device && *device &&
+    if (rotctld_mgr_host_is_local(host_text) &&
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart)))
     {
+        gboolean autopick = device_autopick &&
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(device_autopick));
+
+        device = rot_pref_resolve_device_from_ui(autopick, &device_note);
+        if (device == NULL || *device == '\0')
+        {
+            const gchar *msg = device_note ? device_note
+                                           : _("No serial device selected.");
+            rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+                                 _("rotctld connection failed"),
+                                 msg);
+            g_free(device);
+            g_free(device_note);
+            return;
+        }
+
         rot_protocol_t proto =
             rot_protocol_from_combo(GTK_COMBO_BOX(protocol));
         if (!rot_protocol_is_valid(proto))
@@ -407,7 +505,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
                     "rotctld spawn: protocol=%s model=%s",
                     rot_protocol_name(proto),
                     rot_protocol_model_name(proto));
-        mgr = rotctld_mgr_spawn(host_text, port_val, model, device, baud_val,
+        mgr = rotctld_mgr_spawn(spawn_host, port_val, model, device, baud_val,
                                 TRUE, &error);
         if (mgr == NULL)
         {
@@ -419,7 +517,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
                                  detail);
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         "rotctld test spawn failed host=%s port=%d error=%s",
-                        host_text, port_val,
+                        spawn_host, port_val,
                         error ? error : "unknown");
             g_free(error);
             g_free(detail);
@@ -432,7 +530,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
         rotctld_mgr_set_log_callback(mgr, NULL, NULL);
     }
 
-    ok = rotctld_mgr_wait_for_port(host_text, port_val, 2000);
+    ok = rotctld_mgr_wait_for_port(spawn_host, port_val, 5000);
     if (!ok)
         stderr_tail = mgr ? rotctld_mgr_get_log_tail(mgr) : NULL;
 
@@ -446,7 +544,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
                              _("rotctld connection OK"),
                              detail);
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "rotctld test ok host=%s port=%d", host_text, port_val);
+                    "rotctld test ok host=%s port=%d", spawn_host, port_val);
     }
     else
     {
@@ -461,7 +559,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
                              detail);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     "rotctld test failed host=%s port=%d",
-                    host_text, port_val);
+                    spawn_host, port_val);
     }
 
     if (spawned)
@@ -504,6 +602,7 @@ static void update_widgets(rotor_conf_t * conf)
     gtk_entry_set_text(GTK_ENTRY(device_manual),
                        conf->device_manual ? conf->device_manual : "");
     rot_pref_scan_devices_async(conf->device);
+    rot_pref_update_device_ui_state();
 
     gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), conf->aztype);
 
@@ -535,6 +634,7 @@ static void clear_widgets()
     gtk_entry_set_text(GTK_ENTRY(device_manual), "");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(device_autopick), TRUE);
     rot_pref_scan_devices_async(NULL);
+    rot_pref_update_device_ui_state();
     gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), ROT_AZ_TYPE_360);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 360);
@@ -608,33 +708,45 @@ static void protocol_changed_cb(GtkComboBox * box, gpointer data)
 
 static void device_refresh_cb(GtkButton *button, gpointer data)
 {
-    gchar *current = NULL;
+    const gchar *current_id = NULL;
 
     (void)button;
     (void)data;
 
     if (device_combo)
-        current = gtk_combo_box_text_get_active_text(
-            GTK_COMBO_BOX_TEXT(device_combo));
+        current_id = gtk_combo_box_get_active_id(
+            GTK_COMBO_BOX(device_combo));
 
-    rot_pref_scan_devices_async(current);
-    g_free(current);
+    rot_pref_scan_devices_async(current_id);
 }
 
 static void device_autopick_toggled_cb(GtkToggleButton *button, gpointer data)
 {
-    gchar *current = NULL;
+    const gchar *current_id = NULL;
+    const gchar *manual_text = NULL;
+    gboolean autopick = FALSE;
 
     (void)data;
 
+    autopick = gtk_toggle_button_get_active(button);
     if (device_combo)
-        current = gtk_combo_box_text_get_active_text(
-            GTK_COMBO_BOX_TEXT(device_combo));
+        current_id = gtk_combo_box_get_active_id(
+            GTK_COMBO_BOX(device_combo));
+    if (device_manual)
+        manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
 
     rot_pref_update_device_combo(device_cache,
-                                 current,
-                                 gtk_toggle_button_get_active(button));
-    g_free(current);
+                                 current_id,
+                                 autopick,
+                                 manual_text);
+}
+
+static void device_combo_changed_cb(GtkComboBox *box, gpointer data)
+{
+    (void)box;
+    (void)data;
+
+    rot_pref_update_device_ui_state();
 }
 
 static void aztype_changed_cb(GtkComboBox * box, gpointer data)
@@ -669,6 +781,7 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     GtkWidget      *table;
     GtkWidget      *label;
     GtkWidget      *test_button;
+    GtkWidget      *device_manual_row;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -775,21 +888,32 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     gtk_widget_set_tooltip_text(device_combo,
                                 _("Select the serial device for your rotor."));
     gtk_grid_attach(GTK_GRID(table), device_combo, 1, 6, 2, 1);
+    g_signal_connect(device_combo, "changed",
+                     G_CALLBACK(device_combo_changed_cb), NULL);
 
     device_refresh = gtk_button_new_with_label(_("Refresh"));
     gtk_grid_attach(GTK_GRID(table), device_refresh, 3, 6, 1, 1);
     g_signal_connect(device_refresh, "clicked",
                      G_CALLBACK(device_refresh_cb), NULL);
 
-    /* Manual path */
-    label = gtk_label_new(_("Manual path"));
+    /* Custom device path */
+    device_manual_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(device_manual_row), 6);
+
+    label = gtk_label_new(_("Custom device path"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(device_manual_row), label, 0, 0, 1, 1);
 
     device_manual = gtk_entry_new();
     gtk_widget_set_tooltip_text(device_manual,
-                                _("Override the device path (advanced)."));
-    gtk_grid_attach(GTK_GRID(table), device_manual, 1, 7, 3, 1);
+                                _("Used only when Device=Other..."));
+    gtk_grid_attach(GTK_GRID(device_manual_row), device_manual, 1, 0, 3, 1);
+
+    device_manual_revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(device_manual_revealer),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_container_add(GTK_CONTAINER(device_manual_revealer), device_manual_row);
+    gtk_grid_attach(GTK_GRID(table), device_manual_revealer, 0, 7, 4, 1);
 
     device_autopick = gtk_check_button_new_with_label(_("Auto-pick best match"));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(device_autopick), TRUE);
@@ -937,7 +1061,10 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     if (conf->name != NULL)
         update_widgets(conf);
     else
+    {
         rot_pref_scan_devices_async(NULL);
+        rot_pref_update_device_ui_state();
+    }
 
     gtk_widget_show_all(table);
 
@@ -968,22 +1095,47 @@ static gboolean apply_changes(rotor_conf_t * conf)
     if (conf->baud <= 0)
         conf->baud = rot_protocol_default_baud(conf->protocol);
 
-    if (conf->device)
-        g_free(conf->device);
-    conf->device = gtk_combo_box_text_get_active_text(
-        GTK_COMBO_BOX_TEXT(device_combo));
-
-    if (conf->device_manual)
-        g_free(conf->device_manual);
     {
-        const gchar *manual_text =
-            gtk_entry_get_text(GTK_ENTRY(device_manual));
-        conf->device_manual =
-            (manual_text && *manual_text) ? g_strdup(manual_text) : NULL;
-    }
+        gboolean autopick = gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(device_autopick));
+        const gchar *active_id = NULL;
+        const gchar *manual_text = NULL;
+        gchar *picked = NULL;
 
-    conf->device_autopick =
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(device_autopick));
+        if (device_combo)
+            active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(device_combo));
+        if (device_manual)
+            manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
+
+        if (conf->device)
+            g_free(conf->device);
+        conf->device = NULL;
+
+        if (conf->device_manual)
+            g_free(conf->device_manual);
+        conf->device_manual = NULL;
+
+        if (autopick)
+        {
+            picked = rot_pref_resolve_device(active_id, TRUE, NULL);
+            conf->device = picked;
+        }
+        else if (rot_pref_is_other_id(active_id) ||
+                 active_id == NULL || *active_id == '\0')
+        {
+            if (manual_text && *manual_text)
+            {
+                conf->device = g_strdup(manual_text);
+                conf->device_manual = g_strdup(manual_text);
+            }
+        }
+        else
+        {
+            conf->device = g_strdup(active_id);
+        }
+
+        conf->device_autopick = autopick;
+    }
 
     /* az type */
     conf->aztype = gtk_combo_box_get_active(GTK_COMBO_BOX(aztype));
