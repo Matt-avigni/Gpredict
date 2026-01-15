@@ -122,7 +122,7 @@
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
 #define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
 #define RIGCTRL_RESPONSE_SHOW_LOG 1003
-#define RIGCTRL_TRSP_POPUP_MAX_HEIGHT 360
+#define RIGCTRL_TRSP_POPUP_MAX_HEIGHT 400
 
 static GHashTable *rigctld_device_cache = NULL;
 static GHashTable *rig_freq_cache = NULL;
@@ -244,6 +244,8 @@ static void     rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data);
 static void     rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data);
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
                                           GType child_type);
+static void     rigctrl_trsp_fix_expansion(GtkWidget *widget,
+                                           GtkWidget *list);
 static gint     rigctld_parse_identifier_pid(const gchar *identifier);
 static void     rigctld_set_spawn_state(GtkRigCtrl *ctrl,
                                         gboolean secondary,
@@ -1624,6 +1626,8 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
 
     if (popup_widget != NULL)
     {
+        GtkWidget *tree = NULL;
+
         gtk_widget_set_hexpand(popup_widget, FALSE);
         gtk_widget_set_vexpand(popup_widget, FALSE);
 
@@ -1631,6 +1635,7 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
         while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
             scrolled = gtk_widget_get_parent(scrolled);
 
+        tree = rigctrl_trsp_find_child(popup_widget, GTK_TYPE_TREE_VIEW);
         if (GTK_IS_SCROLLED_WINDOW(scrolled))
         {
             gtk_widget_set_hexpand(scrolled, FALSE);
@@ -1639,15 +1644,19 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
                                            GTK_POLICY_NEVER,
                                            GTK_POLICY_AUTOMATIC);
             gtk_scrolled_window_set_propagate_natural_height(
-                GTK_SCROLLED_WINDOW(scrolled), TRUE);
-#if GTK_CHECK_VERSION(3, 16, 0)
-            gtk_scrolled_window_set_max_content_height(
-                GTK_SCROLLED_WINDOW(scrolled), RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
-#else
+                GTK_SCROLLED_WINDOW(scrolled), FALSE);
             gtk_widget_set_size_request(scrolled, -1,
                                         RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
-#endif
         }
+
+        if (GTK_IS_TREE_VIEW(tree))
+        {
+            gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
+            gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(tree), TRUE);
+        }
+
+        if (tree != NULL)
+            rigctrl_trsp_fix_expansion(popup_widget, tree);
 
         if (g_object_get_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked") == NULL)
         {
@@ -1694,6 +1703,9 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
     GtkWidget *tree = NULL;
     GtkAdjustment *vadj;
     GtkTreePath *path;
+    gint popup_min = 0, popup_nat = 0;
+    gint scrolled_min = 0, scrolled_nat = 0;
+    gint list_min = 0, list_nat = 0;
 
     (void)data;
 
@@ -1721,11 +1733,25 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
         gtk_tree_path_free(path);
     }
 
+    gtk_widget_queue_resize(scrolled);
+    gtk_widget_queue_resize(widget);
+
+    gtk_widget_get_preferred_height(widget, &popup_min, &popup_nat);
+    gtk_widget_get_preferred_height(scrolled, &scrolled_min, &scrolled_nat);
+    if (tree != NULL)
+        gtk_widget_get_preferred_height(tree, &list_min, &list_nat);
+
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s: trsp popup show height=%d width=%d"),
+                _("%s: trsp popup show alloc=%dx%d scroll_alloc=%dx%d "
+                  "pref popup=%d/%d scroll=%d/%d list=%d/%d"),
                 __func__,
+                gtk_widget_get_allocated_width(widget),
+                gtk_widget_get_allocated_height(widget),
+                gtk_widget_get_allocated_width(scrolled),
                 gtk_widget_get_allocated_height(scrolled),
-                gtk_widget_get_allocated_width(scrolled));
+                popup_min, popup_nat,
+                scrolled_min, scrolled_nat,
+                list_min, list_nat);
 }
 
 static void rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data)
@@ -1763,6 +1789,34 @@ static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget, GType child_type)
 
     g_list_free(children);
     return child;
+}
+
+static void rigctrl_trsp_fix_expansion(GtkWidget *widget, GtkWidget *list)
+{
+    GList *children = NULL;
+    GList *entry = NULL;
+
+    if (widget == NULL)
+        return;
+
+    if (widget != list)
+    {
+        gtk_widget_set_hexpand(widget, FALSE);
+        gtk_widget_set_vexpand(widget, FALSE);
+    }
+    else
+    {
+        gtk_widget_set_hexpand(widget, TRUE);
+        gtk_widget_set_vexpand(widget, TRUE);
+    }
+
+    if (!GTK_IS_CONTAINER(widget))
+        return;
+
+    children = gtk_container_get_children(GTK_CONTAINER(widget));
+    for (entry = children; entry != NULL; entry = entry->next)
+        rigctrl_trsp_fix_expansion(GTK_WIDGET(entry->data), list);
+    g_list_free(children);
 }
 
 static gint rigctld_parse_identifier_pid(const gchar *identifier)
@@ -2180,9 +2234,6 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
 {
     trsp_t         *trsp = NULL;
     guint           i, n;
-
-    if (ctrl->TrspSel != NULL)
-        gtk_combo_box_popdown(GTK_COMBO_BOX(ctrl->TrspSel));
 
     if (ctrl->trsplist != NULL)
     {
