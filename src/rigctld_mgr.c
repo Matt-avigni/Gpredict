@@ -1050,24 +1050,49 @@ static void rigctld_mgr_wait_exit(RigctldMgr *mgr, gint timeout_ms)
     }
 }
 
+static gint rigctld_mgr_parse_pid(RigctldMgr *mgr)
+{
+    const gchar *identifier = NULL;
+    gchar *endp = NULL;
+    glong pid = 0;
+
+    if (mgr == NULL || mgr->proc == NULL)
+        return 0;
+
+    identifier = g_subprocess_get_identifier(mgr->proc);
+    if (identifier == NULL || *identifier == '\0')
+        return 0;
+
+    pid = g_ascii_strtoll(identifier, &endp, 10);
+    if (endp == identifier || pid <= 0 || pid > G_MAXINT)
+        return 0;
+
+    return (gint) pid;
+}
+
 void rigctld_mgr_terminate(RigctldMgr **mgr_ptr)
 {
     RigctldMgr *mgr;
+    gint pid = 0;
 
     if (mgr_ptr == NULL || *mgr_ptr == NULL)
         return;
 
     mgr = *mgr_ptr;
+    pid = rigctld_mgr_parse_pid(mgr);
 
     if (mgr->proc != NULL)
     {
         if (!rigctld_mgr_proc_exited(mgr))
         {
 #if defined(G_OS_UNIX) && GLIB_CHECK_VERSION(2, 40, 0)
-            g_subprocess_send_signal(mgr->proc, SIGTERM);
-            rigctld_mgr_wait_exit(mgr, 1500);
+            if (pid > 0)
+            {
+                g_subprocess_send_signal(mgr->proc, SIGTERM);
+                rigctld_mgr_wait_exit(mgr, 1500);
+            }
 #endif
-            if (!rigctld_mgr_proc_exited(mgr))
+            if (!rigctld_mgr_proc_exited(mgr) && pid > 0)
                 g_subprocess_force_exit(mgr->proc);
         }
 

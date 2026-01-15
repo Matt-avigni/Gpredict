@@ -114,6 +114,9 @@
 #define RIGCTLD_HEALTH_RETRY_DELAY_MS 50
 #define RIGCTLD_AUTOSTART_MAX_RESTARTS 2
 #define RIGCTLD_AUTOSTART_RETRY_DELAY_MS 150
+#define RIGCTLD_MODEL_IC9700 3081
+#define RIGCTLD_MODEL_IC905 3090
+#define RIGCTLD_IC905_FALLBACK_TIMEOUT_MS 12000
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
 #define RIGCTRL_RECONNECT_BACKOFF_MAX_MS 10000
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
@@ -174,7 +177,8 @@ static void     apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
                                       gdouble xit);
 static void     update_rit_xit_offsets(GtkRigCtrl * ctrl);
 static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
-                              const gchar *label);
+                              const gchar *label,
+                              gboolean *stale_device_out);
 static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    radio_conf_t *conf,
                                                    gint *sock,
@@ -188,11 +192,14 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
 static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                                        radio_conf_t *conf,
                                        RigctldMgr **mgr,
+                                       gboolean secondary,
                                        const gchar *role,
                                        gchar **connect_host,
                                        gboolean *error_reported);
 static gboolean open_rigctld_socket_host(const gchar *host, gint port,
-                                         gint *sock);
+                                         gint *sock,
+                                         gint *err_out,
+                                         gint *so_err_out);
 static void     schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                         const gchar *role);
 static void     schedule_rig_autostart_error(GtkRigCtrl *ctrl,
@@ -237,6 +244,17 @@ static void     rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data);
 static void     rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data);
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
                                           GType child_type);
+static gint     rigctld_parse_identifier_pid(const gchar *identifier);
+static void     rigctld_set_spawn_state(GtkRigCtrl *ctrl,
+                                        gboolean secondary,
+                                        RigctldMgr *mgr);
+static void     rigctld_clear_spawn_state(GtkRigCtrl *ctrl,
+                                          gboolean secondary);
+static gboolean rigctld_spawned_by_us(const GtkRigCtrl *ctrl,
+                                      gboolean secondary);
+static void     rigctld_terminate_spawned(GtkRigCtrl *ctrl,
+                                          gboolean secondary,
+                                          RigctldMgr **mgr_ptr);
 static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out);
 static const gchar *rig_rprt_error_string(gint code);
 static void     rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
@@ -246,6 +264,7 @@ static void     rigctld_persist_device(GtkRigCtrl *ctrl, radio_conf_t *conf,
 static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
                                                radio_conf_t *conf,
                                                RigctldMgr **mgr,
+                                               gboolean secondary,
                                                const gchar *role,
                                                gboolean *reported,
                                                gint *restart_attempts,
@@ -284,6 +303,9 @@ static gboolean rigctrl_editing_for_role(GtkRigCtrl *ctrl, gboolean secondary);
 static radio_conf_t *rigctrl_load_conf(const gchar *rig_id);
 static void     rigctrl_apply_conf_update(radio_conf_t *dst,
                                           const radio_conf_t *src);
+static void     schedule_rig_backend_error(GtkRigCtrl *ctrl,
+                                           radio_conf_t *conf,
+                                           const gchar *role);
 static void     rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
                                               const gchar *rig_id,
                                               const radio_conf_t *updated);
@@ -1201,8 +1223,8 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->rigctl_thread = NULL;
     }
 
-    rigctld_mgr_terminate(&ctrl->rigctld_mgr2);
-    rigctld_mgr_terminate(&ctrl->rigctld_mgr);
+    rigctld_terminate_spawned(ctrl, TRUE, &ctrl->rigctld_mgr2);
+    rigctld_terminate_spawned(ctrl, FALSE, &ctrl->rigctld_mgr);
 
     if (ctrl->term_view != NULL)
     {
@@ -1293,6 +1315,10 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->missing_model_reported = NULL;
     ctrl->rigctld_mgr = NULL;
     ctrl->rigctld_mgr2 = NULL;
+    ctrl->rigctld_spawned = FALSE;
+    ctrl->rigctld_spawn_pid = 0;
+    ctrl->rigctld_spawned2 = FALSE;
+    ctrl->rigctld_spawn_pid2 = 0;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
     ctrl->resize_idle_id = 0;
@@ -1737,6 +1763,89 @@ static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget, GType child_type)
 
     g_list_free(children);
     return child;
+}
+
+static gint rigctld_parse_identifier_pid(const gchar *identifier)
+{
+    gchar *endp = NULL;
+    glong pid = 0;
+
+    if (identifier == NULL || *identifier == '\0')
+        return 0;
+
+    pid = g_ascii_strtoll(identifier, &endp, 10);
+    if (endp == identifier || pid <= 0 || pid > G_MAXINT)
+        return 0;
+
+    return (gint) pid;
+}
+
+static void rigctld_set_spawn_state(GtkRigCtrl *ctrl,
+                                    gboolean secondary,
+                                    RigctldMgr *mgr)
+{
+    gint pid = 0;
+    const gchar *identifier = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    identifier = rigctld_mgr_get_identifier(mgr);
+    pid = rigctld_parse_identifier_pid(identifier);
+
+    if (secondary)
+    {
+        ctrl->rigctld_spawned2 = (mgr != NULL);
+        ctrl->rigctld_spawn_pid2 = pid;
+    }
+    else
+    {
+        ctrl->rigctld_spawned = (mgr != NULL);
+        ctrl->rigctld_spawn_pid = pid;
+    }
+}
+
+static void rigctld_clear_spawn_state(GtkRigCtrl *ctrl, gboolean secondary)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (secondary)
+    {
+        ctrl->rigctld_spawned2 = FALSE;
+        ctrl->rigctld_spawn_pid2 = 0;
+    }
+    else
+    {
+        ctrl->rigctld_spawned = FALSE;
+        ctrl->rigctld_spawn_pid = 0;
+    }
+}
+
+static gboolean rigctld_spawned_by_us(const GtkRigCtrl *ctrl,
+                                      gboolean secondary)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    return secondary ? ctrl->rigctld_spawned2 : ctrl->rigctld_spawned;
+}
+
+static void rigctld_terminate_spawned(GtkRigCtrl *ctrl,
+                                      gboolean secondary,
+                                      RigctldMgr **mgr_ptr)
+{
+    if (mgr_ptr == NULL || *mgr_ptr == NULL)
+    {
+        rigctld_clear_spawn_state(ctrl, secondary);
+        return;
+    }
+
+    if (!rigctld_spawned_by_us(ctrl, secondary))
+        return;
+
+    rigctld_mgr_terminate(mgr_ptr);
+    rigctld_clear_spawn_state(ctrl, secondary);
 }
 
 /*
@@ -5403,6 +5512,7 @@ static void rigctld_cache_device(radio_model_t model, const gchar *device)
 static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
                                                radio_conf_t *conf,
                                                RigctldMgr **mgr,
+                                               gboolean secondary,
                                                const gchar *role,
                                                gboolean *reported,
                                                gint *restart_attempts,
@@ -5434,7 +5544,7 @@ static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
                  "restarting rigctld with autodetect (%s) attempt=%d",
                  reason ? reason : "autodetect",
                  *restart_attempts);
-    rigctld_mgr_terminate(mgr);
+    rigctld_terminate_spawned(ctrl, secondary, mgr);
 
     if (!rigctld_autodetect_device(ctrl, conf, role, reported))
         return FALSE;
@@ -5653,6 +5763,162 @@ static gint rigctld_pick_ephemeral_port(gint avoid_port)
     return selected;
 }
 
+static void rigctld_set_blocking(gint fd, gboolean blocking)
+{
+#ifndef WIN32
+    gint flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags >= 0)
+    {
+        if (blocking)
+            fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        else
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+#else
+    u_long mode = blocking ? 0 : 1;
+
+    ioctlsocket((SOCKET)fd, FIONBIO, &mode);
+#endif
+}
+
+static gboolean rigctld_connect_addrinfo_timeout(const gchar *host, gint port,
+                                                 gint timeout_ms, gint *sock,
+                                                 gint *err_out,
+                                                 gint *so_err_out)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    gchar            portstr[16];
+    gboolean         connected = FALSE;
+    gint             status;
+    gint             last_err = 0;
+    gint             last_so_err = 0;
+
+    if (host == NULL || sock == NULL)
+        return FALSE;
+
+    if (err_out)
+        *err_out = 0;
+    if (so_err_out)
+        *so_err_out = 0;
+
+    *sock = -1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    g_snprintf(portstr, sizeof(portstr), "%d", port);
+    status = getaddrinfo(host, portstr, &hints, &res);
+    if (status != 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: getaddrinfo failed for %s:%d (%s)"),
+                    __func__, host, port, gai_strerror(status));
+        return FALSE;
+    }
+
+    for (ai = res; ai != NULL; ai = ai->ai_next)
+    {
+        gchar addrbuf[NI_MAXHOST];
+        gint fd = -1;
+        gint err = 0;
+        gint so_err = 0;
+        gint connect_rc = -1;
+        fd_set wset;
+        struct timeval tv;
+        gint sel = 0;
+        socklen_t so_len = sizeof(so_err);
+
+        if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
+                        addrbuf, sizeof(addrbuf), NULL, 0,
+                        NI_NUMERICHOST) != 0)
+            g_strlcpy(addrbuf, host, sizeof(addrbuf));
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    _("%s: attempting connect to %s:%d (%s)"),
+                    __func__, host, port, addrbuf);
+
+        fd = (gint) socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+            continue;
+
+        rigctld_set_blocking(fd, FALSE);
+
+        connect_rc = connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen);
+        if (connect_rc == 0)
+        {
+            connected = TRUE;
+        }
+        else
+        {
+#ifdef WIN32
+            err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS ||
+                err == WSAEALREADY)
+#else
+            err = errno;
+            if (err == EINPROGRESS || err == EALREADY)
+#endif
+            {
+                FD_ZERO(&wset);
+                FD_SET(fd, &wset);
+                tv.tv_sec = timeout_ms / 1000;
+                tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef WIN32
+                sel = select(0, NULL, &wset, NULL, &tv);
+#else
+                sel = select(fd + 1, NULL, &wset, NULL, &tv);
+#endif
+                if (sel > 0)
+                {
+                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+#ifdef WIN32
+                                   (char *)&so_err, &so_len
+#else
+                                   &so_err, &so_len
+#endif
+                        ) == 0 && so_err == 0)
+                    {
+                        connected = TRUE;
+                    }
+                    else
+                    {
+                        err = so_err;
+                    }
+                }
+            }
+        }
+
+        if (connected)
+        {
+            rigctld_set_blocking(fd, TRUE);
+            *sock = fd;
+            last_err = 0;
+            last_so_err = 0;
+            break;
+        }
+
+        if (err != 0)
+            last_err = err;
+        if (so_err != 0)
+            last_so_err = so_err;
+        rigctld_close_fd(fd);
+    }
+
+    freeaddrinfo(res);
+
+    if (err_out)
+        *err_out = last_err;
+    if (so_err_out)
+        *so_err_out = last_so_err;
+
+    return connected;
+}
+
 static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
                                          gint *sock)
 {
@@ -5727,12 +5993,21 @@ static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
 }
 
 static gboolean open_rigctld_socket_host(const gchar *host, gint port,
-                                         gint *sock)
+                                         gint *sock,
+                                         gint *err_out,
+                                         gint *so_err_out)
 {
     const gchar    *target = host;
+    gint            err = 0;
+    gint            so_err = 0;
 
     if (host == NULL || sock == NULL)
         return FALSE;
+
+    if (err_out)
+        *err_out = 0;
+    if (so_err_out)
+        *so_err_out = 0;
 
     if (port <= 0)
     {
@@ -5744,12 +6019,25 @@ static gboolean open_rigctld_socket_host(const gchar *host, gint port,
     if (g_ascii_strcasecmp(host, "localhost") == 0)
         target = "127.0.0.1";
 
-    if (rigctld_connect_addrinfo(target, port, sock))
+    if (rigctld_connect_addrinfo_timeout(target, port,
+                                         RIGCTLD_SOCKET_TIMEOUT_MS,
+                                         sock, &err, &so_err))
+    {
+        rigctld_apply_socket_timeouts(*sock);
+        if (err_out)
+            *err_out = 0;
+        if (so_err_out)
+            *so_err_out = 0;
         return TRUE;
+    }
 
     sat_log_log(SAT_LOG_LEVEL_ERROR,
-                _("%s: Failed to connect to %s:%d"),
-                __func__, target, port);
+                _("%s: Failed to connect to %s:%d (errno=%d so_error=%d)"),
+                __func__, target, port, err, so_err);
+    if (err_out)
+        *err_out = err;
+    if (so_err_out)
+        *so_err_out = so_err;
     return FALSE;
 }
 
@@ -5795,18 +6083,7 @@ static gboolean rigctld_try_connect_once(const gchar *host, gint port,
         if (fd < 0)
             continue;
 
-#ifndef WIN32
-        {
-            gint flags = fcntl(fd, F_GETFL, 0);
-            if (flags >= 0)
-                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        }
-#else
-        {
-            u_long mode = 1;
-            ioctlsocket((SOCKET)fd, FIONBIO, &mode);
-        }
-#endif
+        rigctld_set_blocking(fd, FALSE);
 
         connect_rc = connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen);
         if (connect_rc == 0)
@@ -5991,6 +6268,11 @@ static gint rigctld_expected_model(const radio_conf_t *conf)
     return model;
 }
 
+static gboolean rigctld_is_ic905(const radio_conf_t *conf)
+{
+    return rigctld_expected_model(conf) == RIGCTLD_MODEL_IC905;
+}
+
 static void rigctld_extract_first_lines(const gchar *text,
                                         gchar **line1_out,
                                         gchar **line2_out)
@@ -6038,19 +6320,23 @@ static void rigctld_extract_first_lines(const gchar *text,
         g_free(line2);
 }
 
-static gboolean close_rigctld_socket(gint * sock)
+static gboolean close_rigctld_socket(gint * sock, gboolean send_quit)
 {
     gint            written;
 
     if (sock == NULL || *sock == -1)
         return TRUE;
 
-    written = send(*sock, "q\x0a", 2, 0);
-    if (written != 2)
+    written = 0;
+    if (send_quit)
     {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s:%s: Sent 2 bytes but sent %d."),
-                    __FILE__, __func__, written);
+        written = send(*sock, "q\x0a", 2, 0);
+        if (written != 2)
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s:%s: Sent 2 bytes but sent %d."),
+                        __FILE__, __func__, written);
+        }
     }
 #ifndef WIN32
     shutdown(*sock, SHUT_RDWR);
@@ -6298,6 +6584,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     guint   filtered = 0;
     rigctld_preset_defaults_t preset;
     const gchar *cached = NULL;
+    gboolean is_ic905 = rigctld_is_ic905(conf);
 
     if (error_reported)
         *error_reported = FALSE;
@@ -6323,7 +6610,8 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     }
 
     if ((conf->rigctld_civaddr == NULL || *conf->rigctld_civaddr == '\0') &&
-        preset.civaddr != NULL && *preset.civaddr != '\0')
+        preset.civaddr != NULL && *preset.civaddr != '\0' &&
+        !is_ic905)
     {
         g_free(conf->rigctld_civaddr);
         conf->rigctld_civaddr = g_strdup(preset.civaddr);
@@ -6683,7 +6971,7 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
                  role ? role : "rig",
                  context ? context : "command");
 
-    close_rigctld_socket(sock_ptr);
+    close_rigctld_socket(sock_ptr, rigctld_spawned_by_us(ctrl, secondary));
     rigctrl_schedule_reconnect(ctrl, secondary, role);
 }
 
@@ -6691,6 +6979,7 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
 static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                                        radio_conf_t *conf,
                                        RigctldMgr **mgr,
+                                       gboolean secondary,
                                        const gchar *role,
                                        gchar **connect_host,
                                        gboolean *error_reported)
@@ -6702,6 +6991,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     gboolean        ok = FALSE;
     gboolean        own_host = FALSE;
     gint            restart_attempts = 0;
+    gboolean        is_ic905 = FALSE;
+    gboolean        ic905_fallback = FALSE;
 
     if (error_reported)
         *error_reported = FALSE;
@@ -6730,6 +7021,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
 
     {
         rigctld_preset_defaults_t preset;
+        gboolean is_ic905 = rigctld_is_ic905(conf);
 
         if (radio_model_get_rigctld_defaults(conf->radio_model, &preset) &&
             (conf->rigctld_conn == RIGCTLD_CONN_SERIAL ||
@@ -6739,7 +7031,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                 conf->rigctld_baud = preset.baud;
             if ((conf->rigctld_civaddr == NULL ||
                  *conf->rigctld_civaddr == '\0') &&
-                preset.civaddr != NULL && *preset.civaddr != '\0')
+                preset.civaddr != NULL && *preset.civaddr != '\0' &&
+                !is_ic905)
             {
                 g_free(conf->rigctld_civaddr);
                 conf->rigctld_civaddr = g_strdup(preset.civaddr);
@@ -6806,7 +7099,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     }
 
     if (mgr && *mgr != NULL && !rigctld_mgr_is_running(*mgr))
-        rigctld_mgr_terminate(mgr);
+        rigctld_terminate_spawned(ctrl, secondary, mgr);
 
     if (conf->rigctld_device && *conf->rigctld_device &&
         radio_model_to_hamlib_model(conf->radio_model) > 0)
@@ -6814,132 +7107,155 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         rigctld_cache_device(conf->radio_model, conf->rigctld_device);
     }
 
-    if (rigctld_mgr_port_is_open(host, conf->port, 200))
     {
-        gint detected_model = 0;
-        gint expected_model = rigctld_expected_model(conf);
-        rigctld_probe_result_t probe =
-            rigctld_wait_for_ready(host, conf->port, 1000,
-                                   expected_model, &detected_model);
+        gint listen_err = 0;
+        gboolean listening =
+            rigctld_try_connect_once(host, conf->port, 200, &listen_err);
 
-        if (probe == RIGCTLD_PROBE_OK)
+        if (listening)
         {
+            gint detected_model = 0;
+            gint expected_model = rigctld_expected_model(conf);
+            rigctld_probe_result_t probe =
+                rigctld_wait_for_ready(host, conf->port, 1000,
+                                       expected_model, &detected_model);
+
+            if (probe == RIGCTLD_PROBE_OK)
+            {
+                if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                    rigctld_mgr_host_is_local(conf->host))
+                {
+                    gdouble freq = 0.0;
+                    gchar *reply = NULL;
+                    gchar *log_tail = NULL;
+                    gboolean stale = FALSE;
+
+                    if (!rigctld_probe_frequency(host, conf->port,
+                                                 RIGCTLD_HEALTH_TIMEOUT_MS,
+                                                 RIGCTLD_HEALTH_RETRIES,
+                                                 &freq, &reply))
+                    {
+                        if (mgr && *mgr)
+                            log_tail = rigctld_mgr_get_log_tail(*mgr);
+                        stale = rigctld_reply_indicates_stale_device(reply) ||
+                            rigctld_log_tail_indicates_stale_device(log_tail);
+
+                        if (stale)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_WARN,
+                                        _("%s: rigctld listening but stale device detected; restarting autodetect"),
+                                        __func__);
+                            rig_term_log(ctrl, "gpredict:err",
+                                         "rigctld listening but stale device detected; restarting autodetect");
+                            if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                               secondary,
+                                                               role, &reported,
+                                                               &restart_attempts,
+                                                               "stale device"))
+                            {
+                                g_free(reply);
+                                g_free(log_tail);
+                                goto restart_autostart;
+                            }
+                            if (mgr == NULL || *mgr == NULL)
+                            {
+                                schedule_rig_backend_error(ctrl, conf, role);
+                                g_free(reply);
+                                g_free(log_tail);
+                                reported = TRUE;
+                                goto out;
+                            }
+                        }
+
+                        detail = g_strdup_printf(
+                            _("rigctld did not respond to health probes on %s:%d."),
+                            host, conf->port);
+                        schedule_rig_autostart_error(ctrl, conf, role, detail);
+                        g_free(detail);
+                        g_free(reply);
+                        g_free(log_tail);
+                        reported = TRUE;
+                        goto out;
+                    }
+
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                _("%s: rigctld health probe ok (freq=%.0f)"),
+                                __func__, freq);
+                    rig_term_log(ctrl, "gpredict",
+                                 "rigctld health probe ok (freq=%.0f)", freq);
+                    g_free(reply);
+                    g_free(log_tail);
+                }
+
+                rig_term_log(ctrl, "gpredict",
+                             "rigctld reachable at %s:%d", host, conf->port);
+                ok = TRUE;
+                goto out;
+            }
+
+            if (probe == RIGCTLD_PROBE_MISMATCH)
+            {
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld model mismatch expected=%d got=%d at %s:%d",
+                             expected_model, detected_model,
+                             host, conf->port);
+                detail = g_strdup_printf(
+                    _("rigctld model mismatch at %s:%d.\nExpected %d, got %d."),
+                    host, conf->port, expected_model, detected_model);
+                schedule_rig_autostart_error(ctrl, conf, role, detail);
+                g_free(detail);
+                reported = TRUE;
+                goto out;
+            }
+
             if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
                 rigctld_mgr_host_is_local(conf->host))
             {
-                gdouble freq = 0.0;
-                gchar *reply = NULL;
                 gchar *log_tail = NULL;
                 gboolean stale = FALSE;
 
-                if (!rigctld_probe_frequency(host, conf->port,
-                                             RIGCTLD_HEALTH_TIMEOUT_MS,
-                                             RIGCTLD_HEALTH_RETRIES,
-                                             &freq, &reply))
+                if (mgr && *mgr)
+                    log_tail = rigctld_mgr_get_log_tail(*mgr);
+                stale = rigctld_log_tail_indicates_stale_device(log_tail);
+
+                if (stale)
                 {
-                    if (mgr && *mgr)
-                        log_tail = rigctld_mgr_get_log_tail(*mgr);
-                    stale = rigctld_reply_indicates_stale_device(reply) ||
-                        rigctld_log_tail_indicates_stale_device(log_tail);
-
-                    if (stale)
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                _("%s: rigctld probe failed; stale device detected"),
+                                __func__);
+                    rig_term_log(ctrl, "gpredict:err",
+                                 "rigctld probe failed; stale device detected");
+                    if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                       secondary,
+                                                       role, &reported,
+                                                       &restart_attempts,
+                                                       "stale device"))
                     {
-                        sat_log_log(SAT_LOG_LEVEL_WARN,
-                                    _("%s: rigctld listening but stale device detected; restarting autodetect"),
-                                    __func__);
-                        rig_term_log(ctrl, "gpredict:err",
-                                     "rigctld listening but stale device detected; restarting autodetect");
-                        if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
-                                                           role, &reported,
-                                                           &restart_attempts,
-                                                           "stale device"))
-                        {
-                            g_free(reply);
-                            g_free(log_tail);
-                            goto restart_autostart;
-                        }
+                        g_free(log_tail);
+                        goto restart_autostart;
                     }
-
-                    detail = g_strdup_printf(
-                        _("rigctld did not respond to health probes on %s:%d."),
-                        host, conf->port);
-                    schedule_rig_autostart_error(ctrl, conf, role, detail);
-                    g_free(detail);
-                    g_free(reply);
-                    g_free(log_tail);
-                    reported = TRUE;
-                    goto out;
                 }
-
-                sat_log_log(SAT_LOG_LEVEL_INFO,
-                            _("%s: rigctld health probe ok (freq=%.0f)"),
-                            __func__, freq);
-                rig_term_log(ctrl, "gpredict",
-                             "rigctld health probe ok (freq=%.0f)", freq);
-                g_free(reply);
                 g_free(log_tail);
             }
 
-            rig_term_log(ctrl, "gpredict",
-                         "rigctld reachable at %s:%d", host, conf->port);
-            ok = TRUE;
-            goto out;
-        }
-
-        if (probe == RIGCTLD_PROBE_MISMATCH)
-        {
-            rig_term_log(ctrl, "gpredict:err",
-                         "rigctld model mismatch expected=%d got=%d at %s:%d",
-                         expected_model, detected_model,
-                         host, conf->port);
             detail = g_strdup_printf(
-                _("rigctld model mismatch at %s:%d.\nExpected %d, got %d."),
-                host, conf->port, expected_model, detected_model);
+                _("rigctld at %s:%d is reachable but did not respond to probes."),
+                host, conf->port);
             schedule_rig_autostart_error(ctrl, conf, role, detail);
+            rig_term_log(ctrl, "gpredict:err",
+                         "rigctld reachable but not responding at %s:%d",
+                         host, conf->port);
             g_free(detail);
             reported = TRUE;
             goto out;
         }
 
-        if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
-            rigctld_mgr_host_is_local(conf->host))
+        if (listen_err != 0)
         {
-            gchar *log_tail = NULL;
-            gboolean stale = FALSE;
-
-            if (mgr && *mgr)
-                log_tail = rigctld_mgr_get_log_tail(*mgr);
-            stale = rigctld_log_tail_indicates_stale_device(log_tail);
-
-            if (stale)
-            {
-                sat_log_log(SAT_LOG_LEVEL_WARN,
-                            _("%s: rigctld probe failed; stale device detected"),
-                            __func__);
-                rig_term_log(ctrl, "gpredict:err",
-                             "rigctld probe failed; stale device detected");
-                if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
-                                                   role, &reported,
-                                                   &restart_attempts,
-                                                   "stale device"))
-                {
-                    g_free(log_tail);
-                    goto restart_autostart;
-                }
-            }
-            g_free(log_tail);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        _("%s: rigctld not listening on %s:%d (err=%d)"),
+                        __func__, host, conf->port, listen_err);
         }
-
-        detail = g_strdup_printf(
-            _("rigctld at %s:%d is reachable but did not respond to probes."),
-            host, conf->port);
-        schedule_rig_autostart_error(ctrl, conf, role, detail);
-        rig_term_log(ctrl, "gpredict:err",
-                     "rigctld reachable but not responding at %s:%d",
-                     host, conf->port);
-        g_free(detail);
-        reported = TRUE;
-        goto out;
     }
 
     if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
@@ -6990,12 +7306,45 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
 restart_autostart:
     if (mgr && *mgr == NULL)
     {
+        const radio_conf_t *spawn_conf = conf;
+        radio_conf_t spawn_override;
+        gchar *fallback_args = NULL;
+
+        if (is_ic905 && ic905_fallback)
+        {
+            spawn_override = *conf;
+            spawn_override.rigctld_civaddr = NULL;
+            if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
+            {
+                fallback_args = g_strdup_printf(
+                    "%s -C timeout=%d",
+                    conf->rigctld_extra_args,
+                    RIGCTLD_IC905_FALLBACK_TIMEOUT_MS);
+            }
+            else
+            {
+                fallback_args = g_strdup_printf(
+                    "-C timeout=%d",
+                    RIGCTLD_IC905_FALLBACK_TIMEOUT_MS);
+            }
+            spawn_override.rigctld_extra_args = fallback_args;
+            spawn_conf = &spawn_override;
+
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: IC-905 fallback spawn (no civaddr, timeout=%d)"),
+                        __func__, RIGCTLD_IC905_FALLBACK_TIMEOUT_MS);
+            rig_term_log(ctrl, "gpredict",
+                         "IC-905 fallback spawn (no civaddr, timeout=%d)",
+                         RIGCTLD_IC905_FALLBACK_TIMEOUT_MS);
+        }
+
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: rigctld not reachable; attempting auto-start for %s:%d"),
                     __func__, host, conf->port);
         rig_term_log(ctrl, "gpredict",
                      "auto-start rigctld for %s:%d", host, conf->port);
-        *mgr = rigctld_mgr_spawn(conf, host, &errmsg, NULL, NULL);
+        *mgr = rigctld_mgr_spawn(spawn_conf, host, &errmsg, NULL, NULL);
+        g_free(fallback_args);
         if (*mgr == NULL)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -7021,6 +7370,7 @@ restart_autostart:
             goto out;
         }
 
+        rigctld_set_spawn_state(ctrl, secondary, *mgr);
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: rigctld started pid=%s"),
                     __func__,
@@ -7063,6 +7413,20 @@ restart_autostart:
                              host, conf->port, waited_ms);
             }
 
+            if (is_ic905 && !ic905_fallback)
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: IC-905 auto-start retry without civaddr"),
+                            __func__);
+                rig_term_log(ctrl, "gpredict:err",
+                             "IC-905 auto-start retry without civaddr");
+                ic905_fallback = TRUE;
+                rigctld_terminate_spawned(ctrl, secondary, mgr);
+                g_free(exit_detail);
+                g_free(stderr_text);
+                goto restart_autostart;
+            }
+
             if (mgr)
                 stderr_text = rigctld_mgr_get_log_tail(*mgr);
 
@@ -7076,7 +7440,7 @@ restart_autostart:
                     host, conf->port);
 
             schedule_rig_autostart_error(ctrl, conf, role, detail);
-            rigctld_mgr_terminate(mgr);
+            rigctld_terminate_spawned(ctrl, secondary, mgr);
             g_free(exit_detail);
             g_free(stderr_text);
             g_free(detail);
@@ -7119,6 +7483,7 @@ restart_autostart:
                 rig_term_log(ctrl, "gpredict:err",
                              "rigctld listening but stale device detected; restarting autodetect");
                 if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                   secondary,
                                                    role, &reported,
                                                    &restart_attempts,
                                                    "stale device"))
@@ -7127,6 +7492,20 @@ restart_autostart:
                     g_free(log_tail);
                     goto restart_autostart;
                 }
+            }
+
+            if (is_ic905 && !ic905_fallback)
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: IC-905 rigctld not responding; retrying without civaddr"),
+                            __func__);
+                rig_term_log(ctrl, "gpredict:err",
+                             "IC-905 rigctld not responding; retrying without civaddr");
+                ic905_fallback = TRUE;
+                rigctld_terminate_spawned(ctrl, secondary, mgr);
+                g_free(reply);
+                g_free(log_tail);
+                goto restart_autostart;
             }
 
             detail = g_strdup_printf(
@@ -7198,6 +7577,7 @@ restart_autostart:
                     rig_term_log(ctrl, "gpredict:err",
                                  "rigctld probe failed; stale device detected");
                     if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                       secondary,
                                                        role, &reported,
                                                        &restart_attempts,
                                                        "stale device"))
@@ -7207,6 +7587,21 @@ restart_autostart:
                         goto restart_autostart;
                     }
                 }
+            }
+
+            if (probe != RIGCTLD_PROBE_MISMATCH &&
+                is_ic905 && !ic905_fallback)
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: IC-905 rigctld not responding; retrying without civaddr"),
+                            __func__);
+                rig_term_log(ctrl, "gpredict:err",
+                             "IC-905 rigctld not responding; retrying without civaddr");
+                ic905_fallback = TRUE;
+                rigctld_terminate_spawned(ctrl, secondary, mgr);
+                g_free(stderr_text);
+                g_free(log_tail);
+                goto restart_autostart;
             }
 
             if (probe == RIGCTLD_PROBE_MISMATCH)
@@ -7234,7 +7629,7 @@ restart_autostart:
             }
 
             schedule_rig_autostart_error(ctrl, conf, role, detail);
-            rigctld_mgr_terminate(mgr);
+            rigctld_terminate_spawned(ctrl, secondary, mgr);
             g_free(stderr_text);
             g_free(log_tail);
             g_free(detail);
@@ -7266,8 +7661,11 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
         secondary ? &ctrl->rigctld_mgr2 : &ctrl->rigctld_mgr;
     gchar       *host = NULL;
     gboolean     reported = FALSE;
+    gint         err = 0;
+    gint         so_err = 0;
 
-    if (!ensure_rigctld_running(ctrl, conf, mgr, role, &host, &reported))
+    if (!ensure_rigctld_running(ctrl, conf, mgr, secondary, role, &host,
+                                &reported))
     {
         if (error_reported)
             *error_reported = reported;
@@ -7285,13 +7683,14 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
 
     rig_term_log(ctrl, "gpredict",
                  "connecting to %s:%d", host, conf->port);
-    if (!open_rigctld_socket_host(host, conf->port, sock))
+    if (!open_rigctld_socket_host(host, conf->port, sock, &err, &so_err))
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: Failed to connect to %s:%d"),
                     __func__, host, conf->port);
         rig_term_log(ctrl, "gpredict:err",
-                     "connect failed to %s:%d", host, conf->port);
+                     "connect failed to %s:%d (errno=%d so_error=%d)",
+                     host, conf->port, err, so_err);
         g_free(host);
         if (error_reported)
             *error_reported = reported;
@@ -7306,7 +7705,8 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
 }
 
 static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
-                              const gchar *label)
+                              const gchar *label,
+                              gboolean *stale_device_out)
 {
     gchar           buffback[1024];
     gchar          *line1 = NULL;
@@ -7316,13 +7716,24 @@ static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
     gboolean        ok;
     const gchar    *role = (label != NULL) ? label : _("rig");
     const radio_conf_t *conf = NULL;
+    RigctldMgr     *mgr = NULL;
+    gboolean        stale = FALSE;
+
+    if (stale_device_out)
+        *stale_device_out = FALSE;
 
     if (ctrl != NULL)
     {
         if (sock == ctrl->sock)
+        {
             conf = ctrl->conf;
+            mgr = ctrl->rigctld_mgr;
+        }
         else if (sock == ctrl->sock2)
+        {
             conf = ctrl->conf2;
+            mgr = ctrl->rigctld_mgr2;
+        }
         else
             conf = ctrl->conf;
     }
@@ -7335,6 +7746,15 @@ static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: probe failed to write/read (%s)"),
                     __func__, role);
+        if (mgr != NULL)
+        {
+            gchar *log_tail = rigctld_mgr_get_log_tail(mgr);
+            if (rigctld_log_tail_indicates_stale_device(log_tail))
+                stale = TRUE;
+            g_free(log_tail);
+        }
+        if (stale_device_out)
+            *stale_device_out = stale;
         return FALSE;
     }
 
@@ -7351,6 +7771,17 @@ static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: probe got invalid dump_state from %s"),
                     __func__, role);
+        if (rigctld_reply_indicates_stale_device(buffback))
+            stale = TRUE;
+        if (mgr != NULL)
+        {
+            gchar *log_tail = rigctld_mgr_get_log_tail(mgr);
+            if (rigctld_log_tail_indicates_stale_device(log_tail))
+                stale = TRUE;
+            g_free(log_tail);
+        }
+        if (stale_device_out)
+            *stale_device_out = stale;
         g_free(line1);
         g_free(line2);
         return FALSE;
@@ -7425,6 +7856,51 @@ static void schedule_rig_conn_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
     info->role = g_strdup(role);
 
     g_idle_add(rig_conn_error_idle, info);
+}
+
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *host;
+    gint        port;
+    gchar      *role;
+} RigBackendErrorInfo;
+
+static gboolean rig_backend_error_idle(gpointer data)
+{
+    RigBackendErrorInfo *info = data;
+    gchar *details;
+    const gchar *summary =
+        _("Rig backend could not open serial port. See Rig Log for details.");
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    details = g_strdup_printf(_("Rig: %s\nHost: %s\nPort: %d"),
+                              info->role ? info->role : _("rig"),
+                              info->host ? info->host : "(null) - missing",
+                              info->port);
+    rig_show_error_dialog_with_details(info->ctrl,
+                                       _("Unable to connect to radio"),
+                                       summary, details);
+    g_free(details);
+    g_free(info->host);
+    g_free(info->role);
+    g_free(info);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_rig_backend_error(GtkRigCtrl *ctrl, radio_conf_t *conf,
+                                       const gchar *role)
+{
+    RigBackendErrorInfo *info = g_new0(RigBackendErrorInfo, 1);
+
+    info->ctrl = ctrl;
+    info->host = rigctld_mgr_normalize_host(conf ? conf->host : NULL);
+    info->port = conf ? conf->port : 0;
+    info->role = g_strdup(role);
+
+    g_idle_add(rig_backend_error_idle, info);
 }
 
 typedef struct {
@@ -7671,12 +8147,14 @@ static void rigctrl_close(GtkRigCtrl * data)
 
     if (ctrl->conf2 != NULL)
     {
-        close_rigctld_socket(&(ctrl->sock2));
+        close_rigctld_socket(&(ctrl->sock2),
+                             rigctld_spawned_by_us(ctrl, TRUE));
     }
-    close_rigctld_socket(&(ctrl->sock));
+    close_rigctld_socket(&(ctrl->sock),
+                         rigctld_spawned_by_us(ctrl, FALSE));
 
-    rigctld_mgr_terminate(&ctrl->rigctld_mgr2);
-    rigctld_mgr_terminate(&ctrl->rigctld_mgr);
+    rigctld_terminate_spawned(ctrl, TRUE, &ctrl->rigctld_mgr2);
+    rigctld_terminate_spawned(ctrl, FALSE, &ctrl->rigctld_mgr);
 
     rigctrl_reset_reconnect(ctrl, FALSE);
     rigctrl_reset_reconnect(ctrl, TRUE);
@@ -7706,17 +8184,26 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
 
         {
             gboolean error_reported = FALSE;
+            gboolean stale_device = FALSE;
 
             if (!open_rigctld_socket_with_autostart(ctrl, ctrl->conf,
                                                     &(ctrl->sock),
                                                     FALSE, _("receiver"),
                                                     &error_reported) ||
-                !probe_rigctld(ctrl, ctrl->sock, _("receiver rig")))
+                !probe_rigctld(ctrl, ctrl->sock, _("receiver rig"),
+                               &stale_device))
             {
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: receiver rig open/probe failed"), __func__);
-                close_rigctld_socket(&(ctrl->sock));
-                if (!error_reported && !ctrl->rx_conn_error_reported)
+                close_rigctld_socket(&(ctrl->sock),
+                                     rigctld_spawned_by_us(ctrl, FALSE));
+                if (stale_device && !ctrl->rx_conn_error_reported)
+                {
+                    schedule_rig_backend_error(ctrl, ctrl->conf, _("receiver"));
+                    ctrl->rx_conn_error_reported = TRUE;
+                }
+                if (!stale_device &&
+                    !error_reported && !ctrl->rx_conn_error_reported)
                 {
                     schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
                     ctrl->rx_conn_error_reported = TRUE;
@@ -7750,18 +8237,27 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
 
         {
             gboolean error_reported = FALSE;
+            gboolean stale_device = FALSE;
 
             tx_ok = open_rigctld_socket_with_autostart(
                 ctrl, ctrl->conf2, &(ctrl->sock2), TRUE, _("uplink"),
                 &error_reported);
             if (tx_ok)
-                tx_ok = probe_rigctld(ctrl, ctrl->sock2, _("uplink rig"));
+                tx_ok = probe_rigctld(ctrl, ctrl->sock2, _("uplink rig"),
+                                      &stale_device);
             if (!tx_ok)
             {
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: uplink rig open/probe failed"), __func__);
-                close_rigctld_socket(&(ctrl->sock2));
-                if (!error_reported && !ctrl->tx_conn_error_reported)
+                close_rigctld_socket(&(ctrl->sock2),
+                                     rigctld_spawned_by_us(ctrl, TRUE));
+                if (stale_device && !ctrl->tx_conn_error_reported)
+                {
+                    schedule_rig_backend_error(ctrl, ctrl->conf2, _("uplink"));
+                    ctrl->tx_conn_error_reported = TRUE;
+                }
+                if (!stale_device &&
+                    !error_reported && !ctrl->tx_conn_error_reported)
                 {
                     schedule_rig_conn_error(ctrl, ctrl->conf2, _("uplink"));
                     ctrl->tx_conn_error_reported = TRUE;

@@ -126,6 +126,10 @@ struct _gtk_rig_ctrl {
 
     RigctldMgr     *rigctld_mgr;        /*!< Auto-started rigctld manager (primary) */
     RigctldMgr     *rigctld_mgr2;       /*!< Auto-started rigctld manager (secondary) */
+    gboolean        rigctld_spawned;    /*!< TRUE if primary rigctld was spawned by gpredict */
+    gint            rigctld_spawn_pid;  /*!< PID for spawned primary rigctld (if known) */
+    gboolean        rigctld_spawned2;   /*!< TRUE if secondary rigctld was spawned by gpredict */
+    gint            rigctld_spawn_pid2; /*!< PID for spawned secondary rigctld (if known) */
 
     GpTermView     *term_view;          /*!< Embedded radio debug terminal */
     GtkWidget      *log_toggle;         /*!< Logs toggle button */
