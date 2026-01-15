@@ -230,7 +230,13 @@ static void     rigctrl_schedule_status(GtkRigCtrl *ctrl,
                                         gboolean is_error);
 static gboolean rigctrl_configure_trsp_popup_idle(gpointer data);
 static void     rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data);
+static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
+                                                GdkEventButton *event,
+                                                gpointer data);
 static void     rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data);
+static void     rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data);
+static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
+                                          GType child_type);
 static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out);
 static const gchar *rig_rprt_error_string(gint code);
 static void     rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
@@ -1562,44 +1568,69 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
     AtkObject *popup_acc;
     GtkWidget *popup_widget = NULL;
     GtkWidget *scrolled = NULL;
+    gint attempt = 0;
 
     if (combo == NULL)
         return G_SOURCE_REMOVE;
 
+    attempt = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(combo),
+                                                "rigctrl-popup-attempt"));
     popup_acc = gtk_combo_box_get_popup_accessible(combo);
     if (popup_acc != NULL)
         popup_widget = gtk_accessible_get_widget(GTK_ACCESSIBLE(popup_acc));
 
+    if (popup_widget == NULL)
+    {
+        if (attempt < 4)
+        {
+            g_object_set_data(G_OBJECT(combo), "rigctrl-popup-attempt",
+                              GINT_TO_POINTER(attempt + 1));
+            g_timeout_add(25, rigctrl_configure_trsp_popup_idle,
+                          g_object_ref(combo));
+        }
+
+        g_object_unref(combo);
+        return G_SOURCE_REMOVE;
+    }
+
+    g_object_set_data(G_OBJECT(combo), "rigctrl-popup-attempt",
+                      GINT_TO_POINTER(0));
+
     if (popup_widget != NULL)
     {
+        gtk_widget_set_hexpand(popup_widget, FALSE);
+        gtk_widget_set_vexpand(popup_widget, FALSE);
+
         scrolled = popup_widget;
         while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
             scrolled = gtk_widget_get_parent(scrolled);
 
         if (GTK_IS_SCROLLED_WINDOW(scrolled))
         {
+            gtk_widget_set_hexpand(scrolled, FALSE);
+            gtk_widget_set_vexpand(scrolled, FALSE);
             gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
                                            GTK_POLICY_NEVER,
                                            GTK_POLICY_AUTOMATIC);
             gtk_scrolled_window_set_propagate_natural_height(
-                GTK_SCROLLED_WINDOW(scrolled), FALSE);
+                GTK_SCROLLED_WINDOW(scrolled), TRUE);
+#if GTK_CHECK_VERSION(3, 16, 0)
+            gtk_scrolled_window_set_max_content_height(
+                GTK_SCROLLED_WINDOW(scrolled), RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
+#else
             gtk_widget_set_size_request(scrolled, -1,
                                         RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
-        }
-        else
-        {
-            gtk_widget_set_size_request(popup_widget, -1,
-                                        RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
+#endif
         }
 
         if (g_object_get_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked") == NULL)
         {
             g_object_set_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked",
                               GINT_TO_POINTER(1));
-            g_signal_connect(popup_widget, "show",
-                             G_CALLBACK(rigctrl_trsp_popup_show), NULL);
             g_signal_connect(popup_widget, "map",
                              G_CALLBACK(rigctrl_trsp_popup_show), NULL);
+            g_signal_connect(popup_widget, "hide",
+                             G_CALLBACK(rigctrl_trsp_popup_hide), NULL);
         }
     }
 
@@ -1617,10 +1648,26 @@ static void rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data)
     g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
 }
 
+static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
+                                                GdkEventButton *event,
+                                                gpointer data)
+{
+    (void)event;
+    (void)data;
+
+    if (widget == NULL)
+        return FALSE;
+
+    g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
+    return FALSE;
+}
+
 static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
 {
     GtkWidget *scrolled = widget;
+    GtkWidget *tree = NULL;
     GtkAdjustment *vadj;
+    GtkTreePath *path;
 
     (void)data;
 
@@ -1638,7 +1685,58 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
         return;
 
     gtk_adjustment_set_value(vadj, gtk_adjustment_get_lower(vadj));
-    gtk_widget_queue_resize(scrolled);
+
+    tree = rigctrl_trsp_find_child(widget, GTK_TYPE_TREE_VIEW);
+    if (GTK_IS_TREE_VIEW(tree))
+    {
+        path = gtk_tree_path_new_first();
+        gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL,
+                                     TRUE, 0.0, 0.0);
+        gtk_tree_path_free(path);
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                _("%s: trsp popup show height=%d width=%d"),
+                __func__,
+                gtk_widget_get_allocated_height(scrolled),
+                gtk_widget_get_allocated_width(scrolled));
+}
+
+static void rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data)
+{
+    (void)data;
+
+    if (widget == NULL)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, _("%s: trsp popup hide"), __func__);
+}
+
+static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget, GType child_type)
+{
+    GList *children = NULL;
+    GList *entry = NULL;
+    GtkWidget *child = NULL;
+
+    if (widget == NULL)
+        return NULL;
+
+    if (G_TYPE_CHECK_INSTANCE_TYPE(widget, child_type))
+        return widget;
+
+    if (!GTK_IS_CONTAINER(widget))
+        return NULL;
+
+    children = gtk_container_get_children(GTK_CONTAINER(widget));
+    for (entry = children; entry != NULL; entry = entry->next)
+    {
+        child = rigctrl_trsp_find_child(GTK_WIDGET(entry->data), child_type);
+        if (child != NULL)
+            break;
+    }
+
+    g_list_free(children);
+    return child;
 }
 
 /*
@@ -2547,6 +2645,8 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     load_trsp_list(ctrl);
     g_signal_connect(ctrl->TrspSel, "realize",
                      G_CALLBACK(rigctrl_trsp_combo_realize), NULL);
+    g_signal_connect(ctrl->TrspSel, "button-press-event",
+                     G_CALLBACK(rigctrl_trsp_combo_button_press), NULL);
     g_signal_connect(ctrl->TrspSel, "changed", G_CALLBACK(trsp_selected_cb),
                      ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 1, 2, 1);
