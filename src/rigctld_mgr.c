@@ -4,8 +4,10 @@
 
 #include <gio/gio.h>
 #include <glib/gi18n.h>
+#include <glib/gstdio.h>
 #include <string.h>
 #include <limits.h>
+#include <stdio.h>
 
 #ifdef G_OS_UNIX
 #include <unistd.h>
@@ -36,6 +38,8 @@ struct _RigctldMgr {
     GThread     *exit_thread;
     GMutex       log_lock;
     GString     *log;
+    FILE        *log_file;
+    gchar       *log_path;
     RigctldMgrLogFunc log_cb;
     gpointer     log_cb_data;
     gboolean     proc_exited;
@@ -303,6 +307,25 @@ static void rigctld_mgr_log_append(RigctldMgr *mgr, const gchar *data,
     g_mutex_unlock(&mgr->log_lock);
 }
 
+static void rigctld_mgr_log_to_file(RigctldMgr *mgr,
+                                    const gchar *prefix,
+                                    const gchar *line)
+{
+    if (mgr == NULL)
+        return;
+
+    g_mutex_lock(&mgr->log_lock);
+    if (mgr->log_file != NULL)
+    {
+        if (prefix && *prefix)
+            fprintf(mgr->log_file, "%s: %s\n", prefix, line ? line : "");
+        else
+            fprintf(mgr->log_file, "%s\n", line ? line : "");
+        fflush(mgr->log_file);
+    }
+    g_mutex_unlock(&mgr->log_lock);
+}
+
 static gpointer rigctld_mgr_read_stream(gpointer data)
 {
     RigctldLogReader *reader = data;
@@ -320,11 +343,13 @@ static gpointer rigctld_mgr_read_stream(gpointer data)
         {
             rigctld_mgr_log_append(reader->mgr, line, length);
             rigctld_mgr_log_append(reader->mgr, "\n", 1);
+            rigctld_mgr_log_to_file(reader->mgr, reader->prefix, line);
             rigctld_mgr_emit_log(reader->mgr, reader->prefix, line);
         }
         else
         {
             rigctld_mgr_log_append(reader->mgr, "\n", 1);
+            rigctld_mgr_log_to_file(reader->mgr, reader->prefix, "");
             rigctld_mgr_emit_log(reader->mgr, reader->prefix, "");
         }
         g_free(line);
@@ -336,6 +361,7 @@ static gpointer rigctld_mgr_read_stream(gpointer data)
                                      error->message);
         rigctld_mgr_log_append(reader->mgr, msg, strlen(msg));
         rigctld_mgr_log_append(reader->mgr, "\n", 1);
+        rigctld_mgr_log_to_file(reader->mgr, "rigctld:err", msg);
         rigctld_mgr_emit_log(reader->mgr, "rigctld:err", msg);
         g_free(msg);
         g_clear_error(&error);
@@ -624,7 +650,8 @@ gboolean rigctld_mgr_wait_for_port(const gchar *host, gint port,
 RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
                               const gchar *bind_host,
                               gchar **error_out,
-                              gchar **cmdline_out)
+                              gchar **cmdline_out,
+                              const gchar *log_path)
 {
     RigctldMgr    *mgr = NULL;
     GSubprocess   *proc = NULL;
@@ -870,11 +897,27 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     mgr->proc = proc;
     g_mutex_init(&mgr->log_lock);
     mgr->log = g_string_new(NULL);
+    mgr->log_file = NULL;
+    mgr->log_path = NULL;
     mgr->proc_exited = FALSE;
     mgr->exit_ready = FALSE;
     mgr->exit_reported = FALSE;
     mgr->exit_status = -1;
     mgr->exit_signal = 0;
+    if (log_path && *log_path)
+    {
+        mgr->log_file = g_fopen(log_path, "w");
+        if (mgr->log_file == NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "rigctld log file open failed: %s",
+                        log_path);
+        }
+        else
+        {
+            mgr->log_path = g_strdup(log_path);
+        }
+    }
 
     if (g_subprocess_get_stdout_pipe(proc))
     {
@@ -920,6 +963,36 @@ gboolean rigctld_mgr_is_running(const RigctldMgr *mgr)
         return FALSE;
 
     return !rigctld_mgr_proc_exited((RigctldMgr *)mgr);
+}
+
+gboolean rigctld_mgr_get_exit_info(RigctldMgr *mgr,
+                                   gboolean *exited,
+                                   gint *exit_status,
+                                   gint *exit_signal)
+{
+    gboolean ready = FALSE;
+    gboolean exited_local = FALSE;
+    gint status = -1;
+    gint signal = 0;
+
+    if (mgr == NULL)
+        return FALSE;
+
+    g_mutex_lock(&mgr->log_lock);
+    ready = mgr->exit_ready;
+    exited_local = mgr->proc_exited;
+    status = mgr->exit_status;
+    signal = mgr->exit_signal;
+    g_mutex_unlock(&mgr->log_lock);
+
+    if (exited)
+        *exited = exited_local;
+    if (exit_status)
+        *exit_status = status;
+    if (exit_signal)
+        *exit_signal = signal;
+
+    return ready;
 }
 
 const gchar *rigctld_mgr_get_identifier(const RigctldMgr *mgr)
@@ -1020,6 +1093,12 @@ void rigctld_mgr_terminate(RigctldMgr **mgr_ptr)
     }
 
     g_clear_object(&mgr->proc);
+    if (mgr->log_file != NULL)
+    {
+        fclose(mgr->log_file);
+        mgr->log_file = NULL;
+    }
+    g_free(mgr->log_path);
     g_mutex_clear(&mgr->log_lock);
     if (mgr->log)
         g_string_free(mgr->log, TRUE);

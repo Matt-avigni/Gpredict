@@ -21,8 +21,13 @@ gboolean     rigctld_mgr_wait_for_port(const gchar *host, gint port,
 RigctldMgr  *rigctld_mgr_spawn(const radio_conf_t *conf,
                                const gchar *bind_host,
                                gchar **error_out,
-                               gchar **cmdline_out);
+                               gchar **cmdline_out,
+                               const gchar *log_path);
 gboolean     rigctld_mgr_is_running(const RigctldMgr *mgr);
+gboolean     rigctld_mgr_get_exit_info(RigctldMgr *mgr,
+                                       gboolean *exited,
+                                       gint *exit_status,
+                                       gint *exit_signal);
 const gchar *rigctld_mgr_get_identifier(const RigctldMgr *mgr);
 gchar       *rigctld_mgr_get_log_tail(RigctldMgr *mgr);
 void         rigctld_mgr_set_log_callback(RigctldMgr *mgr,

@@ -45,6 +45,9 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#ifndef WIN32
+#include <fcntl.h>
+#endif
 
 /* NETWORK */
 #ifndef WIN32
@@ -59,6 +62,9 @@
 #include <sys/socket.h>         /* socket(), connect(), send() */
 #else
 #include <winsock2.h>
+#endif
+#ifdef G_OS_WIN32
+#include <windows.h>
 #endif
 
 #include "compat.h"
@@ -99,6 +105,13 @@
 #define RIGCTLD_AUTODETECT_WAIT_MS 1500
 #define RIGCTLD_AUTODETECT_PROBE_MS 1500
 #define RIGCTLD_PROBE_SHORT_MS 300
+#define RIGCTLD_STARTUP_TIMEOUT_MS 2000
+#define RIGCTLD_STARTUP_POLL_MS 25
+#define RIGCTLD_AUTOSTART_TIMEOUT_MS 2000
+#define RIGCTLD_AUTOSTART_POLL_MS 20
+#define RIGCTLD_HEALTH_TIMEOUT_MS 200
+#define RIGCTLD_HEALTH_RETRIES 3
+#define RIGCTLD_HEALTH_RETRY_DELAY_MS 50
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
 #define RIGCTRL_RECONNECT_BACKOFF_MAX_MS 10000
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
@@ -4908,6 +4921,53 @@ static void rigctld_apply_socket_timeouts(gint fd)
 #endif
 }
 
+static gboolean rigctld_serial_device_exists(const gchar *device)
+{
+    if (device == NULL || *device == '\0')
+        return FALSE;
+
+#ifdef G_OS_WIN32
+    {
+        const gchar *path = device;
+        gchar *alt_path = NULL;
+        HANDLE handle;
+        DWORD err = 0;
+        gboolean exists = FALSE;
+
+        if (!g_str_has_prefix(device, "\\\\.\\") &&
+            g_ascii_strncasecmp(device, "COM", 3) == 0)
+        {
+            alt_path = g_strdup_printf("\\\\.\\%s", device);
+            path = alt_path;
+        }
+
+        handle = CreateFileA(path,
+                             0,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             NULL,
+                             OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL,
+                             NULL);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            exists = TRUE;
+            CloseHandle(handle);
+        }
+        else
+        {
+            err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED)
+                exists = TRUE;
+        }
+
+        g_free(alt_path);
+        return exists;
+    }
+#else
+    return g_file_test(device, G_FILE_TEST_EXISTS);
+#endif
+}
+
 static void rigctld_apply_socket_timeouts_ms(gint fd, gint timeout_ms)
 {
 #ifndef WIN32
@@ -4958,6 +5018,24 @@ static void rigctld_cache_device(radio_model_t model, const gchar *device)
     g_hash_table_replace(rigctld_device_cache,
                          GINT_TO_POINTER(model),
                          g_strdup(device));
+}
+
+static void rigctld_persist_device(GtkRigCtrl *ctrl, radio_conf_t *conf,
+                                   const gchar *reason)
+{
+    if (conf == NULL || conf->name == NULL ||
+        conf->rigctld_device == NULL || *conf->rigctld_device == '\0')
+        return;
+
+    radio_conf_save(conf);
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: saved autodetect device %s (%s)"),
+                __func__, conf->rigctld_device,
+                reason ? reason : "autodetect");
+    rig_term_log(ctrl, "gpredict",
+                 "saved autodetect device %s (%s)",
+                 conf->rigctld_device,
+                 reason ? reason : "autodetect");
 }
 
 static GSList *rigctld_prioritize_candidate(GSList *list,
@@ -5251,6 +5329,230 @@ static gboolean open_rigctld_socket_host(const gchar *host, gint port,
     return FALSE;
 }
 
+static gboolean rigctld_try_connect_once(const gchar *host, gint port,
+                                         gint timeout_ms, gint *last_err)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    gchar            portstr[16];
+    gboolean         connected = FALSE;
+    gint             status;
+
+    if (host == NULL)
+        return FALSE;
+
+    if (last_err)
+        *last_err = 0;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    g_snprintf(portstr, sizeof(portstr), "%d", port);
+    status = getaddrinfo(host, portstr, &hints, &res);
+    if (status != 0)
+        return FALSE;
+
+    for (ai = res; ai != NULL; ai = ai->ai_next)
+    {
+        gint fd = -1;
+        gint err = 0;
+        gint connect_rc = -1;
+        fd_set wset;
+        struct timeval tv;
+        gint sel = 0;
+        gint so_err = 0;
+        socklen_t so_len = sizeof(so_err);
+
+        fd = (gint) socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+            continue;
+
+#ifndef WIN32
+        {
+            gint flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0)
+                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+#else
+        {
+            u_long mode = 1;
+            ioctlsocket((SOCKET)fd, FIONBIO, &mode);
+        }
+#endif
+
+        connect_rc = connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen);
+        if (connect_rc == 0)
+        {
+            connected = TRUE;
+        }
+        else
+        {
+#ifdef WIN32
+            err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS ||
+                err == WSAEALREADY)
+#else
+            err = errno;
+            if (err == EINPROGRESS || err == EALREADY)
+#endif
+            {
+                FD_ZERO(&wset);
+                FD_SET(fd, &wset);
+                tv.tv_sec = timeout_ms / 1000;
+                tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef WIN32
+                sel = select(0, NULL, &wset, NULL, &tv);
+#else
+                sel = select(fd + 1, NULL, &wset, NULL, &tv);
+#endif
+                if (sel > 0)
+                {
+                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+#ifdef WIN32
+                                   (char *)&so_err, &so_len
+#else
+                                   &so_err, &so_len
+#endif
+                        ) == 0 && so_err == 0)
+                    {
+                        connected = TRUE;
+                    }
+                    else
+                    {
+                        err = so_err;
+                    }
+                }
+            }
+        }
+
+#ifndef WIN32
+        close(fd);
+#else
+        closesocket((SOCKET)fd);
+#endif
+
+        if (connected)
+            break;
+
+        if (last_err)
+            *last_err = err;
+    }
+
+    freeaddrinfo(res);
+    return connected;
+}
+
+static gboolean rigctld_wait_tcp_listen(GtkRigCtrl *ctrl,
+                                        RigctldMgr *mgr,
+                                        const gchar *host,
+                                        gint port,
+                                        gint timeout_ms,
+                                        gint poll_ms,
+                                        gint *waited_ms_out,
+                                        gchar **exit_detail_out)
+{
+    gint64 start_us = g_get_monotonic_time();
+    gint waited_ms = 0;
+    gint last_err = 0;
+
+    if (waited_ms_out)
+        *waited_ms_out = 0;
+    if (exit_detail_out)
+        *exit_detail_out = NULL;
+
+    while (waited_ms < timeout_ms)
+    {
+        gint64 attempt_start = g_get_monotonic_time();
+
+        if (mgr && !rigctld_mgr_is_running(mgr))
+        {
+            gboolean exited = FALSE;
+            gint status = -1;
+            gint signal = 0;
+
+            rigctld_mgr_get_exit_info(mgr, &exited, &status, &signal);
+            if (exit_detail_out)
+            {
+                if (signal > 0)
+                    *exit_detail_out =
+                        g_strdup_printf("rigctld exited via signal %d", signal);
+                else if (status >= 0)
+                    *exit_detail_out =
+                        g_strdup_printf("rigctld exit status %d", status);
+                else
+                    *exit_detail_out = g_strdup("rigctld exited");
+            }
+            if (waited_ms_out)
+                *waited_ms_out = waited_ms;
+            return FALSE;
+        }
+
+        if (rigctld_try_connect_once(host, port, poll_ms, &last_err))
+        {
+            if (waited_ms_out)
+                *waited_ms_out = waited_ms;
+            return TRUE;
+        }
+
+        waited_ms = (gint) ((g_get_monotonic_time() - start_us) / 1000);
+        if (waited_ms >= timeout_ms)
+            break;
+
+        {
+            gint attempt_ms = (gint) ((g_get_monotonic_time() - attempt_start) / 1000);
+            gint sleep_ms = poll_ms - attempt_ms;
+
+            if (sleep_ms > 0)
+                g_usleep((gulong) sleep_ms * 1000);
+        }
+    }
+
+    if (waited_ms_out)
+        *waited_ms_out = waited_ms;
+    (void)last_err;
+    (void)ctrl;
+    return FALSE;
+}
+
+static gchar *rigctld_read_log_tail(const gchar *path, guint max_lines)
+{
+    gchar *contents = NULL;
+    gsize  length = 0;
+    gchar **lines = NULL;
+    gint total = 0;
+    gint start = 0;
+    GString *out = NULL;
+
+    if (path == NULL || *path == '\0')
+        return NULL;
+
+    if (!g_file_get_contents(path, &contents, &length, NULL))
+        return NULL;
+
+    lines = g_strsplit(contents, "\n", -1);
+    for (total = 0; lines[total] != NULL; total++)
+        ;
+
+    if ((gint) max_lines < total)
+        start = total - (gint) max_lines;
+
+    out = g_string_new(NULL);
+    for (gint i = start; lines[i] != NULL; i++)
+    {
+        g_string_append(out, lines[i]);
+        if (lines[i + 1] != NULL)
+            g_string_append(out, "\n");
+    }
+
+    g_strfreev(lines);
+    g_free(contents);
+    return g_string_free(out, FALSE);
+}
+
 static gint rigctld_expected_model(const radio_conf_t *conf)
 {
     gint model = 0;
@@ -5421,6 +5723,112 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
     return RIGCTLD_PROBE_OK;
 }
 
+static gboolean rigctld_parse_frequency_response(const gchar *text,
+                                                 gdouble *freq_out)
+{
+    gchar *trimmed = NULL;
+    gchar **parts = NULL;
+    gchar *endptr = NULL;
+    gdouble freq = 0.0;
+    gboolean ok = FALSE;
+
+    if (freq_out)
+        *freq_out = 0.0;
+
+    if (text == NULL || *text == '\0')
+        return FALSE;
+
+    trimmed = g_strdup(text);
+    g_strstrip(trimmed);
+    if (*trimmed == '\0')
+        goto out;
+
+    parts = g_strsplit_set(trimmed, " \r\n\t", -1);
+    if (parts[0] == NULL || *parts[0] == '\0')
+        goto out;
+
+    if (g_str_has_prefix(parts[0], "RPRT"))
+        goto out;
+
+    freq = g_ascii_strtod(parts[0], &endptr);
+    if (endptr == parts[0])
+        goto out;
+
+    if (freq_out)
+        *freq_out = freq;
+    ok = TRUE;
+
+out:
+    g_strfreev(parts);
+    g_free(trimmed);
+    return ok;
+}
+
+static gboolean rigctld_probe_frequency(const gchar *host, gint port,
+                                        gint timeout_ms, gint retries,
+                                        gdouble *freq_out,
+                                        gchar **reply_out)
+{
+    gint attempt = 0;
+    gchar *last_reply = NULL;
+    gdouble freq = 0.0;
+
+    if (reply_out)
+        *reply_out = NULL;
+
+    for (attempt = 0; attempt < retries; attempt++)
+    {
+        gint sock = -1;
+        gchar buffer[256];
+        const gchar *cmd = "f\n";
+        gint size;
+
+        if (!rigctld_connect_addrinfo(host, port, &sock))
+        {
+            g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
+            continue;
+        }
+
+        rigctld_apply_socket_timeouts_ms(sock, timeout_ms);
+
+        size = (gint) strlen(cmd);
+        if (send(sock, cmd, size, 0) != size)
+        {
+            rigctld_close_fd(sock);
+            g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
+            continue;
+        }
+
+        size = (gint) recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (size > 0)
+        {
+            buffer[size] = '\0';
+            g_free(last_reply);
+            last_reply = g_strdup(buffer);
+            if (rigctld_parse_frequency_response(buffer, &freq))
+            {
+                rigctld_close_fd(sock);
+                if (freq_out)
+                    *freq_out = freq;
+                if (reply_out)
+                    *reply_out = g_strdup(buffer);
+                g_free(last_reply);
+                return TRUE;
+            }
+        }
+
+        rigctld_close_fd(sock);
+        g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
+    }
+
+    if (reply_out)
+        *reply_out = last_reply;
+    else
+        g_free(last_reply);
+
+    return FALSE;
+}
+
 static rigctld_probe_result_t rigctld_wait_for_ready(const gchar *host,
                                                      gint port,
                                                      gint timeout_ms,
@@ -5579,8 +5987,12 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
         gchar *errmsg = NULL;
         gchar *reply = NULL;
         gchar *cmdline = NULL;
+        gchar *log_path = NULL;
+        gchar *log_tail = NULL;
+        gchar *exit_detail = NULL;
         gint temp_port = -1;
         gint detected_model = 0;
+        gint waited_ms = 0;
         radio_conf_t probe_conf;
 
         if (tried >= RIGCTLD_AUTODETECT_MAX_CANDIDATES)
@@ -5615,7 +6027,25 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
         probe_conf.rigctld_device = candidate;
         probe_conf.port = temp_port;
 
-        probe_mgr = rigctld_mgr_spawn(&probe_conf, host, &errmsg, &cmdline);
+        {
+            GError *tmp_err = NULL;
+            gint log_fd = g_file_open_tmp("gpredict-rigctld-autodetect-XXXXXX.log",
+                                          &log_path, &tmp_err);
+            if (log_fd >= 0)
+                g_close(log_fd, NULL);
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: auto-detect log file create failed (%s)"),
+                            __func__, tmp_err ? tmp_err->message : "unknown");
+                g_clear_error(&tmp_err);
+                g_free(log_path);
+                log_path = NULL;
+            }
+        }
+
+        probe_mgr = rigctld_mgr_spawn(&probe_conf, host, &errmsg, &cmdline,
+                                      log_path);
         if (cmdline != NULL)
         {
             sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -5637,20 +6067,57 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                 fatal_err = g_strdup(errmsg);
             g_free(errmsg);
             g_free(cmdline);
+            if (log_path)
+            {
+                g_unlink(log_path);
+                g_free(log_path);
+            }
             break;
         }
 
-        if (!rigctld_mgr_wait_for_port(host, temp_port,
-                                       RIGCTLD_AUTODETECT_WAIT_MS))
+        if (!rigctld_wait_tcp_listen(ctrl, probe_mgr, host, temp_port,
+                                     RIGCTLD_STARTUP_TIMEOUT_MS,
+                                     RIGCTLD_STARTUP_POLL_MS,
+                                     &waited_ms, &exit_detail))
         {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        _("%s: auto-detect no listen on %s:%d"),
-                        __func__, host, temp_port);
-            rig_term_log(ctrl, "gpredict:err",
-                         "auto-detect no listen on %s:%d",
-                         host, temp_port);
+            if (exit_detail != NULL)
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: auto-detect rigctld exited early for %s (%s)"),
+                            __func__, candidate, exit_detail);
+                rig_term_log(ctrl, "gpredict:err",
+                             "auto-detect rigctld exited early for %s (%s)",
+                             candidate, exit_detail);
+            }
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            _("%s: auto-detect no listen on %s:%d after %d ms"),
+                            __func__, host, temp_port, waited_ms);
+                rig_term_log(ctrl, "gpredict:err",
+                             "auto-detect no listen on %s:%d after %d ms",
+                             host, temp_port, waited_ms);
+            }
+            if (log_path)
+                log_tail = rigctld_read_log_tail(log_path, 30);
+            if (log_tail && *log_tail)
+            {
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            _("%s: auto-detect rigctld log tail for %s:\n%s"),
+                            __func__, candidate, log_tail);
+                rig_term_log(ctrl, "gpredict:err",
+                             "auto-detect rigctld log tail for %s:\n%s",
+                             candidate, log_tail);
+            }
+            g_free(log_tail);
+            g_free(exit_detail);
             rigctld_mgr_terminate(&probe_mgr);
             g_free(cmdline);
+            if (log_path)
+            {
+                g_unlink(log_path);
+                g_free(log_path);
+            }
             continue;
         }
 
@@ -5698,6 +6165,11 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                 g_free(reply);
                 rigctld_mgr_terminate(&probe_mgr);
                 g_free(cmdline);
+                if (log_path)
+                {
+                    g_unlink(log_path);
+                    g_free(log_path);
+                }
                 break;
             }
 
@@ -5718,6 +6190,11 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
             rigctld_mgr_terminate(&probe_mgr);
         }
         g_free(cmdline);
+        if (log_path)
+        {
+            g_unlink(log_path);
+            g_free(log_path);
+        }
     }
 
     gp_serial_free_candidates(candidates);
@@ -5955,6 +6432,28 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         goto out;
     }
 
+    if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+        conf->rigctld_device && *conf->rigctld_device &&
+        rigctld_mgr_host_is_local(conf->host))
+    {
+        if (!rigctld_serial_device_exists(conf->rigctld_device))
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        _("%s: configured serial device missing (%s), "
+                          "falling back to autodetect"),
+                        __func__, conf->rigctld_device);
+            rig_term_log(ctrl, "gpredict:err",
+                         "configured serial device missing (%s), "
+                         "falling back to autodetect",
+                         conf->rigctld_device);
+            g_free(conf->rigctld_device);
+            conf->rigctld_device = NULL;
+            if (!rigctld_autodetect_device(ctrl, conf, role, &reported))
+                goto out;
+            rigctld_persist_device(ctrl, conf, "missing device");
+        }
+    }
+
     if (conf->rigctld_autostart &&
         conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
         (conf->rigctld_device == NULL || *conf->rigctld_device == '\0') &&
@@ -5962,6 +6461,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     {
         if (!rigctld_autodetect_device(ctrl, conf, role, &reported))
             goto out;
+        rigctld_persist_device(ctrl, conf, "autodetect");
     }
 
     if (conf->rigctld_model <= 0 &&
@@ -5977,6 +6477,9 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         goto out;
     }
 
+    gboolean tried_autodetect_fallback = FALSE;
+
+restart_autostart:
     if (mgr && *mgr == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -5984,7 +6487,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                     __func__, host, conf->port);
         rig_term_log(ctrl, "gpredict",
                      "auto-start rigctld for %s:%d", host, conf->port);
-        *mgr = rigctld_mgr_spawn(conf, host, &errmsg, NULL);
+        *mgr = rigctld_mgr_spawn(conf, host, &errmsg, NULL, NULL);
         if (*mgr == NULL)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -6022,35 +6525,112 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         rigctld_mgr_set_log_callback(*mgr, rigctld_log_cb, ctrl);
     }
 
-    if (!rigctld_mgr_wait_for_port(host, conf->port, 5000))
     {
-        gchar *stderr_text = NULL;
+        gchar *exit_detail = NULL;
+        gint waited_ms = 0;
 
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: auto-start failed; rigctld not listening on %s:%d"),
-                    __func__, host, conf->port);
-        rig_term_log(ctrl, "gpredict:err",
-                     "rigctld not listening on %s:%d",
-                     host, conf->port);
+        if (!rigctld_wait_tcp_listen(ctrl, *mgr, host, conf->port,
+                                     RIGCTLD_AUTOSTART_TIMEOUT_MS,
+                                     RIGCTLD_AUTOSTART_POLL_MS,
+                                     &waited_ms, &exit_detail))
+        {
+            gchar *stderr_text = NULL;
 
-        if (mgr)
-            stderr_text = rigctld_mgr_get_log_tail(*mgr);
+            if (exit_detail != NULL)
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: auto-start failed; rigctld exited early (%s)"),
+                            __func__, exit_detail);
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld exited early (%s)",
+                             exit_detail);
+            }
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: auto-start failed; rigctld not listening on %s:%d after %d ms"),
+                            __func__, host, conf->port, waited_ms);
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld not listening on %s:%d after %d ms",
+                             host, conf->port, waited_ms);
+            }
 
-        if (stderr_text && *stderr_text)
+            if (mgr)
+                stderr_text = rigctld_mgr_get_log_tail(*mgr);
+
+            if (stderr_text && *stderr_text)
+                detail = g_strdup_printf(
+                    _("rigctld did not start listening on %s:%d.\n%s"),
+                    host, conf->port, stderr_text);
+            else
+                detail = g_strdup_printf(
+                    _("rigctld did not start listening on %s:%d."),
+                    host, conf->port);
+
+            schedule_rig_autostart_error(ctrl, conf, role, detail);
+            rigctld_mgr_terminate(mgr);
+            g_free(exit_detail);
+            g_free(stderr_text);
+            g_free(detail);
+            reported = TRUE;
+            goto out;
+        }
+
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rigctld listening on %s:%d after %d ms"),
+                    __func__, host, conf->port, waited_ms);
+        rig_term_log(ctrl, "gpredict",
+                     "rigctld listening on %s:%d after %d ms",
+                     host, conf->port, waited_ms);
+        g_free(exit_detail);
+    }
+
+    if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+        rigctld_mgr_host_is_local(conf->host))
+    {
+        gdouble freq = 0.0;
+        gchar *reply = NULL;
+
+        if (!rigctld_probe_frequency(host, conf->port,
+                                     RIGCTLD_HEALTH_TIMEOUT_MS,
+                                     RIGCTLD_HEALTH_RETRIES,
+                                     &freq, &reply))
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        _("%s: rigctld listening but unhealthy, restarting with autodetect"),
+                        __func__);
+            rig_term_log(ctrl, "gpredict:err",
+                         "rigctld listening but unhealthy, restarting with autodetect");
+            if (!tried_autodetect_fallback)
+            {
+                tried_autodetect_fallback = TRUE;
+                rigctld_mgr_terminate(mgr);
+                if (!rigctld_autodetect_device(ctrl, conf, role, &reported))
+                {
+                    g_free(reply);
+                    goto out;
+                }
+                rigctld_persist_device(ctrl, conf, "unhealthy");
+                g_free(reply);
+                goto restart_autostart;
+            }
+
             detail = g_strdup_printf(
-                _("rigctld did not start listening on %s:%d.\n%s"),
-                host, conf->port, stderr_text);
-        else
-            detail = g_strdup_printf(
-                _("rigctld did not start listening on %s:%d."),
+                _("rigctld did not respond to health probes on %s:%d."),
                 host, conf->port);
+            schedule_rig_autostart_error(ctrl, conf, role, detail);
+            g_free(detail);
+            g_free(reply);
+            reported = TRUE;
+            goto out;
+        }
 
-        schedule_rig_autostart_error(ctrl, conf, role, detail);
-        rigctld_mgr_terminate(mgr);
-        g_free(stderr_text);
-        g_free(detail);
-        reported = TRUE;
-        goto out;
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: rigctld health probe ok (freq=%.0f)"),
+                    __func__, freq);
+        rig_term_log(ctrl, "gpredict",
+                     "rigctld health probe ok (freq=%.0f)", freq);
+        g_free(reply);
     }
 
     {
