@@ -26,6 +26,7 @@
 #include "compat.h"
 #include "gpredict-utils.h"
 #include "sat-cfg.h"
+#include "sat-log.h"
 #include "sat-pref.h"
 #include "sat-pref-general.h"
 #include "sat-pref-interfaces.h"
@@ -51,6 +52,10 @@ GtkWidget      *window;         /* dialog window */
 extern GtkWidget *app;
 
 static void     button_press_cb(GtkWidget * widget, gpointer nbook);
+static void     sat_pref_dialog_response(GtkDialog *dialog,
+                                         gint response,
+                                         gpointer user_data);
+static void     sat_pref_dialog_destroy(GtkWidget *widget, gpointer user_data);
 
 /**
  * Create and run preferences dialog.
@@ -73,7 +78,6 @@ void sat_pref_run()
     GtkWidget      *butbox;
     GtkWidget      *genbut, *modbut, *ifbut, *predbut;
     gchar          *iconfile;
-    gint            response;
 
     /* Create notebook and add individual pages.
        The individual pages will need the GKeyFile
@@ -144,10 +148,16 @@ void sat_pref_run()
     gtk_box_pack_start(GTK_BOX(hbox), nbook, TRUE, TRUE, 0);
     gtk_widget_show_all(hbox);
 
+    if (window != NULL && GTK_IS_WINDOW(window))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG, "sat-pref dialog already open");
+        gtk_window_present(GTK_WINDOW(window));
+        return;
+    }
+
     /* create and display preferences window */
     window = gtk_dialog_new_with_buttons(_("Gpredict Preferences :: General"),
                                          GTK_WINDOW(app),
-                                         GTK_DIALOG_MODAL |
                                          GTK_DIALOG_DESTROY_WITH_PARENT,
                                          "_Cancel", GTK_RESPONSE_REJECT,
                                          "_OK", GTK_RESPONSE_ACCEPT,
@@ -164,7 +174,41 @@ void sat_pref_run()
 
     gtk_button_clicked(GTK_BUTTON(genbut));
 
-    response = gtk_dialog_run(GTK_DIALOG(window));
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "sat-pref dialog created");
+    g_signal_connect(window, "response",
+                     G_CALLBACK(sat_pref_dialog_response), NULL);
+    g_signal_connect(window, "destroy",
+                     G_CALLBACK(sat_pref_dialog_destroy), NULL);
+    gtk_widget_show_all(window);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "sat-pref dialog shown");
+    gtk_window_present(GTK_WINDOW(window));
+}
+
+/** 
+ * Handle button press events
+ *
+ * Basically consists of switching pages in the notebook. The page number is
+ * received via the nbook parameter.
+ */
+static void button_press_cb(GtkWidget * widget, gpointer nbook)
+{
+    gint            page =
+        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "page"));
+
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(nbook), page);
+
+    gtk_window_set_title(GTK_WINDOW(window), _(WINDOW_TITLE[page]));
+}
+
+static void sat_pref_dialog_response(GtkDialog *dialog,
+                                     gint response,
+                                     gpointer user_data)
+{
+    (void)user_data;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "sat-pref dialog response=%d", response);
+
     switch (response)
     {
     case GTK_RESPONSE_ACCEPT:
@@ -182,21 +226,15 @@ void sat_pref_run()
         sat_pref_predict_cancel();
         break;
     }
-    gtk_widget_destroy(window);
+
+    gtk_widget_destroy(GTK_WIDGET(dialog));
 }
 
-/** 
- * Handle button press events
- *
- * Basically consists of switching pages in the notebook. The page number is
- * received via the nbook parameter.
- */
-static void button_press_cb(GtkWidget * widget, gpointer nbook)
+static void sat_pref_dialog_destroy(GtkWidget *widget, gpointer user_data)
 {
-    gint            page =
-        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "page"));
+    (void)user_data;
 
-    gtk_notebook_set_current_page(GTK_NOTEBOOK(nbook), page);
-
-    gtk_window_set_title(GTK_WINDOW(window), _(WINDOW_TITLE[page]));
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "sat-pref dialog destroyed");
+    if (widget == window)
+        window = NULL;
 }

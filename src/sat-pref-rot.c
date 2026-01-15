@@ -39,16 +39,89 @@ static GtkWidget *editbutton;
 static GtkWidget *delbutton;
 static GtkWidget *rotlist;
 
+typedef struct {
+    GtkListStore *store;
+    GtkTreeIter   iter;
+    gboolean      have_iter;
+} RotPrefEditorContext;
+
+static void rot_pref_store_set(GtkListStore *store,
+                               GtkTreeIter *iter,
+                               const rotor_conf_t *conf)
+{
+    gtk_list_store_set(store, iter,
+                       ROT_LIST_COL_NAME, conf->name,
+                       ROT_LIST_COL_HOST, conf->host,
+                       ROT_LIST_COL_PORT, conf->port,
+                       ROT_LIST_COL_PROTOCOL, conf->protocol,
+                       ROT_LIST_COL_BAUD, conf->baud,
+                       ROT_LIST_COL_DEVICE, conf->device,
+                       ROT_LIST_COL_DEVICE_MANUAL, conf->device_manual,
+                       ROT_LIST_COL_DEVICE_AUTOPICK, conf->device_autopick,
+                       ROT_LIST_COL_AUTOSTART, conf->autostart,
+                       ROT_LIST_COL_MINAZ, conf->minaz,
+                       ROT_LIST_COL_MAXAZ, conf->maxaz,
+                       ROT_LIST_COL_MINEL, conf->minel,
+                       ROT_LIST_COL_MAXEL, conf->maxel,
+                       ROT_LIST_COL_AZTYPE, conf->aztype,
+                       ROT_LIST_COL_AZSTOPPOS, conf->azstoppos,
+                       ROT_LIST_COL_AXIS_MODE, conf->axis_mode,
+                       ROT_LIST_COL_USE_OFFSET, conf->use_offset,
+                       ROT_LIST_COL_AZ_OFFSET, conf->az_offset,
+                       ROT_LIST_COL_EL_OFFSET, conf->el_offset,
+                       ROT_LIST_COL_AZ_INVERT, conf->invert_az,
+                       ROT_LIST_COL_EL_INVERT, conf->invert_el,
+                       -1);
+}
+
+static void rot_pref_free_conf(rotor_conf_t *conf)
+{
+    if (conf == NULL)
+        return;
+
+    g_free(conf->name);
+    g_free(conf->host);
+    g_free(conf->device);
+    g_free(conf->device_manual);
+    g_free(conf);
+}
+
+static void rot_pref_editor_done(rotor_conf_t *conf,
+                                 gboolean applied,
+                                 gpointer user_data)
+{
+    RotPrefEditorContext *ctx = user_data;
+
+    if (applied && conf != NULL && conf->name != NULL)
+    {
+        if (ctx != NULL && ctx->store != NULL)
+        {
+            if (!ctx->have_iter)
+                gtk_list_store_append(ctx->store, &ctx->iter);
+            rot_pref_store_set(ctx->store, &ctx->iter, conf);
+        }
+    }
+
+    rot_pref_free_conf(conf);
+
+    if (ctx != NULL)
+    {
+        if (ctx->store)
+            g_object_unref(ctx->store);
+        g_free(ctx);
+    }
+}
+
 
 static void add_cb(GtkWidget * button, gpointer data)
 {
-    GtkTreeIter     item;       /* new item added to the list store */
-    GtkListStore   *liststore;
-
     (void)button;
     (void)data;
 
-    rotor_conf_t    conf = {
+    rotor_conf_t *conf = g_new0(rotor_conf_t, 1);
+    RotPrefEditorContext *ctx = g_new0(RotPrefEditorContext, 1);
+
+    *conf = (rotor_conf_t){
         .name = NULL,
         .host = NULL,
         .port = 4533,
@@ -72,50 +145,14 @@ static void add_cb(GtkWidget * button, gpointer data)
         .invert_el = FALSE,
     };
 
-    conf.baud = rot_protocol_default_baud(conf.protocol);
+    conf->baud = rot_protocol_default_baud(conf->protocol);
 
-    /* run rot conf editor */
-    sat_pref_rot_editor_run(&conf);
+    ctx->store =
+        GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(rotlist)));
+    g_object_ref(ctx->store);
+    ctx->have_iter = FALSE;
 
-    /* add new rot to the list */
-    if (conf.name != NULL)
-    {
-        liststore =
-            GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(rotlist)));
-        gtk_list_store_append(liststore, &item);
-        gtk_list_store_set(liststore, &item,
-                           ROT_LIST_COL_NAME, conf.name,
-                           ROT_LIST_COL_HOST, conf.host,
-                           ROT_LIST_COL_PORT, conf.port,
-                           ROT_LIST_COL_PROTOCOL, conf.protocol,
-                           ROT_LIST_COL_BAUD, conf.baud,
-                           ROT_LIST_COL_DEVICE, conf.device,
-                           ROT_LIST_COL_DEVICE_MANUAL, conf.device_manual,
-                           ROT_LIST_COL_DEVICE_AUTOPICK, conf.device_autopick,
-                           ROT_LIST_COL_AUTOSTART, conf.autostart,
-                           ROT_LIST_COL_MINAZ, conf.minaz,
-                           ROT_LIST_COL_MAXAZ, conf.maxaz,
-                           ROT_LIST_COL_MINEL, conf.minel,
-                           ROT_LIST_COL_MAXEL, conf.maxel,
-                           ROT_LIST_COL_AZTYPE, conf.aztype,
-                           ROT_LIST_COL_AZSTOPPOS, conf.azstoppos,
-                           ROT_LIST_COL_AXIS_MODE, conf.axis_mode,
-                           ROT_LIST_COL_USE_OFFSET, conf.use_offset,
-                           ROT_LIST_COL_AZ_OFFSET, conf.az_offset,
-                           ROT_LIST_COL_EL_OFFSET, conf.el_offset,
-                           ROT_LIST_COL_AZ_INVERT, conf.invert_az,
-                           ROT_LIST_COL_EL_INVERT, conf.invert_el,
-                           -1);
-
-        g_free(conf.name);
-
-        if (conf.host != NULL)
-            g_free(conf.host);
-        if (conf.device != NULL)
-            g_free(conf.device);
-        if (conf.device_manual != NULL)
-            g_free(conf.device_manual);
-    }
+    sat_pref_rot_editor_run(conf, rot_pref_editor_done, ctx);
 }
 
 static void edit_cb(GtkWidget * button, gpointer data)
@@ -124,35 +161,11 @@ static void edit_cb(GtkWidget * button, gpointer data)
     GtkTreeModel   *selmod;
     GtkTreeSelection *selection;
     GtkTreeIter     iter;
+    rotor_conf_t   *conf = NULL;
+    RotPrefEditorContext *ctx = NULL;
 
     (void)button;               /* avoid unused parameter compiler warning */
     (void)data;                 /* avoid unused parameter compiler warning */
-
-    rotor_conf_t    conf = {
-        .name = NULL,
-        .host = NULL,
-        .port = 4533,
-        .protocol = ROT_PROTOCOL_GS232B,
-        .baud = 0,
-        .device = NULL,
-        .device_manual = NULL,
-        .device_autopick = TRUE,
-        .autostart = TRUE,
-        .minaz = 0,
-        .maxaz = 360,
-        .minel = 0,
-        .maxel = 90,
-        .aztype = ROT_AZ_TYPE_360,
-        .azstoppos = 0,         //used in the "new rotator" dialog
-        .axis_mode = ROT_AXIS_MODE_AZ_EL,
-        .use_offset = FALSE,
-        .az_offset = 0.0,
-        .el_offset = 0.0,
-        .invert_az = FALSE,
-        .invert_el = FALSE,
-    };
-
-    conf.baud = rot_protocol_default_baud(conf.protocol);
 
     /* If there are no entries, we have a bug since the button should 
        have been disabled. */
@@ -171,91 +184,82 @@ static void edit_cb(GtkWidget * button, gpointer data)
        FIXME: do we really need to work with two models?
      */
     selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(rotlist));
-    if (gtk_tree_selection_get_selected(selection, &selmod, &iter))
-    {
-        gtk_tree_model_get(model, &iter,
-                           ROT_LIST_COL_NAME, &conf.name,
-                           ROT_LIST_COL_HOST, &conf.host,
-                           ROT_LIST_COL_PORT, &conf.port,
-                           ROT_LIST_COL_PROTOCOL, &conf.protocol,
-                           ROT_LIST_COL_BAUD, &conf.baud,
-                           ROT_LIST_COL_DEVICE, &conf.device,
-                           ROT_LIST_COL_DEVICE_MANUAL, &conf.device_manual,
-                           ROT_LIST_COL_DEVICE_AUTOPICK, &conf.device_autopick,
-                           ROT_LIST_COL_AUTOSTART, &conf.autostart,
-                           ROT_LIST_COL_MINAZ, &conf.minaz,
-                           ROT_LIST_COL_MAXAZ, &conf.maxaz,
-                           ROT_LIST_COL_MINEL, &conf.minel,
-                           ROT_LIST_COL_MAXEL, &conf.maxel,
-                           ROT_LIST_COL_AZTYPE, &conf.aztype,
-                           ROT_LIST_COL_AZSTOPPOS, &conf.azstoppos,
-                           ROT_LIST_COL_AXIS_MODE, &conf.axis_mode,
-                           ROT_LIST_COL_USE_OFFSET, &conf.use_offset,
-                           ROT_LIST_COL_AZ_OFFSET, &conf.az_offset,
-                           ROT_LIST_COL_EL_OFFSET, &conf.el_offset,
-                           ROT_LIST_COL_AZ_INVERT, &conf.invert_az,
-                           ROT_LIST_COL_EL_INVERT, &conf.invert_el,
-                           -1);
-    }
-    else
+    if (!gtk_tree_selection_get_selected(selection, &selmod, &iter))
     {
         GtkWidget      *dialog;
 
         dialog = gtk_message_dialog_new(GTK_WINDOW(window),
-                                        GTK_DIALOG_MODAL |
                                         GTK_DIALOG_DESTROY_WITH_PARENT,
                                         GTK_MESSAGE_ERROR,
                                         GTK_BUTTONS_OK,
                                         _
                                         ("Select the rotator you want to edit\n"
                                          "and try again!"));
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
+        g_signal_connect_swapped(dialog, "response",
+                                 G_CALLBACK(gtk_widget_destroy), dialog);
+        gtk_widget_show(dialog);
 
         return;
     }
 
-    /* run radio configuration editor */
-    sat_pref_rot_editor_run(&conf);
+    conf = g_new0(rotor_conf_t, 1);
+    *conf = (rotor_conf_t){
+        .name = NULL,
+        .host = NULL,
+        .port = 4533,
+        .protocol = ROT_PROTOCOL_GS232B,
+        .baud = 0,
+        .device = NULL,
+        .device_manual = NULL,
+        .device_autopick = TRUE,
+        .autostart = TRUE,
+        .minaz = 0,
+        .maxaz = 360,
+        .minel = 0,
+        .maxel = 90,
+        .aztype = ROT_AZ_TYPE_360,
+        .azstoppos = 0,
+        .axis_mode = ROT_AXIS_MODE_AZ_EL,
+        .use_offset = FALSE,
+        .az_offset = 0.0,
+        .el_offset = 0.0,
+        .invert_az = FALSE,
+        .invert_el = FALSE,
+    };
 
-    /* apply changes */
-    if (conf.name != NULL)
-    {
-        gtk_list_store_set(GTK_LIST_STORE(model), &iter,
-                           ROT_LIST_COL_NAME, conf.name,
-                           ROT_LIST_COL_HOST, conf.host,
-                           ROT_LIST_COL_PORT, conf.port,
-                           ROT_LIST_COL_PROTOCOL, conf.protocol,
-                           ROT_LIST_COL_BAUD, conf.baud,
-                           ROT_LIST_COL_DEVICE, conf.device,
-                           ROT_LIST_COL_DEVICE_MANUAL, conf.device_manual,
-                           ROT_LIST_COL_DEVICE_AUTOPICK, conf.device_autopick,
-                           ROT_LIST_COL_AUTOSTART, conf.autostart,
-                           ROT_LIST_COL_MINAZ, conf.minaz,
-                           ROT_LIST_COL_MAXAZ, conf.maxaz,
-                           ROT_LIST_COL_MINEL, conf.minel,
-                           ROT_LIST_COL_MAXEL, conf.maxel,
-                           ROT_LIST_COL_AZTYPE, conf.aztype,
-                           ROT_LIST_COL_AZSTOPPOS, conf.azstoppos,
-                           ROT_LIST_COL_AXIS_MODE, conf.axis_mode,
-                           ROT_LIST_COL_USE_OFFSET, conf.use_offset,
-                           ROT_LIST_COL_AZ_OFFSET, conf.az_offset,
-                           ROT_LIST_COL_EL_OFFSET, conf.el_offset,
-                           ROT_LIST_COL_AZ_INVERT, conf.invert_az,
-                           ROT_LIST_COL_EL_INVERT, conf.invert_el,
-                           -1);
-    }
+    conf->baud = rot_protocol_default_baud(conf->protocol);
 
-    /* clean up memory */
-    if (conf.name)
-        g_free(conf.name);
+    gtk_tree_model_get(model, &iter,
+                       ROT_LIST_COL_NAME, &conf->name,
+                       ROT_LIST_COL_HOST, &conf->host,
+                       ROT_LIST_COL_PORT, &conf->port,
+                       ROT_LIST_COL_PROTOCOL, &conf->protocol,
+                       ROT_LIST_COL_BAUD, &conf->baud,
+                       ROT_LIST_COL_DEVICE, &conf->device,
+                       ROT_LIST_COL_DEVICE_MANUAL, &conf->device_manual,
+                       ROT_LIST_COL_DEVICE_AUTOPICK, &conf->device_autopick,
+                       ROT_LIST_COL_AUTOSTART, &conf->autostart,
+                       ROT_LIST_COL_MINAZ, &conf->minaz,
+                       ROT_LIST_COL_MAXAZ, &conf->maxaz,
+                       ROT_LIST_COL_MINEL, &conf->minel,
+                       ROT_LIST_COL_MAXEL, &conf->maxel,
+                       ROT_LIST_COL_AZTYPE, &conf->aztype,
+                       ROT_LIST_COL_AZSTOPPOS, &conf->azstoppos,
+                       ROT_LIST_COL_AXIS_MODE, &conf->axis_mode,
+                       ROT_LIST_COL_USE_OFFSET, &conf->use_offset,
+                       ROT_LIST_COL_AZ_OFFSET, &conf->az_offset,
+                       ROT_LIST_COL_EL_OFFSET, &conf->el_offset,
+                       ROT_LIST_COL_AZ_INVERT, &conf->invert_az,
+                       ROT_LIST_COL_EL_INVERT, &conf->invert_el,
+                       -1);
 
-    if (conf.host != NULL)
-        g_free(conf.host);
-    if (conf.device != NULL)
-        g_free(conf.device);
-    if (conf.device_manual != NULL)
-        g_free(conf.device_manual);
+    ctx = g_new0(RotPrefEditorContext, 1);
+    ctx->store = GTK_LIST_STORE(model);
+    g_object_ref(ctx->store);
+    ctx->iter = iter;
+    ctx->have_iter = TRUE;
+
+    sat_pref_rot_editor_run(conf, rot_pref_editor_done, ctx);
 }
 
 static void delete_cb(GtkWidget * button, gpointer data)
@@ -290,15 +294,15 @@ static void delete_cb(GtkWidget * button, gpointer data)
         GtkWidget      *dialog;
 
         dialog = gtk_message_dialog_new(GTK_WINDOW(window),
-                                        GTK_DIALOG_MODAL |
                                         GTK_DIALOG_DESTROY_WITH_PARENT,
                                         GTK_MESSAGE_ERROR,
                                         GTK_BUTTONS_OK,
                                         _
                                         ("Select the rotator you want to delete\n"
                                          "and try again!"));
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
+        g_signal_connect_swapped(dialog, "response",
+                                 G_CALLBACK(gtk_widget_destroy), dialog);
+        gtk_widget_show(dialog);
     }
 }
 

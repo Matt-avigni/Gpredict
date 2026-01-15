@@ -202,6 +202,9 @@ struct _GtkRotCtrl {
     gint64          last_oob_log_us;
     gdouble         last_oob_raw_az, last_oob_raw_el;
     gdouble         last_oob_mapped_az, last_oob_mapped_el;
+    gint64          manual_edit_until_us;
+    gint64          last_manual_sync_log_us;
+    gboolean        manual_sync_pending;
 };
 
 struct _GtkRotCtrlClass {
@@ -227,6 +230,13 @@ static void rot_schedule_cmd_reject(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_log_out_of_range(GtkRotCtrl *ctrl,
                                  gdouble raw_az, gdouble raw_el,
                                  const rot_cmd_map_t *map);
+static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
+                                       gpointer data);
+static gboolean rotctrl_should_sync_manual(GtkRotCtrl *ctrl);
+static gboolean rotctrl_sync_manual_from_position(GtkRotCtrl *ctrl,
+                                                  gdouble az_abs, gdouble el,
+                                                  gdouble *setaz,
+                                                  gdouble *setel);
 
 static void rot_term_log(GtkRotCtrl *ctrl, const gchar *prefix,
                          const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
@@ -1335,6 +1345,83 @@ static void rot_format_deg_2(char *out, gsize outsz, gdouble val)
     g_strlcpy(out, buf, outsz);
 }
 
+static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
+                                       gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)widget;
+    (void)event;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
+    ctrl->manual_sync_pending = FALSE;
+    return FALSE;
+}
+
+static gboolean rotctrl_should_sync_manual(GtkRotCtrl *ctrl)
+{
+    gint64 now;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    if (!ctrl->manual_sync_pending)
+        return FALSE;
+
+    now = g_get_monotonic_time();
+    if (now < ctrl->manual_edit_until_us)
+        return FALSE;
+
+    return TRUE;
+}
+
+static gboolean rotctrl_sync_manual_from_position(GtkRotCtrl *ctrl,
+                                                  gdouble az_abs, gdouble el,
+                                                  gdouble *setaz,
+                                                  gdouble *setel)
+{
+    gdouble az_conf;
+    gdouble cur_az;
+    gdouble cur_el;
+    gboolean changed = FALSE;
+    gint64 now;
+
+    if (!rotctrl_should_sync_manual(ctrl))
+        return FALSE;
+
+    az_conf = rot_az_to_conf(ctrl->conf, az_abs);
+    cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+    cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+
+    if (fabs(cur_az - az_conf) >= 0.05 || fabs(cur_el - el) >= 0.05)
+    {
+        gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), az_conf);
+        gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), el);
+        if (setaz)
+            *setaz = az_conf;
+        if (setel)
+            *setel = el;
+        changed = TRUE;
+    }
+
+    if (changed)
+    {
+        now = g_get_monotonic_time();
+        if (now - ctrl->last_manual_sync_log_us > 2000000)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rotor manual sync: az=%.2f el=%.2f", az_conf, el);
+            ctrl->last_manual_sync_log_us = now;
+        }
+        ctrl->manual_sync_pending = FALSE;
+    }
+
+    return changed;
+}
+
 static gboolean rot_parse_first_number(const gchar *line, gdouble *out)
 {
     if (line == NULL || out == NULL)
@@ -1662,6 +1749,12 @@ static gboolean rotctld_handshake(GtkRotCtrl *ctrl, gint sock,
             *rejected = TRUE;
         return FALSE;
     }
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.azi_in = az;
+    ctrl->client.ele_in = el;
+    g_mutex_unlock(&ctrl->client.mutex);
+    ctrl->manual_sync_pending = TRUE;
 
     return TRUE;
 }
@@ -2289,6 +2382,12 @@ static GtkWidget *create_az_widgets(GtkRotCtrl * ctrl)
     gtk_container_add(GTK_CONTAINER(frame), table);
 
     ctrl->AzSet = gtk_rot_knob_new(0.0, 360.0, 180.0);
+    gtk_widget_add_events(ctrl->AzSet,
+                          GDK_BUTTON_PRESS_MASK | GDK_SCROLL_MASK);
+    g_signal_connect(ctrl->AzSet, "button-press-event",
+                     G_CALLBACK(rot_manual_input_event), ctrl);
+    g_signal_connect(ctrl->AzSet, "scroll-event",
+                     G_CALLBACK(rot_manual_input_event), ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->AzSet, 0, 0, 3, 1);
 
     label = gtk_label_new(NULL);
@@ -2324,6 +2423,12 @@ static GtkWidget *create_el_widgets(GtkRotCtrl * ctrl)
     gtk_container_add(GTK_CONTAINER(frame), table);
 
     ctrl->ElSet = gtk_rot_knob_new(0.0, 90.0, 45.0);
+    gtk_widget_add_events(ctrl->ElSet,
+                          GDK_BUTTON_PRESS_MASK | GDK_SCROLL_MASK);
+    g_signal_connect(ctrl->ElSet, "button-press-event",
+                     G_CALLBACK(rot_manual_input_event), ctrl);
+    g_signal_connect(ctrl->ElSet, "scroll-event",
+                     G_CALLBACK(rot_manual_input_event), ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->ElSet, 0, 0, 3, 1);
 
     label = gtk_label_new(NULL);
@@ -2573,6 +2678,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 {
                     gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
                                                  rotaz, rotel);
+                }
+
+                if (ctrl->conf != NULL)
+                {
+                    rotctrl_sync_manual_from_position(ctrl, rotaz, rotel,
+                                                      &setaz, &setel);
                 }
             }
         }
@@ -3513,6 +3624,7 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->errcnt = 0;
     ctrl->out_of_range = FALSE;
     ctrl->last_oob_log_us = 0;
+    ctrl->manual_sync_pending = TRUE;
 
     if (ctrl->client.thread != NULL)
     {
@@ -4356,37 +4468,48 @@ typedef struct {
     gint        port;
 } RotWrongDaemonInfo;
 
-static gboolean rot_wrong_daemon_idle(gpointer data)
+static void rot_show_message(GtkRotCtrl *ctrl,
+                             GtkMessageType type,
+                             const gchar *title,
+                             const gchar *message)
 {
-    RotWrongDaemonInfo *info = data;
     GtkWidget *toplevel;
     GtkWindow *parent = NULL;
     GtkWidget *dialog;
+
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    dialog = gtk_message_dialog_new(parent,
+                                    GTK_DIALOG_DESTROY_WITH_PARENT,
+                                    type,
+                                    GTK_BUTTONS_OK,
+                                    "%s",
+                                    message ? message : "");
+    if (title && *title)
+        gtk_window_set_title(GTK_WINDOW(dialog), title);
+
+    g_signal_connect_swapped(dialog, "response",
+                             G_CALLBACK(gtk_widget_destroy), dialog);
+    gtk_widget_show(dialog);
+}
+
+static gboolean rot_wrong_daemon_idle(gpointer data)
+{
+    RotWrongDaemonInfo *info = data;
     GtkWidget *status_label;
-    gchar *body;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
-    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(info->ctrl));
-    if (GTK_IS_WINDOW(toplevel))
-        parent = GTK_WINDOW(toplevel);
-
-    body = g_strdup_printf(
-        _("Port %d already in use by non-rotctld service.\n\nHost: %s\nPort: %d"),
-        info->port,
-        info->host ? info->host : _("(missing)"),
-        info->port);
-
-    dialog = gtk_message_dialog_new(parent,
-                                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                    GTK_MESSAGE_ERROR,
-                                    GTK_BUTTONS_OK,
-                                    "%s", body);
-    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor error"));
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
-    g_free(body);
+    rot_show_message(info->ctrl,
+                     GTK_MESSAGE_ERROR,
+                     _("Rotor error"),
+                     _("Port already in use by a non-rotctld service."));
 
     if (info->ctrl && info->ctrl->LockBut)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(info->ctrl->LockBut), FALSE);
@@ -4424,24 +4547,14 @@ typedef struct {
 
 static void rot_show_cmd_reject_error(GtkRotCtrl *ctrl, const gchar *reason)
 {
-    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-    GtkWindow *parent = NULL;
     const gchar *msg = reason ? reason
                               : _("rotctld reachable but rejects position commands; "
                                   "check backend/model, limits, and axis mode");
 
-    if (GTK_IS_WINDOW(toplevel))
-        parent = GTK_WINDOW(toplevel);
-
-    GtkWidget *dialog = gtk_message_dialog_new(
-        parent,
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_ERROR,
-        GTK_BUTTONS_OK,
-        "%s", msg);
-    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor command rejected"));
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    rot_show_message(ctrl,
+                     GTK_MESSAGE_ERROR,
+                     _("Rotor command rejected"),
+                     msg);
 }
 
 static gboolean rot_cmd_reject_idle(gpointer data)
@@ -4483,60 +4596,30 @@ static void rot_schedule_cmd_reject(GtkRotCtrl *ctrl, const gchar *reason)
  */
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl)
 {
-    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-    GtkWindow *parent = NULL;
-    if (GTK_IS_WINDOW(toplevel))
-        parent = GTK_WINDOW(toplevel);
-    GtkWidget *dialog = gtk_message_dialog_new(
-        parent,
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_ERROR,
-        GTK_BUTTONS_OK,
-        "%s", _("Unable to find a rotor!"));
-    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor error"));
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    rot_show_message(ctrl,
+                     GTK_MESSAGE_ERROR,
+                     _("Rotor error"),
+                     _("Unable to find a rotor!"));
 }
 
 static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason)
 {
-    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-    GtkWindow *parent = NULL;
     const gchar *msg = reason ? reason : _("Invalid rotor configuration.");
 
-    if (GTK_IS_WINDOW(toplevel))
-        parent = GTK_WINDOW(toplevel);
-
-    GtkWidget *dialog = gtk_message_dialog_new(
-        parent,
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_ERROR,
-        GTK_BUTTONS_OK,
-        "%s", msg);
-    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor configuration error"));
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    rot_show_message(ctrl,
+                     GTK_MESSAGE_ERROR,
+                     _("Rotor configuration error"),
+                     msg);
 }
 
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason)
 {
     const gchar *msg = reason ? reason
                               : _("No valid rotor trajectory for this pass.");
-    GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-    GtkWindow *parent = NULL;
-
-    if (GTK_IS_WINDOW(toplevel))
-        parent = GTK_WINDOW(toplevel);
-
-    GtkWidget *dialog = gtk_message_dialog_new(
-        parent,
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_ERROR,
-        GTK_BUTTONS_OK,
-        "%s", msg);
-    gtk_window_set_title(GTK_WINDOW(dialog), _("Rotor trajectory blocked"));
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    rot_show_message(ctrl,
+                     GTK_MESSAGE_ERROR,
+                     _("Rotor trajectory blocked"),
+                     msg);
 }
 
 static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data)
@@ -5084,28 +5167,15 @@ static void
 rot_calibration_start_cb(GtkButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
-    GtkWidget *toplevel;
-    GtkWindow *parent = NULL;
 
     (void)button;
 
     /* Require a valid configuration and an engaged, running client. */
     if (!ctrl->conf || !ctrl->engaged || !ctrl->client.running) {
-        GtkWidget *dlg;
-
-        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-        if (GTK_IS_WINDOW(toplevel))
-            parent = GTK_WINDOW(toplevel);
-
-        dlg = gtk_message_dialog_new(parent,
-                                     GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                     GTK_MESSAGE_WARNING,
-                                     GTK_BUTTONS_OK,
-                                     "%s",
-                                     _("Engage the rotator before starting calibration."));
-        gtk_window_set_title(GTK_WINDOW(dlg), _("Calibration"));
-        gtk_dialog_run(GTK_DIALOG(dlg));
-        gtk_widget_destroy(dlg);
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_WARNING,
+                         _("Calibration"),
+                         _("Engage the rotator before starting calibration."));
         return;
     }
 
@@ -5143,24 +5213,12 @@ rot_calibration_start_cb(GtkButton *button, gpointer data)
 
     /* Inform the user what to do next. */
     {
-        GtkWidget *dlg;
-
-        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-        if (GTK_IS_WINDOW(toplevel))
-            parent = GTK_WINDOW(toplevel);
-
-        dlg = gtk_message_dialog_new(
-            parent,
-            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_INFO,
-            GTK_BUTTONS_OK,
-            "%s",
-            _("The rotor has been commanded to AZ=0°, EL=0°.\n\n"
-              "Now mechanically align the antenna boom to true North\n"
-              "and level. When you are done, click OK."));
-        gtk_window_set_title(GTK_WINDOW(dlg), _("Calibration"));
-        gtk_dialog_run(GTK_DIALOG(dlg));
-        gtk_widget_destroy(dlg);
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_INFO,
+                         _("Calibration"),
+                         _("The rotor has been commanded to AZ=0°, EL=0°.\n\n"
+                           "Now mechanically align the antenna boom to true North\n"
+                           "and level. When you are done, click OK."));
     }
 }
 
@@ -5178,28 +5236,15 @@ static void
 rot_park_zenith_cb(GtkButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
-    GtkWidget *toplevel;
-    GtkWindow *parent = NULL;
 
     (void)button;
 
     /* Require a valid configuration and an engaged, running client. */
     if (!ctrl->conf || !ctrl->engaged || !ctrl->client.running) {
-        GtkWidget *dlg;
-
-        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-        if (GTK_IS_WINDOW(toplevel))
-            parent = GTK_WINDOW(toplevel);
-
-        dlg = gtk_message_dialog_new(parent,
-                                     GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                     GTK_MESSAGE_WARNING,
-                                     GTK_BUTTONS_OK,
-                                     "%s",
-                                     _("Engage the rotator before parking it."));
-        gtk_window_set_title(GTK_WINDOW(dlg), _("Park rotor"));
-        gtk_dialog_run(GTK_DIALOG(dlg));
-        gtk_widget_destroy(dlg);
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_WARNING,
+                         _("Park rotor"),
+                         _("Engage the rotator before parking it."));
         return;
     }
 
@@ -5217,23 +5262,11 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
 
     /* Inform the user what was commanded. */
     {
-        GtkWidget *dlg;
-
-        toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
-        if (GTK_IS_WINDOW(toplevel))
-            parent = GTK_WINDOW(toplevel);
-
-        dlg = gtk_message_dialog_new(
-            parent,
-            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_INFO,
-            GTK_BUTTONS_OK,
-            "%s",
-            _("The rotor has been commanded to AZ=0°, EL=90° (park position).\n\n"
-              "Verify that the antenna is pointing straight up over true North."));
-        gtk_window_set_title(GTK_WINDOW(dlg), _("Park rotor"));
-        gtk_dialog_run(GTK_DIALOG(dlg));
-        gtk_widget_destroy(dlg);
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_INFO,
+                         _("Park rotor"),
+                         _("The rotor has been commanded to AZ=0°, EL=90° (park position).\n\n"
+                           "Verify that the antenna is pointing straight up over true North."));
     }
 }
 
@@ -5383,6 +5416,9 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->last_oob_raw_el = 0.0;
     ctrl->last_oob_mapped_az = 0.0;
     ctrl->last_oob_mapped_el = 0.0;
+    ctrl->manual_edit_until_us = 0;
+    ctrl->last_manual_sync_log_us = 0;
+    ctrl->manual_sync_pending = FALSE;
     memset(&ctrl->trajectory_plan, 0, sizeof(ctrl->trajectory_plan));
     rot_plan_reset(&ctrl->trajectory_plan);
     /* Default to conservative send-only until rotctld probe says otherwise. */

@@ -39,6 +39,87 @@ static GtkWidget *editbutton;
 static GtkWidget *delbutton;
 static GtkWidget *riglist;
 
+typedef struct {
+    GtkListStore *store;
+    GtkTreeIter   iter;
+    gboolean      have_iter;
+} RigPrefEditorContext;
+
+static void rig_pref_store_set(GtkListStore *store,
+                               GtkTreeIter *iter,
+                               const radio_conf_t *conf)
+{
+    gtk_list_store_set(store, iter,
+                       RIG_LIST_COL_NAME, conf->name,
+                       RIG_LIST_COL_HOST, conf->host,
+                       RIG_LIST_COL_PORT, conf->port,
+                       RIG_LIST_COL_TYPE, conf->type,
+                       RIG_LIST_COL_RADIO_MODEL, conf->radio_model,
+                       RIG_LIST_COL_RADIO_MODE, conf->radio_mode,
+                       RIG_LIST_COL_PTT, conf->ptt,
+                       RIG_LIST_COL_UPLINK_VFO, conf->uplink_vfo,
+                       RIG_LIST_COL_DOWNLINK_VFO, conf->downlink_vfo,
+                       RIG_LIST_COL_LO, conf->lo,
+                       RIG_LIST_COL_LOUP, conf->loup,
+                       RIG_LIST_COL_SIGAOS, conf->signal_aos,
+                       RIG_LIST_COL_SIGLOS, conf->signal_los,
+                       RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                       conf->rigctld_autostart,
+                       RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                       conf->rigctld_auto_power_on,
+                       RIG_LIST_COL_RIGCTLD_PATH, conf->rigctld_path,
+                       RIG_LIST_COL_RIGCTLD_MODEL, conf->rigctld_model,
+                       RIG_LIST_COL_RIGCTLD_CONN_TYPE, conf->rigctld_conn,
+                       RIG_LIST_COL_RIGCTLD_DEVICE, conf->rigctld_device,
+                       RIG_LIST_COL_RIGCTLD_BAUD, conf->rigctld_baud,
+                       RIG_LIST_COL_RIGCTLD_CIVADDR, conf->rigctld_civaddr,
+                       RIG_LIST_COL_RIGCTLD_EXTRA_ARGS, conf->rigctld_extra_args,
+                       RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                       conf->rigctld_autodetect_match,
+                       -1);
+}
+
+static void rig_pref_free_conf(radio_conf_t *conf)
+{
+    if (conf == NULL)
+        return;
+
+    g_free(conf->name);
+    g_free(conf->host);
+    g_free(conf->rigctld_path);
+    g_free(conf->rigctld_device);
+    g_free(conf->rigctld_civaddr);
+    g_free(conf->rigctld_extra_args);
+    g_free(conf->rigctld_autodetect_match);
+    g_free(conf);
+}
+
+static void rig_pref_editor_done(radio_conf_t *conf,
+                                 gboolean applied,
+                                 gpointer user_data)
+{
+    RigPrefEditorContext *ctx = user_data;
+
+    if (applied && conf != NULL && conf->name != NULL)
+    {
+        if (ctx != NULL && ctx->store != NULL)
+        {
+            if (!ctx->have_iter)
+                gtk_list_store_append(ctx->store, &ctx->iter);
+            rig_pref_store_set(ctx->store, &ctx->iter, conf);
+        }
+    }
+
+    rig_pref_free_conf(conf);
+
+    if (ctx != NULL)
+    {
+        if (ctx->store)
+            g_object_unref(ctx->store);
+        g_free(ctx);
+    }
+}
+
 static GtkTreeModel *create_and_fill_model()
 {
     GtkListStore   *liststore;  /* the list store data structure */
@@ -435,7 +516,44 @@ static void edit_cb(GtkWidget * button, gpointer data)
     (void)button;
     (void)data;
 
-    radio_conf_t    conf = {
+    radio_conf_t   *conf = NULL;
+    RigPrefEditorContext *ctx = NULL;
+
+    /* If there are no entries, we have a bug since the button should 
+       have been disabled. */
+    if (gtk_tree_model_iter_n_children(model, NULL) < 1)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s:%s: Edit button should have been disabled."),
+                    __FILE__, __func__);
+        //gtk_widget_set_sensitive (button, FALSE);
+
+        return;
+    }
+
+    /* get selected row
+       FIXME: do we really need to work with two models?
+     */
+    selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(riglist));
+    if (!gtk_tree_selection_get_selected(selection, &selmod, &iter))
+    {
+        GtkWidget      *dialog;
+
+        dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+                                        GTK_DIALOG_DESTROY_WITH_PARENT,
+                                        GTK_MESSAGE_ERROR,
+                                        GTK_BUTTONS_OK,
+                                        _("Select the radio you want to edit\n"
+                                          "and try again!"));
+        g_signal_connect_swapped(dialog, "response",
+                                 G_CALLBACK(gtk_widget_destroy), dialog);
+        gtk_widget_show(dialog);
+
+        return;
+    }
+
+    conf = g_new0(radio_conf_t, 1);
+    *conf = (radio_conf_t){
         .name = NULL,
         .host = NULL,
         .port = 4532,
@@ -464,134 +582,49 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .rigctld_autodetect_match = NULL
     };
 
-    /* If there are no entries, we have a bug since the button should 
-       have been disabled. */
-    if (gtk_tree_model_iter_n_children(model, NULL) < 1)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s:%s: Edit button should have been disabled."),
-                    __FILE__, __func__);
-        //gtk_widget_set_sensitive (button, FALSE);
+    gtk_tree_model_get(model, &iter,
+                       RIG_LIST_COL_NAME, &conf->name,
+                       RIG_LIST_COL_HOST, &conf->host,
+                       RIG_LIST_COL_PORT, &conf->port,
+                       RIG_LIST_COL_TYPE, &conf->type,
+                       RIG_LIST_COL_RADIO_MODEL, &conf->radio_model,
+                       RIG_LIST_COL_RADIO_MODE, &conf->radio_mode,
+                       RIG_LIST_COL_PTT, &conf->ptt,
+                       RIG_LIST_COL_UPLINK_VFO, &conf->uplink_vfo,
+                       RIG_LIST_COL_DOWNLINK_VFO, &conf->downlink_vfo,
+                       RIG_LIST_COL_LO, &conf->lo,
+                       RIG_LIST_COL_LOUP, &conf->loup,
+                       RIG_LIST_COL_SIGAOS, &conf->signal_aos,
+                       RIG_LIST_COL_SIGLOS, &conf->signal_los,
+                       RIG_LIST_COL_RIGCTLD_AUTOSTART,
+                       &conf->rigctld_autostart,
+                       RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
+                       &conf->rigctld_auto_power_on,
+                       RIG_LIST_COL_RIGCTLD_PATH,
+                       &conf->rigctld_path,
+                       RIG_LIST_COL_RIGCTLD_MODEL,
+                       &conf->rigctld_model,
+                       RIG_LIST_COL_RIGCTLD_CONN_TYPE,
+                       &conf->rigctld_conn,
+                       RIG_LIST_COL_RIGCTLD_DEVICE,
+                       &conf->rigctld_device,
+                       RIG_LIST_COL_RIGCTLD_BAUD,
+                       &conf->rigctld_baud,
+                       RIG_LIST_COL_RIGCTLD_CIVADDR,
+                       &conf->rigctld_civaddr,
+                       RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
+                       &conf->rigctld_extra_args,
+                       RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
+                       &conf->rigctld_autodetect_match,
+                       -1);
 
-        return;
-    }
+    ctx = g_new0(RigPrefEditorContext, 1);
+    ctx->store = GTK_LIST_STORE(model);
+    g_object_ref(ctx->store);
+    ctx->iter = iter;
+    ctx->have_iter = TRUE;
 
-    /* get selected row
-       FIXME: do we really need to work with two models?
-     */
-    selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(riglist));
-    if (gtk_tree_selection_get_selected(selection, &selmod, &iter))
-    {
-        gtk_tree_model_get(model, &iter,
-                           RIG_LIST_COL_NAME, &conf.name,
-                           RIG_LIST_COL_HOST, &conf.host,
-                           RIG_LIST_COL_PORT, &conf.port,
-                           RIG_LIST_COL_TYPE, &conf.type,
-                           RIG_LIST_COL_RADIO_MODEL, &conf.radio_model,
-                           RIG_LIST_COL_RADIO_MODE, &conf.radio_mode,
-                           RIG_LIST_COL_PTT, &conf.ptt,
-                           RIG_LIST_COL_UPLINK_VFO, &conf.uplink_vfo,
-                           RIG_LIST_COL_DOWNLINK_VFO, &conf.downlink_vfo,
-                           RIG_LIST_COL_LO, &conf.lo,
-                           RIG_LIST_COL_LOUP, &conf.loup,
-                           RIG_LIST_COL_SIGAOS, &conf.signal_aos,
-                           RIG_LIST_COL_SIGLOS, &conf.signal_los,
-                           RIG_LIST_COL_RIGCTLD_AUTOSTART,
-                           &conf.rigctld_autostart,
-                           RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
-                           &conf.rigctld_auto_power_on,
-                           RIG_LIST_COL_RIGCTLD_PATH,
-                           &conf.rigctld_path,
-                           RIG_LIST_COL_RIGCTLD_MODEL,
-                           &conf.rigctld_model,
-                           RIG_LIST_COL_RIGCTLD_CONN_TYPE,
-                           &conf.rigctld_conn,
-                           RIG_LIST_COL_RIGCTLD_DEVICE,
-                           &conf.rigctld_device,
-                           RIG_LIST_COL_RIGCTLD_BAUD,
-                           &conf.rigctld_baud,
-                           RIG_LIST_COL_RIGCTLD_CIVADDR,
-                           &conf.rigctld_civaddr,
-                           RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
-                           &conf.rigctld_extra_args,
-                           RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
-                           &conf.rigctld_autodetect_match,
-                           -1);
-    }
-    else
-    {
-        GtkWidget      *dialog;
-
-        dialog = gtk_message_dialog_new(GTK_WINDOW(window),
-                                        GTK_DIALOG_MODAL |
-                                        GTK_DIALOG_DESTROY_WITH_PARENT,
-                                        GTK_MESSAGE_ERROR,
-                                        GTK_BUTTONS_OK,
-                                        _("Select the radio you want to edit\n"
-                                          "and try again!"));
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-
-        return;
-    }
-
-    /* run radio configuration editor */
-    sat_pref_rig_editor_run(&conf);
-
-    /* apply changes */
-    if (conf.name != NULL)
-    {
-        gtk_list_store_set(GTK_LIST_STORE(model), &iter,
-                           RIG_LIST_COL_NAME, conf.name,
-                           RIG_LIST_COL_HOST, conf.host,
-                           RIG_LIST_COL_PORT, conf.port,
-                           RIG_LIST_COL_TYPE, conf.type,
-                           RIG_LIST_COL_RADIO_MODEL, conf.radio_model,
-                           RIG_LIST_COL_RADIO_MODE, conf.radio_mode,
-                           RIG_LIST_COL_PTT, conf.ptt,
-                           RIG_LIST_COL_UPLINK_VFO, conf.uplink_vfo,
-                           RIG_LIST_COL_DOWNLINK_VFO, conf.downlink_vfo,
-                           RIG_LIST_COL_LO, conf.lo,
-                           RIG_LIST_COL_LOUP, conf.loup,
-                           RIG_LIST_COL_SIGAOS, conf.signal_aos,
-                           RIG_LIST_COL_SIGLOS, conf.signal_los,
-                           RIG_LIST_COL_RIGCTLD_AUTOSTART,
-                           conf.rigctld_autostart,
-                           RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
-                           conf.rigctld_auto_power_on,
-                           RIG_LIST_COL_RIGCTLD_PATH, conf.rigctld_path,
-                           RIG_LIST_COL_RIGCTLD_MODEL, conf.rigctld_model,
-                           RIG_LIST_COL_RIGCTLD_CONN_TYPE, conf.rigctld_conn,
-                           RIG_LIST_COL_RIGCTLD_DEVICE, conf.rigctld_device,
-                           RIG_LIST_COL_RIGCTLD_BAUD, conf.rigctld_baud,
-                           RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
-                           RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
-                           conf.rigctld_extra_args,
-                           RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
-                           conf.rigctld_autodetect_match,
-                           -1);
-    }
-
-    /* clean up memory */
-    if (conf.name)
-        g_free(conf.name);
-
-    if (conf.host != NULL)
-        g_free(conf.host);
-
-    if (conf.rigctld_path)
-        g_free(conf.rigctld_path);
-
-    if (conf.rigctld_device)
-        g_free(conf.rigctld_device);
-
-    if (conf.rigctld_civaddr)
-        g_free(conf.rigctld_civaddr);
-
-    if (conf.rigctld_extra_args)
-        g_free(conf.rigctld_extra_args);
-    if (conf.rigctld_autodetect_match)
-        g_free(conf.rigctld_autodetect_match);
+    sat_pref_rig_editor_run(conf, rig_pref_editor_done, ctx);
 }
 
 static void row_activated_cb(GtkTreeView * tree_view,
@@ -771,14 +804,14 @@ static void delete_cb(GtkWidget * button, gpointer data)
         GtkWidget      *dialog;
 
         dialog = gtk_message_dialog_new(GTK_WINDOW(window),
-                                        GTK_DIALOG_MODAL |
                                         GTK_DIALOG_DESTROY_WITH_PARENT,
                                         GTK_MESSAGE_ERROR,
                                         GTK_BUTTONS_OK,
                                         _("Select the radio you want to "
                                           "delete\nand try again!"));
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
+        g_signal_connect_swapped(dialog, "response",
+                                 G_CALLBACK(gtk_widget_destroy), dialog);
+        gtk_widget_show(dialog);
     }
 }
 
@@ -793,13 +826,13 @@ static void delete_cb(GtkWidget * button, gpointer data)
  */
 static void add_cb(GtkWidget * button, gpointer data)
 {
-    GtkTreeIter     item;       /* new item added to the list store */
-    GtkListStore   *liststore;
-
     (void)button;
     (void)data;
 
-    radio_conf_t    conf = {
+    radio_conf_t *conf = g_new0(radio_conf_t, 1);
+    RigPrefEditorContext *ctx = g_new0(RigPrefEditorContext, 1);
+
+    *conf = (radio_conf_t){
         .name = NULL,
         .host = NULL,
         .port = 4532,
@@ -828,64 +861,12 @@ static void add_cb(GtkWidget * button, gpointer data)
         .rigctld_autodetect_match = NULL
     };
 
-    /* run rig conf editor */
-    sat_pref_rig_editor_run(&conf);
+    ctx->store =
+        GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(riglist)));
+    g_object_ref(ctx->store);
+    ctx->have_iter = FALSE;
 
-    /* add new rig to the list */
-    if (conf.name != NULL)
-    {
-        liststore =
-            GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(riglist)));
-        gtk_list_store_append(liststore, &item);
-        gtk_list_store_set(liststore, &item,
-                           RIG_LIST_COL_NAME, conf.name,
-                           RIG_LIST_COL_HOST, conf.host,
-                           RIG_LIST_COL_PORT, conf.port,
-                           RIG_LIST_COL_TYPE, conf.type,
-                           RIG_LIST_COL_RADIO_MODEL, conf.radio_model,
-                           RIG_LIST_COL_RADIO_MODE, conf.radio_mode,
-                           RIG_LIST_COL_PTT, conf.ptt,
-                           RIG_LIST_COL_UPLINK_VFO, conf.uplink_vfo,
-                           RIG_LIST_COL_DOWNLINK_VFO, conf.downlink_vfo,
-                           RIG_LIST_COL_LO, conf.lo,
-                           RIG_LIST_COL_LOUP, conf.loup,
-                           RIG_LIST_COL_SIGAOS, conf.signal_aos,
-                           RIG_LIST_COL_SIGLOS, conf.signal_los,
-                           RIG_LIST_COL_RIGCTLD_AUTOSTART,
-                           conf.rigctld_autostart,
-                           RIG_LIST_COL_RIGCTLD_AUTO_POWER_ON,
-                           conf.rigctld_auto_power_on,
-                           RIG_LIST_COL_RIGCTLD_PATH, conf.rigctld_path,
-                           RIG_LIST_COL_RIGCTLD_MODEL, conf.rigctld_model,
-                           RIG_LIST_COL_RIGCTLD_CONN_TYPE, conf.rigctld_conn,
-                           RIG_LIST_COL_RIGCTLD_DEVICE, conf.rigctld_device,
-                           RIG_LIST_COL_RIGCTLD_BAUD, conf.rigctld_baud,
-                           RIG_LIST_COL_RIGCTLD_CIVADDR, conf.rigctld_civaddr,
-                           RIG_LIST_COL_RIGCTLD_EXTRA_ARGS,
-                           conf.rigctld_extra_args,
-                           RIG_LIST_COL_RIGCTLD_AUTODETECT_MATCH,
-                           conf.rigctld_autodetect_match,
-                           -1);
-
-        g_free(conf.name);
-
-        if (conf.host != NULL)
-            g_free(conf.host);
-
-        if (conf.rigctld_path)
-            g_free(conf.rigctld_path);
-
-        if (conf.rigctld_device)
-            g_free(conf.rigctld_device);
-
-        if (conf.rigctld_civaddr)
-            g_free(conf.rigctld_civaddr);
-
-        if (conf.rigctld_extra_args)
-            g_free(conf.rigctld_extra_args);
-        if (conf.rigctld_autodetect_match)
-            g_free(conf.rigctld_autodetect_match);
-    }
+    sat_pref_rig_editor_run(conf, rig_pref_editor_done, ctx);
 }
 
 /**

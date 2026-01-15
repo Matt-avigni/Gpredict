@@ -81,6 +81,19 @@ struct _gtk_rig_ctrl {
     gdouble         lastrxf;    /*!< Last frequency sent to receiver. */
     gdouble         lasttxf;    /*!< Last frequency sent to tranmitter. */
     gdouble         du, dd;     /*!< Last computed up/down Doppler shift; computed in update() */
+    gdouble         user_base_down_hz; /*!< User-entered downlink base frequency. */
+    gdouble         user_base_up_hz;   /*!< User-entered uplink base frequency. */
+    gdouble         doppler_down_hz;   /*!< Current downlink Doppler offset. */
+    gdouble         doppler_up_hz;     /*!< Current uplink Doppler offset. */
+    gdouble         rig_target_down_hz; /*!< Target rig downlink frequency. */
+    gdouble         rig_target_up_hz;   /*!< Target rig uplink frequency. */
+    gdouble         rig_actual_down_hz; /*!< Last observed rig downlink frequency. */
+    gdouble         rig_actual_up_hz;   /*!< Last observed rig uplink frequency. */
+    gdouble         last_valid_target_down_hz; /*!< Last valid downlink target sent. */
+    gdouble         last_valid_target_up_hz;   /*!< Last valid uplink target sent. */
+    gboolean        user_edit_down; /*!< User edited downlink base freq in session. */
+    gboolean        user_edit_up;   /*!< User edited uplink base freq in session. */
+    gboolean        suppress_user_base; /*!< Guard for programmatic base updates. */
 
     gint64          last_toggle_tx;     /*!< Last time when exec_toggle_tx_cycle() was executed (seconds)
                                            -1 indicates that an update should be performed ASAP */

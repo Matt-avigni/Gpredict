@@ -66,14 +66,39 @@ static gboolean device_scan_in_progress = FALSE;
 static GSList *device_cache = NULL;
 static const gchar *ROT_DEVICE_OTHER_ID = "other";
 
+typedef struct {
+    rotor_conf_t          *conf;
+    RotPrefEditorDoneFunc  done;
+    gpointer               user_data;
+    gboolean               finished;
+} RotPrefDialogState;
+
+static void rot_pref_message_response(GtkDialog *dialog,
+                                      gint response,
+                                      gpointer user_data)
+{
+    (void)user_data;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rot-pref message dialog response=%d", response);
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static void rot_pref_message_destroy(GtkWidget *widget, gpointer user_data)
+{
+    (void)widget;
+    (void)user_data;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref message dialog destroyed");
+}
+
 static void rot_pref_show_dialog(GtkMessageType type,
                                  const gchar *primary,
                                  const gchar *secondary)
 {
     GtkWindow *parent = dialog ? GTK_WINDOW(dialog) : NULL;
     GtkWidget *msg = gtk_message_dialog_new(parent,
-                                            GTK_DIALOG_MODAL |
-                                                GTK_DIALOG_DESTROY_WITH_PARENT,
+                                            GTK_DIALOG_DESTROY_WITH_PARENT,
                                             type,
                                             GTK_BUTTONS_OK,
                                             "%s",
@@ -84,8 +109,14 @@ static void rot_pref_show_dialog(GtkMessageType type,
                                                  "%s",
                                                  secondary);
     }
-    gtk_dialog_run(GTK_DIALOG(msg));
-    gtk_widget_destroy(msg);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rot-pref message dialog show primary=%s",
+                primary ? primary : "(null)");
+    g_signal_connect(msg, "response",
+                     G_CALLBACK(rot_pref_message_response), NULL);
+    g_signal_connect(msg, "destroy",
+                     G_CALLBACK(rot_pref_message_destroy), NULL);
+    gtk_widget_show(msg);
 }
 
 static gboolean rot_pref_list_contains(GSList *list, const gchar *value)
@@ -437,7 +468,6 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
     gint port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
     gchar *device = NULL;
     gchar *device_note = NULL;
-    gchar *detail = NULL;
     gchar *stderr_tail = NULL;
     gboolean ok = FALSE;
     gboolean spawned = FALSE;
@@ -514,18 +544,14 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
                                 TRUE, &error);
         if (mgr == NULL)
         {
-            detail = g_strdup_printf("Host: %s\nPort: %d\nError: %s",
-                                     host_text, port_val,
-                                     error ? error : "spawn failed");
             rot_pref_show_dialog(GTK_MESSAGE_ERROR,
                                  _("rotctld connection failed"),
-                                 detail);
+                                 _("See log for details."));
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         "rotctld test spawn failed host=%s port=%d error=%s",
                         spawn_host, port_val,
                         error ? error : "unknown");
             g_free(error);
-            g_free(detail);
             g_free(device);
             g_free(device_note);
             return;
@@ -541,36 +567,28 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
 
     if (ok)
     {
-        detail = g_strdup_printf("Host: %s\nPort: %d%s",
-                                 host_text, port_val,
-                                 device ? "\nrotctld responded to dump_state"
-                                        : "\nrotctld responded");
         rot_pref_show_dialog(GTK_MESSAGE_INFO,
                              _("rotctld connection OK"),
-                             detail);
+                             _("See log for details."));
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "rotctld test ok host=%s port=%d", spawn_host, port_val);
     }
     else
     {
-        detail = g_strdup_printf("Host: %s\nPort: %d\nError: %s%s%s",
-                                 host_text, port_val,
-                                 device_note ? device_note
-                                             : "No response to dump_state",
-                                 stderr_tail ? "\nLast rotctld stderr:\n" : "",
-                                 stderr_tail ? stderr_tail : "");
         rot_pref_show_dialog(GTK_MESSAGE_ERROR,
                              _("rotctld connection failed"),
-                             detail);
+                             _("See log for details."));
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     "rotctld test failed host=%s port=%d",
                     spawn_host, port_val);
+        if (stderr_tail && *stderr_tail)
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        "rotctld stderr tail:\n%s", stderr_tail);
     }
 
     if (spawned)
         rotctld_mgr_terminate(&mgr);
 
-    g_free(detail);
     g_free(stderr_tail);
     g_free(device);
     g_free(device_note);
@@ -1172,6 +1190,67 @@ static gboolean apply_changes(rotor_conf_t * conf)
     return TRUE;
 }
 
+static void rot_pref_dialog_response(GtkDialog *dialog,
+                                     gint response,
+                                     gpointer user_data)
+{
+    RotPrefDialogState *state = user_data;
+
+    if (state == NULL)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rot-pref editor response=%d", response);
+    switch (response)
+    {
+    case GTK_RESPONSE_OK:
+        if (apply_changes(state->conf))
+        {
+            if (state->done)
+                state->done(state->conf, TRUE, state->user_data);
+            state->finished = TRUE;
+            state->done = NULL;
+            gtk_widget_destroy(GTK_WIDGET(dialog));
+        }
+        break;
+
+    case GTK_RESPONSE_REJECT:
+        clear_widgets();
+        break;
+
+    default:
+        if (state->done)
+            state->done(state->conf, FALSE, state->user_data);
+        state->finished = TRUE;
+        state->done = NULL;
+        gtk_widget_destroy(GTK_WIDGET(dialog));
+        break;
+    }
+}
+
+static void rot_pref_dialog_destroy(GtkWidget *widget, gpointer user_data)
+{
+    RotPrefDialogState *state = user_data;
+
+    (void)widget;
+
+    if (state == NULL)
+        return;
+
+    if (!state->finished && state->done)
+        state->done(state->conf, FALSE, state->user_data);
+    dialog = NULL;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref editor destroyed");
+    g_free(state);
+
+    if (device_cache)
+    {
+        gp_serial_free_candidates(device_cache);
+        device_cache = NULL;
+    }
+    device_scan_in_progress = FALSE;
+}
+
 /**
  * Add or edit a rotor configuration.
  *
@@ -1179,15 +1258,15 @@ static gboolean apply_changes(rotor_conf_t * conf)
  *
  * If conf->name is not NULL the widgets will be populated with the data.
  */
-void sat_pref_rot_editor_run(rotor_conf_t * conf)
+void sat_pref_rot_editor_run(rotor_conf_t *conf,
+                             RotPrefEditorDoneFunc done,
+                             gpointer user_data)
 {
-    gint            response;
-    gboolean        finished = FALSE;
+    RotPrefDialogState *state;
 
     /* create dialog and add contents */
     dialog = gtk_dialog_new_with_buttons(_("Edit rotator configuration"),
                                          GTK_WINDOW(window),
-                                         GTK_DIALOG_MODAL |
                                          GTK_DIALOG_DESTROY_WITH_PARENT,
                                          "_Clear", GTK_RESPONSE_REJECT,
                                          "_Cancel", GTK_RESPONSE_CANCEL,
@@ -1202,40 +1281,18 @@ void sat_pref_rot_editor_run(rotor_conf_t * conf)
                       (gtk_dialog_get_content_area(GTK_DIALOG(dialog))),
                       create_editor_widgets(conf));
 
-    /* this hacky-thing is to keep the dialog running in case the
-       CLEAR button is plressed. OK and CANCEL will exit the loop
-     */
-    while (!finished)
-    {
-        response = gtk_dialog_run(GTK_DIALOG(dialog));
+    state = g_new0(RotPrefDialogState, 1);
+    state->conf = conf;
+    state->done = done;
+    state->user_data = user_data;
 
-        switch (response)
-        {
-        case GTK_RESPONSE_OK:
-            if (apply_changes(conf))
-                finished = TRUE;
-            else
-                finished = FALSE;
-            break;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref editor created");
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(rot_pref_dialog_response), state);
+    g_signal_connect(dialog, "destroy",
+                     G_CALLBACK(rot_pref_dialog_destroy), state);
 
-        case GTK_RESPONSE_REJECT:
-            /* CLEAR */
-            clear_widgets();
-            break;
+    gtk_widget_show_all(dialog);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref editor shown");
 
-        default:
-            /* Everything else is considered CANCEL */
-            finished = TRUE;
-            break;
-        }
-    }
-
-    gtk_widget_destroy(dialog);
-
-    if (device_cache)
-    {
-        gp_serial_free_candidates(device_cache);
-        device_cache = NULL;
-    }
-    device_scan_in_progress = FALSE;
 }

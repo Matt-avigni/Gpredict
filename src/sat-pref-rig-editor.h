@@ -4,6 +4,12 @@
 #include <gtk/gtk.h>
 #include "radio-conf.h"
 
-void            sat_pref_rig_editor_run(radio_conf_t * conf);
+typedef void (*RigPrefEditorDoneFunc)(radio_conf_t *conf,
+                                      gboolean applied,
+                                      gpointer user_data);
+
+void            sat_pref_rig_editor_run(radio_conf_t * conf,
+                                        RigPrefEditorDoneFunc done,
+                                        gpointer user_data);
 
 #endif

@@ -63,9 +63,35 @@ static GtkWidget *rigctld_extra_args; /* rigctld extra args */
 static gint rigctld_model_custom = 0; /* remember custom rig model */
 static radio_model_t last_radio_model = RADIO_MODEL_OTHER;
 
+typedef struct {
+    GtkWidget *combo;
+    GtkWidget *entry;
+    GSList    *candidates;
+} RigPortDialogState;
+
+typedef struct {
+    radio_conf_t          *conf;
+    RigPrefEditorDoneFunc  done;
+    gpointer               user_data;
+    gboolean               finished;
+} RigPrefDialogState;
+
+static void rig_pref_message_response(GtkDialog *dialog,
+                                      gint response,
+                                      gpointer user_data);
+static void rig_pref_message_destroy(GtkWidget *widget, gpointer user_data);
+
 static void rig_pref_show_dialog(GtkMessageType type,
                                  const gchar *primary,
                                  const gchar *secondary);
+static void rig_pref_dialog_response(GtkDialog *dialog,
+                                     gint response,
+                                     gpointer user_data);
+static void rig_pref_dialog_destroy(GtkWidget *widget, gpointer user_data);
+static void rig_pref_port_dialog_response(GtkDialog *dialog,
+                                          gint response,
+                                          gpointer user_data);
+static void rig_pref_port_dialog_destroy(GtkWidget *widget, gpointer user_data);
 
 static gboolean rigctld_conn_is_tcp(void)
 {
@@ -119,81 +145,20 @@ static void update_rigctld_connection_ui(gboolean enabled)
         gtk_widget_set_sensitive(rigctld_baud, enabled && !is_tcp);
 }
 
-static gboolean rig_pref_is_preferred_device(const gchar *path)
-{
-    gboolean match = FALSE;
-    gchar *lower = NULL;
-
-    if (path == NULL)
-        return FALSE;
-
-    lower = g_ascii_strdown(path, -1);
-    if (lower)
-    {
-        match = (g_strrstr(lower, "usbserial") != NULL) ||
-                (g_strrstr(lower, "usbmodem") != NULL) ||
-                (g_strrstr(lower, "slab") != NULL) ||
-                (g_strrstr(lower, "wch") != NULL) ||
-                (g_strrstr(lower, "ftdi") != NULL);
-    }
-    g_free(lower);
-    return match;
-}
-
-static gboolean rig_pref_list_contains(GSList *list, const gchar *item)
-{
-    if (item == NULL)
-        return FALSE;
-
-    for (GSList *iter = list; iter != NULL; iter = iter->next)
-    {
-        if (g_strcmp0(iter->data, item) == 0)
-            return TRUE;
-    }
-    return FALSE;
-}
-
-static gchar *rig_pref_pick_best_device(GSList *list, const gchar *current)
-{
-    if (list == NULL)
-        return NULL;
-
-    if (list->next == NULL)
-        return g_strdup(list->data);
-
-    if (current && rig_pref_list_contains(list, current))
-    {
-        gboolean current_preferred = rig_pref_is_preferred_device(current);
-        gboolean have_preferred = FALSE;
-
-        for (GSList *iter = list; iter != NULL; iter = iter->next)
-        {
-            if (rig_pref_is_preferred_device(iter->data))
-            {
-                have_preferred = TRUE;
-                break;
-            }
-        }
-
-        if (!have_preferred || current_preferred)
-            return g_strdup(current);
-    }
-
-    for (GSList *iter = list; iter != NULL; iter = iter->next)
-    {
-        if (rig_pref_is_preferred_device(iter->data))
-            return g_strdup(iter->data);
-    }
-
-    return g_strdup(list->data);
-}
-
 static void rigctld_find_port_cb(GtkButton *button, gpointer data)
 {
     const gchar *current = NULL;
     GSList *candidates = NULL;
-    gchar *picked = NULL;
     guint count = 0;
+    GtkWidget *dialog;
+    GtkWidget *content;
+    GtkWidget *combo;
+    GtkWidget *label;
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+    gint active_index = -1;
+    gint index = 0;
+    RigPortDialogState *state = NULL;
 
     (void)button;
     (void)data;
@@ -222,20 +187,101 @@ static void rigctld_find_port_cb(GtkButton *button, gpointer data)
         return;
     }
 
-    picked = rig_pref_pick_best_device(candidates, current);
-    if (picked)
-    {
-        gtk_entry_set_text(GTK_ENTRY(rigctld_device), picked);
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "rigctld find port selected=%s", picked);
-    }
-    else
-        rig_pref_show_dialog(GTK_MESSAGE_WARNING,
-                             _("No serial ports found."),
-                             NULL);
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(rigctld_device));
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
 
-    g_free(picked);
-    gp_serial_free_candidates(candidates);
+    dialog = gtk_dialog_new_with_buttons(_("Select serial port"),
+                                         parent,
+                                         GTK_DIALOG_DESTROY_WITH_PARENT,
+                                         _("_Cancel"),
+                                         GTK_RESPONSE_CANCEL,
+                                         _("_Select"),
+                                         GTK_RESPONSE_OK,
+                                         NULL);
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    label = gtk_label_new(_("Choose a serial port:"));
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 5);
+
+    combo = gtk_combo_box_text_new();
+    for (GSList *iter = candidates; iter != NULL; iter = iter->next)
+    {
+        const gchar *candidate = iter->data;
+
+        if (candidate == NULL)
+            continue;
+
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), candidate);
+        if (current && *current && g_strcmp0(current, candidate) == 0)
+            active_index = index;
+        index++;
+    }
+    if (active_index >= 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active_index);
+    gtk_box_pack_start(GTK_BOX(content), combo, FALSE, FALSE, 5);
+
+    state = g_new0(RigPortDialogState, 1);
+    state->combo = combo;
+    state->entry = rigctld_device;
+    state->candidates = candidates;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rig-pref port dialog show candidates=%u", count);
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(rig_pref_port_dialog_response), state);
+    g_signal_connect(dialog, "destroy",
+                     G_CALLBACK(rig_pref_port_dialog_destroy), state);
+
+    gtk_widget_show_all(dialog);
+}
+
+static void rig_pref_port_dialog_response(GtkDialog *dialog,
+                                          gint response,
+                                          gpointer user_data)
+{
+    RigPortDialogState *state = user_data;
+
+    if (state == NULL)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rig-pref port dialog response=%d", response);
+    if (response == GTK_RESPONSE_OK)
+    {
+        gchar *picked = gtk_combo_box_text_get_active_text(
+            GTK_COMBO_BOX_TEXT(state->combo));
+        if (picked != NULL && *picked != '\0')
+        {
+            gtk_entry_set_text(GTK_ENTRY(state->entry), picked);
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "rigctld find port selected=%s", picked);
+        }
+        else
+        {
+            rig_pref_show_dialog(GTK_MESSAGE_WARNING,
+                                 _("No serial port selected."),
+                                 NULL);
+        }
+        g_free(picked);
+    }
+
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static void rig_pref_port_dialog_destroy(GtkWidget *widget, gpointer user_data)
+{
+    RigPortDialogState *state = user_data;
+
+    (void)widget;
+
+    if (state == NULL)
+        return;
+
+    gp_serial_free_candidates(state->candidates);
+    g_free(state);
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rig-pref port dialog destroyed");
 }
 
 static void apply_preset_rigctld_defaults(radio_model_t model,
@@ -318,8 +364,7 @@ static void rig_pref_show_dialog(GtkMessageType type,
 {
     GtkWindow *parent = dialog ? GTK_WINDOW(dialog) : NULL;
     GtkWidget *msg = gtk_message_dialog_new(parent,
-                                            GTK_DIALOG_MODAL |
-                                                GTK_DIALOG_DESTROY_WITH_PARENT,
+                                            GTK_DIALOG_DESTROY_WITH_PARENT,
                                             type,
                                             GTK_BUTTONS_OK,
                                             "%s",
@@ -330,8 +375,33 @@ static void rig_pref_show_dialog(GtkMessageType type,
                                                  "%s",
                                                  secondary);
     }
-    gtk_dialog_run(GTK_DIALOG(msg));
-    gtk_widget_destroy(msg);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rig-pref message dialog show primary=%s",
+                primary ? primary : "(null)");
+    g_signal_connect(msg, "response",
+                     G_CALLBACK(rig_pref_message_response), NULL);
+    g_signal_connect(msg, "destroy",
+                     G_CALLBACK(rig_pref_message_destroy), NULL);
+    gtk_widget_show(msg);
+}
+
+static void rig_pref_message_response(GtkDialog *dialog,
+                                      gint response,
+                                      gpointer user_data)
+{
+    (void)user_data;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rig-pref message dialog response=%d", response);
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static void rig_pref_message_destroy(GtkWidget *widget, gpointer user_data)
+{
+    (void)widget;
+    (void)user_data;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rig-pref message dialog destroyed");
 }
 
 static gboolean socket_send_all(GSocket *sock, const gchar *data, gsize len,
@@ -474,7 +544,6 @@ static void rigctld_test_connection_cb(GtkButton *button, gpointer data)
     gint port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
     gchar *reply = NULL;
     gchar *err = NULL;
-    gchar *detail = NULL;
     gboolean ok;
 
     (void)button;
@@ -483,25 +552,18 @@ static void rigctld_test_connection_cb(GtkButton *button, gpointer data)
     ok = rigctld_test_query(host_text, port_val, &reply, &err);
     if (ok)
     {
-        detail = g_strdup_printf("Host: %s\nPort: %d\nReply: %s",
-                                 host_text, port_val,
-                                 reply ? reply : "(none)");
         rig_pref_show_dialog(GTK_MESSAGE_INFO,
                              _("rigctld connection OK"),
-                             detail);
+                             _("See log for details."));
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "rigctld test ok host=%s port=%d reply=%s",
                     host_text, port_val, reply ? reply : "(none)");
     }
     else
     {
-        detail = g_strdup_printf("Host: %s\nPort: %d\nError: %s\nReply: %s",
-                                 host_text, port_val,
-                                 err ? err : "unknown",
-                                 reply ? reply : "(none)");
         rig_pref_show_dialog(GTK_MESSAGE_ERROR,
                              _("rigctld connection failed"),
-                             detail);
+                             _("See log for details."));
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     "rigctld test failed host=%s port=%d error=%s reply=%s",
                     host_text, port_val,
@@ -509,7 +571,6 @@ static void rigctld_test_connection_cb(GtkButton *button, gpointer data)
                     reply ? reply : "(none)");
     }
 
-    g_free(detail);
     g_free(reply);
     g_free(err);
 }
@@ -816,34 +877,6 @@ static void radio_model_changed(GtkComboBox *box, gpointer data)
     update_rigctld_model_sensitivity(enabled);
 }
 
-static void rig_pref_force_toplevel_resize(GtkWidget *widget)
-{
-    GtkWidget *toplevel;
-
-    if (widget == NULL)
-        return;
-
-    toplevel = gtk_widget_get_toplevel(widget);
-    if (!GTK_IS_WINDOW(toplevel))
-        return;
-
-    gtk_widget_set_size_request(toplevel, -1, -1);
-    gtk_widget_queue_resize(toplevel);
-    gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
-}
-
-static void advanced_expander_notify(GObject *obj, GParamSpec *pspec,
-                                     gpointer data)
-{
-    GtkExpander *expander = GTK_EXPANDER(obj);
-
-    (void)pspec;
-    (void)data;
-
-    if (!gtk_expander_get_expanded(expander))
-        rig_pref_force_toplevel_resize(GTK_WIDGET(expander));
-}
-
 static GtkWidget *create_editor_widgets(radio_conf_t * conf)
 {
     GtkWidget      *table;
@@ -851,7 +884,7 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     GtkWidget      *label;
     GtkWidget      *test_button;
     GtkWidget      *vbox;
-    GtkWidget      *advanced_expander;
+    GtkWidget      *notebook;
 
     vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
 
@@ -1149,24 +1182,6 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
     g_signal_connect(rigctld_model, "value-changed",
                      G_CALLBACK(rigctld_model_changed), NULL);
 
-    /* rigctld device */
-    rigctld_device_label = gtk_label_new(_("Serial device"));
-    g_object_set(rigctld_device_label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), rigctld_device_label, 0, 15, 1, 1);
-
-    rigctld_device = gtk_entry_new();
-    gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
-    gtk_widget_set_tooltip_text(rigctld_device,
-                                _("Serial device for rigctld (e.g. /dev/ttyUSB0)."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_device, 1, 15, 2, 1);
-
-    rigctld_device_find = gtk_button_new_with_label(_("Find port"));
-    gtk_widget_set_tooltip_text(rigctld_device_find,
-                                _("Scan serial ports and select a likely match."));
-    gtk_grid_attach(GTK_GRID(table), rigctld_device_find, 3, 15, 1, 1);
-    g_signal_connect(rigctld_device_find, "clicked",
-                     G_CALLBACK(rigctld_find_port_cb), NULL);
-
     /* rigctld baud */
     rigctld_baud_label = gtk_label_new(_("Baud"));
     g_object_set(rigctld_baud_label, "xalign", 1.0, "yalign", 0.5, NULL);
@@ -1227,18 +1242,38 @@ static GtkWidget *create_editor_widgets(radio_conf_t * conf)
                                 _("Extra rigctld arguments (optional)."));
     gtk_grid_attach(GTK_GRID(advanced_table), rigctld_extra_args, 1, 3, 3, 1);
 
-    advanced_expander = gtk_expander_new(_("Advanced..."));
-    gtk_container_add(GTK_CONTAINER(advanced_expander), advanced_table);
-    g_signal_connect(advanced_expander, "notify::expanded",
-                     G_CALLBACK(advanced_expander_notify), NULL);
+    /* rigctld device (manual override) */
+    rigctld_device_label = gtk_label_new(_("Serial device (manual)"));
+    g_object_set(rigctld_device_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_device_label, 0, 4, 1, 1);
+
+    rigctld_device = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(rigctld_device), 200);
+    gtk_widget_set_tooltip_text(rigctld_device,
+                                _("Manual serial device override (e.g. /dev/cu.usbserial-1234)."));
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_device, 1, 4, 2, 1);
+
+    rigctld_device_find = gtk_button_new_with_label(_("Choose..."));
+    gtk_widget_set_tooltip_text(rigctld_device_find,
+                                _("Choose a serial port from the available list."));
+    gtk_grid_attach(GTK_GRID(advanced_table), rigctld_device_find, 3, 4, 1, 1);
+    g_signal_connect(rigctld_device_find, "clicked",
+                     G_CALLBACK(rigctld_find_port_cb), NULL);
+
+    notebook = gtk_notebook_new();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                             table,
+                             gtk_label_new(_("Basic")));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+                             advanced_table,
+                             gtk_label_new(_("Advanced")));
 
     if (conf->name != NULL)
         update_widgets(conf);
     else
         update_autostart_sensitivity(TRUE);
 
-    gtk_box_pack_start(GTK_BOX(vbox), table, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), advanced_expander, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), notebook, FALSE, FALSE, 0);
     gtk_widget_show_all(vbox);
 
     return vbox;
@@ -1393,16 +1428,70 @@ static gboolean apply_changes(radio_conf_t * conf)
     return TRUE;
 }
 
-/* Add or edit a radio configuration */
-void sat_pref_rig_editor_run(radio_conf_t * conf)
+static void rig_pref_dialog_response(GtkDialog *dialog,
+                                     gint response,
+                                     gpointer user_data)
 {
-    gint            response;
-    gboolean        finished = FALSE;
+    RigPrefDialogState *state = user_data;
+
+    if (state == NULL)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rig-pref editor response=%d", response);
+    switch (response)
+    {
+    case GTK_RESPONSE_OK:
+        if (apply_changes(state->conf))
+        {
+            if (state->done)
+                state->done(state->conf, TRUE, state->user_data);
+            state->finished = TRUE;
+            state->done = NULL;
+            gtk_widget_destroy(GTK_WIDGET(dialog));
+        }
+        break;
+
+    case GTK_RESPONSE_REJECT:
+        clear_widgets();
+        break;
+
+    default:
+        if (state->done)
+            state->done(state->conf, FALSE, state->user_data);
+        state->finished = TRUE;
+        state->done = NULL;
+        gtk_widget_destroy(GTK_WIDGET(dialog));
+        break;
+    }
+}
+
+static void rig_pref_dialog_destroy(GtkWidget *widget, gpointer user_data)
+{
+    RigPrefDialogState *state = user_data;
+
+    (void)widget;
+
+    if (state == NULL)
+        return;
+
+    if (!state->finished && state->done)
+        state->done(state->conf, FALSE, state->user_data);
+    dialog = NULL;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rig-pref editor destroyed");
+    g_free(state);
+}
+
+/* Add or edit a radio configuration */
+void sat_pref_rig_editor_run(radio_conf_t *conf,
+                             RigPrefEditorDoneFunc done,
+                             gpointer user_data)
+{
+    RigPrefDialogState *state;
 
     /* create dialog and add contents */
     dialog = gtk_dialog_new_with_buttons(_("Edit radio configuration"),
                                          GTK_WINDOW(window),
-                                         GTK_DIALOG_MODAL |
                                          GTK_DIALOG_DESTROY_WITH_PARENT,
                                          "_Clear", GTK_RESPONSE_REJECT,
                                          "_Cancel", GTK_RESPONSE_CANCEL,
@@ -1417,34 +1506,17 @@ void sat_pref_rig_editor_run(radio_conf_t * conf)
                       (gtk_dialog_get_content_area(GTK_DIALOG(dialog))),
                       create_editor_widgets(conf));
 
-    /* keep the dialog running when CLEAR button is plressed
-     * OK and CANCEL will exit the loop
-     */
-    while (!finished)
-    {
-        response = gtk_dialog_run(GTK_DIALOG(dialog));
+    state = g_new0(RigPrefDialogState, 1);
+    state->conf = conf;
+    state->done = done;
+    state->user_data = user_data;
 
-        switch (response)
-        {
-            /* OK */
-        case GTK_RESPONSE_OK:
-            if (apply_changes(conf))
-                finished = TRUE;
-            else
-                finished = FALSE;
-            break;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rig-pref editor created");
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(rig_pref_dialog_response), state);
+    g_signal_connect(dialog, "destroy",
+                     G_CALLBACK(rig_pref_dialog_destroy), state);
 
-            /* CLEAR */
-        case GTK_RESPONSE_REJECT:
-            clear_widgets();
-            break;
-
-            /* Everything else is considered CANCEL */
-        default:
-            finished = TRUE;
-            break;
-        }
-    }
-
-    gtk_widget_destroy(dialog);
+    gtk_widget_show_all(dialog);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rig-pref editor shown");
 }

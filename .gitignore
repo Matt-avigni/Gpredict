@@ -43,3 +43,5 @@ GPATH
 *.la
 .libs/
 src/*/.DS_Store
+_install/
+_install/**

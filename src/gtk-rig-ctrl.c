@@ -112,10 +112,14 @@
 #define RIGCTLD_HEALTH_TIMEOUT_MS 200
 #define RIGCTLD_HEALTH_RETRIES 3
 #define RIGCTLD_HEALTH_RETRY_DELAY_MS 50
+#define RIGCTLD_AUTOSTART_MAX_RESTARTS 2
+#define RIGCTLD_AUTOSTART_RETRY_DELAY_MS 150
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
 #define RIGCTRL_RECONNECT_BACKOFF_MAX_MS 10000
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
 #define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
+#define RIGCTRL_RESPONSE_SHOW_LOG 1003
+#define RIGCTRL_TRSP_POPUP_MAX_HEIGHT 360
 
 static GHashTable *rigctld_device_cache = NULL;
 static GHashTable *rig_freq_cache = NULL;
@@ -209,13 +213,37 @@ static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
 static void     rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply);
 static void     rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
                                       const gchar *reply, gint code);
+static void     rigctrl_set_user_base_freq(GtkRigCtrl *ctrl,
+                                           gboolean downlink,
+                                           gdouble hz,
+                                           gboolean mark_manual);
+static gdouble  rigctrl_get_user_base_freq(GtkRigCtrl *ctrl,
+                                           gboolean downlink);
+static gboolean rigctrl_sat_freq_within_limits(const GtkRigCtrl *ctrl,
+                                               gboolean downlink,
+                                               gdouble sat_freq);
+static void     rig_error_dialog_response(GtkDialog *dialog, gint response_id,
+                                          gpointer data);
+static void     rigctrl_show_log(GtkRigCtrl *ctrl);
 static void     rigctrl_schedule_status(GtkRigCtrl *ctrl,
                                         const gchar *text,
                                         gboolean is_error);
+static gboolean rigctrl_configure_trsp_popup_idle(gpointer data);
+static void     rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data);
+static void     rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data);
 static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out);
 static const gchar *rig_rprt_error_string(gint code);
 static void     rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
                                const gchar *line, gpointer user_data);
+static void     rigctld_persist_device(GtkRigCtrl *ctrl, radio_conf_t *conf,
+                                       const gchar *reason);
+static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
+                                               radio_conf_t *conf,
+                                               RigctldMgr **mgr,
+                                               const gchar *role,
+                                               gboolean *reported,
+                                               gint *restart_attempts,
+                                               const gchar *reason);
 static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
 static gboolean is_full_duplex_main_sub_active(const GtkRigCtrl *ctrl);
 static const gchar *vfo_name(vfo_t vfo);
@@ -268,6 +296,8 @@ static void     rigctrl_set_selection_id(GtkRigCtrl *ctrl,
                                          gboolean rebuilt);
 static void     rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
                                                  gboolean rebuilt);
+static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
+                             const gchar *fmt, ...);
 
 /*  add thread for hamlib communication */
 gpointer        rigctl_run(gpointer data);
@@ -297,8 +327,7 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
 
     dialog =
         gtk_message_dialog_new(parent,
-                               GTK_DIALOG_MODAL |
-                                   GTK_DIALOG_DESTROY_WITH_PARENT,
+                               GTK_DIALOG_DESTROY_WITH_PARENT,
                                GTK_MESSAGE_ERROR,
                                GTK_BUTTONS_CLOSE,
                                "%s",
@@ -311,8 +340,63 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
                                                  secondary);
     }
 
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    g_signal_connect_swapped(dialog, "response",
+                             G_CALLBACK(gtk_widget_destroy), dialog);
+    gtk_widget_show(dialog);
+}
+
+static void rig_error_dialog_response(GtkDialog *dialog, gint response_id,
+                                      gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    if (response_id == RIGCTRL_RESPONSE_SHOW_LOG)
+        rigctrl_show_log(ctrl);
+
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static void rig_show_error_dialog_with_details(GtkRigCtrl *ctrl,
+                                               const gchar *primary,
+                                               const gchar *summary,
+                                               const gchar *details)
+{
+    GtkWidget *toplevel;
+    GtkWindow *parent = NULL;
+    GtkWidget *dialog;
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    dialog =
+        gtk_message_dialog_new(parent,
+                               GTK_DIALOG_DESTROY_WITH_PARENT,
+                               GTK_MESSAGE_ERROR,
+                               GTK_BUTTONS_NONE,
+                               "%s",
+                               summary ? summary :
+                                   (primary ? primary : _("Radio error")));
+    if (primary != NULL && *primary != '\0')
+        gtk_window_set_title(GTK_WINDOW(dialog), primary);
+
+    if (details != NULL && *details != '\0')
+    {
+        rig_term_log(ctrl, "gpredict:err", "%s", details);
+        sat_log_log(SAT_LOG_LEVEL_ERROR, "%s", details);
+    }
+
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Show log"),
+                          RIGCTRL_RESPONSE_SHOW_LOG);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Close"),
+                          GTK_RESPONSE_CLOSE);
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(rig_error_dialog_response), ctrl);
+    gtk_widget_show(dialog);
 }
 
 static void free_radio_conf(radio_conf_t *conf)
@@ -507,9 +591,38 @@ static void rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
     }
 }
 
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *rig_id;
+} RigOpenConfInfo;
+
+static void rigctrl_open_radio_config_done(radio_conf_t *conf,
+                                           gboolean applied,
+                                           gpointer user_data)
+{
+    RigOpenConfInfo *info = user_data;
+
+    if (info == NULL)
+        return;
+
+    if (info->ctrl)
+        rigctrl_set_editing(info->ctrl, info->rig_id, FALSE);
+
+    if (applied && conf != NULL)
+    {
+        radio_conf_save(conf);
+        rigctrl_update_conf_from_disk(info->ctrl, info->rig_id, conf);
+    }
+
+    free_radio_conf(conf);
+    g_free(info->rig_id);
+    g_free(info);
+}
+
 static void rigctrl_open_radio_config(GtkRigCtrl *ctrl, const gchar *rig_id)
 {
     radio_conf_t *conf;
+    RigOpenConfInfo *info;
 
     if (ctrl == NULL || rig_id == NULL || *rig_id == '\0')
         return;
@@ -528,14 +641,13 @@ static void rigctrl_open_radio_config(GtkRigCtrl *ctrl, const gchar *rig_id)
         return;
     }
 
+    info = g_new0(RigOpenConfInfo, 1);
+    info->ctrl = ctrl;
+    info->rig_id = g_strdup(rig_id);
+
     rigctrl_set_editing(ctrl, rig_id, TRUE);
     rig_term_log(ctrl, "gpredict", "edit radio config %s", rig_id);
-    sat_pref_rig_editor_run(conf);
-    rigctrl_set_editing(ctrl, rig_id, FALSE);
-
-    radio_conf_save(conf);
-    rigctrl_update_conf_from_disk(ctrl, rig_id, conf);
-    free_radio_conf(conf);
+    sat_pref_rig_editor_run(conf, rigctrl_open_radio_config_done, info);
 }
 
 static void rigctrl_disable_autostart(GtkRigCtrl *ctrl, const gchar *rig_id)
@@ -698,6 +810,47 @@ static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out)
     if (code_out)
         *code_out = (gint) code;
     return TRUE;
+}
+
+static gboolean rigctld_reply_indicates_stale_device(const gchar *reply)
+{
+    gint code = 0;
+
+    if (reply == NULL)
+        return FALSE;
+
+    if (rig_parse_rprt_code(reply, &code) && code == -6)
+        return TRUE;
+
+    if (g_strrstr(reply, "No such file or directory") != NULL)
+        return TRUE;
+    if (g_strrstr(reply, "no such file or directory") != NULL)
+        return TRUE;
+
+    return FALSE;
+}
+
+static gboolean rigctld_log_tail_indicates_stale_device(const gchar *log_tail)
+{
+    gchar *lower = NULL;
+    gboolean match = FALSE;
+
+    if (log_tail == NULL || *log_tail == '\0')
+        return FALSE;
+
+    lower = g_ascii_strdown(log_tail, -1);
+    if (g_strrstr(lower, "no such file or directory") != NULL ||
+        g_strrstr(lower, "status=-6") != NULL ||
+        g_strrstr(lower, "port_open") != NULL ||
+        g_strrstr(lower, "rig_open") != NULL ||
+        g_strrstr(lower, "file not found") != NULL ||
+        g_strrstr(lower, "cannot find the file") != NULL)
+    {
+        match = TRUE;
+    }
+
+    g_free(lower);
+    return match;
 }
 
 static void rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
@@ -922,15 +1075,19 @@ static void rig_show_conn_error(GtkRigCtrl *ctrl,
     const gchar    *host = (conf && conf->host) ? conf->host : "(null)";
     gint            port = conf ? conf->port : 0;
     const gchar    *label = (role != NULL) ? role : _("rig");
-    gchar          *body;
+    gchar          *details;
+    const gchar    *summary =
+        _("rigctld did not respond. See Rig Log for details.");
 
     if (ctrl == NULL)
         return;
 
-    body = g_strdup_printf(_("Unable to connect to rigctld (%s)\nHost: %s\nPort: %d"),
-                           label, host, port);
-    rig_show_error_dialog(ctrl, _("Unable to connect to rigctld"), body);
-    g_free(body);
+    details = g_strdup_printf(_("Rig: %s\nHost: %s\nPort: %d"),
+                              label, host, port);
+    rig_show_error_dialog_with_details(ctrl,
+                                       _("Unable to connect to radio"),
+                                       summary, details);
+    g_free(details);
 }
 
 static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
@@ -1147,6 +1304,19 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->lasttxptt = TRUE;
     ctrl->lastrxf = 0.0;
     ctrl->lasttxf = 0.0;
+    ctrl->user_base_down_hz = 0.0;
+    ctrl->user_base_up_hz = 0.0;
+    ctrl->doppler_down_hz = 0.0;
+    ctrl->doppler_up_hz = 0.0;
+    ctrl->rig_target_down_hz = 0.0;
+    ctrl->rig_target_up_hz = 0.0;
+    ctrl->rig_actual_down_hz = 0.0;
+    ctrl->rig_actual_up_hz = 0.0;
+    ctrl->last_valid_target_down_hz = 0.0;
+    ctrl->last_valid_target_up_hz = 0.0;
+    ctrl->user_edit_down = FALSE;
+    ctrl->user_edit_up = FALSE;
+    ctrl->suppress_user_base = FALSE;
     ctrl->last_toggle_tx = -1;
 }
 
@@ -1228,6 +1398,249 @@ static void update_count_down(GtkRigCtrl * ctrl, gdouble t)
     g_free(aoslos);
 }
 
+static void rigctrl_set_user_base_freq(GtkRigCtrl *ctrl,
+                                       gboolean downlink,
+                                       gdouble hz,
+                                       gboolean mark_manual)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->suppress_user_base = TRUE;
+    if (downlink)
+        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqDown), hz);
+    else
+        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqUp), hz);
+    ctrl->suppress_user_base = FALSE;
+
+    if (downlink)
+        ctrl->user_base_down_hz = hz;
+    else
+        ctrl->user_base_up_hz = hz;
+
+    if (mark_manual)
+    {
+        if (downlink)
+            ctrl->user_edit_down = TRUE;
+        else
+            ctrl->user_edit_up = TRUE;
+    }
+}
+
+static gdouble rigctrl_get_user_base_freq(GtkRigCtrl *ctrl,
+                                          gboolean downlink)
+{
+    gdouble value = downlink ? ctrl->user_base_down_hz
+                             : ctrl->user_base_up_hz;
+
+    if (value <= 0.0)
+    {
+        GtkWidget *knob = downlink ? ctrl->SatFreqDown : ctrl->SatFreqUp;
+        if (knob != NULL)
+            value = gtk_freq_knob_get_value(GTK_FREQ_KNOB(knob));
+    }
+
+    return value;
+}
+
+static gboolean rigctrl_sat_freq_within_limits(const GtkRigCtrl *ctrl,
+                                               gboolean downlink,
+                                               gdouble sat_freq)
+{
+    gdouble min = 0.0;
+    gdouble max = 0.0;
+
+    if (ctrl == NULL || ctrl->trsp == NULL)
+        return TRUE;
+
+    if (downlink)
+    {
+        if (ctrl->trsp->downlow > 0.0 && ctrl->trsp->downhigh > 0.0)
+        {
+            min = MIN(ctrl->trsp->downlow, ctrl->trsp->downhigh);
+            max = MAX(ctrl->trsp->downlow, ctrl->trsp->downhigh);
+        }
+    }
+    else
+    {
+        if (ctrl->trsp->uplow > 0.0 && ctrl->trsp->uphigh > 0.0)
+        {
+            min = MIN(ctrl->trsp->uplow, ctrl->trsp->uphigh);
+            max = MAX(ctrl->trsp->uplow, ctrl->trsp->uphigh);
+        }
+    }
+
+    if (min <= 0.0 || max <= 0.0)
+        return TRUE;
+
+    return sat_freq >= min && sat_freq <= max;
+}
+
+static gdouble rigctrl_adjust_target(GtkRigCtrl *ctrl,
+                                     gboolean downlink,
+                                     gdouble base_sat,
+                                     gdouble doppler,
+                                     gdouble target_rig,
+                                     gboolean *target_ok_out)
+{
+    gdouble sat_target = base_sat + doppler;
+    gboolean ok = rigctrl_sat_freq_within_limits(ctrl, downlink, sat_target);
+    gdouble last_valid = downlink ? ctrl->last_valid_target_down_hz
+                                  : ctrl->last_valid_target_up_hz;
+
+    if (!ok)
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "rig update: side=%s target out of range sat=%.0f",
+                    downlink ? "RX" : "TX", sat_target);
+        if (target_ok_out)
+            *target_ok_out = FALSE;
+        if (last_valid > 0.0)
+            return last_valid;
+        return target_rig;
+    }
+
+    if (target_ok_out)
+        *target_ok_out = TRUE;
+    if (downlink)
+        ctrl->last_valid_target_down_hz = target_rig;
+    else
+        ctrl->last_valid_target_up_hz = target_rig;
+    return target_rig;
+}
+
+static gdouble rigctrl_compute_target(GtkRigCtrl *ctrl,
+                                      gboolean downlink,
+                                      gdouble lo,
+                                      gboolean use_rit_xit,
+                                      gdouble *base_sat_out,
+                                      gdouble *doppler_out,
+                                      gboolean *target_ok_out)
+{
+    gdouble base_sat = 0.0;
+    gdouble doppler = 0.0;
+    gdouble target_rig = 0.0;
+
+    if (ctrl == NULL)
+    {
+        if (target_ok_out)
+            *target_ok_out = FALSE;
+        return 0.0;
+    }
+
+    base_sat = rigctrl_get_user_base_freq(ctrl, downlink);
+    if (ctrl->tracking && !use_rit_xit)
+        doppler = downlink ? ctrl->dd : ctrl->du;
+
+    target_rig = base_sat + doppler - lo;
+
+    if (base_sat_out)
+        *base_sat_out = base_sat;
+    if (doppler_out)
+        *doppler_out = doppler;
+
+    return rigctrl_adjust_target(ctrl, downlink, base_sat,
+                                 doppler, target_rig, target_ok_out);
+}
+
+static void rigctrl_show_log(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->log_toggle != NULL)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_toggle), TRUE);
+    else if (ctrl->term_view != NULL)
+        gp_term_view_set_visible(ctrl->term_view, TRUE);
+
+    rigctrl_schedule_resize(ctrl);
+}
+
+static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
+{
+    GtkComboBox *combo = GTK_COMBO_BOX(data);
+    AtkObject *popup_acc;
+    GtkWidget *popup_widget = NULL;
+    GtkWidget *scrolled = NULL;
+
+    if (combo == NULL)
+        return G_SOURCE_REMOVE;
+
+    popup_acc = gtk_combo_box_get_popup_accessible(combo);
+    if (popup_acc != NULL)
+        popup_widget = gtk_accessible_get_widget(GTK_ACCESSIBLE(popup_acc));
+
+    if (popup_widget != NULL)
+    {
+        scrolled = popup_widget;
+        while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
+            scrolled = gtk_widget_get_parent(scrolled);
+
+        if (GTK_IS_SCROLLED_WINDOW(scrolled))
+        {
+            gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                           GTK_POLICY_NEVER,
+                                           GTK_POLICY_AUTOMATIC);
+            gtk_scrolled_window_set_propagate_natural_height(
+                GTK_SCROLLED_WINDOW(scrolled), FALSE);
+            gtk_widget_set_size_request(scrolled, -1,
+                                        RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
+        }
+        else
+        {
+            gtk_widget_set_size_request(popup_widget, -1,
+                                        RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
+        }
+
+        if (g_object_get_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked") == NULL)
+        {
+            g_object_set_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked",
+                              GINT_TO_POINTER(1));
+            g_signal_connect(popup_widget, "show",
+                             G_CALLBACK(rigctrl_trsp_popup_show), NULL);
+            g_signal_connect(popup_widget, "map",
+                             G_CALLBACK(rigctrl_trsp_popup_show), NULL);
+        }
+    }
+
+    g_object_unref(combo);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data)
+{
+    (void)data;
+
+    if (widget == NULL)
+        return;
+
+    g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
+}
+
+static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
+{
+    GtkWidget *scrolled = widget;
+    GtkAdjustment *vadj;
+
+    (void)data;
+
+    if (widget == NULL)
+        return;
+
+    while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
+        scrolled = gtk_widget_get_parent(scrolled);
+
+    if (!GTK_IS_SCROLLED_WINDOW(scrolled))
+        return;
+
+    vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
+    if (vadj == NULL)
+        return;
+
+    gtk_adjustment_set_value(vadj, gtk_adjustment_get_lower(vadj));
+    gtk_widget_queue_resize(scrolled);
+}
+
 /*
  * Update rig control state.
  *
@@ -1277,15 +1690,17 @@ void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
         g_free(buff);
 
         /* Doppler shift down */
-        satfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
+        satfreq = rigctrl_get_user_base_freq(ctrl, TRUE);
         ctrl->dd = -satfreq * (ctrl->target->range_rate / 299792.4580); // Hz
+        ctrl->doppler_down_hz = ctrl->dd;
         buff = g_strdup_printf("%.0f Hz", ctrl->dd);
         gtk_label_set_text(GTK_LABEL(ctrl->SatDopDown), buff);
         g_free(buff);
 
         /* Doppler shift up */
-        satfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
+        satfreq = rigctrl_get_user_base_freq(ctrl, FALSE);
         ctrl->du = satfreq * (ctrl->target->range_rate / 299792.4580);  // Hz
+        ctrl->doppler_up_hz = ctrl->du;
         buff = g_strdup_printf("%.0f Hz", ctrl->du);
         gtk_label_set_text(GTK_LABEL(ctrl->SatDopUp), buff);
         g_free(buff);
@@ -1332,7 +1747,7 @@ static void track_downlink(GtkRigCtrl * ctrl)
         else
             up = ctrl->trsp->uplow + delta;
 
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqUp), up);
+        rigctrl_set_user_base_freq(ctrl, FALSE, up, FALSE);
     }
 }
 
@@ -1358,7 +1773,7 @@ static void track_uplink(GtkRigCtrl * ctrl)
         else
             down = ctrl->trsp->downlow + delta;
 
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqDown), down);
+        rigctrl_set_user_base_freq(ctrl, TRUE, down, FALSE);
     }
 }
 
@@ -1390,6 +1805,13 @@ static void downlink_changed_cb(GtkFreqKnob * knob, gpointer data)
 
     (void)knob;
 
+    if (ctrl->suppress_user_base)
+        return;
+
+    ctrl->user_base_down_hz =
+        gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
+    ctrl->user_edit_down = TRUE;
+
     if (ctrl->trsplock)
         track_downlink(ctrl);
 }
@@ -1399,6 +1821,13 @@ static void uplink_changed_cb(GtkFreqKnob * knob, gpointer data)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
 
     (void)knob;
+
+    if (ctrl->suppress_user_base)
+        return;
+
+    ctrl->user_base_up_hz =
+        gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
+    ctrl->user_edit_up = TRUE;
 
     if (ctrl->trsplock)
         track_uplink(ctrl);
@@ -1545,6 +1974,9 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
     trsp_t         *trsp = NULL;
     guint           i, n;
 
+    if (ctrl->TrspSel != NULL)
+        gtk_combo_box_popdown(GTK_COMBO_BOX(ctrl->TrspSel));
+
     if (ctrl->trsplist != NULL)
     {
         n = g_slist_length(ctrl->trsplist);
@@ -1586,7 +2018,8 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
     }
 
     ctrl->trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, 0);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->TrspSel), 0);
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(ctrl->TrspSel)) != 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->TrspSel), 0);
 }
 
 static gboolean have_conf()
@@ -1644,6 +2077,8 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
 
         /* read transponders for new target */
         load_trsp_list(ctrl);
+        ctrl->user_edit_down = FALSE;
+        ctrl->user_edit_up = FALSE;
     }
     else
     {
@@ -1673,12 +2108,9 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
  * To avoid conflicts with manual frequency changes on the radio, the sync between
  * RIG and GPREDICT is invalidated after the tuning operation is performed.
  */
-static void trsp_tune_cb(GtkButton * button, gpointer data)
+static void rigctrl_apply_trsp_preset(GtkRigCtrl *ctrl, gboolean mark_manual)
 {
-    GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gdouble         freq;
-
-    (void)button;
 
     if (ctrl->trsp == NULL)
         return;
@@ -1688,7 +2120,7 @@ static void trsp_tune_cb(GtkButton * button, gpointer data)
     {
         freq = ctrl->trsp->downlow +
             labs((long)ctrl->trsp->downhigh - (long)ctrl->trsp->downlow) / 2;
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqDown), freq);
+        rigctrl_set_user_base_freq(ctrl, TRUE, freq, mark_manual);
 
         /* invalidate RIG<->GPREDICT sync */
         ctrl->lastrxf = 0.0;
@@ -1699,11 +2131,20 @@ static void trsp_tune_cb(GtkButton * button, gpointer data)
     {
         freq = ctrl->trsp->uplow +
             labs((long)ctrl->trsp->uphigh - (long)ctrl->trsp->uplow) / 2;
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqUp), freq);
+        rigctrl_set_user_base_freq(ctrl, FALSE, freq, mark_manual);
 
         /* invalidate RIG<->GPREDICT sync */
         ctrl->lasttxf = 0.0;
     }
+}
+
+static void trsp_tune_cb(GtkButton * button, gpointer data)
+{
+    GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+
+    (void)button;
+
+    rigctrl_apply_trsp_preset(ctrl, TRUE);
 }
 
 /*
@@ -1714,6 +2155,7 @@ static void trsp_selected_cb(GtkComboBox * box, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gint            i, n;
+    gboolean        allow_autofill = TRUE;
 
     i = gtk_combo_box_get_active(box);
     n = g_slist_length(ctrl->trsplist);
@@ -1726,7 +2168,9 @@ static void trsp_selected_cb(GtkComboBox * box, gpointer data)
     else if (i < n)
     {
         ctrl->trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, i);
-        trsp_tune_cb(NULL, data);
+        allow_autofill = !ctrl->user_edit_down && !ctrl->user_edit_up;
+        if (allow_autofill)
+            rigctrl_apply_trsp_preset(ctrl, FALSE);
     }
     else
     {
@@ -2004,9 +2448,9 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
             rig_show_error_dialog(
                 ctrl,
                 _("Unable to engage radio"),
-                _("No valid radio configuration is selected.\n"
-                  "Please create or select a radio configuration in\n"
-                  "Interfaces → Radios before engaging radio control."));
+                _("No radio configuration is selected. See log for details."));
+            rig_term_log(ctrl, "gpredict:err",
+                         "no radio config selected; open Interfaces -> Radios");
             rigctrl_fail_engage(ctrl);
             return;
         }
@@ -2052,6 +2496,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
 {
     GtkWidget      *frame, *table, *label, *track;
     GtkWidget      *tune, *trsplock, *hbox;
+    GtkWidget      *trsp_label;
     gchar          *buff;
     guint           i, n;
     sat_t          *sat = NULL;
@@ -2089,21 +2534,30 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), track, 3, 0, 1, 1);
     g_signal_connect(track, "toggled", G_CALLBACK(track_toggle_cb), ctrl);
 
-    /* Transponder selector, tune, and trsplock buttons */
+    /* Service/payload preset selector, apply, and lock buttons */
+    trsp_label = gtk_label_new(_("Service / Payload preset"));
+    g_object_set(trsp_label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), trsp_label, 0, 1, 1, 1);
+
     ctrl->TrspSel = gtk_combo_box_text_new();
-    gtk_widget_set_tooltip_text(ctrl->TrspSel, _("Select a transponder"));
+    gtk_combo_box_set_popup_fixed_width(GTK_COMBO_BOX(ctrl->TrspSel), TRUE);
+    gtk_widget_set_tooltip_text(ctrl->TrspSel,
+                                _("Select a service/payload preset. "
+                                  "Use Apply preset to copy its frequencies."));
     load_trsp_list(ctrl);
+    g_signal_connect(ctrl->TrspSel, "realize",
+                     G_CALLBACK(rigctrl_trsp_combo_realize), NULL);
     g_signal_connect(ctrl->TrspSel, "changed", G_CALLBACK(trsp_selected_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 0, 1, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 1, 2, 1);
 
     /* buttons */
-    tune = gtk_button_new_with_label(_("T"));
+    tune = gtk_button_new_with_label(_("Apply preset"));
     gtk_widget_set_tooltip_text(tune,
-                                _("Tune the radio to this transponder. "
+                                _("Apply the selected preset frequencies. "
                                   "The uplink and downlink will be set to the "
                                   "center of the transponder passband. In case "
-                                  "of beacons, only the downlink will be tuned "
+                                  "of beacons, only the downlink will be set "
                                   "to the beacon frequency."));
     g_signal_connect(tune, "clicked", G_CALLBACK(trsp_tune_cb), ctrl);
 
@@ -2111,8 +2565,8 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_tooltip_text(trsplock,
                                 _("Lock the uplink and the downlink to each "
                                   "other. Whenever you change the downlink "
-                                  "(in the controller or on the dial, the "
-                                  "uplink will track it according to whether "
+                                  "(in the controller), the uplink will track "
+                                  "it according to whether "
                                   "the transponder is inverting or not. "
                                   "Similarly, if you change the uplink the "
                                   "downlink will track it automatically.\n\n"
@@ -2767,7 +3221,10 @@ static gboolean rigctrl_validate_mode(GtkRigCtrl *ctrl,
                            radio_model_to_string(conf->radio_model),
                            radio_mode_to_string(conf->radio_mode),
                            allowed ? allowed : _("none"));
-    rig_show_error_dialog(ctrl, _("Unsupported radio mode"), body);
+    rig_term_log(ctrl, "gpredict:err", "%s", body);
+    rig_show_error_dialog(ctrl,
+                          _("Unsupported radio mode"),
+                          _("See log for details."));
     sat_log_log(SAT_LOG_LEVEL_ERROR,
                 "%s: unsupported radio mode rig=%s model=%s mode=%s allowed=%s",
                 __func__,
@@ -3213,7 +3670,9 @@ static gboolean rig_ctrl_timeout_cb(gpointer data)
 
 static void exec_rx_cycle(GtkRigCtrl * ctrl)
 {
-    gdouble         readfreq = 0.0, tmpfreq, satfreqd, satfrequ;
+    gdouble         readfreq = 0.0;
+    gdouble         tmpfreq = 0.0;
+    gdouble         base_sat = 0.0;
     gboolean        ptt = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
@@ -3223,6 +3682,8 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     gdouble         base_freq = 0.0;
     gdouble         doppler_hz = 0.0;
     gdouble         sent_freq = 0.0;
+    gdouble         target_up = 0.0;
+    gboolean        target_ok = TRUE;
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
@@ -3256,31 +3717,11 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
         }
         else if (fabs(readfreq - ctrl->lastrxf) >= 1.0)
         {
-            /* user might have altered radio frequency => update transponder knob */
+            /* user might have altered radio frequency => update rig readback */
             gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
                                     readfreq);
             ctrl->lastrxf = readfreq;
-
-            /* doppler shift; only if we are tracking */
-            if (ctrl->tracking)
-            {
-                if (use_rit_xit)
-                    satfreqd = readfreq + ctrl->conf->lo;
-                else
-                    satfreqd = (readfreq - ctrl->dd + ctrl->conf->lo);
-            }
-            else
-            {
-                satfreqd = readfreq + ctrl->conf->lo;
-            }
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqDown),
-                                    satfreqd);
-
-            /* Update uplink if locked to downlink */
-            if (ctrl->trsplock)
-            {
-                track_downlink(ctrl);
-            }
+            ctrl->rig_actual_down_hz = readfreq;
 
             /* no need to forward track */
             return;
@@ -3289,35 +3730,22 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
 
     /* now, forward tracking */
 
-    /* If we are tracking, calculate the radio freq by applying both dopper shift
-       and tranverter LO frequency. If we are not tracking, apply only LO frequency.
-     */
-    satfreqd = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
-    satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
-    if (ctrl->tracking && !use_rit_xit)
-    {
-        /* downlink */
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                satfreqd + ctrl->dd - ctrl->conf->lo);
-        /* uplink */
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                satfrequ + ctrl->du - ctrl->conf->loup);
-    }
-    else
-    {
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                satfreqd - ctrl->conf->lo);
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                satfrequ - ctrl->conf->loup);
-    }
+    tmpfreq = rigctrl_compute_target(ctrl, TRUE, ctrl->conf->lo,
+                                     use_rit_xit, &base_sat,
+                                     &doppler_hz, &target_ok);
+    target_up = rigctrl_compute_target(ctrl, FALSE, ctrl->conf->loup,
+                                       use_rit_xit, NULL, NULL, NULL);
+    ctrl->rig_target_down_hz = tmpfreq;
+    ctrl->rig_target_up_hz = target_up;
 
-    base_freq = satfreqd - ctrl->conf->lo;
-    doppler_hz = (ctrl->tracking && !use_rit_xit) ? ctrl->dd : 0.0;
-    sent_freq = base_freq + doppler_hz;
-    tmpfreq = sent_freq;
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), tmpfreq);
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), target_up);
+
+    base_freq = base_sat - ctrl->conf->lo;
+    sent_freq = tmpfreq;
 
     /* if device is engaged, send freq command to radio */
-    if ((ctrl->engaged) && (ptt == FALSE) &&
+    if ((ctrl->engaged) && (ptt == FALSE) && target_ok &&
         (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
     {
         {
@@ -3365,6 +3793,9 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lastrxf = readback;
+                    ctrl->rig_actual_down_hz = readback;
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                                            readback);
 
                     /* This is only effective in RIG_TYPE_TRX mode.
                        Invalidate ctrl->lasttxf for two reasons.
@@ -3402,13 +3833,17 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
 
 static void exec_tx_cycle(GtkRigCtrl * ctrl)
 {
-    gdouble         readfreq = 0.0, tmpfreq, satfreqd, satfrequ;
+    gdouble         readfreq = 0.0;
+    gdouble         tmpfreq = 0.0;
+    gdouble         base_sat = 0.0;
     gboolean        ptt = TRUE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
     gdouble         base_freq = 0.0;
     gdouble         doppler_hz = 0.0;
     gdouble         sent_freq = 0.0;
+    gdouble         target_down = 0.0;
+    gboolean        target_ok = TRUE;
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
@@ -3436,29 +3871,10 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
         }
         else if (fabs(readfreq - ctrl->lasttxf) >= 1.0)
         {
-            /* user might have altered radio frequency => update transponder knob */
+            /* user might have altered radio frequency => update rig readback */
             gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), readfreq);
             ctrl->lasttxf = readfreq;
-
-            /* doppler shift; only if we are tracking */
-            if (ctrl->tracking)
-            {
-                if (use_rit_xit)
-                    satfrequ = readfreq + ctrl->conf->loup;
-                else
-                    satfrequ = readfreq - ctrl->du + ctrl->conf->loup;
-            }
-            else
-            {
-                satfrequ = readfreq + ctrl->conf->loup;
-            }
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqUp), satfrequ);
-
-            /* Follow with downlink if transponder is locked */
-            if (ctrl->trsplock)
-            {
-                track_uplink(ctrl);
-            }
+            ctrl->rig_actual_up_hz = readfreq;
 
             /* no need to forward track */
             return;
@@ -3467,35 +3883,22 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
 
     /* now, forward tracking */
 
-    /* If we are tracking, calculate the radio freq by applying both dopper shift
-       and tranverter LO frequency. If we are not tracking, apply only LO frequency.
-     */
-    satfreqd = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
-    satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
-    if (ctrl->tracking && !use_rit_xit)
-    {
-        /* downlink */
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                satfreqd + ctrl->dd - ctrl->conf->lo);
-        /* uplink */
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                satfrequ + ctrl->du - ctrl->conf->loup);
-    }
-    else
-    {
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                satfreqd - ctrl->conf->lo);
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                satfrequ - ctrl->conf->loup);
-    }
+    tmpfreq = rigctrl_compute_target(ctrl, FALSE, ctrl->conf->loup,
+                                     use_rit_xit, &base_sat,
+                                     &doppler_hz, &target_ok);
+    target_down = rigctrl_compute_target(ctrl, TRUE, ctrl->conf->lo,
+                                         use_rit_xit, NULL, NULL, NULL);
+    ctrl->rig_target_up_hz = tmpfreq;
+    ctrl->rig_target_down_hz = target_down;
 
-    base_freq = satfrequ - ctrl->conf->loup;
-    doppler_hz = (ctrl->tracking && !use_rit_xit) ? ctrl->du : 0.0;
-    sent_freq = base_freq + doppler_hz;
-    tmpfreq = sent_freq;
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), target_down);
+
+    base_freq = base_sat - ctrl->conf->loup;
+    sent_freq = tmpfreq;
 
     /* if device is engaged, send freq command to radio */
-    if ((ctrl->engaged) && (ptt == TRUE) &&
+    if ((ctrl->engaged) && (ptt == TRUE) && target_ok &&
         (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
     {
         {
@@ -3536,6 +3939,9 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
+                    ctrl->rig_actual_up_hz = readback;
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                                            readback);
 
                     /* This is only effective in RIG_TYPE_TRX mode.
                        Invalidate ctrl->lastrxf for two reasons.
@@ -3624,8 +4030,11 @@ static void exec_toggle_cycle(GtkRigCtrl * ctrl)
 
 static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
 {
-    gdouble         tmpfreq;
+    gdouble         tmpfreq = 0.0;
     gboolean        ptt = TRUE;
+    gboolean        use_rit_xit =
+        (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
+    gboolean        target_ok = TRUE;
 
     if (ctrl->engaged && ctrl->conf->ptt)
     {
@@ -3638,11 +4047,17 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
         return;
     }
 
-    /* Get the desired uplink frequency from controller */
-    tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqUp));
+    if (is_full_duplex_main_sub_active(ctrl))
+        use_rit_xit = FALSE;
+
+    tmpfreq = rigctrl_compute_target(ctrl, FALSE, ctrl->conf->loup,
+                                     use_rit_xit, NULL, NULL, &target_ok);
+    ctrl->rig_target_up_hz = tmpfreq;
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
 
     /* if device is engaged, send freq command to radio */
-    if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 10.0))
+    if ((ctrl->engaged) && target_ok &&
+        (fabs(ctrl->lasttxf - tmpfreq) >= 10.0))
     {
         if (set_freq_toggle(ctrl, ctrl->sock, tmpfreq))
         {
@@ -3663,8 +4078,8 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
 static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
 {
     rig_mode_dispatch_t plan;
-    gdouble         satfreqd;
-    gdouble         satfrequ;
+    gdouble         base_sat_down = 0.0;
+    gdouble         base_sat_up = 0.0;
     gdouble         rigfreqd;
     gdouble         rigfrequ;
     gdouble         doppler_down = 0.0;
@@ -3672,6 +4087,8 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
     gdouble         readback = 0.0;
     gboolean        set_ok;
     gboolean        read_ok;
+    gboolean        down_ok = TRUE;
+    gboolean        up_ok = TRUE;
 
     if (ctrl == NULL || ctrl->conf == NULL)
         return;
@@ -3683,21 +4100,14 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
     if (!plan.send_downlink && !plan.send_uplink)
         return;
 
-    satfreqd = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
-    satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
-
-    if (ctrl->tracking)
-    {
-        rigfreqd = satfreqd + ctrl->dd - ctrl->conf->lo;
-        rigfrequ = satfrequ + ctrl->du - ctrl->conf->loup;
-        doppler_down = ctrl->dd;
-        doppler_up = ctrl->du;
-    }
-    else
-    {
-        rigfreqd = satfreqd - ctrl->conf->lo;
-        rigfrequ = satfrequ - ctrl->conf->loup;
-    }
+    rigfreqd = rigctrl_compute_target(ctrl, TRUE, ctrl->conf->lo, FALSE,
+                                      &base_sat_down, &doppler_down,
+                                      &down_ok);
+    rigfrequ = rigctrl_compute_target(ctrl, FALSE, ctrl->conf->loup, FALSE,
+                                      &base_sat_up, &doppler_up,
+                                      &up_ok);
+    ctrl->rig_target_down_hz = rigfreqd;
+    ctrl->rig_target_up_hz = rigfrequ;
 
     gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), rigfreqd);
     gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), rigfrequ);
@@ -3713,11 +4123,16 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
                         "FULL-DUPLEX MAIN/SUB: invalid downlink VFO");
             ctrl->errcnt++;
         }
+        else if (!down_ok)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX skipped (out of range)");
+        }
         else
         {
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
-                        rigfreqd - doppler_down,
+                        base_sat_down - ctrl->conf->lo,
                         doppler_down,
                         rigfreqd,
                         vfo_name(plan.downlink_vfo));
@@ -3739,6 +4154,9 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lastrxf = readback;
+                    ctrl->rig_actual_down_hz = readback;
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                                            readback);
                 }
                 else
                 {
@@ -3761,11 +4179,16 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
                         "FULL-DUPLEX MAIN/SUB: invalid uplink VFO");
             ctrl->errcnt++;
         }
+        else if (!up_ok)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX skipped (out of range)");
+        }
         else
         {
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
-                        rigfrequ - doppler_up,
+                        base_sat_up - ctrl->conf->loup,
                         doppler_up,
                         rigfrequ,
                         vfo_name(plan.uplink_vfo));
@@ -3787,6 +4210,9 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
+                    ctrl->rig_actual_up_hz = readback;
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                                            readback);
                 }
                 else
                 {
@@ -3804,7 +4230,9 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
 
 static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
 {
-    gdouble         readfreq = 0.0, tmpfreq, satfreqd, satfrequ;
+    gdouble         readfreq = 0.0;
+    gdouble         tmpfreq = 0.0;
+    gdouble         base_sat = 0.0;
     gboolean        dialchanged = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
@@ -3814,6 +4242,8 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     gdouble         base_freq = 0.0;
     gdouble         doppler_hz = 0.0;
     gdouble         sent_freq = 0.0;
+    gdouble         target_down = 0.0;
+    gboolean        target_ok = TRUE;
 
     if (is_full_duplex_main_sub_active(ctrl))
         use_rit_xit = FALSE;
@@ -3846,29 +4276,11 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
         {
             dialchanged = TRUE;
 
-            /* user might have altered radio frequency => update transponder knob */
+            /* user might have altered radio frequency => update rig readback */
             gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), readfreq);
             ctrl->lasttxf = readfreq;
+            ctrl->rig_actual_up_hz = readfreq;
 
-            /* doppler shift; only if we are tracking */
-            if (ctrl->tracking)
-            {
-                if (use_rit_xit)
-                    satfrequ = readfreq + ctrl->conf->loup;
-                else
-                    satfrequ = readfreq - ctrl->du + ctrl->conf->loup;
-            }
-            else
-            {
-                satfrequ = readfreq + ctrl->conf->loup;
-            }
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqUp), satfrequ);
-
-            /* Follow with downlink if transponder is locked */
-            if (ctrl->trsplock)
-            {
-                track_uplink(ctrl);
-            }
         }
     }
 
@@ -3879,39 +4291,23 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
         return;
     }
 
-    /* If we are tracking, calculate the radio freq by applying both dopper shift
-       and tranverter LO frequency. If we are not tracking, apply only LO frequency.
-     */
-    satfreqd = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
-    satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
-    if (ctrl->tracking)
-    {
-        /* downlink */
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                use_rit_xit ?
-                                satfreqd - ctrl->conf->lo :
-                                satfreqd + ctrl->dd - ctrl->conf->lo);
-        /* uplink */
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                use_rit_xit ?
-                                satfrequ - ctrl->conf->loup :
-                                satfrequ + ctrl->du - ctrl->conf->loup);
-    }
-    else
-    {
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                satfreqd - ctrl->conf->lo);
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                satfrequ - ctrl->conf->loup);
-    }
+    tmpfreq = rigctrl_compute_target(ctrl, FALSE, ctrl->conf->loup,
+                                     use_rit_xit, &base_sat,
+                                     &doppler_hz, &target_ok);
+    target_down = rigctrl_compute_target(ctrl, TRUE, ctrl->conf->lo,
+                                         use_rit_xit, NULL, NULL, NULL);
+    ctrl->rig_target_up_hz = tmpfreq;
+    ctrl->rig_target_down_hz = target_down;
 
-    base_freq = satfrequ - ctrl->conf->loup;
-    doppler_hz = (ctrl->tracking && !use_rit_xit) ? ctrl->du : 0.0;
-    sent_freq = base_freq + doppler_hz;
-    tmpfreq = sent_freq;
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), target_down);
+
+    base_freq = base_sat - ctrl->conf->loup;
+    sent_freq = tmpfreq;
 
     /* if device is engaged, send freq command to radio */
-    if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+    if ((ctrl->engaged) && target_ok &&
+        (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
     {
         {
             gboolean set_ok;
@@ -3958,6 +4354,9 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
+                    ctrl->rig_actual_up_hz = readback;
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                                            readback);
                 }
                 else
                 {
@@ -3984,273 +4383,154 @@ static void exec_duplex_cycle(GtkRigCtrl * ctrl)
 
 static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
 {
-    gdouble         tmpfreq, readfreq, satfreqd, satfrequ;
-    gboolean        dialchanged = FALSE;
+    gdouble         tmpfreq = 0.0;
+    gdouble         readfreq = 0.0;
+    gboolean        down_dialchanged = FALSE;
+    gboolean        up_dialchanged = FALSE;
     gboolean        rx_use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
     gboolean        tx_use_rit_xit =
         (ctrl->conf2 != NULL) ? ctrl->conf2->supports_rit_xit : FALSE;
+    gboolean        down_ok = TRUE;
+    gboolean        up_ok = TRUE;
 
-    /* Execute downlink cycle using ctrl->conf */
     if (ctrl->engaged && (ctrl->lastrxf > 0.0))
     {
-        /* get frequency from receiver */
         if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
-        {
-            /* error => use a passive value */
             readfreq = ctrl->lastrxf;
-        }
 
         if (fabs(readfreq - ctrl->lastrxf) >= 1.0)
         {
-            dialchanged = TRUE;
-
-            /* user might have altered radio frequency => update transponder knob */
+            down_dialchanged = TRUE;
             gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
                                     readfreq);
             ctrl->lastrxf = readfreq;
-
-            /* doppler shift; only if we are tracking */
-            if (ctrl->tracking)
-            {
-                if (rx_use_rit_xit)
-                    satfreqd = readfreq + ctrl->conf->lo;
-                else
-                    satfreqd = readfreq - ctrl->dd + ctrl->conf->lo;
-            }
-            else
-            {
-                satfreqd = readfreq + ctrl->conf->lo;
-            }
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqDown),
-                                    satfreqd);
-
-            /* Update uplink if locked to downlink */
-            if (ctrl->trsplock)
-            {
-                track_downlink(ctrl);
-            }
+            ctrl->rig_actual_down_hz = readfreq;
         }
     }
 
-    if (dialchanged)
+    if (down_dialchanged)
     {
-        /* update uplink */
-        satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
-        if (ctrl->tracking && !tx_use_rit_xit)
-        {
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                    satfrequ + ctrl->du - ctrl->conf2->loup);
-        }
-        else
-        {
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                    satfrequ - ctrl->conf2->loup);
-        }
+        if (ctrl->conf2 == NULL)
+            return;
 
-        tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqUp));
+        tmpfreq = rigctrl_compute_target(ctrl, FALSE, ctrl->conf2->loup,
+                                         tx_use_rit_xit, NULL, NULL, &up_ok);
+        ctrl->rig_target_up_hz = tmpfreq;
+        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
 
-        /* if device is engaged, send freq command to radio */
-        if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+        if ((ctrl->engaged) && up_ok &&
+            (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
         {
             if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
             {
-                /* reset error counter */
                 ctrl->errcnt = 0;
-
-                /* give radio a chance to set frequency */
                 g_usleep(WR_DEL);
-
-                /* The actual frequency migh be different from what we have set */
                 if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
+                {
                     ctrl->lasttxf = tmpfreq;
+                    ctrl->rig_actual_up_hz = tmpfreq;
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                                            tmpfreq);
+                }
                 else
+                {
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                                 "rig update: side=TX readback failed; keeping last");
+                }
             }
             else
             {
                 ctrl->errcnt++;
             }
         }
-    }                           /* dialchanged on downlink */
-    else
+        return;
+    }
+
+    if (ctrl->conf == NULL)
+        return;
+
+    tmpfreq = rigctrl_compute_target(ctrl, TRUE, ctrl->conf->lo,
+                                     rx_use_rit_xit, NULL, NULL, &down_ok);
+    ctrl->rig_target_down_hz = tmpfreq;
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), tmpfreq);
+
+    if ((ctrl->engaged) && down_ok &&
+        (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
     {
-        /* if no dial change on downlink perform forward tracking on downlink
-           and execute uplink controller too */
-        satfreqd = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
-        if (ctrl->tracking)
+        if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
         {
-            /* downlink */
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                    rx_use_rit_xit ?
-                                    satfreqd - ctrl->conf->lo :
-                                    satfreqd + ctrl->dd - ctrl->conf->lo);
+            ctrl->errcnt = 0;
+            g_usleep(WR_DEL);
+            if (get_freq_simplex_strict(ctrl, ctrl->sock, &tmpfreq))
+            {
+                ctrl->lastrxf = tmpfreq;
+                ctrl->rig_actual_down_hz = tmpfreq;
+                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                                        tmpfreq);
+            }
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rig update: side=RX readback failed; keeping last");
+            }
         }
         else
         {
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                    satfreqd - ctrl->conf->lo);
+            ctrl->errcnt++;
         }
+    }
 
-        tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqDown));
+    if (ctrl->conf2 == NULL)
+        return;
 
-        /* if device is engaged, send freq command to radio */
-        if ((ctrl->engaged) && (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
+    if (ctrl->engaged && (ctrl->lasttxf > 0.0))
+    {
+        if (!get_freq_simplex(ctrl, ctrl->sock2, &readfreq))
+            readfreq = ctrl->lasttxf;
+
+        if (fabs(readfreq - ctrl->lasttxf) >= 1.0)
         {
-            if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
-            {
-                /* reset error counter */
-                ctrl->errcnt = 0;
-
-                /* give radio a chance to set frequency */
-                g_usleep(WR_DEL);
-
-                /* The actual frequency migh be different from what we have set */
-                if (get_freq_simplex_strict(ctrl, ctrl->sock, &tmpfreq))
-                    ctrl->lastrxf = tmpfreq;
-                else
-                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                "rig update: side=RX readback failed; keeping last");
-            }
-            else
-            {
-                ctrl->errcnt++;
-            }
+            up_dialchanged = TRUE;
+            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), readfreq);
+            ctrl->lasttxf = readfreq;
+            ctrl->rig_actual_up_hz = readfreq;
         }
+    }
 
-        /* Now execute uplink controller */
+    if (up_dialchanged)
+        return;
 
-        /* check if uplink dial has changed */
-        if ((ctrl->engaged) && (ctrl->lasttxf > 0.0))
+    tmpfreq = rigctrl_compute_target(ctrl, FALSE, ctrl->conf2->loup,
+                                     tx_use_rit_xit, NULL, NULL, &up_ok);
+    ctrl->rig_target_up_hz = tmpfreq;
+    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
+
+    if ((ctrl->engaged) && up_ok &&
+        (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+    {
+        if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
         {
-            if (!get_freq_simplex(ctrl, ctrl->sock2, &readfreq))
+            ctrl->errcnt = 0;
+            g_usleep(WR_DEL);
+            if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
             {
-                /* error => use a passive value */
-                readfreq = ctrl->lasttxf;
-            }
-
-            if (fabs(readfreq - ctrl->lasttxf) >= 1.0)
-            {
-                dialchanged = TRUE;
-
+                ctrl->lasttxf = tmpfreq;
+                ctrl->rig_actual_up_hz = tmpfreq;
                 gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                        readfreq);
-                ctrl->lasttxf = readfreq;
-
-                /* doppler shift; only if we are tracking */
-                if (ctrl->tracking)
-                {
-                    if (tx_use_rit_xit)
-                        satfrequ = readfreq + ctrl->conf2->loup;
-                    else
-                        satfrequ = readfreq - ctrl->du + ctrl->conf2->loup;
-                }
-                else
-                {
-                    satfrequ = readfreq + ctrl->conf2->loup;
-                }
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->SatFreqUp),
-                                        satfrequ);
-
-                /* Follow with downlink if transponder is locked */
-                if (ctrl->trsplock)
-                {
-                    track_uplink(ctrl);
-                }
-            }
-        }
-
-        if (dialchanged)
-        {                       /* on uplink */
-            /* update downlink */
-            satfreqd =
-                gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqDown));
-            if (ctrl->tracking)
-            {
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                        rx_use_rit_xit ?
-                                        satfreqd - ctrl->conf->lo :
-                                        satfreqd + ctrl->dd - ctrl->conf->lo);
+                                        tmpfreq);
             }
             else
             {
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                        satfreqd - ctrl->conf->lo);
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rig update: side=TX readback failed; keeping last");
             }
-
-            tmpfreq =
-                gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqDown));
-
-            /* if device is engaged, send freq command to radio */
-            if ((ctrl->engaged) && (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
-            {
-                if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
-                {
-                    /* reset error counter */
-                    ctrl->errcnt = 0;
-
-                    /* give radio a chance to set frequency */
-                    g_usleep(WR_DEL);
-
-                    /* The actual frequency migh be different from what we have set */
-                    if (get_freq_simplex_strict(ctrl, ctrl->sock, &tmpfreq))
-                        ctrl->lastrxf = tmpfreq;
-                    else
-                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                    "rig update: side=RX readback failed; keeping last");
-                }
-                else
-                {
-                    ctrl->errcnt++;
-                }
-            }
-        }                       /* dialchanged on uplink */
+        }
         else
         {
-            /* perform forward tracking on uplink */
-            satfrequ = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->SatFreqUp));
-            if (ctrl->tracking)
-            {
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                        tx_use_rit_xit ?
-                                        satfrequ - ctrl->conf2->loup :
-                                        satfrequ + ctrl->du -
-                                        ctrl->conf2->loup);
-            }
-            else
-            {
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                        satfrequ - ctrl->conf2->loup);
-            }
-
-            tmpfreq = gtk_freq_knob_get_value(GTK_FREQ_KNOB(ctrl->RigFreqUp));
-
-            /* if device is engaged, send freq command to radio */
-            if ((ctrl->engaged) && (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
-            {
-                if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
-                {
-                    /* reset error counter */
-                    ctrl->errcnt = 0;
-
-                    /* give radio a chance to set frequency */
-                    g_usleep(WR_DEL);
-
-                    /* The actual frequency might be different from what we have set. */
-                    if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
-                        ctrl->lasttxf = tmpfreq;
-                    else
-                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                    "rig update: side=TX readback failed; keeping last");
-                }
-                else
-                {
-                    ctrl->errcnt++;
-                }
-            }
-        }                       /* else dialchange on uplink */
-    }                           /* else dialchange on downlink */
+            ctrl->errcnt++;
+        }
+    }
 }
 
 static gboolean get_ptt(GtkRigCtrl * ctrl, gint sock)
@@ -5018,6 +5298,50 @@ static void rigctld_cache_device(radio_model_t model, const gchar *device)
     g_hash_table_replace(rigctld_device_cache,
                          GINT_TO_POINTER(model),
                          g_strdup(device));
+}
+
+static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
+                                               radio_conf_t *conf,
+                                               RigctldMgr **mgr,
+                                               const gchar *role,
+                                               gboolean *reported,
+                                               gint *restart_attempts,
+                                               const gchar *reason)
+{
+    if (restart_attempts == NULL || conf == NULL)
+        return FALSE;
+
+    if (*restart_attempts >= RIGCTLD_AUTOSTART_MAX_RESTARTS)
+        return FALSE;
+
+    if (mgr == NULL || *mgr == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    _("%s: autodetect restart skipped; rigctld not managed"),
+                    __func__);
+        rig_term_log(ctrl, "gpredict:err",
+                     "autodetect restart skipped; rigctld not managed");
+        return FALSE;
+    }
+
+    (*restart_attempts)++;
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                _("%s: restarting rigctld with autodetect (%s) attempt=%d"),
+                __func__,
+                reason ? reason : "autodetect",
+                *restart_attempts);
+    rig_term_log(ctrl, "gpredict",
+                 "restarting rigctld with autodetect (%s) attempt=%d",
+                 reason ? reason : "autodetect",
+                 *restart_attempts);
+    rigctld_mgr_terminate(mgr);
+
+    if (!rigctld_autodetect_device(ctrl, conf, role, reported))
+        return FALSE;
+
+    rigctld_persist_device(ctrl, conf, reason);
+    g_usleep(RIGCTLD_AUTOSTART_RETRY_DELAY_MS * 1000);
+    return TRUE;
 }
 
 static void rigctld_persist_device(GtkRigCtrl *ctrl, radio_conf_t *conf,
@@ -6277,6 +6601,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     gboolean        reported = FALSE;
     gboolean        ok = FALSE;
     gboolean        own_host = FALSE;
+    gint            restart_attempts = 0;
 
     if (error_reported)
         *error_reported = FALSE;
@@ -6399,6 +6724,62 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
 
         if (probe == RIGCTLD_PROBE_OK)
         {
+            if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                rigctld_mgr_host_is_local(conf->host))
+            {
+                gdouble freq = 0.0;
+                gchar *reply = NULL;
+                gchar *log_tail = NULL;
+                gboolean stale = FALSE;
+
+                if (!rigctld_probe_frequency(host, conf->port,
+                                             RIGCTLD_HEALTH_TIMEOUT_MS,
+                                             RIGCTLD_HEALTH_RETRIES,
+                                             &freq, &reply))
+                {
+                    if (mgr && *mgr)
+                        log_tail = rigctld_mgr_get_log_tail(*mgr);
+                    stale = rigctld_reply_indicates_stale_device(reply) ||
+                        rigctld_log_tail_indicates_stale_device(log_tail);
+
+                    if (stale)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_WARN,
+                                    _("%s: rigctld listening but stale device detected; restarting autodetect"),
+                                    __func__);
+                        rig_term_log(ctrl, "gpredict:err",
+                                     "rigctld listening but stale device detected; restarting autodetect");
+                        if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                           role, &reported,
+                                                           &restart_attempts,
+                                                           "stale device"))
+                        {
+                            g_free(reply);
+                            g_free(log_tail);
+                            goto restart_autostart;
+                        }
+                    }
+
+                    detail = g_strdup_printf(
+                        _("rigctld did not respond to health probes on %s:%d."),
+                        host, conf->port);
+                    schedule_rig_autostart_error(ctrl, conf, role, detail);
+                    g_free(detail);
+                    g_free(reply);
+                    g_free(log_tail);
+                    reported = TRUE;
+                    goto out;
+                }
+
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            _("%s: rigctld health probe ok (freq=%.0f)"),
+                            __func__, freq);
+                rig_term_log(ctrl, "gpredict",
+                             "rigctld health probe ok (freq=%.0f)", freq);
+                g_free(reply);
+                g_free(log_tail);
+            }
+
             rig_term_log(ctrl, "gpredict",
                          "rigctld reachable at %s:%d", host, conf->port);
             ok = TRUE;
@@ -6418,6 +6799,35 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
             g_free(detail);
             reported = TRUE;
             goto out;
+        }
+
+        if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+            rigctld_mgr_host_is_local(conf->host))
+        {
+            gchar *log_tail = NULL;
+            gboolean stale = FALSE;
+
+            if (mgr && *mgr)
+                log_tail = rigctld_mgr_get_log_tail(*mgr);
+            stale = rigctld_log_tail_indicates_stale_device(log_tail);
+
+            if (stale)
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: rigctld probe failed; stale device detected"),
+                            __func__);
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld probe failed; stale device detected");
+                if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                   role, &reported,
+                                                   &restart_attempts,
+                                                   "stale device"))
+                {
+                    g_free(log_tail);
+                    goto restart_autostart;
+                }
+            }
+            g_free(log_tail);
         }
 
         detail = g_strdup_printf(
@@ -6476,8 +6886,6 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         reported = TRUE;
         goto out;
     }
-
-    gboolean tried_autodetect_fallback = FALSE;
 
 restart_autostart:
     if (mgr && *mgr == NULL)
@@ -6590,29 +6998,35 @@ restart_autostart:
     {
         gdouble freq = 0.0;
         gchar *reply = NULL;
+        gchar *log_tail = NULL;
+        gboolean stale = FALSE;
 
         if (!rigctld_probe_frequency(host, conf->port,
                                      RIGCTLD_HEALTH_TIMEOUT_MS,
                                      RIGCTLD_HEALTH_RETRIES,
                                      &freq, &reply))
         {
-            sat_log_log(SAT_LOG_LEVEL_WARN,
-                        _("%s: rigctld listening but unhealthy, restarting with autodetect"),
-                        __func__);
-            rig_term_log(ctrl, "gpredict:err",
-                         "rigctld listening but unhealthy, restarting with autodetect");
-            if (!tried_autodetect_fallback)
+            if (mgr && *mgr)
+                log_tail = rigctld_mgr_get_log_tail(*mgr);
+            stale = rigctld_reply_indicates_stale_device(reply) ||
+                rigctld_log_tail_indicates_stale_device(log_tail);
+
+            if (stale)
             {
-                tried_autodetect_fallback = TRUE;
-                rigctld_mgr_terminate(mgr);
-                if (!rigctld_autodetect_device(ctrl, conf, role, &reported))
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            _("%s: rigctld listening but stale device detected; restarting autodetect"),
+                            __func__);
+                rig_term_log(ctrl, "gpredict:err",
+                             "rigctld listening but stale device detected; restarting autodetect");
+                if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                   role, &reported,
+                                                   &restart_attempts,
+                                                   "stale device"))
                 {
                     g_free(reply);
-                    goto out;
+                    g_free(log_tail);
+                    goto restart_autostart;
                 }
-                rigctld_persist_device(ctrl, conf, "unhealthy");
-                g_free(reply);
-                goto restart_autostart;
             }
 
             detail = g_strdup_printf(
@@ -6621,6 +7035,7 @@ restart_autostart:
             schedule_rig_autostart_error(ctrl, conf, role, detail);
             g_free(detail);
             g_free(reply);
+            g_free(log_tail);
             reported = TRUE;
             goto out;
         }
@@ -6631,6 +7046,7 @@ restart_autostart:
         rig_term_log(ctrl, "gpredict",
                      "rigctld health probe ok (freq=%.0f)", freq);
         g_free(reply);
+        g_free(log_tail);
     }
 
     {
@@ -6642,6 +7058,8 @@ restart_autostart:
         if (probe != RIGCTLD_PROBE_OK)
         {
             gchar *stderr_text = NULL;
+            gchar *log_tail = NULL;
+            gboolean stale = FALSE;
 
             if (probe == RIGCTLD_PROBE_MISMATCH)
             {
@@ -6663,8 +7081,33 @@ restart_autostart:
                              host, conf->port);
             }
 
-            if (mgr)
+            if (mgr && *mgr)
                 stderr_text = rigctld_mgr_get_log_tail(*mgr);
+
+            if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                rigctld_mgr_host_is_local(conf->host))
+            {
+                if (mgr && *mgr)
+                    log_tail = rigctld_mgr_get_log_tail(*mgr);
+                stale = rigctld_log_tail_indicates_stale_device(log_tail);
+                if (stale)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                _("%s: rigctld probe failed; stale device detected"),
+                                __func__);
+                    rig_term_log(ctrl, "gpredict:err",
+                                 "rigctld probe failed; stale device detected");
+                    if (rigctld_try_autodetect_restart(ctrl, conf, mgr,
+                                                       role, &reported,
+                                                       &restart_attempts,
+                                                       "stale device"))
+                    {
+                        g_free(stderr_text);
+                        g_free(log_tail);
+                        goto restart_autostart;
+                    }
+                }
+            }
 
             if (probe == RIGCTLD_PROBE_MISMATCH)
             {
@@ -6693,6 +7136,7 @@ restart_autostart:
             schedule_rig_autostart_error(ctrl, conf, role, detail);
             rigctld_mgr_terminate(mgr);
             g_free(stderr_text);
+            g_free(log_tail);
             g_free(detail);
             reported = TRUE;
             goto out;
@@ -6848,19 +7292,21 @@ typedef struct {
 static gboolean rig_conn_error_idle(gpointer data)
 {
     RigConnErrorInfo *info = data;
-    gchar            *body;
+    gchar            *details;
+    const gchar      *summary =
+        _("rigctld did not respond. See Rig Log for details.");
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
-    body = g_strdup_printf(_("Rigctld not reachable (%s)\nHost: %s\nPort: %d"),
-                           info->role ? info->role : _("rig"),
-                           info->host ? info->host : "(null) - missing",
-                           info->port);
-    rig_show_error_dialog(info->ctrl,
-                          _("Rigctld not reachable"),
-                          body);
-    g_free(body);
+    details = g_strdup_printf(_("Rig: %s\nHost: %s\nPort: %d"),
+                              info->role ? info->role : _("rig"),
+                              info->host ? info->host : "(null) - missing",
+                              info->port);
+    rig_show_error_dialog_with_details(info->ctrl,
+                                       _("Unable to connect to radio"),
+                                       summary, details);
+    g_free(details);
     g_free(info->host);
     g_free(info->role);
     g_free(info);
@@ -6894,9 +7340,14 @@ static gboolean rig_autostart_error_idle(gpointer data)
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
+    if (info->body && *info->body)
+    {
+        rig_term_log(info->ctrl, "gpredict:err", "%s", info->body);
+        sat_log_log(SAT_LOG_LEVEL_ERROR, "%s", info->body);
+    }
     rig_show_error_dialog(info->ctrl,
                           info->title ? info->title : _("rigctld error"),
-                          info->body ? info->body : "");
+                          _("See log for details."));
     g_free(info->title);
     g_free(info->body);
     g_free(info);
@@ -6938,9 +7389,14 @@ static gboolean rig_autodetect_error_idle(gpointer data)
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
+    if (info->body && *info->body)
+    {
+        rig_term_log(info->ctrl, "gpredict:err", "%s", info->body);
+        sat_log_log(SAT_LOG_LEVEL_ERROR, "%s", info->body);
+    }
     rig_show_error_dialog(info->ctrl,
                           _("Radio not found"),
-                          info->body ? info->body : "");
+                          _("See log for details."));
     g_free(info->body);
     g_free(info);
 
@@ -6971,13 +7427,38 @@ typedef struct {
     gchar      *rig_id;
 } RigMissingModelInfo;
 
+static void rig_missing_model_response(GtkDialog *dialog,
+                                       gint response,
+                                       gpointer user_data)
+{
+    RigMissingModelInfo *info = user_data;
+
+    if (info == NULL)
+        return;
+
+    switch (response)
+    {
+    case RIGCTRL_RESPONSE_OPEN_CONFIG:
+        rigctrl_open_radio_config(info->ctrl, info->rig_id);
+        break;
+    case RIGCTRL_RESPONSE_DISABLE_AUTOSTART:
+        rigctrl_disable_autostart(info->ctrl, info->rig_id);
+        break;
+    default:
+        break;
+    }
+
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+    g_free(info->rig_id);
+    g_free(info);
+}
+
 static gboolean rig_missing_model_idle(gpointer data)
 {
     RigMissingModelInfo *info = data;
     GtkWidget *toplevel;
     GtkWindow *parent = NULL;
     GtkWidget *dialog;
-    gint response;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
@@ -6990,8 +7471,7 @@ static gboolean rig_missing_model_idle(gpointer data)
     }
 
     dialog = gtk_message_dialog_new(parent,
-                                    GTK_DIALOG_MODAL |
-                                        GTK_DIALOG_DESTROY_WITH_PARENT,
+                                    GTK_DIALOG_DESTROY_WITH_PARENT,
                                     GTK_MESSAGE_ERROR,
                                     GTK_BUTTONS_NONE,
                                     "%s",
@@ -7006,23 +7486,10 @@ static gboolean rig_missing_model_idle(gpointer data)
                           _("Dismiss"),
                           GTK_RESPONSE_CANCEL);
 
-    response = gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(rig_missing_model_response), info);
+    gtk_widget_show(dialog);
 
-    switch (response)
-    {
-    case RIGCTRL_RESPONSE_OPEN_CONFIG:
-        rigctrl_open_radio_config(info->ctrl, info->rig_id);
-        break;
-    case RIGCTRL_RESPONSE_DISABLE_AUTOSTART:
-        rigctrl_disable_autostart(info->ctrl, info->rig_id);
-        break;
-    default:
-        break;
-    }
-
-    g_free(info->rig_id);
-    g_free(info);
     return G_SOURCE_REMOVE;
 }
 

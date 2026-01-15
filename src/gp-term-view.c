@@ -323,7 +323,16 @@ void gp_term_view_set_visible(GpTermView *view, gboolean visible)
     if (view == NULL || view->revealer == NULL)
         return;
 
-    gtk_revealer_set_reveal_child(GTK_REVEALER(view->revealer), visible);
+    if (visible)
+    {
+        gtk_widget_show(view->revealer);
+        gtk_revealer_set_reveal_child(GTK_REVEALER(view->revealer), TRUE);
+    }
+    else
+    {
+        gtk_revealer_set_reveal_child(GTK_REVEALER(view->revealer), FALSE);
+        gtk_widget_hide(view->revealer);
+    }
 }
 
 void gp_term_view_clear(GpTermView *view)

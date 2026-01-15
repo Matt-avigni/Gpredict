@@ -4,6 +4,12 @@
 #include <gtk/gtk.h>
 #include "rotor-conf.h"
 
-void            sat_pref_rot_editor_run(rotor_conf_t * conf);
+typedef void (*RotPrefEditorDoneFunc)(rotor_conf_t *conf,
+                                      gboolean applied,
+                                      gpointer user_data);
+
+void            sat_pref_rot_editor_run(rotor_conf_t * conf,
+                                        RotPrefEditorDoneFunc done,
+                                        gpointer user_data);
 
 #endif
