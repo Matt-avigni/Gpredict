@@ -75,6 +75,7 @@
 #include "rig-mode-dispatch.h"
 #include "predict-tools.h"
 #include "radio-conf.h"
+#include "rigctld-io.h"
 #include "rigctld_mgr.h"
 #include "rotctld-parse.h"
 #include "serial-ports.h"
@@ -100,6 +101,8 @@
 #define MAX_ERROR_COUNT 5
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
+#define RIGCTLD_DUMP_STATE_IDLE_MS 100
+#define RIGCTLD_FOLLOW_IDLE_MS 50
 #define RIGCTLD_AUTODETECT_MAX_CANDIDATES 8
 #define RIGCTLD_AUTODETECT_TOTAL_MS 10000
 #define RIGCTLD_AUTODETECT_WAIT_MS 1500
@@ -133,6 +136,46 @@ typedef enum {
     RIGCTLD_PROBE_MISMATCH
 } rigctld_probe_result_t;
 
+typedef enum {
+    RIG_SESSION_STOPPED = 0,
+    RIG_SESSION_STARTING_RIGCTLD,
+    RIG_SESSION_CONNECTING,
+    RIG_SESSION_PROBING,
+    RIG_SESSION_CONFIGURING,
+    RIG_SESSION_READY,
+    RIG_SESSION_DEGRADED,
+    RIG_SESSION_RECONNECTING
+} rig_session_state_t;
+
+typedef enum {
+    RIG_STRATEGY_PLAIN_FREQ = 0,
+    RIG_STRATEGY_SELECT_VFO,
+    RIG_STRATEGY_VFO_OPT_ARGS
+} rig_strategy_t;
+
+typedef struct _RigSession {
+    rig_session_state_t state;
+    rig_strategy_t strategy;
+    gchar *state_reason;
+    gchar *backend_version;
+    gint rig_model;
+    gboolean has_get_vfo;
+    gboolean has_set_vfo;
+    gboolean has_set_vfo_opt;
+    gboolean vfo_opt_enabled;
+    gboolean vfo_opt_unsafe;
+    gchar *default_vfo_token;
+    GPtrArray *vfo_candidates;
+    GHashTable *vfo_working;
+    gboolean strategy_logged;
+    gchar *label;
+} RigSession;
+
+static void rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
+                         const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
+static gboolean rigctld_parse_frequency_response(const gchar *text,
+                                                 gdouble *freq_out);
+
 static const gchar *rigctld_probe_result_name(rigctld_probe_result_t result)
 {
     switch (result)
@@ -146,6 +189,153 @@ static const gchar *rigctld_probe_result_name(rigctld_probe_result_t result)
     default:
         return "UNKNOWN";
     }
+}
+
+static RigSession *rig_session_new(const gchar *label)
+{
+    RigSession *session = g_new0(RigSession, 1);
+
+    session->state = RIG_SESSION_STOPPED;
+    session->strategy = RIG_STRATEGY_PLAIN_FREQ;
+    session->rig_model = 0;
+    session->has_get_vfo = FALSE;
+    session->has_set_vfo = FALSE;
+    session->has_set_vfo_opt = FALSE;
+    session->vfo_opt_enabled = FALSE;
+    session->vfo_opt_unsafe = FALSE;
+    session->vfo_candidates = g_ptr_array_new_with_free_func(g_free);
+    session->vfo_working = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                 g_free, NULL);
+    session->strategy_logged = FALSE;
+    session->label = g_strdup(label ? label : "rig");
+
+    return session;
+}
+
+static void rig_session_reset(RigSession *session)
+{
+    if (session == NULL)
+        return;
+
+    session->state = RIG_SESSION_STOPPED;
+    session->strategy = RIG_STRATEGY_PLAIN_FREQ;
+    g_free(session->state_reason);
+    session->state_reason = NULL;
+    g_free(session->backend_version);
+    session->backend_version = NULL;
+    session->rig_model = 0;
+    session->has_get_vfo = FALSE;
+    session->has_set_vfo = FALSE;
+    session->has_set_vfo_opt = FALSE;
+    session->vfo_opt_enabled = FALSE;
+    session->vfo_opt_unsafe = FALSE;
+    g_free(session->default_vfo_token);
+    session->default_vfo_token = NULL;
+    if (session->vfo_candidates)
+        g_ptr_array_set_size(session->vfo_candidates, 0);
+    if (session->vfo_working)
+        g_hash_table_remove_all(session->vfo_working);
+    session->strategy_logged = FALSE;
+}
+
+static void rig_session_free(RigSession **session_ptr)
+{
+    RigSession *session;
+
+    if (session_ptr == NULL || *session_ptr == NULL)
+        return;
+
+    session = *session_ptr;
+    g_free(session->state_reason);
+    g_free(session->backend_version);
+    g_free(session->default_vfo_token);
+    g_free(session->label);
+    if (session->vfo_candidates)
+        g_ptr_array_free(session->vfo_candidates, TRUE);
+    if (session->vfo_working)
+        g_hash_table_destroy(session->vfo_working);
+
+    g_free(session);
+    *session_ptr = NULL;
+}
+
+static const gchar *rig_session_state_name(rig_session_state_t state)
+{
+    switch (state)
+    {
+    case RIG_SESSION_STOPPED:
+        return "STOPPED";
+    case RIG_SESSION_STARTING_RIGCTLD:
+        return "STARTING_RIGCTLD";
+    case RIG_SESSION_CONNECTING:
+        return "CONNECTING";
+    case RIG_SESSION_PROBING:
+        return "PROBING";
+    case RIG_SESSION_CONFIGURING:
+        return "CONFIGURING";
+    case RIG_SESSION_READY:
+        return "READY";
+    case RIG_SESSION_DEGRADED:
+        return "DEGRADED";
+    case RIG_SESSION_RECONNECTING:
+        return "RECONNECTING";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const gchar *rig_strategy_name(rig_strategy_t strategy)
+{
+    switch (strategy)
+    {
+    case RIG_STRATEGY_PLAIN_FREQ:
+        return "PLAIN_FREQ";
+    case RIG_STRATEGY_SELECT_VFO:
+        return "SELECT_VFO_BEFORE_OP";
+    case RIG_STRATEGY_VFO_OPT_ARGS:
+        return "VFO_OPT_WITH_ARGS";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void rig_session_set_state(GtkRigCtrl *ctrl, RigSession *session,
+                                  rig_session_state_t state,
+                                  const gchar *reason_fmt, ...)
+{
+    gchar *reason = NULL;
+    va_list args;
+
+    if (session == NULL)
+        return;
+
+    if (reason_fmt != NULL)
+    {
+        va_start(args, reason_fmt);
+        reason = g_strdup_vprintf(reason_fmt, args);
+        va_end(args);
+    }
+
+    if (session->state != state || reason != NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rig session (%s) state=%s reason=%s",
+                    session->label ? session->label : "rig",
+                    rig_session_state_name(state),
+                    reason ? reason : "(none)");
+        if (ctrl != NULL)
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "rig session (%s) state=%s reason=%s",
+                         session->label ? session->label : "rig",
+                         rig_session_state_name(state),
+                         reason ? reason : "(none)");
+        }
+    }
+
+    session->state = state;
+    g_free(session->state_reason);
+    session->state_reason = reason;
 }
 
 /* radio control functions */
@@ -176,9 +366,34 @@ static gboolean set_xit(GtkRigCtrl * ctrl, gint sock, gdouble hz);
 static void     apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
                                       gdouble xit);
 static void     update_rit_xit_offsets(GtkRigCtrl * ctrl);
-static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
-                              const gchar *label,
-                              gboolean *stale_device_out);
+static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
+static RigSession *rig_session_for_socket(GtkRigCtrl *ctrl, gint sock);
+static rig_strategy_t rig_session_strategy(GtkRigCtrl *ctrl, gint sock);
+static const gchar *rig_session_default_vfo_token(RigSession *session);
+static gboolean rig_session_vfo_candidate_exists(const RigSession *session,
+                                                 const gchar *token);
+static void     rig_session_add_vfo_candidate(RigSession *session,
+                                              const gchar *token);
+static void     rig_session_parse_vfo_list(RigSession *session,
+                                           const gchar *line);
+static void     rig_session_parse_dump_state(RigSession *session,
+                                             const gchar *text);
+static gboolean rig_session_try_get_freq(GtkRigCtrl *ctrl, gint sock,
+                                         const gchar *cmd,
+                                         gdouble *freq_out,
+                                         gchar *reply, gsize reply_len);
+static gboolean rig_session_try_set_ok(GtkRigCtrl *ctrl, gint sock,
+                                       const gchar *cmd,
+                                       gchar *reply, gsize reply_len);
+static gboolean rig_session_try_select_vfo(GtkRigCtrl *ctrl, gint sock,
+                                           const gchar *token);
+static gboolean rig_session_send_command(GtkRigCtrl *ctrl, gint sock,
+                                         const gchar *cmd,
+                                         gchar *buffout, gint sizeout);
+static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
+                                                RigSession *session,
+                                                gint sock,
+                                                const radio_conf_t *conf);
 static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    radio_conf_t *conf,
                                                    gint *sock,
@@ -214,8 +429,6 @@ static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
-static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
-                             const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
 static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
 static void     rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply);
 static void     rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
@@ -226,6 +439,19 @@ static void     rigctrl_set_user_base_freq(GtkRigCtrl *ctrl,
                                            gboolean mark_manual);
 static gdouble  rigctrl_get_user_base_freq(GtkRigCtrl *ctrl,
                                            gboolean downlink);
+static void     rigctrl_reset_doppler_smoothing(GtkRigCtrl *ctrl);
+static void     rigctrl_update_payload_profile(GtkRigCtrl *ctrl,
+                                               const gchar *reason);
+static void     rigctrl_log_payload_profile(GtkRigCtrl *ctrl,
+                                            const gchar *context);
+static void     rigctrl_update_doppler(GtkRigCtrl *ctrl);
+static void     rigctrl_apply_transponder_map(GtkRigCtrl *ctrl,
+                                              const PayloadProfile *profile,
+                                              gdouble *base_down_hz,
+                                              gdouble *base_up_hz);
+static gboolean rigctrl_should_send_freq(GtkRigCtrl *ctrl,
+                                         gboolean downlink,
+                                         gdouble target_freq_hz);
 static gboolean rigctrl_sat_freq_within_limits(const GtkRigCtrl *ctrl,
                                                gboolean downlink,
                                                gdouble sat_freq);
@@ -235,6 +461,21 @@ static void     rigctrl_show_log(GtkRigCtrl *ctrl);
 static void     rigctrl_schedule_status(GtkRigCtrl *ctrl,
                                         const gchar *text,
                                         gboolean is_error);
+static gboolean rigctrl_on_main_thread(const GtkRigCtrl *ctrl);
+static const gchar *rigctrl_conn_state_name(rigctrl_conn_state_t state);
+static void     rigctrl_set_conn_state(GtkRigCtrl *ctrl,
+                                       gboolean secondary,
+                                       rigctrl_conn_state_t state,
+                                       const gchar *reason);
+static void     rigctrl_cancel_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
+static void     rigctrl_request_open(GtkRigCtrl *ctrl, const gchar *reason);
+static gboolean rigctrl_open_idle(gpointer data);
+static void     rigctrl_request_close(GtkRigCtrl *ctrl);
+static gboolean rigctrl_close_idle(gpointer data);
+static void     rigctrl_close_internal(GtkRigCtrl *ctrl);
+static void     rigctrl_close_socket_internal(GtkRigCtrl *ctrl,
+                                              gboolean secondary);
+static gboolean rigctrl_close_socket_idle(gpointer data);
 static gboolean rigctrl_configure_trsp_popup_idle(gpointer data);
 static void     rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data);
 static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
@@ -281,8 +522,6 @@ static gboolean rigctrl_validate_mode(GtkRigCtrl *ctrl,
                                       const radio_conf_t *conf,
                                       const gchar *role);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
-static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
-                                      gint64 now_us);
 static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                                            const gchar *role);
 static void     rigctrl_reset_error_gates(GtkRigCtrl *ctrl);
@@ -331,7 +570,7 @@ static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
 
 /*  add thread for hamlib communication */
 gpointer        rigctl_run(gpointer data);
-static gboolean rigctrl_open(GtkRigCtrl * data);
+static gboolean rigctrl_open_internal(GtkRigCtrl * data);
 static void     rigctrl_close(GtkRigCtrl * data);
 static void     setconfig(gpointer data);
 static void     remove_timer(GtkRigCtrl * data);
@@ -349,6 +588,9 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
     GtkWidget *dialog;
 
     if (ctrl == NULL)
+        return;
+
+    if (ctrl->destroying)
         return;
 
     toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
@@ -1023,9 +1265,9 @@ static void rigctrl_combo_set_active_blocked(GtkComboBox *box, gint index,
     if (box == NULL)
         return;
 
-    g_signal_handlers_block_by_func(box, cb, data);
+    g_signal_handlers_block_by_func(box, (gpointer)cb, data);
     gtk_combo_box_set_active(box, index);
-    g_signal_handlers_unblock_by_func(box, cb, data);
+    g_signal_handlers_unblock_by_func(box, (gpointer)cb, data);
 }
 
 static void rigctrl_set_selection_id(GtkRigCtrl *ctrl,
@@ -1055,6 +1297,11 @@ typedef struct {
     gchar      *text;
     gboolean    is_error;
 } RigStatusInfo;
+
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gboolean secondary;
+} RigctrlCloseSocketInfo;
 
 static gboolean rig_status_idle(gpointer data)
 {
@@ -1098,6 +1345,65 @@ static void rigctrl_schedule_status(GtkRigCtrl *ctrl,
     g_idle_add(rig_status_idle, info);
 }
 
+static gboolean rigctrl_on_main_thread(const GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->main_thread == NULL)
+        return FALSE;
+
+    return (g_thread_self() == ctrl->main_thread);
+}
+
+static const gchar *rigctrl_conn_state_name(rigctrl_conn_state_t state)
+{
+    switch (state)
+    {
+    case RIGCTRL_CONN_DISCONNECTED:
+        return "DISCONNECTED";
+    case RIGCTRL_CONN_CONNECTING:
+        return "CONNECTING";
+    case RIGCTRL_CONN_CONNECTED:
+        return "CONNECTED";
+    case RIGCTRL_CONN_DISCONNECTING:
+        return "DISCONNECTING";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void rigctrl_set_conn_state(GtkRigCtrl *ctrl,
+                                   gboolean secondary,
+                                   rigctrl_conn_state_t state,
+                                   const gchar *reason)
+{
+    rigctrl_conn_state_t *state_ptr;
+    const gchar *role;
+    rigctrl_conn_state_t prev_state;
+
+    if (ctrl == NULL)
+        return;
+
+    state_ptr = secondary ? &ctrl->conn_state2 : &ctrl->conn_state;
+    prev_state = *state_ptr;
+    if (prev_state == state)
+        return;
+
+    *state_ptr = state;
+    role = secondary ? "uplink" : "receiver";
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rigctrl %s state %s -> %s (%s)",
+                role,
+                rigctrl_conn_state_name(prev_state),
+                rigctrl_conn_state_name(state),
+                reason ? reason : "no reason");
+    rig_term_log(ctrl, "gpredict",
+                 "rig %s state %s -> %s (%s)",
+                 role,
+                 rigctrl_conn_state_name(prev_state),
+                 rigctrl_conn_state_name(state),
+                 reason ? reason : "no reason");
+}
+
 static void rig_show_conn_error(GtkRigCtrl *ctrl,
                                 radio_conf_t *conf,
                                 const gchar *role)
@@ -1120,6 +1426,23 @@ static void rig_show_conn_error(GtkRigCtrl *ctrl,
     g_free(details);
 }
 
+static void rigctrl_cancel_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
+{
+    guint *source_id;
+
+    if (ctrl == NULL)
+        return;
+
+    source_id = secondary ? &ctrl->reconnect_source_id2
+                          : &ctrl->reconnect_source_id;
+
+    if (*source_id != 0)
+    {
+        g_source_remove(*source_id);
+        *source_id = 0;
+    }
+}
+
 static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
 {
     if (ctrl == NULL)
@@ -1127,12 +1450,14 @@ static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
 
     if (secondary)
     {
+        rigctrl_cancel_reconnect(ctrl, TRUE);
         ctrl->reconnect_backoff_ms2 = 0;
         ctrl->reconnect_next_us2 = 0;
         ctrl->tx_conn_error_reported = FALSE;
     }
     else
     {
+        rigctrl_cancel_reconnect(ctrl, FALSE);
         ctrl->reconnect_backoff_ms = 0;
         ctrl->reconnect_next_us = 0;
         ctrl->rx_conn_error_reported = FALSE;
@@ -1154,23 +1479,54 @@ static void rigctrl_reset_error_gates(GtkRigCtrl *ctrl)
         g_hash_table_remove_all(ctrl->missing_model_reported);
 }
 
-static gboolean rigctrl_reconnect_due(GtkRigCtrl *ctrl, gboolean secondary,
-                                      gint64 now_us)
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gboolean    secondary;
+    gchar      *role;
+} RigctrlReconnectInfo;
+
+static gboolean rigctrl_reconnect_cb(gpointer data)
 {
-    gint64 next_us;
+    RigctrlReconnectInfo *info = data;
+    GtkRigCtrl *ctrl = info ? info->ctrl : NULL;
+    gboolean secondary = info ? info->secondary : FALSE;
+    const gchar *role = info && info->role ?
+        info->role : (secondary ? "uplink" : "receiver");
 
-    if (ctrl == NULL)
-        return FALSE;
+    if (ctrl != NULL)
+    {
+        if (secondary)
+            ctrl->reconnect_source_id2 = 0;
+        else
+            ctrl->reconnect_source_id = 0;
 
-    /* Pause retry attempts while the config editor is open. */
-    if (rigctrl_editing_for_role(ctrl, secondary))
-        return FALSE;
+        if (!ctrl->destroying && ctrl->engaged)
+        {
+            rigctrl_request_open(ctrl, "reconnect timer");
 
-    next_us = secondary ? ctrl->reconnect_next_us2 : ctrl->reconnect_next_us;
-    if (next_us <= 0)
-        return TRUE;
+            if (secondary)
+            {
+                if (ctrl->conf2 != NULL && ctrl->sock2 < 0 &&
+                    !ctrl->opening2)
+                    rigctrl_schedule_reconnect(ctrl, TRUE, role);
+            }
+            else
+            {
+                if (ctrl->sock < 0 && !ctrl->opening)
+                    rigctrl_schedule_reconnect(ctrl, FALSE, role);
+            }
+        }
+    }
 
-    return (now_us >= next_us);
+    if (ctrl != NULL)
+        g_object_unref(ctrl);
+    if (info != NULL)
+    {
+        g_free(info->role);
+        g_free(info);
+    }
+
+    return G_SOURCE_REMOVE;
 }
 
 static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
@@ -1180,14 +1536,32 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
     gint64  now_us;
     gint   *backoff_ptr;
     gint64 *next_ptr;
+    guint  *source_ptr;
 
     if (ctrl == NULL)
+        return;
+
+    if (ctrl->destroying || !ctrl->engaged)
+        return;
+
+    /* Pause retry attempts while the config editor is open. */
+    if (rigctrl_editing_for_role(ctrl, secondary))
+        return;
+
+    if (!secondary && ctrl->conf == NULL)
+        return;
+    if (secondary && ctrl->conf2 == NULL)
         return;
 
     backoff_ptr = secondary ? &ctrl->reconnect_backoff_ms2
                             : &ctrl->reconnect_backoff_ms;
     next_ptr = secondary ? &ctrl->reconnect_next_us2
                          : &ctrl->reconnect_next_us;
+    source_ptr = secondary ? &ctrl->reconnect_source_id2
+                           : &ctrl->reconnect_source_id;
+
+    if (*source_ptr != 0)
+        return;
 
     if (*backoff_ptr <= 0)
         backoff = RIGCTRL_RECONNECT_BACKOFF_MIN_MS;
@@ -1204,6 +1578,29 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
     rig_term_log(ctrl, "gpredict",
                  "reconnect %s in %d ms",
                  role ? role : "rig", backoff);
+
+    {
+        RigSession *session = secondary ? ctrl->rig_session2 : ctrl->rig_session;
+
+        rig_session_set_state(ctrl, session, RIG_SESSION_RECONNECTING,
+                              "backoff %d ms", backoff);
+    }
+
+    {
+        RigctrlReconnectInfo *info = g_new0(RigctrlReconnectInfo, 1);
+
+        info->ctrl = g_object_ref(ctrl);
+        info->secondary = secondary;
+        info->role = g_strdup(role);
+
+        *source_ptr = g_timeout_add(backoff, rigctrl_reconnect_cb, info);
+        if (*source_ptr == 0)
+        {
+            g_object_unref(info->ctrl);
+            g_free(info->role);
+            g_free(info);
+        }
+    }
 }
 
 static GtkBoxClass *parent_class = NULL;
@@ -1211,6 +1608,16 @@ static GtkBoxClass *parent_class = NULL;
 static void gtk_rig_ctrl_destroy(GtkWidget * widget)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(widget);
+
+    ctrl->destroying = TRUE;
+    rigctrl_cancel_reconnect(ctrl, FALSE);
+    rigctrl_cancel_reconnect(ctrl, TRUE);
+    if (ctrl->close_pending_id != 0)
+    {
+        g_source_remove(ctrl->close_pending_id);
+        ctrl->close_pending_id = 0;
+    }
+    remove_timer(ctrl);
 
     if (ctrl->rigctl_thread != NULL)
     {
@@ -1225,6 +1632,8 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->rigctl_thread = NULL;
     }
 
+    rigctrl_close_internal(ctrl);
+
     rigctld_terminate_spawned(ctrl, TRUE, &ctrl->rigctld_mgr2);
     rigctld_terminate_spawned(ctrl, FALSE, &ctrl->rigctld_mgr);
 
@@ -1233,6 +1642,20 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         gp_term_view_free(ctrl->term_view);
         ctrl->term_view = NULL;
     }
+    rigctld_rxbuf_free(&ctrl->rigctld_rxbuf);
+    rigctld_rxbuf_free(&ctrl->rigctld_rxbuf2);
+    rig_session_free(&ctrl->rig_session);
+    rig_session_free(&ctrl->rig_session2);
+    g_free(ctrl->rigctld_vfo_main_token);
+    g_free(ctrl->rigctld_vfo_sub_token);
+    g_free(ctrl->rigctld_vfo_main_token2);
+    g_free(ctrl->rigctld_vfo_sub_token2);
+    ctrl->rigctld_vfo_main_token = NULL;
+    ctrl->rigctld_vfo_sub_token = NULL;
+    ctrl->rigctld_vfo_main_token2 = NULL;
+    ctrl->rigctld_vfo_sub_token2 = NULL;
+    ctrl->rigctld_vfo_map_logged = FALSE;
+    ctrl->rigctld_vfo_map_logged2 = FALSE;
     ctrl->log_toggle = NULL;
     if (ctrl->resize_idle_id != 0)
     {
@@ -1305,6 +1728,17 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->prev_ele = 0.0;
     ctrl->sock = -1;
     ctrl->sock2 = -1;
+    ctrl->conn_state = RIGCTRL_CONN_DISCONNECTED;
+    ctrl->conn_state2 = RIGCTRL_CONN_DISCONNECTED;
+    ctrl->opening = FALSE;
+    ctrl->opening2 = FALSE;
+    ctrl->reconnect_source_id = 0;
+    ctrl->reconnect_source_id2 = 0;
+    ctrl->close_pending_id = 0;
+    ctrl->pending_close_sock = -1;
+    ctrl->pending_close_sock2 = -1;
+    ctrl->destroying = FALSE;
+    ctrl->main_thread = g_thread_self();
     ctrl->reconnect_backoff_ms = 0;
     ctrl->reconnect_backoff_ms2 = 0;
     ctrl->reconnect_next_us = 0;
@@ -1321,6 +1755,16 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_spawn_pid = 0;
     ctrl->rigctld_spawned2 = FALSE;
     ctrl->rigctld_spawn_pid2 = 0;
+    ctrl->rigctld_rxbuf = NULL;
+    ctrl->rigctld_rxbuf2 = NULL;
+    ctrl->rig_session = rig_session_new(_("receiver"));
+    ctrl->rig_session2 = rig_session_new(_("uplink"));
+    ctrl->rigctld_vfo_main_token = NULL;
+    ctrl->rigctld_vfo_sub_token = NULL;
+    ctrl->rigctld_vfo_main_token2 = NULL;
+    ctrl->rigctld_vfo_sub_token2 = NULL;
+    ctrl->rigctld_vfo_map_logged = FALSE;
+    ctrl->rigctld_vfo_map_logged2 = FALSE;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
     ctrl->resize_idle_id = 0;
@@ -1338,6 +1782,15 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->lasttxptt = TRUE;
     ctrl->lastrxf = 0.0;
     ctrl->lasttxf = 0.0;
+    memset(&ctrl->payload_profile, 0, sizeof(ctrl->payload_profile));
+    ctrl->payload_profile_valid = FALSE;
+    ctrl->payload_profile_logged = FALSE;
+    ctrl->doppler_down_ema = 0.0;
+    ctrl->doppler_up_ema = 0.0;
+    ctrl->doppler_ema_valid = FALSE;
+    ctrl->last_doppler_calc_us = 0;
+    ctrl->last_send_down_us = 0;
+    ctrl->last_send_up_us = 0;
     ctrl->user_base_down_hz = 0.0;
     ctrl->user_base_up_hz = 0.0;
     ctrl->doppler_down_hz = 0.0;
@@ -1351,10 +1804,18 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->user_edit_down = FALSE;
     ctrl->user_edit_up = FALSE;
     ctrl->suppress_user_base = FALSE;
+    ctrl->xit_supported = TRUE;
+    ctrl->xit_supported2 = TRUE;
+    ctrl->last_rit_valid = FALSE;
+    ctrl->last_xit_valid = FALSE;
+    ctrl->last_xit_valid2 = FALSE;
+    ctrl->last_rit_offset = 0;
+    ctrl->last_xit_offset = 0;
+    ctrl->last_xit_offset2 = 0;
     ctrl->last_toggle_tx = -1;
 }
 
-GType gtk_rig_ctrl_get_type()
+GType gtk_rig_ctrl_get_type(void)
 {
     static GType    gtk_rig_ctrl_type = 0;
 
@@ -1477,6 +1938,255 @@ static gdouble rigctrl_get_user_base_freq(GtkRigCtrl *ctrl,
     return value;
 }
 
+static void rigctrl_reset_doppler_smoothing(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->doppler_ema_valid = FALSE;
+    ctrl->doppler_down_ema = 0.0;
+    ctrl->doppler_up_ema = 0.0;
+    ctrl->last_doppler_calc_us = 0;
+    ctrl->dd = 0.0;
+    ctrl->du = 0.0;
+    ctrl->doppler_down_hz = 0.0;
+    ctrl->doppler_up_hz = 0.0;
+}
+
+static void rigctrl_log_payload_profile(GtkRigCtrl *ctrl,
+                                        const gchar *context)
+{
+    const PayloadProfile *profile = NULL;
+    const gchar *mode = NULL;
+
+    if (ctrl == NULL || !ctrl->payload_profile_valid)
+        return;
+
+    if (ctrl->payload_profile_logged)
+        return;
+
+    profile = &ctrl->payload_profile;
+    mode = (ctrl->trsp && ctrl->trsp->mode) ? ctrl->trsp->mode : "(none)";
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "DOPPLER profile=%s mode=%s down=%d up=%d transponder_map=%d calc_hz=%d send_hz=%d deadband=%.1f context=%s",
+                payload_type_name(profile->type),
+                mode,
+                profile->apply_doppler_downlink ? 1 : 0,
+                profile->apply_doppler_uplink ? 1 : 0,
+                profile->enable_transponder_map ? 1 : 0,
+                profile->calc_hz,
+                profile->send_hz,
+                profile->deadband_hz,
+                context ? context : "unknown");
+
+    rig_term_log(ctrl, "DOPPLER",
+                 "profile=%s mode=%s down=%d up=%d transponder=%d calc_hz=%d send_hz=%d deadband=%.1f",
+                 payload_type_name(profile->type),
+                 mode,
+                 profile->apply_doppler_downlink ? 1 : 0,
+                 profile->apply_doppler_uplink ? 1 : 0,
+                 profile->enable_transponder_map ? 1 : 0,
+                 profile->calc_hz,
+                 profile->send_hz,
+                 profile->deadband_hz);
+
+    ctrl->payload_profile_logged = TRUE;
+}
+
+static void rigctrl_update_payload_profile(GtkRigCtrl *ctrl,
+                                           const gchar *reason)
+{
+    PayloadProfile profile;
+
+    if (ctrl == NULL)
+        return;
+
+    profile = payload_profile_from_menu_value(ctrl->trsp ? ctrl->trsp->mode : NULL);
+    ctrl->payload_profile = profile;
+    ctrl->payload_profile_valid = TRUE;
+    ctrl->payload_profile_logged = FALSE;
+    rigctrl_reset_doppler_smoothing(ctrl);
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "DOPPLER profile update type=%s reason=%s",
+                payload_type_name(profile.type),
+                reason ? reason : "unknown");
+
+    if (ctrl->engaged)
+        rigctrl_log_payload_profile(ctrl, "profile change");
+}
+
+static void rigctrl_apply_transponder_map(GtkRigCtrl *ctrl,
+                                          const PayloadProfile *profile,
+                                          gdouble *base_down_hz,
+                                          gdouble *base_up_hz)
+{
+    gboolean have_down;
+    gboolean have_up;
+
+    if (ctrl == NULL || profile == NULL || !profile->enable_transponder_map ||
+        ctrl->trsp == NULL || base_down_hz == NULL || base_up_hz == NULL)
+        return;
+
+    if (ctrl->trsp->downlow <= 0.0 || ctrl->trsp->uplow <= 0.0)
+        return;
+
+    have_down = (*base_down_hz > 0.0);
+    have_up = (*base_up_hz > 0.0);
+
+    if (ctrl->trsplock || (have_down && !have_up))
+    {
+        gdouble delta = *base_down_hz - ctrl->trsp->downlow;
+        gdouble up = ctrl->trsp->invert
+                         ? (ctrl->trsp->uphigh - delta)
+                         : (ctrl->trsp->uplow + delta);
+        *base_up_hz = up;
+        if (!have_up)
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "DOPPLER transponder map uplink=%.0f from downlink=%.0f",
+                        up, *base_down_hz);
+        }
+    }
+    else if (!have_down && have_up)
+    {
+        gdouble delta = *base_up_hz - ctrl->trsp->uplow;
+        gdouble down = ctrl->trsp->invert
+                           ? (ctrl->trsp->downhigh - delta)
+                           : (ctrl->trsp->downlow + delta);
+        *base_down_hz = down;
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "DOPPLER transponder map downlink=%.0f from uplink=%.0f",
+                    down, *base_up_hz);
+    }
+}
+
+static void rigctrl_update_doppler(GtkRigCtrl *ctrl)
+{
+    PayloadProfile *profile = NULL;
+    gdouble base_down = 0.0;
+    gdouble base_up = 0.0;
+    gdouble cmd_down = 0.0;
+    gdouble cmd_up = 0.0;
+    gdouble raw_dd = 0.0;
+    gdouble raw_du = 0.0;
+    gdouble alpha = 0.0;
+    gint64 now_us = 0;
+    gint64 min_interval_us = 0;
+
+    if (ctrl == NULL || ctrl->target == NULL)
+        return;
+
+    if (!ctrl->payload_profile_valid)
+        rigctrl_update_payload_profile(ctrl, "init");
+
+    profile = &ctrl->payload_profile;
+    now_us = g_get_monotonic_time();
+    if (profile->calc_hz > 0)
+        min_interval_us = (gint64)(G_USEC_PER_SEC / profile->calc_hz);
+    if (min_interval_us > 0 &&
+        (now_us - ctrl->last_doppler_calc_us) < min_interval_us)
+        return;
+
+    ctrl->last_doppler_calc_us = now_us;
+
+    base_down = rigctrl_get_user_base_freq(ctrl, TRUE);
+    base_up = rigctrl_get_user_base_freq(ctrl, FALSE);
+    rigctrl_apply_transponder_map(ctrl, profile, &base_down, &base_up);
+
+    cmd_down = base_down;
+    cmd_up = base_up;
+    compute_rig_frequencies(profile, base_down, base_up,
+                            ctrl->target->range_rate * 1000.0,
+                            &cmd_down, &cmd_up);
+
+    raw_dd = cmd_down - base_down - profile->downlink_if_offset_hz;
+    raw_du = cmd_up - base_up - profile->uplink_if_offset_hz;
+
+    alpha = profile->ema_alpha;
+    if (alpha < 0.0)
+        alpha = 0.0;
+    if (alpha > 1.0)
+        alpha = 1.0;
+
+    if (!ctrl->doppler_ema_valid)
+    {
+        ctrl->doppler_down_ema = raw_dd;
+        ctrl->doppler_up_ema = raw_du;
+        ctrl->doppler_ema_valid = TRUE;
+    }
+    else
+    {
+        ctrl->doppler_down_ema =
+            alpha * raw_dd + (1.0 - alpha) * ctrl->doppler_down_ema;
+        ctrl->doppler_up_ema =
+            alpha * raw_du + (1.0 - alpha) * ctrl->doppler_up_ema;
+    }
+
+    ctrl->dd = ctrl->doppler_down_ema;
+    ctrl->du = ctrl->doppler_up_ema;
+    ctrl->doppler_down_hz = ctrl->dd;
+    ctrl->doppler_up_hz = ctrl->du;
+
+    {
+        gdouble cmd_down_log = base_down + ctrl->dd + profile->downlink_if_offset_hz;
+        gdouble cmd_up_log = base_up + ctrl->du + profile->uplink_if_offset_hz;
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "DOPPLER profile=%s base_down=%.0f df_down=%.0f cmd_down=%.0f base_up=%.0f df_up=%.0f cmd_up=%.0f",
+                    payload_type_name(profile->type),
+                    base_down,
+                    ctrl->dd,
+                    cmd_down_log,
+                    base_up,
+                    ctrl->du,
+                    cmd_up_log);
+    }
+}
+
+static gboolean rigctrl_should_send_freq(GtkRigCtrl *ctrl,
+                                         gboolean downlink,
+                                         gdouble target_freq_hz)
+{
+    const PayloadProfile *profile = NULL;
+    gint64 now_us = 0;
+    gint64 min_interval_us = 0;
+    gdouble last_sent = 0.0;
+    gdouble deadband = 0.0;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    profile = ctrl->payload_profile_valid ? &ctrl->payload_profile : NULL;
+    if (profile == NULL)
+        return TRUE;
+
+    now_us = g_get_monotonic_time();
+    if (profile->send_hz > 0)
+        min_interval_us = (gint64)(G_USEC_PER_SEC / profile->send_hz);
+
+    if (downlink)
+    {
+        if (min_interval_us > 0 &&
+            (now_us - ctrl->last_send_down_us) < min_interval_us)
+            return FALSE;
+        last_sent = ctrl->lastrxf;
+    }
+    else
+    {
+        if (min_interval_us > 0 &&
+            (now_us - ctrl->last_send_up_us) < min_interval_us)
+            return FALSE;
+        last_sent = ctrl->lasttxf;
+    }
+
+    deadband = (profile->deadband_hz > 0.0) ? profile->deadband_hz : 1.0;
+    if (last_sent > 0.0 && fabs(target_freq_hz - last_sent) < deadband)
+        return FALSE;
+
+    return TRUE;
+}
+
 static gboolean rigctrl_sat_freq_within_limits(const GtkRigCtrl *ctrl,
                                                gboolean downlink,
                                                gdouble sat_freq)
@@ -1552,8 +2262,12 @@ static gdouble rigctrl_compute_target(GtkRigCtrl *ctrl,
                                       gboolean *target_ok_out)
 {
     gdouble base_sat = 0.0;
+    gdouble base_down = 0.0;
+    gdouble base_up = 0.0;
     gdouble doppler = 0.0;
     gdouble target_rig = 0.0;
+    gdouble if_offset = 0.0;
+    PayloadProfile *profile = NULL;
 
     if (ctrl == NULL)
     {
@@ -1562,11 +2276,21 @@ static gdouble rigctrl_compute_target(GtkRigCtrl *ctrl,
         return 0.0;
     }
 
-    base_sat = rigctrl_get_user_base_freq(ctrl, downlink);
+    if (!ctrl->payload_profile_valid)
+        rigctrl_update_payload_profile(ctrl, "compute_target");
+
+    profile = &ctrl->payload_profile;
+    base_down = rigctrl_get_user_base_freq(ctrl, TRUE);
+    base_up = rigctrl_get_user_base_freq(ctrl, FALSE);
+    rigctrl_apply_transponder_map(ctrl, profile, &base_down, &base_up);
+
+    base_sat = downlink ? base_down : base_up;
     if (ctrl->tracking && !use_rit_xit)
         doppler = downlink ? ctrl->dd : ctrl->du;
+    if_offset = downlink ? profile->downlink_if_offset_hz
+                         : profile->uplink_if_offset_hz;
 
-    target_rig = base_sat + doppler - lo;
+    target_rig = base_sat + doppler + if_offset - lo;
 
     if (base_sat_out)
         *base_sat_out = base_sat;
@@ -1911,7 +2635,6 @@ static void rigctld_terminate_spawned(GtkRigCtrl *ctrl,
  */
 void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
 {
-    gdouble         satfreq;
     gchar          *buff;
 
     g_mutex_lock(&ctrl->rig_ctrl_updatelock);
@@ -1950,19 +2673,11 @@ void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
         gtk_label_set_text(GTK_LABEL(ctrl->SatRngRate), buff);
         g_free(buff);
 
-        /* Doppler shift down */
-        satfreq = rigctrl_get_user_base_freq(ctrl, TRUE);
-        ctrl->dd = -satfreq * (ctrl->target->range_rate / 299792.4580); // Hz
-        ctrl->doppler_down_hz = ctrl->dd;
-        buff = g_strdup_printf("%.0f Hz", ctrl->dd);
+        rigctrl_update_doppler(ctrl);
+        buff = g_strdup_printf("%.0f Hz", ctrl->doppler_down_hz);
         gtk_label_set_text(GTK_LABEL(ctrl->SatDopDown), buff);
         g_free(buff);
-
-        /* Doppler shift up */
-        satfreq = rigctrl_get_user_base_freq(ctrl, FALSE);
-        ctrl->du = satfreq * (ctrl->target->range_rate / 299792.4580);  // Hz
-        ctrl->doppler_up_hz = ctrl->du;
-        buff = g_strdup_printf("%.0f Hz", ctrl->du);
+        buff = g_strdup_printf("%.0f Hz", ctrl->doppler_up_hz);
         gtk_label_set_text(GTK_LABEL(ctrl->SatDopUp), buff);
         g_free(buff);
 
@@ -2276,11 +2991,12 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
     }
 
     ctrl->trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, 0);
+    rigctrl_update_payload_profile(ctrl, "load_trsp_list");
     if (gtk_combo_box_get_active(GTK_COMBO_BOX(ctrl->TrspSel)) != 0)
         gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->TrspSel), 0);
 }
 
-static gboolean have_conf()
+static gboolean have_conf(void)
 {
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */
@@ -2436,6 +3152,8 @@ static void trsp_selected_cb(GtkComboBox * box, gpointer data)
                     _("%s: Inconsistency detected in internal transponder "
                       "data (%d,%d)"), __func__, i, n);
     }
+
+    rigctrl_update_payload_profile(ctrl, "trsp_selected");
 }
 
 /*
@@ -2489,7 +3207,7 @@ static void delay_changed_cb(GtkSpinButton * spin, gpointer data)
     if (ctrl->conf)
         ctrl->conf->cycle = ctrl->delay;
 
-    if (ctrl->engaged)
+    if (ctrl->engaged && ctrl->conn_state == RIGCTRL_CONN_CONNECTED)
         start_timer(ctrl);
 }
 
@@ -2730,6 +3448,10 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         gtk_widget_set_sensitive(ctrl->DevSel2, FALSE);
         ctrl->engaged = TRUE;
+        ctrl->payload_profile_logged = FALSE;
+        if (!ctrl->payload_profile_valid)
+            rigctrl_update_payload_profile(ctrl, "engage");
+        rigctrl_log_payload_profile(ctrl, "engage");
         rig_term_log(ctrl, "gpredict", "engage");
 
         /* Start worker thread if not already running */
@@ -2738,6 +3460,14 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
             ctrl->rigctlq = g_async_queue_new();
             ctrl->rigctl_thread =
                 g_thread_new("rigctl_run", rigctl_run, ctrl);
+        }
+
+        if (!rigctrl_open_internal(ctrl))
+        {
+            if (ctrl->sock < 0)
+                rigctrl_schedule_reconnect(ctrl, FALSE, _("receiver"));
+            if (ctrl->conf2 != NULL && ctrl->sock2 < 0)
+                rigctrl_schedule_reconnect(ctrl, TRUE, _("uplink"));
         }
 
         /* Push initial configuration to the worker */
@@ -3070,9 +3800,9 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
     tx_rigs = rigctrl_collect_rig_names(TRUE, FALSE);
 
     g_signal_handlers_block_by_func(ctrl->DevSel,
-                                    G_CALLBACK(primary_rig_selected_cb), ctrl);
+                                    (gpointer)G_CALLBACK(primary_rig_selected_cb), ctrl);
     g_signal_handlers_block_by_func(ctrl->DevSel2,
-                                    G_CALLBACK(secondary_rig_selected_cb), ctrl);
+                                    (gpointer)G_CALLBACK(secondary_rig_selected_cb), ctrl);
 
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(ctrl->DevSel));
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
@@ -3095,9 +3825,9 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
                                     G_CALLBACK(secondary_rig_selected_cb), ctrl);
 
     g_signal_handlers_unblock_by_func(ctrl->DevSel,
-                                      G_CALLBACK(primary_rig_selected_cb), ctrl);
+                                      (gpointer)G_CALLBACK(primary_rig_selected_cb), ctrl);
     g_signal_handlers_unblock_by_func(ctrl->DevSel2,
-                                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
+                                      (gpointer)G_CALLBACK(secondary_rig_selected_cb), ctrl);
 
     rigctrl_set_selection_id(ctrl, "primary", &ctrl->primary_rig_id,
                              rigctrl_combo_get_active_id(GTK_COMBO_BOX(ctrl->DevSel),
@@ -3242,6 +3972,65 @@ static void store_sats(gpointer key, gpointer value, gpointer user_data)
                                        (GCompareFunc) sat_name_compare);
 }
 
+static GString *rigctld_rxbuf_for_socket(GtkRigCtrl *ctrl, gint sock,
+                                         gboolean create)
+{
+    GString **target = NULL;
+
+    if (ctrl == NULL)
+        return NULL;
+
+    if (sock == ctrl->sock)
+        target = &ctrl->rigctld_rxbuf;
+    else if (sock == ctrl->sock2)
+        target = &ctrl->rigctld_rxbuf2;
+
+    if (target == NULL)
+        return NULL;
+
+    if (*target == NULL && create)
+        *target = rigctld_rxbuf_new(256);
+
+    return *target;
+}
+
+static void rigctld_clear_rxbuf_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    GString *buf = rigctld_rxbuf_for_socket(ctrl, sock, FALSE);
+
+    if (buf != NULL)
+        rigctld_rxbuf_clear(buf);
+}
+
+static gboolean rigctld_command_is_dump_state(const gchar *cmd)
+{
+    const gchar *scan = cmd;
+
+    if (scan == NULL)
+        return FALSE;
+
+    while (*scan != '\0' && g_ascii_isspace(*scan))
+        scan++;
+
+    return g_str_has_prefix(scan, "\\dump_state");
+}
+
+static gboolean rigctld_command_is_multiline(const gchar *cmd)
+{
+    const gchar *scan = cmd;
+
+    if (scan == NULL)
+        return FALSE;
+
+    while (*scan != '\0' && g_ascii_isspace(*scan))
+        scan++;
+
+    if (g_str_has_prefix(scan, "\\dump_caps"))
+        return TRUE;
+
+    return FALSE;
+}
+
 static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                                       gchar * buff, gchar * buffout,
                                       gint sizeout)
@@ -3258,6 +4047,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                 _("%s:%s: sending %d bytes to rigctld as \"%s\""),
                 __FILE__, __func__, size, buff);
     /* send command */
+    rigctld_io_lock_acquire();
     written = send(sock, buff, strlen(buff), 0);
     if (written != size)
     {
@@ -3276,31 +4066,118 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
         g_free(trim_cmd);
         rigctrl_schedule_status(ctrl, _("Command send failed"), TRUE);
         rigctrl_handle_socket_error(ctrl, sock, "send");
+        rigctld_io_lock_release();
         return FALSE;
     }
     /* try to read answer */
-    size = recv(sock, buffout, sizeout - 1, 0);
-    if (size == -1)
     {
-        gchar *trim_cmd = g_strdup(buff);
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rigctld port closed"), __func__);
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            rig_term_log(ctrl, "gpredict:err",
-                         "timeout waiting for rigctld reply cmd=%s",
-                         trim_cmd ? g_strchomp(trim_cmd) : "(null)");
-        else
-            rig_term_log(ctrl, "gpredict:err",
-                         "recv failed (%s) cmd=%s",
-                         strerror(errno),
-                         trim_cmd ? g_strchomp(trim_cmd) : "(null)");
-        g_free(trim_cmd);
-        rigctrl_schedule_status(ctrl, _("Command receive failed"), TRUE);
-        rigctrl_handle_socket_error(ctrl, sock, "recv");
-        return FALSE;
-    }
+        gint err = 0;
+        gint drain_err = 0;
+        gboolean saw_rprt = FALSE;
+        gboolean used_multiline = FALSE;
+        gboolean expect_rprt = FALSE;
+        rigctld_read_mode_t read_mode = RIGCTLD_READ_SINGLE;
+        gint idle_timeout_ms = RIGCTLD_FOLLOW_IDLE_MS;
+        GString *rxbuf = rigctld_rxbuf_for_socket(ctrl, sock, TRUE);
 
-    buffout[size] = '\0';
+        if (rxbuf == NULL)
+        {
+            err = EINVAL;
+            size = -1;
+        }
+        else
+        {
+            if (rigctld_command_is_dump_state(buff))
+                read_mode = RIGCTLD_READ_MULTILINE_IDLE;
+            else if (rigctld_command_is_multiline(buff))
+                read_mode = RIGCTLD_READ_MULTILINE_RPRT;
+
+            if (read_mode == RIGCTLD_READ_MULTILINE_IDLE)
+                rigctld_rxbuf_clear(rxbuf);
+            if (read_mode == RIGCTLD_READ_MULTILINE_IDLE)
+                idle_timeout_ms = RIGCTLD_DUMP_STATE_IDLE_MS;
+
+            size = (gint) rigctld_read_response(sock, rxbuf, read_mode,
+                                                buffout, (gsize) sizeout,
+                                                RIGCTLD_SOCKET_TIMEOUT_MS,
+                                                idle_timeout_ms,
+                                                &saw_rprt, &used_multiline,
+                                                &err);
+        }
+
+        if (size == -1)
+        {
+            gchar *trim_cmd = g_strdup(buff);
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: rigctld port closed"), __func__);
+            if (err == EAGAIN || err == EWOULDBLOCK)
+            {
+                rig_term_log(ctrl, "gpredict:err",
+                             "timeout waiting for rigctld reply cmd=%s",
+                             trim_cmd ? g_strchomp(trim_cmd) : "(null)");
+                rigctrl_schedule_status(ctrl,
+                                        _("Rig control timeout (rigctld did not reply)"),
+                                        TRUE);
+            }
+            else
+            {
+                rig_term_log(ctrl, "gpredict:err",
+                             "recv failed (%s) cmd=%s",
+                             strerror(err),
+                             trim_cmd ? g_strchomp(trim_cmd) : "(null)");
+                rigctrl_schedule_status(ctrl, _("Command receive failed"), TRUE);
+            }
+            g_free(trim_cmd);
+            rigctrl_handle_socket_error(ctrl, sock, "recv");
+            rigctld_io_lock_release();
+            return FALSE;
+        }
+
+        if (read_mode == RIGCTLD_READ_SINGLE && used_multiline)
+        {
+            gchar *trim_cmd = g_strdup(buff);
+
+            if (trim_cmd)
+            {
+                g_strchomp(trim_cmd);
+                g_strstrip(trim_cmd);
+            }
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rigctld reply for cmd=%s contained extra lines; treating as multi-line",
+                        (trim_cmd && *trim_cmd) ? trim_cmd : "(null)");
+            g_free(trim_cmd);
+        }
+
+        expect_rprt = (read_mode == RIGCTLD_READ_MULTILINE_RPRT) ||
+            (read_mode == RIGCTLD_READ_SINGLE && used_multiline);
+
+        if (expect_rprt && !saw_rprt)
+        {
+            gchar *trim_cmd = g_strdup(buff);
+
+            if (trim_cmd)
+            {
+                g_strchomp(trim_cmd);
+                g_strstrip(trim_cmd);
+            }
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "rigctld reply missing RPRT terminator cmd=%s; draining",
+                        (trim_cmd && *trim_cmd) ? trim_cmd : "(null)");
+            rig_term_log(ctrl, "gpredict:err",
+                         "rigctld reply missing RPRT terminator cmd=%s; draining",
+                         (trim_cmd && *trim_cmd) ? trim_cmd : "(null)");
+            g_free(trim_cmd);
+
+            rigctld_drain_idle(sock, rxbuf, RIGCTLD_DUMP_STATE_IDLE_MS,
+                               &drain_err);
+            if (drain_err != 0)
+            {
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rigctld drain failed: %s",
+                            strerror(drain_err));
+            }
+        }
+    }
     if (size == 0)
     {
         gchar *trim_cmd = g_strdup(buff);
@@ -3312,6 +4189,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
         g_free(trim_cmd);
         rigctrl_schedule_status(ctrl, _("Rigctld closed connection"), TRUE);
         rigctrl_handle_socket_error(ctrl, sock, "recv");
+        rigctld_io_lock_release();
         return FALSE;
     }
     else
@@ -3359,14 +4237,30 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     if (!rprt_error)
         rigctrl_schedule_status(ctrl, _("OK"), FALSE);
 
+    rigctld_io_lock_release();
     return TRUE;
 }
 
-static gboolean send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
-                                     gchar * buff, gchar * buffout,
-                                     gint sizeout)
+static gboolean send_rigctld_command_internal(GtkRigCtrl * ctrl, gint sock,
+                                              gchar * buff, gchar * buffout,
+                                              gint sizeout,
+                                              gboolean allow_unready)
 {
     gboolean        retval;
+    RigSession     *session = rig_session_for_socket(ctrl, sock);
+
+    if (!allow_unready && session != NULL &&
+        session->state != RIG_SESSION_READY)
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rig session (%s) not ready; skipping cmd=%s",
+                    session->label ? session->label : "rig",
+                    buff ? buff : "(null)");
+        rig_term_log(ctrl, "gpredict:err",
+                     "rig session (%s) not ready; cmd skipped",
+                     session->label ? session->label : "rig");
+        return FALSE;
+    }
 
     /* Enter critical section! */
     g_mutex_lock(&ctrl->writelock);
@@ -3376,6 +4270,31 @@ static gboolean send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     /* Leave critical section! */
     g_mutex_unlock(&ctrl->writelock);
     return (retval);
+}
+
+static gboolean send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
+                                     gchar * buff, gchar * buffout,
+                                     gint sizeout)
+{
+    return send_rigctld_command_internal(ctrl, sock, buff, buffout,
+                                         sizeout, FALSE);
+}
+
+static gboolean rig_session_send_command(GtkRigCtrl *ctrl, gint sock,
+                                         const gchar *cmd,
+                                         gchar *buffout, gint sizeout)
+{
+    gchar *tmp = NULL;
+    gboolean ok;
+
+    if (cmd == NULL)
+        return FALSE;
+
+    tmp = g_strdup(cmd);
+    ok = send_rigctld_command_internal(ctrl, sock, tmp, buffout, sizeout, TRUE);
+    g_free(tmp);
+
+    return ok;
 }
 
 static inline gboolean check_set_response(gchar * buffback, gboolean retcode,
@@ -3429,6 +4348,303 @@ static const gchar *vfo_name(vfo_t vfo)
     default:
         return "Unknown";
     }
+}
+
+static gboolean rigctld_vfo_map_refs(GtkRigCtrl *ctrl, gint sock,
+                                     gchar ***main_ptr,
+                                     gchar ***sub_ptr,
+                                     gboolean **logged_ptr)
+{
+    if (ctrl == NULL || main_ptr == NULL || sub_ptr == NULL || logged_ptr == NULL)
+        return FALSE;
+
+    if (sock == ctrl->sock)
+    {
+        *main_ptr = &ctrl->rigctld_vfo_main_token;
+        *sub_ptr = &ctrl->rigctld_vfo_sub_token;
+        *logged_ptr = &ctrl->rigctld_vfo_map_logged;
+        return TRUE;
+    }
+    if (sock == ctrl->sock2)
+    {
+        *main_ptr = &ctrl->rigctld_vfo_main_token2;
+        *sub_ptr = &ctrl->rigctld_vfo_sub_token2;
+        *logged_ptr = &ctrl->rigctld_vfo_map_logged2;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void rigctld_clear_vfo_map_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    gchar **main_ptr = NULL;
+    gchar **sub_ptr = NULL;
+    gboolean *logged_ptr = NULL;
+
+    if (!rigctld_vfo_map_refs(ctrl, sock, &main_ptr, &sub_ptr, &logged_ptr))
+        return;
+
+    g_free(*main_ptr);
+    g_free(*sub_ptr);
+    *main_ptr = NULL;
+    *sub_ptr = NULL;
+    if (logged_ptr)
+        *logged_ptr = FALSE;
+}
+
+static void rigctld_reset_offset_state_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (sock == ctrl->sock)
+    {
+        ctrl->xit_supported = TRUE;
+        ctrl->last_rit_valid = FALSE;
+        ctrl->last_xit_valid = FALSE;
+        ctrl->last_rit_offset = 0;
+        ctrl->last_xit_offset = 0;
+    }
+    else if (sock == ctrl->sock2)
+    {
+        ctrl->xit_supported2 = TRUE;
+        ctrl->last_xit_valid2 = FALSE;
+        ctrl->last_xit_offset2 = 0;
+    }
+}
+
+static gboolean rigctld_fetch_frequency(GtkRigCtrl *ctrl, gint sock,
+                                        gdouble *freq_out)
+{
+    gchar buffback[128];
+    gboolean retcode;
+    gchar **vbuff = NULL;
+    gdouble freq = 0.0;
+
+    if (freq_out)
+        *freq_out = 0.0;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    retcode = send_rigctld_command(ctrl, sock, "f\n", buffback, sizeof(buffback));
+    retcode = check_get_response(buffback, retcode, __func__);
+    if (!retcode)
+        return FALSE;
+
+    vbuff = g_strsplit(buffback, "\n", 3);
+    if (vbuff[0])
+        freq = g_ascii_strtod(vbuff[0], NULL);
+    g_strfreev(vbuff);
+
+    if (freq_out)
+        *freq_out = freq;
+
+    return freq > 0.0;
+}
+
+static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
+                                      const gchar *token, gdouble freq)
+{
+    gchar *buff = NULL;
+    gchar buffback[128];
+    gboolean retcode = FALSE;
+    gdouble verify = 0.0;
+
+    if (ctrl == NULL || token == NULL || *token == '\0')
+        return FALSE;
+    if (freq <= 0.0)
+        return FALSE;
+
+    buff = g_strdup_printf("V %s\x0a", token);
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, sizeof(buffback));
+    g_free(buff);
+    retcode = check_set_response(buffback, retcode, __func__);
+    if (!retcode)
+        return FALSE;
+
+    buff = g_strdup_printf("F %.0f\x0a", freq);
+    retcode = send_rigctld_command(ctrl, sock, buff, buffback, sizeof(buffback));
+    g_free(buff);
+    retcode = check_set_response(buffback, retcode, __func__);
+    if (!retcode)
+        return FALSE;
+
+    if (!rigctld_fetch_frequency(ctrl, sock, &verify))
+        return FALSE;
+
+    return fabs(verify - freq) <= 1.0;
+}
+
+static gboolean rigctld_prefer_main_sub_tokens(const GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return FALSE;
+
+    if (is_full_duplex_main_sub_configured(ctrl->conf))
+        return TRUE;
+
+    return (ctrl->conf->uplink_vfo == VFO_MAIN &&
+            ctrl->conf->downlink_vfo == VFO_SUB);
+}
+
+static gboolean rigctld_force_main_sub_tokens(const GtkRigCtrl *ctrl,
+                                              const RigSession *session)
+{
+    if (ctrl == NULL || session == NULL)
+        return FALSE;
+
+    if (!rigctld_prefer_main_sub_tokens(ctrl))
+        return FALSE;
+
+    return session->rig_model == RIGCTLD_MODEL_IC9700;
+}
+
+static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
+                                              const RigSession *session,
+                                              vfo_t vfo,
+                                              gint rprt_code)
+{
+    if (ctrl == NULL || session == NULL)
+        return FALSE;
+
+    if (!rigctld_force_main_sub_tokens(ctrl, session))
+        return FALSE;
+
+    if (vfo != VFO_MAIN && vfo != VFO_SUB)
+        return FALSE;
+
+    return rprt_code != 0;
+}
+
+static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
+{
+    static const gchar *main_candidates_default[] =
+        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates_default[] =
+        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+    static const gchar *main_candidates_prefer[] =
+        { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
+    static const gchar *sub_candidates_prefer[] =
+        { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+    static const gchar *main_candidates_strict[] =
+        { "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates_strict[] =
+        { "Sub", "SubA", "VFO_SUB", NULL };
+    const gchar *fallback = vfo_name(vfo);
+    const gchar * const *candidates = NULL;
+    gchar **main_ptr = NULL;
+    gchar **sub_ptr = NULL;
+    gboolean *logged_ptr = NULL;
+    gchar **target_ptr = NULL;
+    RigSession *session = rig_session_for_socket(ctrl, sock);
+    gboolean prefer_main_sub = rigctld_prefer_main_sub_tokens(ctrl);
+    gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
+
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return fallback;
+
+    if (vfo == VFO_NONE)
+        return NULL;
+
+    if (!is_full_duplex_main_sub_configured(ctrl->conf))
+        return fallback;
+
+    if (vfo != VFO_MAIN && vfo != VFO_SUB)
+        return fallback;
+
+    if (!rigctld_vfo_map_refs(ctrl, sock, &main_ptr, &sub_ptr, &logged_ptr))
+        return fallback;
+
+    if (vfo == VFO_MAIN)
+    {
+        if (force_main_sub)
+            candidates = main_candidates_strict;
+        else if (prefer_main_sub)
+            candidates = main_candidates_prefer;
+        else
+            candidates = main_candidates_default;
+        target_ptr = main_ptr;
+    }
+    else
+    {
+        if (force_main_sub)
+            candidates = sub_candidates_strict;
+        else if (prefer_main_sub)
+            candidates = sub_candidates_prefer;
+        else
+            candidates = sub_candidates_default;
+        target_ptr = sub_ptr;
+    }
+
+    if (target_ptr != NULL && *target_ptr != NULL)
+    {
+        if (force_main_sub &&
+            (g_ascii_strcasecmp(*target_ptr, "VFOA") == 0 ||
+             g_ascii_strcasecmp(*target_ptr, "VFOB") == 0))
+        {
+            g_free(*target_ptr);
+            *target_ptr = NULL;
+        }
+        else
+        {
+            return *target_ptr;
+        }
+    }
+
+    {
+        gdouble freq = 0.0;
+
+        if (!rigctld_fetch_frequency(ctrl, sock, &freq))
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        "FULL-DUPLEX MAIN/SUB: failed to read frequency for %s mapping",
+                        vfo == VFO_MAIN ? "Main" : "Sub");
+            rig_term_log(ctrl, "gpredict:err",
+                         "failed to read frequency for %s mapping",
+                         vfo == VFO_MAIN ? "Main" : "Sub");
+            return NULL;
+        }
+
+    for (gint i = 0; candidates[i] != NULL; i++)
+    {
+        if (session != NULL && session->vfo_candidates->len > 0 &&
+            !rig_session_vfo_candidate_exists(session, candidates[i]))
+            continue;
+
+        if (rigctld_try_vfo_token(ctrl, sock, candidates[i], freq))
+        {
+            *target_ptr = g_strdup(candidates[i]);
+            break;
+        }
+    }
+    }
+
+    if (target_ptr == NULL || *target_ptr == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "FULL-DUPLEX MAIN/SUB: unable to map %s VFO token",
+                    vfo == VFO_MAIN ? "Main" : "Sub");
+        rig_term_log(ctrl, "gpredict:err",
+                     "unable to map %s VFO token",
+                     vfo == VFO_MAIN ? "Main" : "Sub");
+        return NULL;
+    }
+
+    if (logged_ptr && !*logged_ptr && main_ptr != NULL && sub_ptr != NULL &&
+        *main_ptr != NULL && *sub_ptr != NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "FULL-DUPLEX MAIN/SUB: mapped Main->%s Sub->%s",
+                    *main_ptr, *sub_ptr);
+        rig_term_log(ctrl, "gpredict",
+                     "mapped Main->%s Sub->%s",
+                     *main_ptr, *sub_ptr);
+        *logged_ptr = TRUE;
+    }
+
+    return *target_ptr;
 }
 
 static void rigctrl_log_config(GtkRigCtrl *ctrl,
@@ -3619,9 +4835,14 @@ static gboolean rigctrl_get_cached_freq(gint sock, const gchar *tag,
 static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
                                      gdouble freq, vfo_t vfo)
 {
-    gchar          *buff;
     gchar           buffback[128];
     gboolean        retcode;
+    const gchar    *token = NULL;
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
+    RigSession     *session = rig_session_for_socket(ctrl, sock);
+    gchar          *freq_cmd = NULL;
+    gint            rprt_code = 0;
+    gboolean        has_rprt = FALSE;
 
     if (!ctrl->conf->vfo_opt)
     {
@@ -3629,14 +4850,99 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
                     "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; sending explicit VFO");
     }
 
-    buff = g_strdup_printf("F %s %10.0f\x0a", vfo_name(vfo), freq);
+    token = rigctld_vfo_token(ctrl, sock, vfo);
+    if (token == NULL)
+        return FALSE;
 
-    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+    if (strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        gchar vcmd[64];
+        gchar vcmd_log[64];
+
+        g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+        g_strlcpy(vcmd_log, vcmd, sizeof(vcmd_log));
+        g_strchomp(vcmd_log);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: select vfo request=%s token=%s cmd='%s'",
+                    vfo_name(vfo), token, vcmd_log);
+        retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+        retcode = check_set_response(buffback, retcode, __func__);
+        if (!retcode)
+            return FALSE;
+        freq_cmd = g_strdup_printf("F %10.0f\x0a", freq);
+    }
+    else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        freq_cmd = g_strdup_printf("F %s %10.0f\x0a", token, freq);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
+                    rig_strategy_name(strategy));
+        freq_cmd = g_strdup_printf("F %10.0f\x0a", freq);
+    }
+
+    if (freq_cmd != NULL)
+    {
+        gchar *cmd_log = g_strdup(freq_cmd);
+        g_strchomp(cmd_log);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: send freq cmd='%s' request=%s token=%s",
+                    cmd_log, vfo_name(vfo),
+                    token ? token : "(null)");
+        g_free(cmd_log);
+    }
+
+    retcode = send_rigctld_command(ctrl, sock, freq_cmd, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 "FULL-DUPLEX MAIN/SUB: set %s %.0f -> %s",
                 vfo_name(vfo), freq, buffback);
-    g_free(buff);
+    if (retcode)
+        has_rprt = rig_parse_rprt_code(buffback, &rprt_code);
 
+    if (retcode && has_rprt &&
+        rigctld_should_retry_main_sub(ctrl, session, vfo, rprt_code))
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "FULL-DUPLEX MAIN/SUB: set %s rejected (RPRT %d); retrying",
+                    vfo_name(vfo), rprt_code);
+        if (token != NULL && *token != '\0')
+        {
+            gchar vcmd[64];
+            gchar vcmd_log[64];
+
+            g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+            g_strlcpy(vcmd_log, vcmd, sizeof(vcmd_log));
+            g_strchomp(vcmd_log);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "FULL-DUPLEX MAIN/SUB: retry select vfo request=%s token=%s cmd='%s'",
+                        vfo_name(vfo), token, vcmd_log);
+            retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+            retcode = check_set_response(buffback, retcode, __func__);
+            if (!retcode)
+            {
+                g_free(freq_cmd);
+                return FALSE;
+            }
+        }
+
+        if (freq_cmd != NULL)
+        {
+            gchar *cmd_log = g_strdup(freq_cmd);
+            g_strchomp(cmd_log);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "FULL-DUPLEX MAIN/SUB: retry freq cmd='%s' request=%s token=%s",
+                        cmd_log, vfo_name(vfo),
+                        token ? token : "(null)");
+            g_free(cmd_log);
+        }
+        retcode = send_rigctld_command(ctrl, sock, freq_cmd, buffback, 128);
+        g_free(freq_cmd);
+        return check_set_response(buffback, retcode, __func__);
+    }
+
+    g_free(freq_cmd);
     return check_set_response(buffback, retcode, __func__);
 }
 
@@ -3649,6 +4955,8 @@ static gboolean get_freq_simplex_vfo_internal(GtkRigCtrl *ctrl, gint sock,
     gboolean        retcode;
     gboolean        retval = TRUE;
     gchar         **vbuff;
+    const gchar    *token = NULL;
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
     if (!ctrl->conf->vfo_opt)
     {
@@ -3656,7 +4964,49 @@ static gboolean get_freq_simplex_vfo_internal(GtkRigCtrl *ctrl, gint sock,
                     "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; requesting explicit VFO");
     }
 
-    buff = g_strdup_printf("f %s\x0a", vfo_name(vfo));
+    token = rigctld_vfo_token(ctrl, sock, vfo);
+    if (token == NULL)
+        return FALSE;
+
+    if (strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        gchar vcmd[64];
+        gchar vcmd_log[64];
+
+        g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+        g_strlcpy(vcmd_log, vcmd, sizeof(vcmd_log));
+        g_strchomp(vcmd_log);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: select vfo request=%s token=%s cmd='%s'",
+                    vfo_name(vfo), token, vcmd_log);
+        retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+        retcode = check_set_response(buffback, retcode, __func__);
+        if (!retcode)
+            return FALSE;
+        buff = g_strdup_printf("f\x0a");
+    }
+    else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        buff = g_strdup_printf("f %s\x0a", token);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
+                    rig_strategy_name(strategy));
+        buff = g_strdup_printf("f\x0a");
+    }
+
+    if (buff != NULL)
+    {
+        gchar *cmd_log = g_strdup(buff);
+        g_strchomp(cmd_log);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: send freq cmd='%s' request=%s token=%s",
+                    cmd_log, vfo_name(vfo),
+                    token ? token : "(null)");
+        g_free(cmd_log);
+    }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
@@ -3716,6 +5066,8 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     gchar          *buff;
     gchar           buffback[128];
     gboolean        retcode;
+    const gchar    *token = NULL;
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
     if (!ctrl->conf->vfo_opt)
     {
@@ -3723,7 +5075,32 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
                     "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; sending explicit VFO");
     }
 
-    buff = g_strdup_printf("I %s %10.0f\x0a", vfo_name(vfo), freq);
+    token = rigctld_vfo_token(ctrl, sock, vfo);
+    if (token == NULL)
+        return FALSE;
+
+    if (strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        gchar vcmd[64];
+
+        g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+        retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+        retcode = check_set_response(buffback, retcode, __func__);
+        if (!retcode)
+            return FALSE;
+        buff = g_strdup_printf("I %10.0f\x0a", freq);
+    }
+    else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        buff = g_strdup_printf("I %s %10.0f\x0a", token, freq);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
+                    rig_strategy_name(strategy));
+        buff = g_strdup_printf("I %10.0f\x0a", freq);
+    }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -3743,6 +5120,8 @@ static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
     gboolean        retcode;
     gboolean        retval = TRUE;
     gchar         **vbuff;
+    const gchar    *token = NULL;
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
     if (freq == NULL)
     {
@@ -3757,7 +5136,32 @@ static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
                     "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; requesting explicit VFO");
     }
 
-    buff = g_strdup_printf("i %s\x0a", vfo_name(vfo));
+    token = rigctld_vfo_token(ctrl, sock, vfo);
+    if (token == NULL)
+        return FALSE;
+
+    if (strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        gchar vcmd[64];
+
+        g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+        retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+        retcode = check_set_response(buffback, retcode, __func__);
+        if (!retcode)
+            return FALSE;
+        buff = g_strdup_printf("i\x0a");
+    }
+    else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        buff = g_strdup_printf("i %s\x0a", token);
+    }
+    else
+    {
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
+                    rig_strategy_name(strategy));
+        buff = g_strdup_printf("i\x0a");
+    }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
@@ -3907,6 +5311,14 @@ static gboolean rig_ctrl_timeout_cb(gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
 
+    if (ctrl == NULL || ctrl->destroying || !ctrl->engaged ||
+        ctrl->conn_state != RIGCTRL_CONN_CONNECTED)
+    {
+        if (ctrl != NULL)
+            ctrl->timerid = 0;
+        return G_SOURCE_REMOVE;
+    }
+
     if (ctrl->conf == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -4006,7 +5418,7 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (ptt == FALSE) && target_ok &&
-        (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
+        rigctrl_should_send_freq(ctrl, TRUE, tmpfreq))
     {
         {
             gboolean set_ok;
@@ -4016,6 +5428,7 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                 use_sat_vfo ? vfo_name(sat_vfo) :
                 (ctrl->conf->vfo_opt ? "currVFO" : "default");
 
+            ctrl->last_send_down_us = g_get_monotonic_time();
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: side=RX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
                         base_freq, doppler_hz, sent_freq, vfo_label);
@@ -4159,7 +5572,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && (ptt == TRUE) && target_ok &&
-        (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+        rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
     {
         {
             gboolean set_ok;
@@ -4168,6 +5581,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
             const gchar *vfo_label =
                 ctrl->conf->vfo_opt ? "currVFO" : "default";
 
+            ctrl->last_send_up_us = g_get_monotonic_time();
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: side=TX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
                         base_freq, doppler_hz, sent_freq, vfo_label);
@@ -4317,8 +5731,9 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && target_ok &&
-        (fabs(ctrl->lasttxf - tmpfreq) >= 10.0))
+        rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
     {
+        ctrl->last_send_up_us = g_get_monotonic_time();
         if (set_freq_toggle(ctrl, ctrl->sock, tmpfreq))
         {
             /* reset error counter */
@@ -4388,6 +5803,11 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX skipped (out of range)");
         }
+        else if (!rigctrl_should_send_freq(ctrl, TRUE, rigfreqd))
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX skipped (deadband/rate)");
+        }
         else
         {
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -4397,6 +5817,7 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
                         rigfreqd,
                         vfo_name(plan.downlink_vfo));
 
+            ctrl->last_send_down_us = g_get_monotonic_time();
             set_ok = set_freq_simplex_vfo(ctrl, ctrl->sock,
                                           rigfreqd, plan.downlink_vfo);
             if (set_ok)
@@ -4444,6 +5865,11 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX skipped (out of range)");
         }
+        else if (!rigctrl_should_send_freq(ctrl, FALSE, rigfrequ))
+        {
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX skipped (deadband/rate)");
+        }
         else
         {
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -4453,6 +5879,7 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl)
                         rigfrequ,
                         vfo_name(plan.uplink_vfo));
 
+            ctrl->last_send_up_us = g_get_monotonic_time();
             set_ok = set_freq_simplex_vfo(ctrl, ctrl->sock,
                                           rigfrequ, plan.uplink_vfo);
             if (set_ok)
@@ -4567,7 +5994,7 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && target_ok &&
-        (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+        rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
     {
         {
             gboolean set_ok;
@@ -4577,6 +6004,7 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                 use_sat_vfo ? vfo_name(sat_vfo) :
                 (ctrl->conf->vfo_opt ? "currVFO" : "default");
 
+            ctrl->last_send_up_us = g_get_monotonic_time();
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: side=TX base=%.0f doppler=%.0f sent=%.0f vfo=%s",
                         base_freq, doppler_hz, sent_freq, vfo_label);
@@ -4680,8 +6108,9 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
         gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
 
         if ((ctrl->engaged) && up_ok &&
-            (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+            rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
         {
+            ctrl->last_send_up_us = g_get_monotonic_time();
             if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
             {
                 ctrl->errcnt = 0;
@@ -4716,8 +6145,9 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
     gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), tmpfreq);
 
     if ((ctrl->engaged) && down_ok &&
-        (fabs(ctrl->lastrxf - tmpfreq) >= 1.0))
+        rigctrl_should_send_freq(ctrl, TRUE, tmpfreq))
     {
+        ctrl->last_send_down_us = g_get_monotonic_time();
         if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
         {
             ctrl->errcnt = 0;
@@ -4767,8 +6197,9 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
     gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), tmpfreq);
 
     if ((ctrl->engaged) && up_ok &&
-        (fabs(ctrl->lasttxf - tmpfreq) >= 1.0))
+        rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
     {
+        ctrl->last_send_up_us = g_get_monotonic_time();
         if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
         {
             ctrl->errcnt = 0;
@@ -4868,6 +6299,75 @@ static radio_conf_t *get_conf_for_socket(GtkRigCtrl * ctrl, gint sock)
     return ctrl->conf;
 }
 
+static RigSession *rig_session_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    if (ctrl == NULL)
+        return NULL;
+
+    if (ctrl->rig_session2 != NULL && sock == ctrl->sock2)
+        return ctrl->rig_session2;
+
+    return ctrl->rig_session;
+}
+
+static rig_strategy_t rig_session_strategy(GtkRigCtrl *ctrl, gint sock)
+{
+    RigSession *session = rig_session_for_socket(ctrl, sock);
+
+    if (session == NULL)
+        return RIG_STRATEGY_PLAIN_FREQ;
+
+    return session->strategy;
+}
+
+static const gchar *rig_session_default_vfo_token(RigSession *session)
+{
+    if (session == NULL)
+        return "currVFO";
+
+    if (session->default_vfo_token != NULL)
+        return session->default_vfo_token;
+
+    return "currVFO";
+}
+
+static gboolean rigctld_xit_supported_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    if (sock == ctrl->sock2)
+        return ctrl->xit_supported2;
+
+    return ctrl->xit_supported;
+}
+
+static void rigctld_disable_xit_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (sock == ctrl->sock2)
+    {
+        if (!ctrl->xit_supported2)
+            return;
+        ctrl->xit_supported2 = FALSE;
+    }
+    else
+    {
+        if (!ctrl->xit_supported)
+            return;
+        ctrl->xit_supported = FALSE;
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "XIT unsupported; disabling for %s rig",
+                sock == ctrl->sock2 ? "uplink" : "primary");
+    rig_term_log(ctrl, "gpredict",
+                 "XIT unsupported; disabling for %s rig",
+                 sock == ctrl->sock2 ? "uplink" : "primary");
+}
+
 static gboolean set_rit(GtkRigCtrl * ctrl, gint sock, gdouble hz)
 {
     gchar          *buff;
@@ -4875,6 +6375,9 @@ static gboolean set_rit(GtkRigCtrl * ctrl, gint sock, gdouble hz)
     gboolean        retcode;
     radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
     gint            offset = (gint) llround(hz);
+
+    if (ctrl->last_rit_valid && offset == ctrl->last_rit_offset)
+        return FALSE;
 
     if (conf != NULL && conf->vfo_opt)
         buff = g_strdup_printf("J currVFO %d\x0a", offset);
@@ -4892,6 +6395,12 @@ static gboolean set_rit(GtkRigCtrl * ctrl, gint sock, gdouble hz)
                     __func__, offset);
     }
 
+    if (retcode)
+    {
+        ctrl->last_rit_valid = TRUE;
+        ctrl->last_rit_offset = offset;
+    }
+
     return retcode;
 }
 
@@ -4902,6 +6411,27 @@ static gboolean set_xit(GtkRigCtrl * ctrl, gint sock, gdouble hz)
     gboolean        retcode;
     radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
     gint            offset = (gint) llround(hz);
+    gint            rprt = 0;
+    gboolean       *valid_ptr = NULL;
+    gint           *last_ptr = NULL;
+
+    if (sock == ctrl->sock2)
+    {
+        valid_ptr = &ctrl->last_xit_valid2;
+        last_ptr = &ctrl->last_xit_offset2;
+    }
+    else
+    {
+        valid_ptr = &ctrl->last_xit_valid;
+        last_ptr = &ctrl->last_xit_offset;
+    }
+
+    if (!rigctld_xit_supported_for_socket(ctrl, sock))
+        return FALSE;
+
+    if (valid_ptr != NULL && last_ptr != NULL &&
+        *valid_ptr && offset == *last_ptr)
+        return FALSE;
 
     if (conf != NULL && conf->vfo_opt)
         buff = g_strdup_printf("Z currVFO %d\x0a", offset);
@@ -4911,12 +6441,24 @@ static gboolean set_xit(GtkRigCtrl * ctrl, gint sock, gdouble hz)
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
 
+    if (retcode && rig_parse_rprt_code(buffback, &rprt) && rprt == -11)
+    {
+        rigctld_disable_xit_for_socket(ctrl, sock);
+        return FALSE;
+    }
+
     retcode = check_set_response(buffback, retcode, __func__);
     if (retcode == FALSE)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: Failed to set XIT offset to %d Hz"),
                     __func__, offset);
+    }
+
+    if (retcode && valid_ptr != NULL && last_ptr != NULL)
+    {
+        *valid_ptr = TRUE;
+        *last_ptr = offset;
     }
 
     return retcode;
@@ -4941,6 +6483,9 @@ static void apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
     {
         tx_support = rx_support;
     }
+
+    if (is_full_duplex_main_sub_configured(ctrl->conf))
+        return;
 
     if (rx_support && ctrl->sock >= 0)
         applied_rit = set_rit(ctrl, ctrl->sock, rit);
@@ -5045,11 +6590,34 @@ static gboolean set_freq_simplex(GtkRigCtrl * ctrl, gint sock, gdouble freq)
     gchar          *buff;
     gchar           buffback[128];
     gboolean        retcode;
+    RigSession     *session = rig_session_for_socket(ctrl, sock);
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("F currVFO %10.0f\x0a", freq);
+    if (strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        const gchar *token = rig_session_default_vfo_token(session);
+
+        if (token != NULL && *token != '\0')
+        {
+            gchar vcmd[64];
+
+            g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+            retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+            retcode = check_set_response(buffback, retcode, __func__);
+            if (!retcode)
+                return FALSE;
+        }
+    }
+
+    if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        const gchar *token = rig_session_default_vfo_token(session);
+        buff = g_strdup_printf("F %s %10.0f\x0a", token, freq);
+    }
     else
+    {
         buff = g_strdup_printf("F %10.0f\x0a", freq);
+    }
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
 
@@ -5067,17 +6635,22 @@ static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gdouble freq)
     gchar          *buff;
     gchar           buffback[128];
     gboolean        retcode;
+    RigSession     *session = rig_session_for_socket(ctrl, sock);
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
     /* send command */
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: set_freq_toggle vfo_opt=%d freq=%.0f"),
                 __func__, ctrl->conf->vfo_opt, freq);
-    if (ctrl->conf->vfo_opt)
+    if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
-        buff = g_strdup_printf("I VFOA %10.0f\x0a", freq);
+        const gchar *token = rig_session_default_vfo_token(session);
+        buff = g_strdup_printf("I %s %10.0f\x0a", token, freq);
     }
     else
+    {
         buff = g_strdup_printf("I %10.0f\x0a", freq);
+    }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
@@ -5143,11 +6716,34 @@ static gboolean get_freq_simplex_internal(GtkRigCtrl * ctrl, gint sock,
     gboolean        retval = TRUE;
     const gchar    *label = ctrl->conf->vfo_opt ? "currVFO" : "default";
     const gint      cache_key = -1;
+    RigSession     *session = rig_session_for_socket(ctrl, sock);
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("f currVFO\x0a");
+    if (strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        const gchar *token = rig_session_default_vfo_token(session);
+
+        if (token != NULL && *token != '\0')
+        {
+            gchar vcmd[64];
+
+            g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+            retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
+            retcode = check_set_response(buffback, retcode, __func__);
+            if (!retcode)
+                goto fallback;
+        }
+    }
+
+    if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        const gchar *token = rig_session_default_vfo_token(session);
+        buff = g_strdup_printf("f %s\x0a", token);
+    }
     else
+    {
         buff = g_strdup_printf("f\x0a");
+    }
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
     if (retcode)
@@ -5171,6 +6767,7 @@ static gboolean get_freq_simplex_internal(GtkRigCtrl * ctrl, gint sock,
         return TRUE;
     }
 
+fallback:
     if (allow_cache && rigctrl_get_cached_freq(sock, "f", cache_key, freq))
     {
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -5197,39 +6794,6 @@ static gboolean get_freq_simplex_strict(GtkRigCtrl * ctrl, gint sock,
 }
 
 /*
- * Get vfo option
- *
- * Returns TRUE if the vfo option enabled was successful, FALSE otherwise
- */
-static gboolean get_vfo_opt(GtkRigCtrl * ctrl, gint sock)
-{
-    gchar          *buff;
-    gchar           buffback[128];
-    gboolean        retcode;
-    gboolean        retval = TRUE;
-
-    buff = g_strdup_printf("\\set_vfo_opt 1\x0a");
-    send_rigctld_command(ctrl, sock, buff, buffback, 128);
-    // we don't really care about the return from set_vto_opt
-    // we'll check to see if it worked next
-    buff = g_strdup_printf("\\chk_vfo\x0a");
-    retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
-    retcode = check_get_response(buffback, retcode, __func__);
-    if (retcode)
-    {
-        if (buffback[0]=='1') return TRUE;
-        else return FALSE;
-    }
-    else
-    {
-        retval = FALSE;
-    }
-
-    g_free(buff);
-    return retval;
-}
-
-/*
  * Get frequency when the radio is working toggle
  *
  * Returns TRUE if the operation was successful, FALSE otherwise
@@ -5243,6 +6807,8 @@ static gboolean get_freq_toggle_internal(GtkRigCtrl * ctrl, gint sock,
     gboolean        retval = TRUE;
     const gchar    *label = ctrl->conf->vfo_opt ? "currVFO" : "default";
     const gint      cache_key = -2;
+    RigSession     *session = rig_session_for_socket(ctrl, sock);
+    rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
 
     if (freq == NULL)
     {
@@ -5252,10 +6818,15 @@ static gboolean get_freq_toggle_internal(GtkRigCtrl * ctrl, gint sock,
     }
 
     /* send command */
-    if (ctrl->conf->vfo_opt)
-        buff = g_strdup_printf("i currVFO\x0a");
+    if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        const gchar *token = rig_session_default_vfo_token(session);
+        buff = g_strdup_printf("i %s\x0a", token);
+    }
     else
+    {
         buff = g_strdup_printf("i\x0a");
+    }
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
     if (retcode)
@@ -6371,12 +7942,370 @@ static void rigctld_extract_first_lines(const gchar *text,
         g_free(line2);
 }
 
-static gboolean close_rigctld_socket(gint * sock, gboolean send_quit)
+static gboolean rig_session_vfo_candidate_exists(const RigSession *session,
+                                                 const gchar *token)
+{
+    if (session == NULL || token == NULL)
+        return FALSE;
+
+    for (guint i = 0; i < session->vfo_candidates->len; i++)
+    {
+        const gchar *entry = g_ptr_array_index(session->vfo_candidates, i);
+        if (entry != NULL && g_ascii_strcasecmp(entry, token) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void rig_session_add_vfo_candidate(RigSession *session,
+                                          const gchar *token)
+{
+    gchar *trimmed = NULL;
+
+    if (session == NULL || token == NULL || *token == '\0')
+        return;
+
+    trimmed = g_strdup(token);
+    g_strstrip(trimmed);
+    if (*trimmed == '\0')
+    {
+        g_free(trimmed);
+        return;
+    }
+
+    if (rig_session_vfo_candidate_exists(session, trimmed))
+    {
+        g_free(trimmed);
+        return;
+    }
+
+    g_ptr_array_add(session->vfo_candidates, trimmed);
+}
+
+static void rig_session_parse_vfo_list(RigSession *session, const gchar *line)
+{
+    const gchar *sep = NULL;
+    gchar *list = NULL;
+    gchar **parts = NULL;
+
+    if (session == NULL || line == NULL)
+        return;
+
+    sep = strchr(line, '=');
+    if (sep == NULL)
+        sep = strchr(line, ':');
+    if (sep == NULL || *(sep + 1) == '\0')
+        return;
+
+    list = g_strdup(sep + 1);
+    g_strstrip(list);
+    parts = g_strsplit_set(list, " \t,", -1);
+    for (gint i = 0; parts[i] != NULL; i++)
+    {
+        if (parts[i][0] == '\0')
+            continue;
+        rig_session_add_vfo_candidate(session, parts[i]);
+    }
+
+    g_strfreev(parts);
+    g_free(list);
+}
+
+static void rig_session_parse_dump_state(RigSession *session, const gchar *text)
+{
+    gchar **lines = NULL;
+
+    if (session == NULL || text == NULL || *text == '\0')
+        return;
+
+    (void) parse_dump_state_model_id(text, &session->rig_model);
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *line = g_strstrip(lines[i]);
+        gchar *lower = NULL;
+
+        if (line[0] == '\0')
+            continue;
+
+        lower = g_ascii_strdown(line, -1);
+        if (g_str_has_prefix(lower, "has_get_vfo"))
+            session->has_get_vfo = g_strrstr(lower, "1") != NULL;
+        if (g_str_has_prefix(lower, "has_set_vfo"))
+            session->has_set_vfo = g_strrstr(lower, "1") != NULL;
+        if (g_str_has_prefix(lower, "has_set_vfo_opt"))
+            session->has_set_vfo_opt = g_strrstr(lower, "1") != NULL;
+
+        if (g_strrstr(lower, "vfo list") != NULL ||
+            g_strrstr(lower, "vfo_list") != NULL)
+        {
+            rig_session_parse_vfo_list(session, line);
+        }
+
+        if (session->backend_version == NULL &&
+            (g_strrstr(lower, "hamlib") != NULL ||
+             g_strrstr(lower, "rigctld") != NULL ||
+             g_strrstr(lower, "backend") != NULL))
+        {
+            session->backend_version = g_strdup(line);
+        }
+
+        g_free(lower);
+    }
+    g_strfreev(lines);
+}
+
+static gboolean rig_session_try_get_freq(GtkRigCtrl *ctrl, gint sock,
+                                         const gchar *cmd,
+                                         gdouble *freq_out,
+                                         gchar *reply, gsize reply_len)
+{
+    gboolean ok;
+
+    if (freq_out)
+        *freq_out = 0.0;
+    if (reply && reply_len > 0)
+        reply[0] = '\0';
+
+    ok = rig_session_send_command(ctrl, sock, cmd, reply, (gint) reply_len);
+    if (!ok)
+        return FALSE;
+
+    return rigctld_parse_frequency_response(reply, freq_out);
+}
+
+static gboolean rig_session_try_set_ok(GtkRigCtrl *ctrl, gint sock,
+                                       const gchar *cmd,
+                                       gchar *reply, gsize reply_len)
+{
+    gboolean ok;
+
+    if (reply && reply_len > 0)
+        reply[0] = '\0';
+
+    ok = rig_session_send_command(ctrl, sock, cmd, reply, (gint) reply_len);
+    if (!ok)
+        return FALSE;
+
+    return check_set_response(reply, ok, __func__);
+}
+
+static gboolean rig_session_try_select_vfo(GtkRigCtrl *ctrl, gint sock,
+                                           const gchar *token)
+{
+    gchar cmd[64];
+    gchar reply[128];
+
+    if (token == NULL || *token == '\0')
+        return FALSE;
+
+    g_snprintf(cmd, sizeof(cmd), "V %s\x0a", token);
+    return rig_session_try_set_ok(ctrl, sock, cmd, reply, sizeof(reply));
+}
+
+static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
+                                                RigSession *session,
+                                                gint sock,
+                                                const radio_conf_t *conf)
+{
+    gchar dump_state[4096];
+    gchar reply[256];
+    gdouble freq = 0.0;
+    gboolean freq_ok = FALSE;
+    gboolean vfo_select_ok = FALSE;
+    gboolean vfo_opt_args_ok = FALSE;
+    gboolean vfo_opt_set = FALSE;
+
+    if (ctrl == NULL || session == NULL || conf == NULL)
+        return FALSE;
+
+    rig_session_set_state(ctrl, session, RIG_SESSION_PROBING,
+                          "probe start");
+
+    if (!rig_session_send_command(ctrl, sock, "\\dump_state\n",
+                                  dump_state, sizeof(dump_state)))
+    {
+        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                              "dump_state failed");
+        return FALSE;
+    }
+
+    rig_session_parse_dump_state(session, dump_state);
+    {
+        gint expected_model = rigctld_expected_model(conf);
+        if (expected_model > 0 && session->rig_model > 0 &&
+            session->rig_model != expected_model)
+        {
+            rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                                  "model mismatch expected=%d got=%d",
+                                  expected_model, session->rig_model);
+            return FALSE;
+        }
+    }
+
+    if (session->vfo_candidates->len == 0)
+    {
+        rig_session_add_vfo_candidate(session, "VFOA");
+        rig_session_add_vfo_candidate(session, "VFOB");
+        rig_session_add_vfo_candidate(session, "Main");
+        rig_session_add_vfo_candidate(session, "MainA");
+        rig_session_add_vfo_candidate(session, "Sub");
+        rig_session_add_vfo_candidate(session, "SubA");
+        rig_session_add_vfo_candidate(session, "currVFO");
+    }
+
+    rig_term_log(ctrl, "gpredict",
+                 "rig session (%s) dump_state model=%d backend=%s vfo_candidates=%u",
+                 session->label ? session->label : "rig",
+                 session->rig_model,
+                 session->backend_version ? session->backend_version : "(unknown)",
+                 session->vfo_candidates->len);
+
+    freq_ok = rig_session_try_get_freq(ctrl, sock, "f\n",
+                                       &freq, reply, sizeof(reply));
+
+    for (guint i = 0; i < session->vfo_candidates->len; i++)
+    {
+        const gchar *token = g_ptr_array_index(session->vfo_candidates, i);
+
+        if (!rig_session_try_select_vfo(ctrl, sock, token))
+            continue;
+
+        if (rig_session_try_get_freq(ctrl, sock, "f\n",
+                                     &freq, reply, sizeof(reply)))
+        {
+            vfo_select_ok = TRUE;
+            g_hash_table_replace(session->vfo_working, g_strdup(token),
+                                 GINT_TO_POINTER(1));
+            if (session->default_vfo_token == NULL)
+                session->default_vfo_token = g_strdup(token);
+        }
+    }
+
+    if (session->has_set_vfo_opt || conf->vfo_opt)
+    {
+        vfo_opt_set = rig_session_try_set_ok(ctrl, sock,
+                                             "\\set_vfo_opt 1\x0a",
+                                             reply, sizeof(reply));
+        if (vfo_opt_set)
+        {
+            session->vfo_opt_enabled = TRUE;
+            if (!rig_session_try_get_freq(ctrl, sock, "f\n",
+                                          &freq, reply, sizeof(reply)))
+            {
+                session->vfo_opt_unsafe = TRUE;
+                rig_session_try_set_ok(ctrl, sock,
+                                       "\\set_vfo_opt 0\x0a",
+                                       reply, sizeof(reply));
+                session->vfo_opt_enabled = FALSE;
+                rig_term_log(ctrl, "gpredict",
+                             "rig session (%s) vfo_opt unsafe; reverting",
+                             session->label ? session->label : "rig");
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "rig session (%s) vfo_opt unsafe; reverting",
+                            session->label ? session->label : "rig");
+            }
+            else
+            {
+                for (guint i = 0; i < session->vfo_candidates->len; i++)
+                {
+                    const gchar *token =
+                        g_ptr_array_index(session->vfo_candidates, i);
+                    gchar cmd[64];
+
+                    g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
+                    if (!rig_session_try_get_freq(ctrl, sock, cmd,
+                                                  &freq, reply, sizeof(reply)))
+                        continue;
+
+                    g_free(session->default_vfo_token);
+                    session->default_vfo_token = g_strdup(token);
+                    g_snprintf(cmd, sizeof(cmd), "F %s %.0f\x0a", token, freq);
+                    if (rig_session_try_set_ok(ctrl, sock, cmd,
+                                               reply, sizeof(reply)))
+                    {
+                        vfo_opt_args_ok = TRUE;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (vfo_opt_args_ok)
+    {
+        session->strategy = RIG_STRATEGY_VFO_OPT_ARGS;
+        if (session->default_vfo_token == NULL)
+            session->default_vfo_token = g_strdup("currVFO");
+    }
+    else if (vfo_select_ok)
+    {
+        session->strategy = RIG_STRATEGY_SELECT_VFO;
+        if (session->vfo_opt_enabled)
+        {
+            rig_session_try_set_ok(ctrl, sock, "\\set_vfo_opt 0\x0a",
+                                   reply, sizeof(reply));
+            session->vfo_opt_enabled = FALSE;
+        }
+        if (vfo_opt_set && !vfo_opt_args_ok)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "rig session (%s) vfo_opt args unsupported; using VFO selection",
+                        session->label ? session->label : "rig");
+        }
+    }
+    else if (freq_ok)
+    {
+        session->strategy = RIG_STRATEGY_PLAIN_FREQ;
+        if (session->vfo_opt_enabled)
+        {
+            rig_session_try_set_ok(ctrl, sock, "\\set_vfo_opt 0\x0a",
+                                   reply, sizeof(reply));
+            session->vfo_opt_enabled = FALSE;
+        }
+    }
+    else
+    {
+        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                              "no usable control strategy");
+        return FALSE;
+    }
+
+    if (!session->strategy_logged)
+    {
+        rig_term_log(ctrl, "gpredict",
+                     "rig session (%s) strategy=%s freq_ok=%d vfo_select_ok=%d vfo_opt_args_ok=%d",
+                     session->label ? session->label : "rig",
+                     rig_strategy_name(session->strategy),
+                     freq_ok ? 1 : 0,
+                     vfo_select_ok ? 1 : 0,
+                     vfo_opt_args_ok ? 1 : 0);
+        session->strategy_logged = TRUE;
+    }
+
+    rig_session_set_state(ctrl, session, RIG_SESSION_READY,
+                          "strategy=%s", rig_strategy_name(session->strategy));
+
+    return TRUE;
+}
+
+static gboolean close_rigctld_socket(GtkRigCtrl *ctrl, gint * sock,
+                                     gboolean send_quit)
 {
     gint            written;
+    GString        *rxbuf = NULL;
 
     if (sock == NULL || *sock == -1)
         return TRUE;
+
+    rxbuf = rigctld_rxbuf_for_socket(ctrl, *sock, FALSE);
+    rigctld_drain_idle(*sock, rxbuf, RIGCTLD_DUMP_STATE_IDLE_MS, NULL);
+    rigctld_clear_rxbuf_for_socket(ctrl, *sock);
+    rigctld_clear_vfo_map_for_socket(ctrl, *sock);
+    rigctld_reset_offset_state_for_socket(ctrl, *sock);
+    rig_session_reset(rig_session_for_socket(ctrl, *sock));
 
     written = 0;
     if (send_quit)
@@ -6410,20 +8339,27 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
 {
     gint  sock = -1;
     gchar buffer[1024];
+    GString *rxbuf = NULL;
     const gchar *cmd = "\\dump_state\n";
     gint  size;
     gchar *line1 = NULL;
     gchar *line2 = NULL;
     gint model = 0;
     gboolean parsed = FALSE;
+    gint err = 0;
 
     if (reply_out)
         *reply_out = NULL;
     if (model_out)
         *model_out = 0;
 
+    rigctld_io_lock_acquire();
+
     if (!rigctld_connect_addrinfo(host, port, &sock))
+    {
+        rigctld_io_lock_release();
         return RIGCTLD_PROBE_NOT_READY;
+    }
 
     rigctld_apply_socket_timeouts_ms(sock, timeout_ms);
 
@@ -6431,13 +8367,22 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
     if (send(sock, cmd, size, 0) != size)
     {
         rigctld_close_fd(sock);
+        rigctld_io_lock_release();
         return RIGCTLD_PROBE_NOT_READY;
     }
 
-    size = (gint) recv(sock, buffer, sizeof(buffer) - 1, 0);
+    rxbuf = rigctld_rxbuf_new(256);
+    size = (gint) rigctld_read_response(sock, rxbuf,
+                                        RIGCTLD_READ_MULTILINE_IDLE,
+                                        buffer, sizeof(buffer),
+                                        timeout_ms,
+                                        RIGCTLD_DUMP_STATE_IDLE_MS,
+                                        NULL, NULL, &err);
+    rigctld_rxbuf_free(&rxbuf);
     if (size <= 0)
     {
         rigctld_close_fd(sock);
+        rigctld_io_lock_release();
         return RIGCTLD_PROBE_NOT_READY;
     }
 
@@ -6458,6 +8403,7 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
         g_free(line1);
         g_free(line2);
         rigctld_close_fd(sock);
+        rigctld_io_lock_release();
         return RIGCTLD_PROBE_NOT_READY;
     }
 
@@ -6474,12 +8420,14 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
         g_free(line1);
         g_free(line2);
         rigctld_close_fd(sock);
+        rigctld_io_lock_release();
         return RIGCTLD_PROBE_MISMATCH;
     }
 
     g_free(line1);
     g_free(line2);
     rigctld_close_fd(sock);
+    rigctld_io_lock_release();
 
     return RIGCTLD_PROBE_OK;
 }
@@ -6541,45 +8489,88 @@ static gboolean rigctld_probe_frequency(const gchar *host, gint port,
     {
         gint sock = -1;
         gchar buffer[256];
+        gchar *line1 = NULL;
         const gchar *cmd = "f\n";
         gint size;
+        gint err = 0;
+        gboolean ok = FALSE;
+        GString *rxbuf = NULL;
+        freq = 0.0;
 
+        rigctld_io_lock_acquire();
         if (!rigctld_connect_addrinfo(host, port, &sock))
         {
+            rigctld_io_lock_release();
             g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
             continue;
         }
 
         rigctld_apply_socket_timeouts_ms(sock, timeout_ms);
+        rxbuf = rigctld_rxbuf_new(128);
 
         size = (gint) strlen(cmd);
         if (send(sock, cmd, size, 0) != size)
         {
+            rigctld_rxbuf_free(&rxbuf);
             rigctld_close_fd(sock);
+            rigctld_io_lock_release();
             g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
             continue;
         }
 
-        size = (gint) recv(sock, buffer, sizeof(buffer) - 1, 0);
-        if (size > 0)
+        size = (gint) rigctld_read_response(sock, rxbuf,
+                                            RIGCTLD_READ_SINGLE,
+                                            buffer, sizeof(buffer),
+                                            timeout_ms,
+                                            RIGCTLD_FOLLOW_IDLE_MS,
+                                            NULL, NULL, &err);
+        if (size <= 0)
         {
-            buffer[size] = '\0';
-            g_free(last_reply);
-            last_reply = g_strdup(buffer);
-            if (rigctld_parse_frequency_response(buffer, &freq))
-            {
-                rigctld_close_fd(sock);
-                if (freq_out)
-                    *freq_out = freq;
-                if (reply_out)
-                    *reply_out = g_strdup(buffer);
-                g_free(last_reply);
-                return TRUE;
-            }
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "rigctld probe: sent \"f\" timed out");
+            rigctld_rxbuf_free(&rxbuf);
+            rigctld_close_fd(sock);
+            rigctld_io_lock_release();
+            g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
+            continue;
         }
 
+        buffer[size] = '\0';
+        rigctld_extract_first_lines(buffer, &line1, NULL);
+        g_free(last_reply);
+        last_reply = g_strdup(line1 ? line1 : buffer);
+
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rigctld probe: sent \"f\" reply=\"%s\"",
+                    line1 ? line1 : "(none)");
+
+        if (rigctld_parse_frequency_response(buffer, &freq))
+        {
+            ok = TRUE;
+        }
+        else if (line1 && g_str_has_prefix(line1, "RPRT"))
+        {
+            ok = TRUE;
+        }
+        else
+        {
+            ok = TRUE;
+        }
+
+        g_free(line1);
+        rigctld_rxbuf_free(&rxbuf);
         rigctld_close_fd(sock);
-        g_usleep(RIGCTLD_HEALTH_RETRY_DELAY_MS * 1000);
+        rigctld_io_lock_release();
+
+        if (ok)
+        {
+            if (freq_out)
+                *freq_out = freq;
+            if (reply_out)
+                *reply_out = g_strdup(last_reply ? last_reply : buffer);
+            g_free(last_reply);
+            return TRUE;
+        }
     }
 
     if (reply_out)
@@ -6993,7 +8984,8 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
 {
     const gchar *role = _("rig");
     gboolean     secondary = FALSE;
-    gint        *sock_ptr = NULL;
+    RigSession  *session = NULL;
+    rigctrl_conn_state_t state;
 
     if (ctrl == NULL)
         return;
@@ -7002,16 +8994,21 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
     {
         role = _("receiver");
         secondary = FALSE;
-        sock_ptr = &ctrl->sock;
+        session = ctrl->rig_session;
     }
     else if (sock == ctrl->sock2)
     {
         role = _("uplink");
         secondary = TRUE;
-        sock_ptr = &ctrl->sock2;
+        session = ctrl->rig_session2;
     }
 
-    if (sock_ptr == NULL)
+    if (session == NULL)
+        return;
+
+    state = secondary ? ctrl->conn_state2 : ctrl->conn_state;
+    if (state == RIGCTRL_CONN_DISCONNECTING ||
+        state == RIGCTRL_CONN_DISCONNECTED)
         return;
 
     sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -7022,7 +9019,26 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
                  role ? role : "rig",
                  context ? context : "command");
 
-    close_rigctld_socket(sock_ptr, rigctld_spawned_by_us(ctrl, secondary));
+    rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                          "socket error during %s",
+                          context ? context : "command");
+
+    rigctrl_set_conn_state(ctrl, secondary, RIGCTRL_CONN_DISCONNECTING,
+                           "socket error");
+
+    if (rigctrl_on_main_thread(ctrl))
+    {
+        rigctrl_close_socket_internal(ctrl, secondary);
+    }
+    else
+    {
+        RigctrlCloseSocketInfo *info = g_new0(RigctrlCloseSocketInfo, 1);
+
+        info->ctrl = g_object_ref(ctrl);
+        info->secondary = secondary;
+        g_idle_add(rigctrl_close_socket_idle, info);
+    }
+
     rigctrl_schedule_reconnect(ctrl, secondary, role);
 }
 
@@ -7218,9 +9234,12 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                             }
                         }
 
-                        detail = g_strdup_printf(
-                            _("rigctld did not respond to health probes on %s:%d."),
-                            host, conf->port);
+                        rig_term_log(ctrl, "gpredict:err",
+                                     "rigctld health probe timeout on %s:%d",
+                                     host, conf->port);
+                        rig_term_log(ctrl, "gpredict:err",
+                                     "rigctld probe: sent \"f\" timed out");
+                        detail = g_strdup(_("Rig control timeout (rigctld did not reply)."));
                         schedule_rig_autostart_error(ctrl, conf, role, detail);
                         g_free(detail);
                         g_free(reply);
@@ -7229,11 +9248,33 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                         goto out;
                     }
 
-                    sat_log_log(SAT_LOG_LEVEL_INFO,
-                                _("%s: rigctld health probe ok (freq=%.0f)"),
-                                __func__, freq);
-                    rig_term_log(ctrl, "gpredict",
-                                 "rigctld health probe ok (freq=%.0f)", freq);
+                    if (reply && *reply)
+                    {
+                        rig_term_log(ctrl, "gpredict",
+                                     "rigctld probe: sent \"f\" reply=\"%s\"",
+                                     reply);
+                    }
+                    else
+                    {
+                        rig_term_log(ctrl, "gpredict",
+                                     "rigctld probe: sent \"f\" reply=\"(none)\"");
+                    }
+
+                    if (freq > 0.0)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    _("%s: rigctld health probe ok (freq=%.0f)"),
+                                    __func__, freq);
+                        rig_term_log(ctrl, "gpredict",
+                                     "rigctld health probe ok (freq=%.0f)",
+                                     freq);
+                    }
+                    else if (reply && *reply)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    _("%s: rigctld health probe ok (reply=%s)"),
+                                    __func__, reply);
+                    }
                     g_free(reply);
                     g_free(log_tail);
                 }
@@ -7559,9 +9600,12 @@ restart_autostart:
                 goto restart_autostart;
             }
 
-            detail = g_strdup_printf(
-                _("rigctld did not respond to health probes on %s:%d."),
-                host, conf->port);
+            rig_term_log(ctrl, "gpredict:err",
+                         "rigctld health probe timeout on %s:%d",
+                         host, conf->port);
+            rig_term_log(ctrl, "gpredict:err",
+                         "rigctld probe: sent \"f\" timed out");
+            detail = g_strdup(_("Rig control timeout (rigctld did not reply)."));
             schedule_rig_autostart_error(ctrl, conf, role, detail);
             g_free(detail);
             g_free(reply);
@@ -7570,11 +9614,32 @@ restart_autostart:
             goto out;
         }
 
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: rigctld health probe ok (freq=%.0f)"),
-                    __func__, freq);
-        rig_term_log(ctrl, "gpredict",
-                     "rigctld health probe ok (freq=%.0f)", freq);
+        if (reply && *reply)
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "rigctld probe: sent \"f\" reply=\"%s\"",
+                         reply);
+        }
+        else
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "rigctld probe: sent \"f\" reply=\"(none)\"");
+        }
+
+        if (freq > 0.0)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: rigctld health probe ok (freq=%.0f)"),
+                        __func__, freq);
+            rig_term_log(ctrl, "gpredict",
+                         "rigctld health probe ok (freq=%.0f)", freq);
+        }
+        else if (reply && *reply)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: rigctld health probe ok (reply=%s)"),
+                        __func__, reply);
+        }
         g_free(reply);
         g_free(log_tail);
     }
@@ -7749,118 +9814,11 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
     }
 
     rig_term_log(ctrl, "gpredict", "connected to %s:%d", host, conf->port);
+    rigctld_clear_vfo_map_for_socket(ctrl, *sock);
+    rigctld_reset_offset_state_for_socket(ctrl, *sock);
     g_free(host);
     if (error_reported)
         *error_reported = reported;
-    return TRUE;
-}
-
-static gboolean probe_rigctld(GtkRigCtrl *ctrl, gint sock,
-                              const gchar *label,
-                              gboolean *stale_device_out)
-{
-    gchar           buffback[1024];
-    gchar          *line1 = NULL;
-    gchar          *line2 = NULL;
-    gint            model = 0;
-    gint            expected_model = 0;
-    gboolean        ok;
-    const gchar    *role = (label != NULL) ? label : _("rig");
-    const radio_conf_t *conf = NULL;
-    RigctldMgr     *mgr = NULL;
-    gboolean        stale = FALSE;
-
-    if (stale_device_out)
-        *stale_device_out = FALSE;
-
-    if (ctrl != NULL)
-    {
-        if (sock == ctrl->sock)
-        {
-            conf = ctrl->conf;
-            mgr = ctrl->rigctld_mgr;
-        }
-        else if (sock == ctrl->sock2)
-        {
-            conf = ctrl->conf2;
-            mgr = ctrl->rigctld_mgr2;
-        }
-        else
-            conf = ctrl->conf;
-    }
-    expected_model = rigctld_expected_model(conf);
-
-    ok = send_rigctld_command(ctrl, sock, "\\dump_state\n", buffback,
-                              (gint) sizeof(buffback));
-    if (!ok)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: probe failed to write/read (%s)"),
-                    __func__, role);
-        if (mgr != NULL)
-        {
-            gchar *log_tail = rigctld_mgr_get_log_tail(mgr);
-            if (rigctld_log_tail_indicates_stale_device(log_tail))
-                stale = TRUE;
-            g_free(log_tail);
-        }
-        if (stale_device_out)
-            *stale_device_out = stale;
-        return FALSE;
-    }
-
-    rigctld_extract_first_lines(buffback, &line1, &line2);
-    ok = parse_dump_state_model_id(buffback, &model);
-    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "rigctld dump_state: line1=%s line2=%s model=%d",
-                line1 ? line1 : "(none)",
-                line2 ? line2 : "(none)",
-                model);
-
-    if (!ok)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: probe got invalid dump_state from %s"),
-                    __func__, role);
-        if (rigctld_reply_indicates_stale_device(buffback))
-            stale = TRUE;
-        if (mgr != NULL)
-        {
-            gchar *log_tail = rigctld_mgr_get_log_tail(mgr);
-            if (rigctld_log_tail_indicates_stale_device(log_tail))
-                stale = TRUE;
-            g_free(log_tail);
-        }
-        if (stale_device_out)
-            *stale_device_out = stale;
-        g_free(line1);
-        g_free(line2);
-        return FALSE;
-    }
-
-    if (expected_model > 0 && model > 0 && model != expected_model)
-    {
-        rig_term_log(ctrl, "gpredict:err",
-                     "rigctld model mismatch expected=%d got=%d line1=%s line2=%s",
-                     expected_model, model,
-                     line1 ? line1 : "(none)",
-                     line2 ? line2 : "(none)");
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rigctld model mismatch expected=%d got=%d line1=%s line2=%s (%s)"),
-                    __func__, expected_model, model,
-                    line1 ? line1 : "(none)",
-                    line2 ? line2 : "(none)",
-                    role);
-        g_free(line1);
-        g_free(line2);
-        return FALSE;
-    }
-
-    g_free(line1);
-    g_free(line2);
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: probe succeeded for %s (model=%d)"),
-                __func__, role, model);
     return TRUE;
 }
 
@@ -8151,10 +10109,10 @@ static gboolean rig_disengage_idle(gpointer data)
         if (ctrl->LockBut != NULL)
         {
             g_signal_handlers_block_by_func(ctrl->LockBut,
-                                            rig_engaged_cb, ctrl);
+                                            (gpointer)rig_engaged_cb, ctrl);
             gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
             g_signal_handlers_unblock_by_func(ctrl->LockBut,
-                                              rig_engaged_cb, ctrl);
+                                              (gpointer)rig_engaged_cb, ctrl);
             rig_engaged_cb(GTK_TOGGLE_BUTTON(ctrl->LockBut), ctrl);
         }
     }
@@ -8177,31 +10135,144 @@ static void rigctrl_fail_engage(GtkRigCtrl *ctrl)
     schedule_rig_disengage(ctrl);
 }
 
+static gboolean rigctrl_open_idle(gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    rigctrl_open_internal(ctrl);
+    g_object_unref(ctrl);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_request_open(GtkRigCtrl *ctrl, const gchar *reason)
+{
+    gboolean need_rx;
+    gboolean need_tx;
+    gboolean schedule = FALSE;
+
+    if (ctrl == NULL || ctrl->destroying || !ctrl->engaged)
+        return;
+
+    /* Opening/state guards keep reconnect attempts from re-entering open(). */
+    need_rx = (ctrl->sock < 0);
+    need_tx = (ctrl->conf2 != NULL && ctrl->sock2 < 0);
+    if (need_rx && ctrl->conn_state == RIGCTRL_CONN_DISCONNECTING)
+        need_rx = FALSE;
+    if (need_tx && ctrl->conn_state2 == RIGCTRL_CONN_DISCONNECTING)
+        need_tx = FALSE;
+    if (!need_rx && !need_tx)
+        return;
+
+    if (need_rx && !ctrl->opening)
+    {
+        ctrl->opening = TRUE;
+        rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_CONNECTING,
+                               reason ? reason : "open requested");
+        schedule = TRUE;
+    }
+
+    if (need_tx && !ctrl->opening2)
+    {
+        ctrl->opening2 = TRUE;
+        rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_CONNECTING,
+                               reason ? reason : "open requested");
+        schedule = TRUE;
+    }
+
+    if (!schedule)
+        return;
+
+    if (rigctrl_on_main_thread(ctrl))
+    {
+        rigctrl_open_internal(ctrl);
+        return;
+    }
+
+    g_object_ref(ctrl);
+    g_idle_add(rigctrl_open_idle, ctrl);
+}
+
+static gboolean rigctrl_close_idle(gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    ctrl->close_pending_id = 0;
+    rigctrl_close_internal(ctrl);
+    g_object_unref(ctrl);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_request_close(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (rigctrl_on_main_thread(ctrl))
+    {
+        rigctrl_close_internal(ctrl);
+        return;
+    }
+
+    if (ctrl->close_pending_id != 0)
+        return;
+
+    g_object_ref(ctrl);
+    ctrl->close_pending_id = g_idle_add(rigctrl_close_idle, ctrl);
+}
+
 static void rigctrl_close(GtkRigCtrl * data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->destroying)
+        return;
+
+    rigctrl_request_close(ctrl);
+}
+
+static void rigctrl_close_internal(GtkRigCtrl * data)
+{
+    GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+
+    if (ctrl == NULL)
+        return;
+
+    /* Stop timers before touching sockets to avoid re-entrant callbacks. */
+    remove_timer(ctrl);
+
+    rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTING,
+                           "close requested");
+    rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_DISCONNECTING,
+                           "close requested");
 
     ctrl->lastrxptt = FALSE;
     ctrl->lasttxptt = TRUE;
     ctrl->lasttxf = 0.0;
     ctrl->lastrxf = 0.0;
 
-    apply_rit_xit_offsets(ctrl, 0.0, 0.0);
-
-    remove_timer(ctrl);
-
-    if ((ctrl->conf->type == RIG_TYPE_TOGGLE_AUTO) ||
-        (ctrl->conf->type == RIG_TYPE_TOGGLE_MAN))
+    if (ctrl->conf != NULL)
     {
-        unset_toggle(ctrl, ctrl->sock);
+        apply_rit_xit_offsets(ctrl, 0.0, 0.0);
+
+        if ((ctrl->conf->type == RIG_TYPE_TOGGLE_AUTO) ||
+            (ctrl->conf->type == RIG_TYPE_TOGGLE_MAN))
+        {
+            if (ctrl->sock >= 0)
+                unset_toggle(ctrl, ctrl->sock);
+        }
     }
 
     if (ctrl->conf2 != NULL)
     {
-        close_rigctld_socket(&(ctrl->sock2),
+        close_rigctld_socket(ctrl, &(ctrl->sock2),
                              rigctld_spawned_by_us(ctrl, TRUE));
     }
-    close_rigctld_socket(&(ctrl->sock),
+    close_rigctld_socket(ctrl, &(ctrl->sock),
                          rigctld_spawned_by_us(ctrl, FALSE));
 
     rigctld_terminate_spawned(ctrl, TRUE, &ctrl->rigctld_mgr2);
@@ -8209,20 +10280,91 @@ static void rigctrl_close(GtkRigCtrl * data)
 
     rigctrl_reset_reconnect(ctrl, FALSE);
     rigctrl_reset_reconnect(ctrl, TRUE);
+
+    ctrl->opening = FALSE;
+    ctrl->opening2 = FALSE;
+
+    rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED, "closed");
+    rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_DISCONNECTED, "closed");
 }
 
-static gboolean rigctrl_open(GtkRigCtrl * data)
+static void rigctrl_close_socket_internal(GtkRigCtrl *ctrl, gboolean secondary)
+{
+    gint *sock_ptr;
+
+    if (ctrl == NULL)
+        return;
+
+    /* Stop timers before closing a socket to keep callbacks out. */
+    remove_timer(ctrl);
+
+    rigctrl_set_conn_state(ctrl, secondary, RIGCTRL_CONN_DISCONNECTING,
+                           "socket close");
+
+    sock_ptr = secondary ? &ctrl->sock2 : &ctrl->sock;
+    if (sock_ptr != NULL && *sock_ptr >= 0)
+        close_rigctld_socket(ctrl, sock_ptr,
+                             rigctld_spawned_by_us(ctrl, secondary));
+
+    if (secondary)
+        ctrl->opening2 = FALSE;
+    else
+        ctrl->opening = FALSE;
+
+    rigctrl_set_conn_state(ctrl, secondary, RIGCTRL_CONN_DISCONNECTED,
+                           "socket closed");
+}
+
+static gboolean rigctrl_close_socket_idle(gpointer data)
+{
+    RigctrlCloseSocketInfo *info = data;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    if (info->ctrl != NULL)
+        rigctrl_close_socket_internal(info->ctrl, info->secondary);
+
+    if (info->ctrl != NULL)
+        g_object_unref(info->ctrl);
+    g_free(info);
+
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean rigctrl_open_internal(GtkRigCtrl * data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gboolean        rx_opened = FALSE;
     gboolean        tx_opened = FALSE;
     gboolean        tx_ok = TRUE;
 
-    if (!ctrl->timerid)
-        start_timer(ctrl);
+    if (ctrl == NULL || ctrl->destroying || !ctrl->engaged)
+        return FALSE;
+
+    if (ctrl->conf == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: missing primary rig configuration"), __func__);
+        rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
+                               "missing config");
+        ctrl->opening = FALSE;
+        ctrl->opening2 = FALSE;
+        return FALSE;
+    }
+
+    if (ctrl->timerid)
+        remove_timer(ctrl);
+
+    if (!ctrl->opening && ctrl->sock < 0)
+        ctrl->opening = TRUE;
+    if (!ctrl->opening2 && ctrl->conf2 != NULL && ctrl->sock2 < 0)
+        ctrl->opening2 = TRUE;
 
     if (ctrl->sock < 0)
     {
+        rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_CONNECTING,
+                               "open start");
         ctrl->wrops = 0;
         rigctrl_log_config(ctrl, ctrl->conf, _("receiver"));
         sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -8236,17 +10378,16 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         {
             gboolean error_reported = FALSE;
             gboolean stale_device = FALSE;
+            RigSession *session = ctrl->rig_session;
 
             if (!open_rigctld_socket_with_autostart(ctrl, ctrl->conf,
                                                     &(ctrl->sock),
                                                     FALSE, _("receiver"),
-                                                    &error_reported) ||
-                !probe_rigctld(ctrl, ctrl->sock, _("receiver rig"),
-                               &stale_device))
+                                                    &error_reported))
             {
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: receiver rig open/probe failed"), __func__);
-                close_rigctld_socket(&(ctrl->sock),
+                close_rigctld_socket(ctrl, &(ctrl->sock),
                                      rigctld_spawned_by_us(ctrl, FALSE));
                 if (stale_device && !ctrl->rx_conn_error_reported)
                 {
@@ -8260,6 +10401,47 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
                     ctrl->rx_conn_error_reported = TRUE;
                 }
                 rigctrl_fail_engage(ctrl);
+                rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
+                                       "open failed");
+                ctrl->opening = FALSE;
+                ctrl->opening2 = FALSE;
+                return FALSE;
+            }
+
+            rig_session_reset(session);
+            rig_session_set_state(ctrl, session, RIG_SESSION_CONNECTING,
+                                  "connected");
+            if (!rig_session_probe_and_configure(ctrl, session,
+                                                 ctrl->sock, ctrl->conf))
+            {
+                RigctldMgr *mgr = ctrl->rigctld_mgr;
+                gchar *log_tail = NULL;
+
+                if (mgr)
+                    log_tail = rigctld_mgr_get_log_tail(mgr);
+                stale_device = rigctld_log_tail_indicates_stale_device(log_tail);
+                g_free(log_tail);
+
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            _("%s: receiver rig session probe failed"), __func__);
+                close_rigctld_socket(ctrl, &(ctrl->sock),
+                                     rigctld_spawned_by_us(ctrl, FALSE));
+                if (stale_device && !ctrl->rx_conn_error_reported)
+                {
+                    schedule_rig_backend_error(ctrl, ctrl->conf, _("receiver"));
+                    ctrl->rx_conn_error_reported = TRUE;
+                }
+                if (!stale_device &&
+                    !error_reported && !ctrl->rx_conn_error_reported)
+                {
+                    schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
+                    ctrl->rx_conn_error_reported = TRUE;
+                }
+                rigctrl_fail_engage(ctrl);
+                rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
+                                       "open failed");
+                ctrl->opening = FALSE;
+                ctrl->opening2 = FALSE;
                 return FALSE;
             }
         }
@@ -8267,8 +10449,8 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         rigctrl_reset_reconnect(ctrl, FALSE);
         rx_opened = TRUE;
 
-        /* check to see if vfo option is enabled */
-        ctrl->conf->vfo_opt = get_vfo_opt(ctrl, ctrl->sock);
+        ctrl->conf->vfo_opt = (ctrl->rig_session &&
+                               ctrl->rig_session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: VFO opt=%d"), __FILE__,
                 __func__, ctrl->conf->vfo_opt);
@@ -8277,6 +10459,8 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     /* set initial frequency */
     if (ctrl->conf2 != NULL && ctrl->sock2 < 0)
     {
+        rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_CONNECTING,
+                               "open start");
         rigctrl_log_config(ctrl, ctrl->conf2, _("uplink"));
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s: opening uplink rig %s:%d"), __func__,
@@ -8289,18 +10473,35 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         {
             gboolean error_reported = FALSE;
             gboolean stale_device = FALSE;
+            RigSession *session = ctrl->rig_session2;
 
             tx_ok = open_rigctld_socket_with_autostart(
                 ctrl, ctrl->conf2, &(ctrl->sock2), TRUE, _("uplink"),
                 &error_reported);
             if (tx_ok)
-                tx_ok = probe_rigctld(ctrl, ctrl->sock2, _("uplink rig"),
-                                      &stale_device);
+            {
+                rig_session_reset(session);
+                rig_session_set_state(ctrl, session, RIG_SESSION_CONNECTING,
+                                      "connected");
+                tx_ok = rig_session_probe_and_configure(ctrl, session,
+                                                        ctrl->sock2,
+                                                        ctrl->conf2);
+                if (!tx_ok)
+                {
+                    RigctldMgr *mgr = ctrl->rigctld_mgr2;
+                    gchar *log_tail = NULL;
+
+                    if (mgr)
+                        log_tail = rigctld_mgr_get_log_tail(mgr);
+                    stale_device = rigctld_log_tail_indicates_stale_device(log_tail);
+                    g_free(log_tail);
+                }
+            }
             if (!tx_ok)
             {
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: uplink rig open/probe failed"), __func__);
-                close_rigctld_socket(&(ctrl->sock2),
+                close_rigctld_socket(ctrl, &(ctrl->sock2),
                                      rigctld_spawned_by_us(ctrl, TRUE));
                 if (stale_device && !ctrl->tx_conn_error_reported)
                 {
@@ -8320,7 +10521,8 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         {
             rigctrl_reset_reconnect(ctrl, TRUE);
             tx_opened = TRUE;
-            ctrl->conf2->vfo_opt = get_vfo_opt(ctrl, ctrl->sock2);
+            ctrl->conf2->vfo_opt = (ctrl->rig_session2 &&
+                                    ctrl->rig_session2->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     _("%s:%s: VFO opt2=%d"), __FILE__,
                     __func__, ctrl->conf2->vfo_opt);
@@ -8330,6 +10532,10 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
     if (ctrl->sock < 0)
     {
         rigctrl_fail_engage(ctrl);
+        rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
+                               "open failed");
+        ctrl->opening = FALSE;
+        ctrl->opening2 = FALSE;
         return FALSE;
     }
 
@@ -8390,6 +10596,27 @@ static gboolean rigctrl_open(GtkRigCtrl * data)
         apply_rit_xit_offsets(ctrl, 0.0, 0.0);
     }
 
+    ctrl->opening = FALSE;
+    ctrl->opening2 = FALSE;
+
+    rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_CONNECTED, "open ok");
+    if (ctrl->conf2 != NULL)
+    {
+        if (ctrl->sock2 >= 0)
+            rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_CONNECTED, "open ok");
+        else
+            rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_DISCONNECTED,
+                                   "open failed");
+    }
+    else
+    {
+        rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_DISCONNECTED,
+                               "no uplink");
+    }
+
+    if (ctrl->sock >= 0 && ctrl->engaged)
+        start_timer(ctrl);
+
     return TRUE;
 }
 
@@ -8415,63 +10642,16 @@ gpointer rigctl_run(gpointer data)
 
         if (t_ctrl->engaged)
         {
-            gint64 now_us = g_get_monotonic_time();
-
-            if (t_ctrl->sock < 0)
-            {
-                if (rigctrl_reconnect_due(t_ctrl, FALSE, now_us))
-                {
-                    rig_term_log(t_ctrl, "gpredict",
-                                 "retry connect receiver");
-                    if (!rigctrl_open(t_ctrl))
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                    _("%s: failed to open receiver rig"),
-                                    __func__);
-                        if (t_ctrl->engaged)
-                            rigctrl_schedule_reconnect(t_ctrl, FALSE,
-                                                       _("receiver"));
-                    }
-                }
-                if (t_ctrl->sock < 0)
-                    continue;
-            }
-
-            if (t_ctrl->conf2 != NULL && t_ctrl->sock2 < 0)
-            {
-                gboolean attempted_tx = FALSE;
-
-                if (rigctrl_reconnect_due(t_ctrl, TRUE, now_us))
-                {
-                    attempted_tx = TRUE;
-                    rig_term_log(t_ctrl, "gpredict",
-                                 "retry connect uplink");
-                    if (!rigctrl_open(t_ctrl))
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                    _("%s: failed to open uplink rig"),
-                                    __func__);
-                    }
-                }
-                if (attempted_tx && t_ctrl->sock2 < 0)
-                {
-                    if (t_ctrl->engaged)
-                        rigctrl_schedule_reconnect(t_ctrl, TRUE, _("uplink"));
-                }
-            }
-
-            if (!t_ctrl->timerid)
-                start_timer(t_ctrl);
+            if (t_ctrl->conn_state != RIGCTRL_CONN_CONNECTED ||
+                t_ctrl->conf == NULL)
+                continue;
         }
         else
         {
             g_mutex_lock(&t_ctrl->widgetsync);
 
-            if (t_ctrl->sock != -1)
+            if (t_ctrl->sock != -1 || t_ctrl->sock2 != -1)
                 rigctrl_close(t_ctrl);
-
-            if (t_ctrl->timerid)
-                remove_timer(t_ctrl);
 
             g_cond_signal(&t_ctrl->widgetready);
             g_mutex_unlock(&t_ctrl->widgetsync);
@@ -8552,11 +10732,8 @@ gpointer rigctl_run(gpointer data)
         //g_print ("       WROPS = %d\n", ctrl->wrops);
     }
 
-    if (t_ctrl->sock >= 0)
+    if (t_ctrl->sock >= 0 || t_ctrl->sock2 >= 0)
         rigctrl_close(t_ctrl);
-
-    if (t_ctrl->timerid)
-        remove_timer(t_ctrl);
 
     return NULL;
 }

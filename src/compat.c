@@ -398,7 +398,7 @@ gchar          *hw_file_name(const gchar * hwfile)
     return filename;
 }
 
-gchar const* get_locale_thousands_sep()
+gchar const* get_locale_thousands_sep(void)
 {
 	struct lconv *locale;
 

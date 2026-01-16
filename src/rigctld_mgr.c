@@ -1,5 +1,6 @@
 #include "rigctld_mgr.h"
 #include "rotctld-parse.h"
+#include "rigctld-io.h"
 #include "sat-log.h"
 
 #include <gio/gio.h>
@@ -485,10 +486,12 @@ static gboolean rigctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
     g_socket_set_blocking(sock, TRUE);
     g_socket_set_timeout(sock, timeout_s);
 
+    rigctld_io_lock_acquire();
     size = g_socket_send(sock, cmd, strlen(cmd), NULL, &error);
     if (size < 0)
     {
         g_clear_error(&error);
+        rigctld_io_lock_release();
         return FALSE;
     }
 
@@ -496,10 +499,12 @@ static gboolean rigctld_mgr_probe_dump_state(GSocket *sock, gint timeout_ms)
     if (size <= 0)
     {
         g_clear_error(&error);
+        rigctld_io_lock_release();
         return FALSE;
     }
 
     buffer[size] = '\0';
+    rigctld_io_lock_release();
 
     ok = rigctld_mgr_dump_state_parse(buffer, &model, &line1, &line2);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,

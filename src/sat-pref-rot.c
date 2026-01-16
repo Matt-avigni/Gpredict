@@ -317,7 +317,7 @@ static void row_activated_cb(GtkTreeView * tree_view,
 
     edit_cb(editbutton, NULL);
 }
-static GtkTreeModel *create_and_fill_model()
+static GtkTreeModel *create_and_fill_model(void)
 {
     GtkListStore   *liststore;  /* the list store data structure */
     GtkTreeIter     item;       /* new item added to the list store */
@@ -540,7 +540,7 @@ static void render_aztype(GtkTreeViewColumn * col,
     g_free(text);
 }
 
-static void create_rot_list()
+static void create_rot_list(void)
 {
     GtkTreeModel   *model;
     GtkCellRenderer *renderer;
@@ -631,7 +631,7 @@ static void create_rot_list()
 
 }
 
-GtkWidget      *sat_pref_rot_create()
+GtkWidget      *sat_pref_rot_create(void)
 {
     GtkWidget      *vbox;       /* vbox containing the list part and the details part */
     GtkWidget      *swin;
@@ -652,7 +652,7 @@ GtkWidget      *sat_pref_rot_create()
 }
 
 /** User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_rot_cancel()
+void sat_pref_rot_cancel(void)
 {
 }
 
@@ -662,7 +662,7 @@ void sat_pref_rot_cancel()
  * First, all .rot files are deleted, whereafter the rotator configurations in
  * the rotlist are saved one by one.
  */
-void sat_pref_rot_ok()
+void sat_pref_rot_ok(void)
 {
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */

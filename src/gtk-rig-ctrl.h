@@ -8,11 +8,13 @@
 #include "gtk-sat-module.h"
 #include "predict-tools.h"
 #include "radio-conf.h"
+#include "payload-profile.h"
 #include "sgpsdp/sgp4sdp4.h"
 #include "trsp-conf.h"
 
 typedef struct _RigctldMgr RigctldMgr;
 typedef struct _GpTermView GpTermView;
+typedef struct _RigSession RigSession;
 
 
 #define GTK_TYPE_RIG_CTRL          (gtk_rig_ctrl_get_type ())
@@ -28,6 +30,13 @@ typedef struct _GpTermView GpTermView;
 
 typedef struct _gtk_rig_ctrl GtkRigCtrl;
 typedef struct _GtkRigCtrlClass GtkRigCtrlClass;
+
+typedef enum {
+    RIGCTRL_CONN_DISCONNECTED = 0,
+    RIGCTRL_CONN_CONNECTING,
+    RIGCTRL_CONN_CONNECTED,
+    RIGCTRL_CONN_DISCONNECTING
+} rigctrl_conn_state_t;
 
 struct _gtk_rig_ctrl {
     GtkBox          box;
@@ -81,6 +90,15 @@ struct _gtk_rig_ctrl {
     gdouble         lastrxf;    /*!< Last frequency sent to receiver. */
     gdouble         lasttxf;    /*!< Last frequency sent to tranmitter. */
     gdouble         du, dd;     /*!< Last computed up/down Doppler shift; computed in update() */
+    PayloadProfile  payload_profile; /*!< Payload profile derived from menu selection. */
+    gboolean        payload_profile_valid; /*!< TRUE when payload profile is initialized. */
+    gboolean        payload_profile_logged; /*!< Avoid repeated payload profile logs. */
+    gdouble         doppler_down_ema; /*!< Smoothed downlink Doppler. */
+    gdouble         doppler_up_ema;   /*!< Smoothed uplink Doppler. */
+    gboolean        doppler_ema_valid; /*!< TRUE once EMA is seeded. */
+    gint64          last_doppler_calc_us; /*!< Last Doppler calc time (monotonic). */
+    gint64          last_send_down_us; /*!< Last downlink send time (monotonic). */
+    gint64          last_send_up_us;   /*!< Last uplink send time (monotonic). */
     gdouble         user_base_down_hz; /*!< User-entered downlink base frequency. */
     gdouble         user_base_up_hz;   /*!< User-entered uplink base frequency. */
     gdouble         doppler_down_hz;   /*!< Current downlink Doppler offset. */
@@ -94,11 +112,29 @@ struct _gtk_rig_ctrl {
     gboolean        user_edit_down; /*!< User edited downlink base freq in session. */
     gboolean        user_edit_up;   /*!< User edited uplink base freq in session. */
     gboolean        suppress_user_base; /*!< Guard for programmatic base updates. */
+    gboolean        xit_supported;      /*!< XIT supported (primary) */
+    gboolean        xit_supported2;     /*!< XIT supported (secondary) */
+    gboolean        last_rit_valid;     /*!< Have applied RIT offset (primary) */
+    gboolean        last_xit_valid;     /*!< Have applied XIT offset (primary) */
+    gboolean        last_xit_valid2;    /*!< Have applied XIT offset (secondary) */
+    gint            last_rit_offset;    /*!< Last RIT offset sent (Hz) */
+    gint            last_xit_offset;    /*!< Last XIT offset sent (Hz, primary) */
+    gint            last_xit_offset2;   /*!< Last XIT offset sent (Hz, secondary) */
 
     gint64          last_toggle_tx;     /*!< Last time when exec_toggle_tx_cycle() was executed (seconds)
                                            -1 indicates that an update should be performed ASAP */
 
     gint            sock, sock2;        /*!< Sockets for controlling the radio(s). */
+    rigctrl_conn_state_t conn_state;    /*!< Primary connection state */
+    rigctrl_conn_state_t conn_state2;   /*!< Secondary connection state */
+    gboolean        opening;            /*!< Guard against re-entrant open */
+    gboolean        opening2;           /*!< Guard against re-entrant open (secondary) */
+    guint           reconnect_source_id;  /*!< Scheduled reconnect source (primary) */
+    guint           reconnect_source_id2; /*!< Scheduled reconnect source (secondary) */
+    guint           close_pending_id;     /*!< Pending close handler source id */
+    gint            pending_close_sock;  /*!< Deferred close fd (primary) */
+    gint            pending_close_sock2; /*!< Deferred close fd (secondary) */
+    gboolean        destroying;          /*!< Guard against teardown races */
     gint            reconnect_backoff_ms;   /*!< Exponential backoff for reconnect (primary). */
     gint            reconnect_backoff_ms2;  /*!< Exponential backoff for reconnect (secondary). */
     gint64          reconnect_next_us;      /*!< Next reconnect time (monotonic us, primary). */
@@ -113,6 +149,14 @@ struct _gtk_rig_ctrl {
     /* debug related */
     guint           wrops;
     guint           rdops;
+    GString        *rigctld_rxbuf;     /*!< Buffered rigctld input (primary) */
+    GString        *rigctld_rxbuf2;    /*!< Buffered rigctld input (secondary) */
+    gchar          *rigctld_vfo_main_token;  /*!< Cached rigctld token for Main (primary) */
+    gchar          *rigctld_vfo_sub_token;   /*!< Cached rigctld token for Sub (primary) */
+    gchar          *rigctld_vfo_main_token2; /*!< Cached rigctld token for Main (secondary) */
+    gchar          *rigctld_vfo_sub_token2;  /*!< Cached rigctld token for Sub (secondary) */
+    gboolean        rigctld_vfo_map_logged;  /*!< Logged VFO mapping (primary) */
+    gboolean        rigctld_vfo_map_logged2; /*!< Logged VFO mapping (secondary) */
 
     /* DL4PD */
     /* threads related stuff */
@@ -123,6 +167,7 @@ struct _gtk_rig_ctrl {
     GCond           widgetready;        /*!< Condition when work is done (sync stuff) */
     GAsyncQueue    *rigctlq;    /*!< Message queue to indicate something has changed */
     GThread        *rigctl_thread;      /*!< Pointer to current rigctl-thread */
+    GThread        *main_thread;        /*!< GTK main thread owning this widget */
 
     RigctldMgr     *rigctld_mgr;        /*!< Auto-started rigctld manager (primary) */
     RigctldMgr     *rigctld_mgr2;       /*!< Auto-started rigctld manager (secondary) */
@@ -130,6 +175,8 @@ struct _gtk_rig_ctrl {
     gint            rigctld_spawn_pid;  /*!< PID for spawned primary rigctld (if known) */
     gboolean        rigctld_spawned2;   /*!< TRUE if secondary rigctld was spawned by gpredict */
     gint            rigctld_spawn_pid2; /*!< PID for spawned secondary rigctld (if known) */
+    RigSession     *rig_session;        /*!< Serialized rigctld session (primary) */
+    RigSession     *rig_session2;       /*!< Serialized rigctld session (secondary) */
 
     GpTermView     *term_view;          /*!< Embedded radio debug terminal */
     GtkWidget      *log_toggle;         /*!< Logs toggle button */

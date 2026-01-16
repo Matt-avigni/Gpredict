@@ -70,7 +70,7 @@ typedef struct {
     gdouble         maxel;      /*!< Upper elevation limit */
     gdouble         azstoppos;  /*!< absolute position of rotation stops; normally = minaz */
     gdouble         threshold;  /*!< Angle difference that triggers new motion command */
-    gboolean        use_offset; /*!< Apply configured az/el offsets */
+    gboolean        use_offset; /*!< Apply configured az/el offsets (zenith guard is handled at runtime) */
     gdouble         az_offset;  /*!< Azimuth offset (degrees) */
     gdouble         el_offset;  /*!< Elevation offset (degrees) */
     gboolean        invert_az;  /*!< Invert azimuth axis */

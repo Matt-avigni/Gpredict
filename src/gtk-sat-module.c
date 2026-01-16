@@ -262,7 +262,7 @@ static void gtk_sat_module_init(GtkSatModule * module,
     module->autotrack = FALSE;
 }
 
-GType gtk_sat_module_get_type()
+GType gtk_sat_module_get_type(void)
 {
     static GType    gtk_sat_module_type = 0;
 

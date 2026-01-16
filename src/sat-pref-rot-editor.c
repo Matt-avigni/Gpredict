@@ -644,7 +644,7 @@ static void update_widgets(rotor_conf_t * conf)
 }
 
 /* called when the user clicks on the CLEAR button */
-static void clear_widgets()
+static void clear_widgets(void)
 {
     gtk_entry_set_text(GTK_ENTRY(name), "");
     gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
@@ -1061,6 +1061,9 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
 
     use_offset = gtk_check_button_new_with_label(_("Enable"));
+    gtk_widget_set_tooltip_text(use_offset,
+                                _("Apply fixed software offsets to azimuth/elevation.\n"
+                                  "Near-zenith tracking (>=85°) automatically holds azimuth."));
     gtk_grid_attach(GTK_GRID(table), use_offset, 1, 17, 1, 1);
 
     label = gtk_label_new(_(" Az offset"));

@@ -75,6 +75,7 @@
 #include "predict-tools.h"
 #include "sat-log.h"
 #include "rotor-conf.h"
+#include "rot-trajectory.h"
 #include "rotor-cmd-map.h"
 #include "rotor-trajectory-planner.h"
 #include "rotctld_mgr.h"
@@ -96,6 +97,14 @@
 #define ROT_PLAN_EL_WEIGHT 1.0
 #define ROT_PLAN_NEAR_LIMIT_MARGIN 2.0
 #define ROT_PLAN_NEAR_LIMIT_PENALTY 5.0
+#define ROTCTLD_SOCKET_TIMEOUT_MS 1000
+#define ROTCTLD_IDLE_TIMEOUT_MS 100
+#define ROTCTLD_FOLLOW_IDLE_MS 50
+#define ROTCTLD_HANDSHAKE_RETRY_MS 250
+#define ROTCTLD_POSITION_POLL_MS 300
+#define ROT_SEND_DEADBAND_DEG 0.1
+#define ROT_ENGAGE_DEADBAND_DEG 0.2
+#define ROT_SEND_RATE_LIMIT_US 200000
 
 typedef struct {
     GThread        *thread;
@@ -114,6 +123,7 @@ typedef struct {
     gdouble         el_min, el_max;
     gboolean        daemon_ok;
     GTimer         *timer;
+    GString        *rxbuf;
 } rotctld_client_t;
 
 typedef struct RotctldProbeState RotctldProbeState;
@@ -156,6 +166,30 @@ typedef struct {
     gchar          *reason;
 } rot_plan_t;
 
+typedef struct {
+    gdouble         az_offset_deg;
+    gdouble         el_offset_deg;
+    gboolean        az_invert;
+    gboolean        el_invert;
+    gdouble         az_min_deg;
+    gdouble         az_max_deg;
+    gdouble         el_min_deg;
+    gdouble         el_max_deg;
+    rot_az_type_t   az_norm_mode;
+    gboolean        zenith_guard_enable;
+    gdouble         zenith_guard_el_deg;
+} RotTransform;
+
+typedef struct {
+    gdouble         az_abs;
+    gdouble         el_raw;
+} RotTransformPre;
+
+typedef enum {
+    ROT_AZ_SEND_ABS = 0,
+    ROT_AZ_SEND_SIGNED
+} rot_az_send_mode_t;
+
 struct _GtkRotCtrl {
     GtkBox          box;
 
@@ -194,6 +228,22 @@ struct _GtkRotCtrl {
     GtkWidget      *offset_check;
     GtkWidget      *az_offset_spin;
     GtkWidget      *el_offset_spin;
+    RotTransform    transform;
+    gboolean        az_hold_active;
+    gdouble         az_hold_value;
+    gint64          last_debug_log_us;
+    gdouble         last_az_sent;
+    gboolean        last_az_sent_valid;
+    rot_az_send_mode_t last_az_send_mode;
+    gdouble         last_cmd_az_cont;
+    gdouble         last_cmd_el;
+    gboolean        last_cmd_cont_valid;
+    gint64          last_send_us;
+    gdouble         last_target_az;
+    gdouble         last_target_el;
+    gboolean        last_target_valid;
+    guint           pos_timerid;
+    gboolean        engage_force_update;
 
     /* Reserved flag; currently always kept FALSE (no special SEND-ONLY mode). */
     gboolean        send_only_mode;
@@ -230,6 +280,7 @@ static void rot_schedule_cmd_reject(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_log_out_of_range(GtkRotCtrl *ctrl,
                                  gdouble raw_az, gdouble raw_el,
                                  const rot_cmd_map_t *map);
+static void     rotctld_clear_rxbuf(GtkRotCtrl *ctrl);
 static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
                                        gpointer data);
 static gboolean rotctrl_should_sync_manual(GtkRotCtrl *ctrl);
@@ -237,6 +288,32 @@ static gboolean rotctrl_sync_manual_from_position(GtkRotCtrl *ctrl,
                                                   gdouble az_abs, gdouble el,
                                                   gdouble *setaz,
                                                   gdouble *setel);
+static gdouble  norm360(gdouble a);
+static gdouble  ang_delta_deg(gdouble a, gdouble b);
+static gdouble  rot_normalize_zero(gdouble v);
+static gdouble  rot_az_norm_360(gdouble az);
+static rot_az_send_mode_t rot_az_send_mode_for_conf(const rotor_conf_t *conf);
+static const gchar *rot_az_send_mode_name(rot_az_send_mode_t mode);
+static gdouble  rot_az_map_for_send(GtkRotCtrl *ctrl,
+                                    gdouble az_in, gdouble el_in,
+                                    gboolean update_state,
+                                    rot_az_send_mode_t *mode_out,
+                                    gdouble *az_cont_out);
+static gdouble  rot_clamp_az_abs(gdouble az, gdouble min, gdouble max,
+                                 gboolean *clamped_out);
+static void     rot_transform_update(GtkRotCtrl *ctrl);
+static void     rot_transform_prepare(const RotTransform *transform,
+                                      gdouble in_az, gdouble in_el,
+                                      RotTransformPre *pre);
+static void     apply_transform(const RotTransform *transform,
+                                gdouble in_az, gdouble in_el,
+                                gdouble *out_az, gdouble *out_el);
+static void     apply_inverse_transform(const RotTransform *transform,
+                                        gdouble in_az, gdouble in_el,
+                                        gdouble *out_az, gdouble *out_el);
+static void rotctrl_start_position_poll(GtkRotCtrl *ctrl);
+static void rotctrl_stop_position_poll(GtkRotCtrl *ctrl);
+static gboolean rotctrl_poll_position_cb(gpointer data);
 
 static void rot_term_log(GtkRotCtrl *ctrl, const gchar *prefix,
                          const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
@@ -283,6 +360,7 @@ static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data);
 static void rot_get_park_position(GtkRotCtrl *ctrl, gdouble *park_az, gdouble *park_el)
 {
     gdouble az = 0.0;
+    gdouble az_abs = 0.0;
     gdouble el = 0.0;
 
     const gchar *env_az = g_getenv("GPREDICT_ROT_PARK_AZ");
@@ -739,6 +817,9 @@ static void rotctld_socket_close(GtkRotCtrl *ctrl, gint * sock)
 #endif
 
     *sock = -1;
+
+    if (ctrl != NULL)
+        rotctld_clear_rxbuf(ctrl);
 }
 
 /* Close a rotctld socket without sending shutdown commands. */
@@ -758,6 +839,316 @@ static void rotctld_socket_close_quiet(gint *sock)
     *sock = -1;
 }
 
+static GString *rotctld_rxbuf_get(GtkRotCtrl *ctrl, gboolean create)
+{
+    if (ctrl == NULL)
+        return NULL;
+
+    if (ctrl->client.rxbuf == NULL && create)
+        ctrl->client.rxbuf = g_string_sized_new(256);
+
+    return ctrl->client.rxbuf;
+}
+
+static void rotctld_rxbuf_clear(GString *buf)
+{
+    if (buf == NULL)
+        return;
+
+    g_string_set_size(buf, 0);
+}
+
+static void rotctld_clear_rxbuf(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    rotctld_rxbuf_clear(ctrl->client.rxbuf);
+}
+
+static gboolean rotctld_rxbuf_find_line(const GString *buf, gsize *line_len)
+{
+    const gchar *pos = NULL;
+
+    if (buf == NULL || buf->len == 0)
+        return FALSE;
+
+    pos = memchr(buf->str, '\n', buf->len);
+    if (pos == NULL)
+        return FALSE;
+
+    if (line_len)
+        *line_len = (gsize)(pos - buf->str) + 1;
+
+    return TRUE;
+}
+
+static gssize rotctld_rxbuf_take_line(GString *buf, gchar *out, gsize out_len)
+{
+    gsize line_len = 0;
+    gsize copy_len = 0;
+
+    if (!rotctld_rxbuf_find_line(buf, &line_len))
+        return 0;
+
+    if (out == NULL || out_len == 0)
+        return -1;
+
+    copy_len = line_len;
+    if (copy_len >= out_len)
+        copy_len = out_len - 1;
+
+    if (copy_len > 0)
+        memcpy(out, buf->str, copy_len);
+    out[copy_len] = '\0';
+
+    g_string_erase(buf, 0, line_len);
+    return (gssize) copy_len;
+}
+
+static gint rotctld_poll_readable(int fd, gint timeout_ms, gint *err_out)
+{
+    GPollFD pfd;
+    gint rc;
+
+    if (err_out)
+        *err_out = 0;
+
+    pfd.fd = fd;
+    pfd.events = G_IO_IN;
+    pfd.revents = 0;
+
+    rc = g_poll(&pfd, 1, timeout_ms);
+    if (rc == 0)
+        return 0;
+    if (rc < 0)
+    {
+        if (err_out)
+            *err_out = errno;
+        return -1;
+    }
+
+    if (pfd.revents & (G_IO_ERR | G_IO_NVAL))
+    {
+        if (err_out)
+            *err_out = EIO;
+        return -1;
+    }
+
+    return 1;
+}
+
+static gboolean rotctld_line_is_rprt(const gchar *line)
+{
+    const gchar *scan = line;
+
+    if (scan == NULL)
+        return FALSE;
+
+    while (*scan != '\0' && g_ascii_isspace(*scan))
+        scan++;
+
+    return g_str_has_prefix(scan, "RPRT ");
+}
+
+static gboolean rotctld_line_is_done(const gchar *line)
+{
+    const gchar *scan = line;
+
+    if (scan == NULL)
+        return FALSE;
+
+    while (*scan != '\0' && g_ascii_isspace(*scan))
+        scan++;
+
+    return g_ascii_strcasecmp(scan, "done") == 0;
+}
+
+static gssize rotctld_read_reply_line(int fd,
+                                      GString *buf,
+                                      gchar *out,
+                                      gsize out_len,
+                                      gint timeout_ms,
+                                      gint *err_out)
+{
+    gint64 deadline_us;
+
+    if (err_out)
+        *err_out = 0;
+
+    if (buf == NULL || out == NULL || out_len == 0)
+    {
+        if (err_out)
+            *err_out = EINVAL;
+        return -1;
+    }
+
+    if (timeout_ms < 0)
+        timeout_ms = 0;
+
+    deadline_us = g_get_monotonic_time() + ((gint64)timeout_ms * 1000);
+
+    for (;;)
+    {
+        gssize copied = rotctld_rxbuf_take_line(buf, out, out_len);
+        if (copied > 0)
+            return copied;
+        if (copied < 0)
+        {
+            if (err_out)
+                *err_out = EINVAL;
+            return -1;
+        }
+
+        gint64 now_us = g_get_monotonic_time();
+        gint64 remaining_us = deadline_us - now_us;
+        gint remaining_ms;
+        gint poll_rc;
+        gchar chunk[512];
+        gssize size;
+
+        if (remaining_us <= 0)
+        {
+            if (err_out)
+                *err_out = EAGAIN;
+            return -1;
+        }
+
+        remaining_ms = (gint)(remaining_us / 1000);
+        if (remaining_ms <= 0)
+            remaining_ms = 1;
+
+        poll_rc = rotctld_poll_readable(fd, remaining_ms, err_out);
+        if (poll_rc <= 0)
+        {
+            if (poll_rc == 0 && err_out)
+                *err_out = EAGAIN;
+            return -1;
+        }
+
+        size = recv(fd, chunk, sizeof(chunk), 0);
+        if (size == 0)
+            return 0;
+        if (size < 0)
+        {
+            if (err_out)
+                *err_out = errno;
+            return -1;
+        }
+
+        g_string_append_len(buf, chunk, (gsize) size);
+    }
+}
+
+typedef enum {
+    ROTCTLD_READ_SINGLE = 0,
+    ROTCTLD_READ_MULTILINE,
+    ROTCTLD_READ_DUMP_STATE
+} rotctld_read_mode_t;
+
+static gssize rotctld_read_response(int fd,
+                                    GString *buf,
+                                    rotctld_read_mode_t mode,
+                                    gchar *out,
+                                    gsize out_len,
+                                    gint base_timeout_ms,
+                                    gint idle_timeout_ms,
+                                    gboolean *saw_rprt,
+                                    gint *err_out)
+{
+    gchar line[512];
+    gssize size;
+    gsize used = 0;
+    gboolean saw_term = FALSE;
+    gboolean multi = (mode != ROTCTLD_READ_SINGLE);
+    gint err = 0;
+    gint lines = 0;
+    gint min_lines = (mode == ROTCTLD_READ_SINGLE) ? 1 : 2;
+
+    if (saw_rprt)
+        *saw_rprt = FALSE;
+    if (err_out)
+        *err_out = 0;
+
+    if (out == NULL || out_len == 0)
+    {
+        if (err_out)
+            *err_out = EINVAL;
+        return -1;
+    }
+
+    out[0] = '\0';
+
+    size = rotctld_read_reply_line(fd, buf, line, sizeof(line),
+                                   base_timeout_ms, &err);
+    if (size <= 0)
+    {
+        if (err_out)
+            *err_out = err;
+        return size;
+    }
+
+    used = g_strlcat(out, line, out_len);
+    lines++;
+    if (rotctld_line_is_rprt(line) || rotctld_line_is_done(line))
+        saw_term = TRUE;
+
+    if (mode == ROTCTLD_READ_SINGLE && !multi)
+    {
+        if (buf != NULL && buf->len > 0)
+            multi = TRUE;
+        else if (!saw_term && idle_timeout_ms > 0)
+        {
+            gint poll_rc = rotctld_poll_readable(fd, idle_timeout_ms, &err);
+            if (poll_rc < 0)
+            {
+                if (err_out)
+                    *err_out = err;
+                return -1;
+            }
+            if (poll_rc > 0)
+                multi = TRUE;
+        }
+    }
+
+    if (!multi)
+    {
+        if (saw_rprt)
+            *saw_rprt = saw_term;
+        return (gssize) used;
+    }
+
+    while (!saw_term)
+    {
+        size = rotctld_read_reply_line(fd, buf, line, sizeof(line),
+                                       idle_timeout_ms, &err);
+        if (size <= 0)
+        {
+            if (size < 0 && err != EAGAIN && err != EWOULDBLOCK)
+            {
+                if (err_out)
+                    *err_out = err;
+                return -1;
+            }
+            if (lines >= min_lines)
+                break;
+            if (err_out)
+                *err_out = err;
+            return -1;
+        }
+
+        used = g_strlcat(out, line, out_len);
+        lines++;
+        if (rotctld_line_is_rprt(line) || rotctld_line_is_done(line))
+            saw_term = TRUE;
+    }
+
+    if (saw_rprt)
+        *saw_rprt = saw_term;
+
+    return (gssize) used;
+}
+
 /*
  * Send a command to rotctld and read the response.
  *
@@ -771,6 +1162,11 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
     gint            written;
     gint            size;
     gint64          start_us = 0;
+    rotctld_read_mode_t read_mode = ROTCTLD_READ_SINGLE;
+    gint            idle_timeout_ms = ROTCTLD_FOLLOW_IDLE_MS;
+    gboolean        saw_rprt = FALSE;
+    gint            err = 0;
+    GString        *rxbuf = NULL;
     const gchar    *host = (ctrl && ctrl->conf && ctrl->conf->host)
                            ? ctrl->conf->host
                            : "(null)";
@@ -809,61 +1205,35 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
         return FALSE;
     }
 
-    /* try to read answer, but with a timeout using select() */
+    if (buff != NULL)
     {
-#ifndef WIN32
-        fd_set fds;
-        struct timeval tv;
-        int ret;
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        ret = select(sock + 1, &fds, NULL, NULL, &tv);
-        if (ret <= 0)
+        const gchar *scan = buff;
+        while (*scan != '\0' && g_ascii_isspace(*scan))
+            scan++;
+
+        if (g_str_has_prefix(scan, "\\dump_state"))
         {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: select() timeout or error waiting for rotctld reply"), __func__);
-            if (ctrl != NULL)
-            {
-                gchar *cmd = g_strdup(buff ? buff : "");
-                g_strchomp(cmd);
-                rot_term_log(ctrl, "gpredict:err",
-                             "%s failed: timeout waiting for reply to '%s' from %s:%d",
-                             __func__, cmd, host, port);
-                g_free(cmd);
-            }
-            return FALSE;
+            read_mode = ROTCTLD_READ_DUMP_STATE;
+            idle_timeout_ms = ROTCTLD_IDLE_TIMEOUT_MS;
         }
-#else
-        /* Windows version */
-        fd_set fds;
-        struct timeval tv;
-        int ret;
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        ret = select(0, &fds, NULL, NULL, &tv);
-        if (ret <= 0)
+        else if (*scan == 'p' && (scan[1] == '\0' || scan[1] == '\n'))
         {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: select() timeout or error waiting for rotctld reply"), __func__);
-            if (ctrl != NULL)
-            {
-                gchar *cmd = g_strdup(buff ? buff : "");
-                g_strchomp(cmd);
-                rot_term_log(ctrl, "gpredict:err",
-                             "%s failed: timeout waiting for reply to '%s' from %s:%d",
-                             __func__, cmd, host, port);
-                g_free(cmd);
-            }
-            return FALSE;
+            read_mode = ROTCTLD_READ_MULTILINE;
+            idle_timeout_ms = ROTCTLD_IDLE_TIMEOUT_MS;
         }
-#endif
-        /* Now safe to call recv() */
-        size = recv(sock, buffout, sizeout, 0);
     }
+
+    rxbuf = rotctld_rxbuf_get(ctrl, TRUE);
+    if (rxbuf == NULL)
+        rxbuf = g_string_sized_new(256);
+    if (read_mode == ROTCTLD_READ_DUMP_STATE && rxbuf != NULL)
+        rotctld_rxbuf_clear(rxbuf);
+
+    size = (gint) rotctld_read_response(sock, rxbuf, read_mode,
+                                        buffout, (gsize) sizeout,
+                                        ROTCTLD_SOCKET_TIMEOUT_MS,
+                                        idle_timeout_ms,
+                                        &saw_rprt, &err);
 
     if (size == -1)
     {
@@ -873,15 +1243,25 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
         {
             gchar *cmd = g_strdup(buff ? buff : "");
             g_strchomp(cmd);
-            rot_term_log(ctrl, "gpredict:err",
-                         "%s failed: recv error for '%s' from %s:%d (%s)",
-                         __func__, cmd, host, port, strerror(errno));
+            if (err == EAGAIN || err == EWOULDBLOCK)
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "%s failed: timeout waiting for reply to '%s' from %s:%d",
+                             __func__, cmd, host, port);
+            }
+            else
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "%s failed: recv error for '%s' from %s:%d (%s)",
+                             __func__, cmd, host, port, strerror(err));
+            }
             g_free(cmd);
         }
         return FALSE;
     }
 
-    buffout[size] = '\0';
+    if (size >= 0 && size < sizeout)
+        buffout[size] = '\0';
     if (size == 0)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -890,6 +1270,11 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
 
     if (ctrl != NULL)
         rot_term_log_rx(ctrl, buff, buffout);
+
+    if (read_mode == ROTCTLD_READ_DUMP_STATE && rxbuf != NULL)
+        rotctld_rxbuf_clear(rxbuf);
+    if (ctrl == NULL && rxbuf != NULL)
+        g_string_free(rxbuf, TRUE);
 
     if (ctrl != NULL && ctrl->verbose_logging && start_us > 0)
     {
@@ -1126,6 +1511,140 @@ static gboolean rot_get_command(GtkRotCtrl *ctrl, gboolean plan_active,
     return from_plan;
 }
 
+static rot_cmd_map_status_t rotctrl_map_command(GtkRotCtrl *ctrl,
+                                                gdouble raw_az,
+                                                gdouble raw_el,
+                                                rot_cmd_map_t *out)
+{
+    RotTransformPre pre = { 0 };
+    gdouble cmd_az = 0.0;
+    gdouble cmd_el = 0.0;
+    gdouble el_clamped = 0.0;
+    gboolean az_clamped = FALSE;
+    gboolean el_clamped_flag = FALSE;
+
+    if (out != NULL)
+    {
+        out->mapped_az = raw_az;
+        out->mapped_el = raw_el;
+        out->send_az = raw_az;
+        out->send_el = raw_el;
+    }
+
+    if (ctrl == NULL || ctrl->conf == NULL || out == NULL)
+        return ROT_CMD_MAP_INVALID_CONF;
+
+    rot_transform_update(ctrl);
+
+    if (ctrl->conf->minel > ctrl->conf->maxel)
+        return ROT_CMD_MAP_INVALID_CONF;
+
+    if (ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        raw_el = ctrl->conf->minel;
+
+    apply_transform(&ctrl->transform, raw_az, raw_el, &cmd_az, &cmd_el);
+
+    rot_transform_prepare(&ctrl->transform, raw_az, raw_el, &pre);
+    (void) rot_clamp_az_abs(pre.az_abs,
+                            ctrl->transform.az_min_deg,
+                            ctrl->transform.az_max_deg,
+                            &az_clamped);
+    el_clamped = CLAMP(pre.el_raw,
+                       ctrl->transform.el_min_deg,
+                       ctrl->transform.el_max_deg);
+    el_clamped_flag = fabs(pre.el_raw - el_clamped) > 1e-6;
+
+    out->mapped_az = pre.az_abs;
+    if (ctrl->transform.az_norm_mode == ROT_AZ_TYPE_180 &&
+        out->mapped_az > 180.0)
+        out->mapped_az -= 360.0;
+    out->mapped_el = pre.el_raw;
+    out->send_az = cmd_az;
+    out->send_el = cmd_el;
+
+    if (az_clamped || el_clamped_flag)
+        return ROT_CMD_MAP_OUT_OF_RANGE;
+
+    return ROT_CMD_MAP_OK;
+}
+
+static void rotctrl_apply_zenith_guard(GtkRotCtrl *ctrl,
+                                       gdouble raw_el,
+                                       gdouble rotaz_abs,
+                                       gboolean rotpos_valid,
+                                       gdouble *cmd_az)
+{
+    gdouble guard_on;
+    gdouble guard_off;
+    gdouble hold_value = 0.0;
+
+    if (ctrl == NULL || cmd_az == NULL)
+        return;
+
+    if (!ctrl->transform.zenith_guard_enable)
+        return;
+
+    if (ctrl->conf != NULL &&
+        ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        return;
+
+    guard_on = ctrl->transform.zenith_guard_el_deg;
+    guard_off = guard_on - 2.0;
+
+    if (!ctrl->az_hold_active && raw_el >= guard_on)
+    {
+        if (rotpos_valid)
+            hold_value = rotaz_abs;
+        else
+            hold_value = *cmd_az;
+
+        ctrl->az_hold_active = TRUE;
+        ctrl->az_hold_value = hold_value;
+    }
+    else if (ctrl->az_hold_active && raw_el < guard_off)
+    {
+        ctrl->az_hold_active = FALSE;
+    }
+
+    if (ctrl->az_hold_active)
+        *cmd_az = ctrl->az_hold_value;
+}
+
+static gboolean rotctrl_should_send(GtkRotCtrl *ctrl,
+                                    gboolean force_send,
+                                    gdouble cmdaz,
+                                    gdouble cmdel,
+                                    gdouble rotaz,
+                                    gdouble rotel,
+                                    gboolean rotpos_valid,
+                                    gint64 now_us)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    /* Rate limit to keep tracking stable and avoid command bursts. */
+    if (ctrl->last_send_us > 0 &&
+        (now_us - ctrl->last_send_us) < ROT_SEND_RATE_LIMIT_US)
+        return FALSE;
+
+    if (force_send && rotpos_valid)
+    {
+        if (fabs(rot_traj_wrap_diff(cmdaz, rotaz)) < ROT_ENGAGE_DEADBAND_DEG &&
+            fabs(cmdel - rotel) < ROT_ENGAGE_DEADBAND_DEG)
+            return FALSE;
+    }
+
+    if (ctrl->last_cmd_cont_valid)
+    {
+        gdouble last_norm = rot_traj_norm_360(ctrl->last_cmd_az_cont);
+        if (fabs(rot_traj_wrap_diff(cmdaz, last_norm)) < ROT_SEND_DEADBAND_DEG &&
+            fabs(cmdel - ctrl->last_cmd_el) < ROT_SEND_DEADBAND_DEG)
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
 static GArray *rot_build_samples(GtkRotCtrl *ctrl, pass_t *pass,
                                  rot_plan_mode_t mode,
                                  gdouble t0, gdouble t1)
@@ -1328,21 +1847,423 @@ static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
         return FALSE;
     }
 
-    /* Send-only mode: reuse last commanded values instead of asking rotctld. */
+    /* Use latest feedback cached by the rotctld client thread. */
     g_mutex_lock(&ctrl->client.mutex);
-    *az = ctrl->client.azi_out;
-    *el = ctrl->client.ele_out;
+    *az = ctrl->client.azi_in;
+    *el = ctrl->client.ele_in;
     g_mutex_unlock(&ctrl->client.mutex);
 
     return TRUE;
+}
+
+static gboolean rotctrl_read_actual_position(GtkRotCtrl *ctrl,
+                                             gdouble *rotaz,
+                                             gdouble *rotel,
+                                             gboolean *error,
+                                             gboolean *cmd_rejected)
+{
+    if (ctrl == NULL || ctrl->monitor || !ctrl->client.running)
+        return FALSE;
+
+    if (!g_mutex_trylock(&ctrl->client.mutex))
+        return FALSE;
+
+    if (error)
+        *error = ctrl->client.io_error;
+    if (cmd_rejected)
+        *cmd_rejected = ctrl->client.cmd_rejected;
+    if (rotaz)
+        *rotaz = ctrl->client.azi_in;
+    if (rotel)
+        *rotel = ctrl->client.ele_in;
+
+    g_mutex_unlock(&ctrl->client.mutex);
+
+    if (rotaz)
+        *rotaz = rot_az_norm_360(*rotaz);
+
+    return TRUE;
+}
+
+static void rotctrl_update_actual_display(GtkRotCtrl *ctrl,
+                                          gdouble rotaz,
+                                          gdouble rotel,
+                                          gboolean error)
+{
+    gchar *text = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    if (error)
+    {
+        gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("ERROR"));
+        gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("ERROR"));
+        gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
+                                     -10.0, -10.0);
+        return;
+    }
+
+    /* update display widgets */
+    gdouble rotaz_disp = rotaz;
+    if (ctrl->conf && ctrl->conf->aztype == ROT_AZ_TYPE_180 &&
+        rotaz_disp > 180.0)
+        rotaz_disp -= 360.0;
+    text = g_strdup_printf("%.2f\302\260", rotaz_disp);
+    gtk_label_set_text(GTK_LABEL(ctrl->AzRead), text);
+    g_free(text);
+    text = g_strdup_printf("%.2f\302\260", rotel);
+    gtk_label_set_text(GTK_LABEL(ctrl->ElRead), text);
+    g_free(text);
+
+    if (ctrl->conf && ctrl->conf->aztype == ROT_AZ_TYPE_180 &&
+        rotaz_disp < 0.0)
+    {
+        gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
+                                     rotaz_disp + 360.0, rotel);
+    }
+    else
+    {
+        gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
+                                     rotaz_disp, rotel);
+    }
+}
+
+static void rotctrl_start_position_poll(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->pos_timerid != 0)
+        return;
+
+    ctrl->pos_timerid =
+        g_timeout_add(ROTCTLD_POSITION_POLL_MS, rotctrl_poll_position_cb, ctrl);
+}
+
+static void rotctrl_stop_position_poll(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->pos_timerid != 0)
+    {
+        g_source_remove(ctrl->pos_timerid);
+        ctrl->pos_timerid = 0;
+    }
+}
+
+static gboolean rotctrl_poll_position_cb(gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gdouble rotaz = 0.0;
+    gdouble rotel = 0.0;
+    gboolean error = FALSE;
+
+    if (ctrl == NULL || !ctrl->engaged || !ctrl->client.running)
+    {
+        if (ctrl != NULL)
+            ctrl->pos_timerid = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    if (rotctrl_read_actual_position(ctrl, &rotaz, &rotel, &error, NULL))
+    {
+        rotctrl_update_actual_display(ctrl, rotaz, rotel, error);
+        if (!error && !ctrl->last_cmd_cont_valid)
+        {
+            ctrl->last_cmd_az_cont = rotaz;
+            ctrl->last_cmd_el = rotel;
+            ctrl->last_cmd_cont_valid = TRUE;
+        }
+    }
+
+    return G_SOURCE_CONTINUE;
 }
 
 static void rot_format_deg_2(char *out, gsize outsz, gdouble val)
 {
     gchar buf[G_ASCII_DTOSTR_BUF_SIZE];
 
+    val = rot_normalize_zero(val);
     g_ascii_formatd(buf, sizeof(buf), "%.2f", val);
     g_strlcpy(out, buf, outsz);
+}
+
+static gdouble norm360(gdouble a)
+{
+    return rot_traj_norm_360(a);
+}
+
+static gdouble ang_delta_deg(gdouble a, gdouble b)
+{
+    return rot_traj_wrap_diff(a, b);
+}
+
+static gdouble rot_normalize_zero(gdouble v)
+{
+    if (fabs(v) < 1e-6)
+        return 0.0;
+    return v;
+}
+
+static gdouble rot_az_norm_360(gdouble az)
+{
+    az = rot_traj_norm_360(az);
+    return rot_normalize_zero(az);
+}
+
+static rot_az_send_mode_t rot_az_send_mode_for_conf(const rotor_conf_t *conf)
+{
+    if (conf == NULL)
+        return ROT_AZ_SEND_ABS;
+
+    if (conf->minaz < 0.0 && conf->maxaz <= 180.0)
+        return ROT_AZ_SEND_SIGNED;
+
+    return ROT_AZ_SEND_ABS;
+}
+
+static const gchar *rot_az_send_mode_name(rot_az_send_mode_t mode)
+{
+    return (mode == ROT_AZ_SEND_SIGNED) ? "SIGNED_180" : "ABS_360";
+}
+
+static gdouble rot_az_map_for_send(GtkRotCtrl *ctrl,
+                                   gdouble az_in, gdouble el_in,
+                                   gboolean update_state,
+                                   rot_az_send_mode_t *mode_out,
+                                   gdouble *az_cont_out)
+{
+    const rotor_conf_t *conf = ctrl ? ctrl->conf : NULL;
+    rot_az_send_mode_t mode = rot_az_send_mode_for_conf(conf);
+    gdouble az360 = rot_az_norm_360(az_in);
+    gdouble az_send = az360;
+    gdouble az_cont = az360;
+    gdouble min_send = conf ? conf->minaz : 0.0;
+    gdouble max_send = conf ? conf->maxaz : 360.0;
+    gdouble min_cont = 0.0;
+    gdouble max_cont = 360.0;
+
+    if (conf != NULL)
+    {
+        rot_cmd_get_abs_az_limits(conf, &min_cont, &max_cont);
+        if (conf->maxaz > 360.0 && conf->minaz >= 0.0)
+        {
+            min_cont = conf->minaz;
+            max_cont = conf->maxaz;
+        }
+    }
+
+    /* Keep azimuth continuous across 0/360 by choosing the closest equivalent. */
+    az_cont = rot_traj_select_continuous_az(
+        az360,
+        (ctrl != NULL) ? ctrl->last_cmd_az_cont : 0.0,
+        (ctrl != NULL) ? ctrl->last_cmd_cont_valid : FALSE,
+        min_cont,
+        max_cont);
+
+    if (mode == ROT_AZ_SEND_SIGNED)
+    {
+        az_send = rot_traj_norm_360(az_cont);
+        if (az_send > 180.0)
+            az_send -= 360.0;
+        if (conf != NULL && min_send <= max_send)
+            az_send = CLAMP(az_send, min_send, max_send);
+    }
+    else
+    {
+        if (max_cont <= 360.0)
+            az_send = rot_traj_norm_360(az_cont);
+        else
+            az_send = az_cont;
+
+        if (conf != NULL && min_send <= max_send)
+            az_send = CLAMP(az_send, min_send, max_send);
+
+        if (max_cont <= 360.0)
+        {
+            if (fabs(az_send - 360.0) < 1e-6)
+                az_send = 0.0;
+            if (az_send >= 359.995 && az_send < 360.5)
+                az_send = 0.0;
+        }
+    }
+
+    az_send = rot_normalize_zero(az_send);
+
+    if (mode_out)
+        *mode_out = mode;
+    if (az_cont_out)
+        *az_cont_out = az_cont;
+    if (ctrl != NULL && update_state)
+    {
+        ctrl->last_cmd_az_cont = az_cont;
+        ctrl->last_cmd_el = el_in;
+        ctrl->last_cmd_cont_valid = TRUE;
+        ctrl->last_az_sent = az_send;
+        ctrl->last_az_sent_valid = TRUE;
+        ctrl->last_az_send_mode = mode;
+    }
+
+    return az_send;
+}
+
+static gboolean rot_az_in_limits(gdouble az, gdouble min, gdouble max)
+{
+    if (min <= max)
+        return (az >= min && az <= max);
+    return (az >= min || az <= max);
+}
+
+static gdouble rot_clamp_az_abs(gdouble az, gdouble min, gdouble max,
+                                gboolean *clamped_out)
+{
+    gdouble az_norm = norm360(az);
+
+    if (rot_az_in_limits(az_norm, min, max))
+    {
+        if (clamped_out)
+            *clamped_out = FALSE;
+        return az_norm;
+    }
+
+    gdouble dmin = fabs(ang_delta_deg(az_norm, min));
+    gdouble dmax = fabs(ang_delta_deg(az_norm, max));
+    if (clamped_out)
+        *clamped_out = TRUE;
+    return (dmin <= dmax) ? min : max;
+}
+
+static void rot_transform_prepare(const RotTransform *transform,
+                                  gdouble in_az, gdouble in_el,
+                                  RotTransformPre *pre)
+{
+    gdouble az = norm360(in_az);
+    gdouble el = in_el;
+
+    if (pre == NULL || transform == NULL)
+        return;
+
+    if (transform->az_invert)
+        az = norm360(360.0 - az);
+    if (transform->el_invert)
+        el = 180.0 - el;
+
+    az = norm360(az + transform->az_offset_deg);
+    el = el + transform->el_offset_deg;
+
+    pre->az_abs = norm360(az);
+    pre->el_raw = el;
+}
+
+static void rot_transform_update(GtkRotCtrl *ctrl)
+{
+    RotTransform *transform;
+
+    if (ctrl == NULL)
+        return;
+
+    transform = &ctrl->transform;
+    transform->az_offset_deg = (ctrl->use_offset ? ctrl->az_offset_deg : 0.0);
+    transform->el_offset_deg = (ctrl->use_offset ? ctrl->el_offset_deg : 0.0);
+    transform->az_invert = (ctrl->conf && ctrl->conf->invert_az);
+    transform->el_invert = (ctrl->conf && ctrl->conf->invert_el);
+    transform->az_norm_mode = (ctrl->conf ? ctrl->conf->aztype : ROT_AZ_TYPE_360);
+    transform->zenith_guard_enable = TRUE;
+    transform->zenith_guard_el_deg = 85.0;
+    {
+        const gchar *env = g_getenv("GPREDICT_ROT_ZENITH_GUARD_EL");
+        if (env && *env)
+        {
+            gchar *endp = NULL;
+            gdouble v = g_ascii_strtod(env, &endp);
+            if (endp != env)
+                transform->zenith_guard_el_deg = CLAMP(v, 0.0, 90.0);
+        }
+    }
+
+    if (ctrl->conf)
+    {
+        rot_cmd_get_abs_az_limits(ctrl->conf,
+                                  &transform->az_min_deg,
+                                  &transform->az_max_deg);
+        transform->el_min_deg = ctrl->conf->minel;
+        transform->el_max_deg = ctrl->conf->maxel;
+    }
+    else
+    {
+        transform->az_min_deg = 0.0;
+        transform->az_max_deg = 360.0;
+        transform->el_min_deg = 0.0;
+        transform->el_max_deg = 90.0;
+    }
+
+    if (transform->el_min_deg > transform->el_max_deg)
+    {
+        gdouble tmp = transform->el_min_deg;
+        transform->el_min_deg = transform->el_max_deg;
+        transform->el_max_deg = tmp;
+    }
+}
+
+static void apply_transform(const RotTransform *transform,
+                            gdouble in_az, gdouble in_el,
+                            gdouble *out_az, gdouble *out_el)
+{
+    RotTransformPre pre = { 0 };
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+    gboolean az_clamped = FALSE;
+
+    if (transform == NULL)
+        return;
+
+    rot_transform_prepare(transform, in_az, in_el, &pre);
+
+    az = rot_clamp_az_abs(pre.az_abs,
+                          transform->az_min_deg,
+                          transform->az_max_deg,
+                          &az_clamped);
+    (void)az_clamped;
+
+    el = CLAMP(pre.el_raw, transform->el_min_deg, transform->el_max_deg);
+
+    az = norm360(az);
+
+    if (out_az)
+        *out_az = az;
+    if (out_el)
+        *out_el = el;
+}
+
+static void apply_inverse_transform(const RotTransform *transform,
+                                    gdouble in_az, gdouble in_el,
+                                    gdouble *out_az, gdouble *out_el)
+{
+    gdouble az = in_az;
+    gdouble el = in_el;
+
+    if (transform == NULL)
+        return;
+
+    az = norm360(az);
+
+    az = norm360(az - transform->az_offset_deg);
+    el = el - transform->el_offset_deg;
+
+    if (transform->az_invert)
+        az = norm360(360.0 - az);
+    if (transform->el_invert)
+        el = 180.0 - el;
+
+    if (transform->az_norm_mode == ROT_AZ_TYPE_180 && az > 180.0)
+        az -= 360.0;
+
+    if (out_az)
+        *out_az = az;
+    if (out_el)
+        *out_el = el;
 }
 
 static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
@@ -1384,6 +2305,7 @@ static gboolean rotctrl_sync_manual_from_position(GtkRotCtrl *ctrl,
                                                   gdouble *setel)
 {
     gdouble az_conf;
+    gdouble el_conf;
     gdouble cur_az;
     gdouble cur_el;
     gboolean changed = FALSE;
@@ -1392,18 +2314,21 @@ static gboolean rotctrl_sync_manual_from_position(GtkRotCtrl *ctrl,
     if (!rotctrl_should_sync_manual(ctrl))
         return FALSE;
 
-    az_conf = rot_az_to_conf(ctrl->conf, az_abs);
+    apply_inverse_transform(&ctrl->transform, az_abs, el, &az_conf, &el_conf);
+    if (ctrl->conf && ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        el_conf = ctrl->conf->minel;
     cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
     cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
 
-    if (fabs(cur_az - az_conf) >= 0.05 || fabs(cur_el - el) >= 0.05)
+    if (fabs(ang_delta_deg(cur_az, az_conf)) >= 0.05 ||
+        fabs(cur_el - el_conf) >= 0.05)
     {
         gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), az_conf);
-        gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), el);
+        gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), el_conf);
         if (setaz)
             *setaz = az_conf;
         if (setel)
-            *setel = el;
+            *setel = el_conf;
         changed = TRUE;
     }
 
@@ -1714,11 +2639,15 @@ static gboolean rotctld_handshake(GtkRotCtrl *ctrl, gint sock,
     gchar elbuf[G_ASCII_DTOSTR_BUF_SIZE];
     gdouble az = 0.0;
     gdouble el = 0.0;
+    gdouble az_abs = 0.0;
     gint rprt_code = 0;
     gboolean have_pos = FALSE;
 
     if (rejected)
         *rejected = FALSE;
+
+    if (ctrl != NULL)
+        rot_transform_update(ctrl);
 
     if (!rotctld_socket_rw(ctrl, sock, "p\n", reply, sizeof(reply) - 1))
         return FALSE;
@@ -1736,9 +2665,50 @@ static gboolean rotctld_handshake(GtkRotCtrl *ctrl, gint sock,
         return FALSE;
     }
 
-    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az);
-    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el);
-    g_snprintf(txbuf, sizeof(txbuf), "P %s %s\n", azbuf, elbuf);
+    if (ctrl != NULL)
+    {
+        gdouble az_checked = norm360(az);
+        if (!rot_az_in_limits(az_checked,
+                              ctrl->transform.az_min_deg,
+                              ctrl->transform.az_max_deg) ||
+            el < (ctrl->transform.el_min_deg - 1e-2) ||
+            el > (ctrl->transform.el_max_deg + 1e-2))
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "%s: rotctld position out of range az=%.2f el=%.2f (az=%.2f..%.2f el=%.2f..%.2f)",
+                        __func__, az, el,
+                        ctrl->transform.az_min_deg,
+                        ctrl->transform.az_max_deg,
+                        ctrl->transform.el_min_deg,
+                        ctrl->transform.el_max_deg);
+            return FALSE;
+        }
+    }
+
+    az_abs = rot_az_norm_360(az);
+
+    if (ctrl != NULL)
+    {
+        g_mutex_lock(&ctrl->client.mutex);
+        ctrl->az_hold_active = FALSE;
+        if (ctrl->transform.zenith_guard_enable &&
+            el >= ctrl->transform.zenith_guard_el_deg)
+        {
+            ctrl->az_hold_active = TRUE;
+            ctrl->az_hold_value = az_abs;
+        }
+        g_mutex_unlock(&ctrl->client.mutex);
+    }
+
+    {
+        rot_az_send_mode_t az_mode = ROT_AZ_SEND_ABS;
+        gdouble az_send = rot_az_map_for_send(ctrl, az, el, FALSE, &az_mode, NULL);
+        gdouble el_send = rot_normalize_zero(el);
+
+        g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az_send);
+        g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el_send);
+        g_snprintf(txbuf, sizeof(txbuf), "P %s %s\n", azbuf, elbuf);
+    }
 
     if (!rotctld_socket_rw(ctrl, sock, txbuf, reply, sizeof(reply) - 1))
         return FALSE;
@@ -1751,7 +2721,7 @@ static gboolean rotctld_handshake(GtkRotCtrl *ctrl, gint sock,
     }
 
     g_mutex_lock(&ctrl->client.mutex);
-    ctrl->client.azi_in = az;
+    ctrl->client.azi_in = az_abs;
     ctrl->client.ele_in = el;
     g_mutex_unlock(&ctrl->client.mutex);
     ctrl->manual_sync_pending = TRUE;
@@ -1788,24 +2758,26 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gchar           send_el_str[32];
     gdouble         az_send = az;
     gdouble         el_send = el;
+    rot_az_send_mode_t az_mode = ROT_AZ_SEND_ABS;
     const gchar    *host = (ctrl && ctrl->conf && ctrl->conf->host)
                            ? ctrl->conf->host
                            : "(null)";
     gint            port = (ctrl && ctrl->conf) ? ctrl->conf->port : 0;
 
+    az_send = rot_az_map_for_send(ctrl, az_send, el_send, TRUE, &az_mode, NULL);
+    el_send = rot_normalize_zero(el_send);
+
     rot_format_deg_2(send_az_str, sizeof(send_az_str), az_send);
     rot_format_deg_2(send_el_str, sizeof(send_el_str), el_send);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s: set_pos send=(%s, %s)"),
-                __func__, send_az_str, send_el_str);
-    g_printerr("MISSION_SOPHIE: set_pos send=(%s, %s)\n",
-               send_az_str, send_el_str);
+                _("%s: set_pos send=(%s, %s) az_mode=%s"),
+                __func__, send_az_str, send_el_str,
+                rot_az_send_mode_name(az_mode));
 
     /* send command (ASCII-safe, locale independent) */
     g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az_send);
     g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el_send);
     g_snprintf(txbuf, sizeof(txbuf), "P %s %s\n", azbuf, elbuf);
-    g_message("ROTCTLD TX: '%s'", txbuf);
     
     retcode = rotctld_socket_rw(ctrl, ctrl->client.socket, txbuf, buffback,
                                 128);
@@ -1813,14 +2785,13 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     if (!retcode) {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: rotctld I/O error while sending P command"), __func__);
-        g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
         rotctld_socket_close_quiet(&ctrl->client.socket);
+        rotctld_clear_rxbuf(ctrl);
         return ROT_SET_IO_ERROR;
     }
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: rotctld replied '%s'"), __func__, buffback);
-    g_printerr("MISSION_SOPHIE: set_pos reply '%s'\n", buffback);
 
     /* Interpret reply:
      *  - If it starts with "RPRT 0"  → success.
@@ -1859,6 +2830,8 @@ static gpointer rotctld_client_thread(gpointer data)
     gboolean        io_error = FALSE;
     gdouble         backoff_sec = 0.5;
     const gdouble   backoff_max = 10.0;
+    gint64          last_poll_us = 0;
+    const gint64    poll_interval_us = (gint64)ROTCTLD_POSITION_POLL_MS * 1000;
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -1882,19 +2855,10 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.limits_valid = FALSE;
     ctrl->client.daemon_ok = FALSE;
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "MISSION_SOPHIE: rotctld_client_thread started for %s:%d",
-                ctrl->conf ? ctrl->conf->host : "(null)",
-                ctrl->conf ? ctrl->conf->port : 0);
-
     rot_term_log_verbose(ctrl, "gpredict:rx",
                          "rotctld client thread started for %s:%d",
                          ctrl->conf ? ctrl->conf->host : "(null)",
                          ctrl->conf ? ctrl->conf->port : 0);
-
-    g_printerr("MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
-                ctrl->conf ? ctrl->conf->host : "(null)",
-                ctrl->conf ? ctrl->conf->port : 0);
 
     while (ctrl->client.running)
     {
@@ -1958,6 +2922,7 @@ static gpointer rotctld_client_thread(gpointer data)
                                  ctrl->conf ? ctrl->conf->port : 0,
                                  ctrl->conf ? ctrl->conf->host : "(null)");
                     rotctld_socket_close_quiet(&ctrl->client.socket);
+                    rotctld_clear_rxbuf(ctrl);
                     g_mutex_lock(&ctrl->client.mutex);
                     ctrl->client.daemon_ok = FALSE;
                     ctrl->client.io_error = TRUE;
@@ -1970,7 +2935,49 @@ static gpointer rotctld_client_thread(gpointer data)
                 }
 
                 gboolean rejected = FALSE;
-                if (!rotctld_handshake(ctrl, ctrl->client.socket, &rejected)) {
+                gboolean handshake_ok = FALSE;
+
+                for (gint attempt = 0; attempt < 2; attempt++)
+                {
+                    if (attempt > 0)
+                        g_usleep(ROTCTLD_HANDSHAKE_RETRY_MS * 1000);
+                    if (rotctld_handshake(ctrl, ctrl->client.socket, &rejected))
+                    {
+                        handshake_ok = TRUE;
+                        break;
+                    }
+                }
+
+                if (!handshake_ok)
+                {
+                    /* Reconnect once, then retry handshake. */
+                    rotctld_socket_close_quiet(&ctrl->client.socket);
+                    rotctld_clear_rxbuf(ctrl);
+                    ctrl->client.socket = rotctld_socket_open(ctrl->conf->host,
+                                                              ctrl->conf->port);
+                    if (ctrl->client.socket != -1)
+                    {
+                        rot_daemon_type_t daemon_retry =
+                            rotctld_dump_state(ctrl, ctrl->client.socket, reply,
+                                               sizeof(reply));
+                        if (daemon_retry == ROT_DAEMON_ROTCTLD)
+                        {
+                            rejected = FALSE;
+                            for (gint attempt = 0; attempt < 2; attempt++)
+                            {
+                                if (attempt > 0)
+                                    g_usleep(ROTCTLD_HANDSHAKE_RETRY_MS * 1000);
+                                if (rotctld_handshake(ctrl, ctrl->client.socket, &rejected))
+                                {
+                                    handshake_ok = TRUE;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!handshake_ok) {
                     sat_log_log(SAT_LOG_LEVEL_ERROR,
                                 "%s: rotctld handshake failed on %s:%d",
                                 __func__,
@@ -1987,10 +2994,13 @@ static gpointer rotctld_client_thread(gpointer data)
                               "check backend/model, limits, and axis mode"));
                     }
                     rotctld_socket_close_quiet(&ctrl->client.socket);
+                    rotctld_clear_rxbuf(ctrl);
                     g_mutex_lock(&ctrl->client.mutex);
                     ctrl->client.daemon_ok = FALSE;
                     ctrl->client.io_error = TRUE;
                     g_mutex_unlock(&ctrl->client.mutex);
+                    if (ctrl->rotctld_mgr)
+                        rotctld_process_stop(ctrl);
                     ctrl->client.running = FALSE;
                     break;
                 }
@@ -2050,15 +3060,6 @@ static gpointer rotctld_client_thread(gpointer data)
             gboolean daemon_ok = FALSE;
             rot_format_deg_2(azs, sizeof(azs), azi);
             rot_format_deg_2(els, sizeof(els), ele);
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%s, %s) engaged=%d monitor=%d",
-                        azs, els,
-                        ctrl->engaged ? 1 : 0,
-                        ctrl->monitor ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%s, %s) engaged=%d monitor=%d\n",
-                       azs, els,
-                       ctrl->engaged ? 1 : 0,
-                       ctrl->monitor ? 1 : 0);
 
             g_mutex_lock(&ctrl->client.mutex);
             daemon_ok = ctrl->client.daemon_ok;
@@ -2071,6 +3072,7 @@ static gpointer rotctld_client_thread(gpointer data)
                              ctrl->conf ? ctrl->conf->host : "(null)",
                              ctrl->conf ? ctrl->conf->port : 0);
                 rotctld_socket_close_quiet(&ctrl->client.socket);
+                rotctld_clear_rxbuf(ctrl);
                 g_mutex_lock(&ctrl->client.mutex);
                 ctrl->client.limits_valid = FALSE;
                 ctrl->client.daemon_ok = FALSE;
@@ -2120,22 +3122,59 @@ static gpointer rotctld_client_thread(gpointer data)
         }
         else
         {
-            gchar azs[32];
-            gchar els[32];
-            rot_format_deg_2(azs, sizeof(azs), azi);
-            rot_format_deg_2(els, sizeof(els), ele);
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: client thread idle – no new target (last_out=(%s, %s))",
-                        azs, els);
-            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%s, %s))\n",
-                       azs, els);
-            rot_term_log_verbose(ctrl, "gpredict:rx",
-                                 "idle: no new target (last_out=%s,%s)",
-                                 azs, els);
+            /* No new target: stay idle without touching last commanded output. */
+        }
+
+        /* Poll actual position to keep UI feedback live while tracking. */
+        gboolean polled_ok = FALSE;
+        if (!io_error && ctrl->client.socket != -1 &&
+            (last_poll_us == 0 || (now_us - last_poll_us) >= poll_interval_us))
+        {
+            gchar reply[256];
+            gdouble poll_az = 0.0;
+            gdouble poll_el = 0.0;
+            gint rprt_code = 0;
+            gboolean daemon_ok = FALSE;
+
+            g_mutex_lock(&ctrl->client.mutex);
+            daemon_ok = ctrl->client.daemon_ok;
+            g_mutex_unlock(&ctrl->client.mutex);
+
+            if (daemon_ok)
+            {
+                if (rotctld_socket_rw(ctrl, ctrl->client.socket, "p\n", reply,
+                                      sizeof(reply) - 1))
+                {
+                    if (rotctld_parse_position_reply(reply, &poll_az, &poll_el,
+                                                     &rprt_code) &&
+                        rprt_code == 0)
+                    {
+                        poll_az = rot_az_norm_360(poll_az);
+                        g_mutex_lock(&ctrl->client.mutex);
+                        ctrl->client.azi_in = poll_az;
+                        ctrl->client.ele_in = poll_el;
+                        g_mutex_unlock(&ctrl->client.mutex);
+                        polled_ok = TRUE;
+                    }
+                    else if (rprt_code != 0)
+                    {
+                        rot_term_log_verbose(ctrl, "gpredict:err",
+                                             "get_position rejected: %s",
+                                             rot_rprt_error_string(rprt_code));
+                    }
+                }
+                else
+                {
+                    io_error = TRUE;
+                }
+            }
+
+            last_poll_us = now_us;
         }
 
         if (io_error) {
             rotctld_socket_close_quiet(&ctrl->client.socket);
+            rotctld_clear_rxbuf(ctrl);
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->client.limits_valid = FALSE;
             ctrl->client.daemon_ok = FALSE;
@@ -2150,22 +3189,17 @@ static gpointer rotctld_client_thread(gpointer data)
          * position read-back.
          */
         g_mutex_lock(&ctrl->client.mutex);
-        if (!io_error && send_cmd && !ctrl->client.cmd_rejected) {
+        if (!io_error && send_cmd && !ctrl->client.cmd_rejected && !polled_ok) {
             ctrl->client.azi_in = ctrl->client.azi_out;
             ctrl->client.ele_in = ctrl->client.ele_out;
         }
         ctrl->client.io_error = io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
-        /* ensure rotctl duty cycle stays below 50%, but wait at least 700 ms */
-        elapsed_time = MAX(g_timer_elapsed(ctrl->client.timer, NULL), 0.7);
+        /* ensure rotctl duty cycle stays below 50%, but wait at least 200 ms */
+        elapsed_time = MAX(g_timer_elapsed(ctrl->client.timer, NULL), 0.2);
         g_usleep((gulong)(elapsed_time * 1e6));
     }
-
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "MISSION_SOPHIE: rotctld_client_thread stopping");
-
-    g_printerr("MISSION_SOPHIE: rotctld_client_thread stopping\n");
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: stopping rotctld client thread"), __func__);
@@ -2517,9 +3551,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     rot_cmd_map_t cmd_map = { 0 };
     rot_cmd_map_status_t map_status = ROT_CMD_MAP_INVALID_CONF;
     gboolean cmd_from_plan = FALSE;
-    gchar *text;
     gboolean error = FALSE;
     gboolean cmd_rejected = FALSE;
+    gboolean rotpos_valid = FALSE;
+    gboolean force_send = FALSE;
+    gint64 now_us = 0;
     sat_t sat_working, *sat;
     GtkWidget *status_label =
         g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
@@ -2528,6 +3564,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         ? (ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP)
                         : ctrl->flipped;
     ctrl->out_of_range = FALSE;
+    now_us = g_get_monotonic_time();
 
     /* parameters for path predictions */
     gdouble time_delta;
@@ -2635,56 +3672,34 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         setel = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
     }
 
+    ctrl->last_target_az = setaz;
+    ctrl->last_target_el = setel;
+    ctrl->last_target_valid = TRUE;
+
     /* Handle I/O with rotctld client if running and not in monitor mode */
     if (ctrl->client.running && !ctrl->monitor)
     {
-        if (g_mutex_trylock(&ctrl->client.mutex))
+        force_send = ctrl->engage_force_update &&
+                     ctrl->tracking && ctrl->target != NULL;
+
+        if (rotctrl_read_actual_position(ctrl, &rotaz, &rotel, &error,
+                                         &cmd_rejected))
         {
-            error = ctrl->client.io_error;
-            cmd_rejected = ctrl->client.cmd_rejected;
-            rotaz = ctrl->client.azi_in;
-            rotel = ctrl->client.ele_in;
-            g_mutex_unlock(&ctrl->client.mutex);
+            rotpos_valid = !error;
+            rotctrl_update_actual_display(ctrl, rotaz, rotel, error);
 
-            /* ensure Azimuth angle is 0-360 degrees */
-            while (rotaz < 0.0)
-                rotaz += 360.0;
-            while (rotaz > 360.0)
-                rotaz -= 360.0;
-
-            if (error)
+            if (!error && !ctrl->last_cmd_cont_valid)
             {
-                gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("ERROR"));
-                gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("ERROR"));
-                gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                             -10.0, -10.0);
+                /* Seed continuous az from actual rotor feedback. */
+                ctrl->last_cmd_az_cont = rotaz;
+                ctrl->last_cmd_el = rotel;
+                ctrl->last_cmd_cont_valid = TRUE;
             }
-            else
+
+            if (!error && ctrl->conf != NULL && !ctrl->tracking)
             {
-                /* update display widgets */
-                text = g_strdup_printf("%.2f\302\260", rotaz);
-                gtk_label_set_text(GTK_LABEL(ctrl->AzRead), text);
-                g_free(text);
-                text = g_strdup_printf("%.2f\302\260", rotel);
-                gtk_label_set_text(GTK_LABEL(ctrl->ElRead), text);
-                g_free(text);
-
-                if (ctrl->conf->aztype == ROT_AZ_TYPE_180 && rotaz < 0.0)
-                {
-                    gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                                 rotaz + 360.0, rotel);
-                }
-                else
-                {
-                    gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                                 rotaz, rotel);
-                }
-
-                if (ctrl->conf != NULL)
-                {
-                    rotctrl_sync_manual_from_position(ctrl, rotaz, rotel,
-                                                      &setaz, &setel);
-                }
+                rotctrl_sync_manual_from_position(ctrl, rotaz, rotel,
+                                                  &setaz, &setel);
             }
         }
 
@@ -2696,19 +3711,27 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         cmd_from_plan = rot_get_command(ctrl, plan_active, setaz, setel,
                                         ctrl->t, &raw_cmd_az, &raw_cmd_el);
 
-        map_status = rot_cmd_map(ctrl->conf, raw_cmd_az, raw_cmd_el, &cmd_map);
+        map_status = rotctrl_map_command(ctrl, raw_cmd_az, raw_cmd_el, &cmd_map);
         cmdaz = cmd_map.send_az;
         cmdel = cmd_map.send_el;
+        rotctrl_apply_zenith_guard(ctrl, raw_cmd_el, rotaz, rotpos_valid,
+                                   &cmdaz);
 
         if (map_status != ROT_CMD_MAP_OK) {
             ctrl->out_of_range = TRUE;
             rot_log_out_of_range(ctrl, raw_cmd_az, raw_cmd_el, &cmd_map);
         }
 
-        if (map_status == ROT_CMD_MAP_OK &&
-            (fabs(cmdaz - rotaz) > ctrl->threshold ||
-             fabs(cmdel - rotel) > ctrl->threshold))
+        if (map_status == ROT_CMD_MAP_OK)
         {
+            gdouble delta_az = fabs(rot_traj_wrap_diff(cmdaz, rotaz));
+            gdouble delta_el = fabs(cmdel - rotel);
+            gboolean needs_update = force_send || !rotpos_valid ||
+                                    delta_az > ctrl->threshold ||
+                                    delta_el > ctrl->threshold;
+
+            if (needs_update)
+            {
             /* If tracking is enabled, refine the target to "lead" the pass
              * a bit into the future, like the original code did.
              * Manual mode skips this and just uses the knob values.
@@ -2788,9 +3811,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             /* Recompute command after any lead adjustments. */
             cmd_from_plan = rot_get_command(ctrl, plan_active, setaz, setel,
                                             ctrl->t, &raw_cmd_az, &raw_cmd_el);
-            map_status = rot_cmd_map(ctrl->conf, raw_cmd_az, raw_cmd_el, &cmd_map);
+            map_status = rotctrl_map_command(ctrl, raw_cmd_az, raw_cmd_el, &cmd_map);
             cmdaz = cmd_map.send_az;
             cmdel = cmd_map.send_el;
+            rotctrl_apply_zenith_guard(ctrl, raw_cmd_el, rotaz, rotpos_valid,
+                                       &cmdaz);
             if (map_status != ROT_CMD_MAP_OK) {
                 ctrl->out_of_range = TRUE;
                 rot_log_out_of_range(ctrl, raw_cmd_az, raw_cmd_el, &cmd_map);
@@ -2800,17 +3825,72 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), setaz);
             gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), setel);
 
-            if (map_status == ROT_CMD_MAP_OK &&
-                g_mutex_trylock(&ctrl->client.mutex))
+            if (map_status == ROT_CMD_MAP_OK)
             {
-                if (fabs(cmdaz - ctrl->client.azi_out) > ctrl->threshold ||
-                    fabs(cmdel - ctrl->client.ele_out) > ctrl->threshold)
+                gboolean engage_deadband = force_send && rotpos_valid &&
+                    fabs(rot_traj_wrap_diff(cmdaz, rotaz)) < ROT_ENGAGE_DEADBAND_DEG &&
+                    fabs(cmdel - rotel) < ROT_ENGAGE_DEADBAND_DEG;
+
+                if (engage_deadband)
+                    ctrl->engage_force_update = FALSE;
+
+                if (!engage_deadband &&
+                    rotctrl_should_send(ctrl, force_send, cmdaz, cmdel,
+                                        rotaz, rotel, rotpos_valid, now_us) &&
+                    g_mutex_trylock(&ctrl->client.mutex))
                 {
-                    ctrl->client.azi_out = cmdaz;
-                    ctrl->client.ele_out = cmdel;
-                    ctrl->client.new_trg = TRUE;
+                    gdouble out_az = ctrl->client.azi_out;
+                    gdouble out_el = ctrl->client.ele_out;
+                    gdouble out_thresh = MAX(ctrl->threshold, ROT_SEND_DEADBAND_DEG);
+
+                    if (force_send ||
+                        fabs(rot_traj_wrap_diff(cmdaz, out_az)) > out_thresh ||
+                        fabs(cmdel - out_el) > out_thresh)
+                    {
+                        ctrl->client.azi_out = cmdaz;
+                        ctrl->client.ele_out = cmdel;
+                        ctrl->client.new_trg = TRUE;
+                        ctrl->last_send_us = now_us;
+                    }
+                    g_mutex_unlock(&ctrl->client.mutex);
                 }
-                g_mutex_unlock(&ctrl->client.mutex);
+
+                if (force_send && ctrl->engage_force_update)
+                    ctrl->engage_force_update = FALSE;
+            }
+            }
+        }
+
+        {
+            gint64 log_now = g_get_monotonic_time();
+            if (log_now - ctrl->last_debug_log_us >= 1000000)
+            {
+                rot_az_send_mode_t az_mode = ROT_AZ_SEND_ABS;
+                gdouble az_cont = 0.0;
+                gdouble send_az = rot_az_map_for_send(ctrl, cmdaz, cmdel, FALSE,
+                                                      &az_mode, &az_cont);
+                gdouble send_el = rot_normalize_zero(cmdel);
+
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "ROT_TRAJ raw=(%.2f, %.2f) mapped=(%.2f, %.2f) cmd=(%.2f, %.2f) cont=%.2f send=(%.2f, %.2f) az_mode=%s cur=(%.2f, %.2f) hold=%d",
+                            raw_cmd_az, raw_cmd_el,
+                            cmd_map.mapped_az, cmd_map.mapped_el,
+                            cmdaz, cmdel,
+                            az_cont,
+                            send_az, send_el,
+                            rot_az_send_mode_name(az_mode),
+                            rotpos_valid ? rotaz : -1.0,
+                            rotpos_valid ? rotel : -1.0,
+                            ctrl->az_hold_active ? 1 : 0);
+                rot_term_log_verbose(ctrl, "ROT_TRAJ",
+                                     "raw=(%.2f,%.2f) mapped=(%.2f,%.2f) cmd=(%.2f,%.2f) cont=%.2f send=(%.2f,%.2f) mode=%s",
+                                     raw_cmd_az, raw_cmd_el,
+                                     cmd_map.mapped_az, cmd_map.mapped_el,
+                                     cmdaz, cmdel,
+                                     az_cont,
+                                     send_az, send_el,
+                                     rot_az_send_mode_name(az_mode));
+                ctrl->last_debug_log_us = log_now;
             }
         }
 
@@ -2859,7 +3939,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                      ctrl->trajectory_plan.valid &&
                      ctrl->trajectory_plan.status != ROT_PLAN_STATUS_FULL_TRACK)
                 status_text = _("PARTIAL");
-            else if (fabs(cmdaz - rotaz) > ctrl->threshold ||
+            else if (fabs(ang_delta_deg(cmdaz, rotaz)) > ctrl->threshold ||
                      fabs(cmdel - rotel) > ctrl->threshold)
                 status_text = _("MOVING");
             else
@@ -2876,18 +3956,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             rot_format_deg_2(cmdel_str, sizeof(cmdel_str), cmdel);
             rot_format_deg_2(rotaz_str, sizeof(rotaz_str), rotaz);
             rot_format_deg_2(rotel_str, sizeof(rotel_str), rotel);
-
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: status=%s set=(%s, %s) rot=(%s, %s) error=%d",
-                        status_text,
-                        cmdaz_str, cmdel_str,
-                        rotaz_str, rotel_str,
-                        error ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: status=%s set=(%s, %s) rot=(%s, %s) error=%d\n",
-                       status_text,
-                       cmdaz_str, cmdel_str,
-                       rotaz_str, rotel_str,
-                       error ? 1 : 0);
         }
     }
     else
@@ -3038,32 +4106,35 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
         ctrl->use_offset = ctrl->conf->use_offset;
         ctrl->az_offset_deg = ctrl->conf->az_offset;
         ctrl->el_offset_deg = ctrl->conf->el_offset;
+        ctrl->last_az_sent_valid = FALSE;
+        ctrl->engage_force_update = FALSE;
 
         if (ctrl->offset_check) {
             g_signal_handlers_block_by_func(ctrl->offset_check,
-                                            G_CALLBACK(offset_toggle_cb), ctrl);
+                                            (gpointer)G_CALLBACK(offset_toggle_cb), ctrl);
             gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->offset_check),
                                          ctrl->use_offset);
             g_signal_handlers_unblock_by_func(ctrl->offset_check,
-                                              G_CALLBACK(offset_toggle_cb), ctrl);
+                                              (gpointer)G_CALLBACK(offset_toggle_cb), ctrl);
         }
         if (ctrl->az_offset_spin) {
             g_signal_handlers_block_by_func(ctrl->az_offset_spin,
-                                            G_CALLBACK(az_offset_changed_cb), ctrl);
+                                            (gpointer)G_CALLBACK(az_offset_changed_cb), ctrl);
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->az_offset_spin),
                                       ctrl->az_offset_deg);
             g_signal_handlers_unblock_by_func(ctrl->az_offset_spin,
-                                              G_CALLBACK(az_offset_changed_cb), ctrl);
+                                              (gpointer)G_CALLBACK(az_offset_changed_cb), ctrl);
         }
         if (ctrl->el_offset_spin) {
             g_signal_handlers_block_by_func(ctrl->el_offset_spin,
-                                            G_CALLBACK(el_offset_changed_cb), ctrl);
+                                            (gpointer)G_CALLBACK(el_offset_changed_cb), ctrl);
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->el_offset_spin),
                                       ctrl->el_offset_deg);
             g_signal_handlers_unblock_by_func(ctrl->el_offset_spin,
-                                              G_CALLBACK(el_offset_changed_cb), ctrl);
+                                              (gpointer)G_CALLBACK(el_offset_changed_cb), ctrl);
         }
 
+        rot_transform_update(ctrl);
         rot_plan_reset(&ctrl->trajectory_plan);
         /* Update flipped when changing rotor if there is a plot */
         set_flipped_pass(ctrl);
@@ -3209,6 +4280,11 @@ static void rotctld_process_stop(GtkRotCtrl *ctrl)
 {
     if (ctrl == NULL)
         return;
+
+    ctrl->az_hold_active = FALSE;
+    ctrl->az_hold_value = 0.0;
+    ctrl->last_az_sent_valid = FALSE;
+    ctrl->engage_force_update = FALSE;
 
     if (ctrl->rotctld_mgr)
         rotctld_mgr_terminate(&ctrl->rotctld_mgr);
@@ -3606,11 +4682,22 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
      * existing knob positions as the current physical position and do
      * not post a new target yet.
      */
+    rot_transform_update(ctrl);
+    gdouble knob_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+    gdouble knob_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+    gdouble cmd_az = knob_az;
+    gdouble cmd_el = knob_el;
+
+    if (ctrl->conf && ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        knob_el = ctrl->conf->minel;
+
+    apply_transform(&ctrl->transform, knob_az, knob_el, &cmd_az, &cmd_el);
+
     g_mutex_lock(&ctrl->client.mutex);
-    ctrl->client.azi_out   = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
-    ctrl->client.ele_out   = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
-    ctrl->client.azi_in    = ctrl->client.azi_out;
-    ctrl->client.ele_in    = ctrl->client.ele_out;
+    ctrl->client.azi_out   = cmd_az;
+    ctrl->client.ele_out   = cmd_el;
+    ctrl->client.azi_in    = cmd_az;
+    ctrl->client.ele_in    = cmd_el;
     ctrl->client.io_error  = FALSE;
     ctrl->client.cmd_rejected = FALSE;
     ctrl->client.reject_backoff_until_us = 0;
@@ -3625,6 +4712,13 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->out_of_range = FALSE;
     ctrl->last_oob_log_us = 0;
     ctrl->manual_sync_pending = TRUE;
+    ctrl->az_hold_active = FALSE;
+    ctrl->az_hold_value = cmd_az;
+    ctrl->engage_force_update = (ctrl->tracking && ctrl->target != NULL);
+    ctrl->last_az_sent_valid = FALSE;
+    ctrl->last_cmd_cont_valid = FALSE;
+    ctrl->last_send_us = 0;
+    ctrl->last_target_valid = FALSE;
 
     if (ctrl->client.thread != NULL)
     {
@@ -3633,6 +4727,7 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
                     __func__);
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         ctrl->engaged = TRUE;
+        rotctrl_start_position_poll(ctrl);
         return;
     }
 
@@ -3663,6 +4758,7 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
 
     gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
     ctrl->engaged = TRUE;
+    rotctrl_start_position_poll(ctrl);
     rot_term_log(ctrl, "gpredict:rx",
                  "rotctld connected %s:%d",
                  ctrl->conf ? ctrl->conf->host : "(null)",
@@ -3678,6 +4774,13 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
         return;
 
     ctrl->engaged = FALSE;
+    rotctrl_stop_position_poll(ctrl);
+    ctrl->az_hold_active = FALSE;
+    ctrl->az_hold_value = 0.0;
+    ctrl->last_az_sent_valid = FALSE;
+    ctrl->last_cmd_cont_valid = FALSE;
+    ctrl->last_send_us = 0;
+    ctrl->engage_force_update = FALSE;
     gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
     if (ctrl->LockBut)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
@@ -4704,6 +5807,11 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
     if (!gtk_toggle_button_get_active(button))
     {
         ctrl->engaged = FALSE;
+        rotctrl_stop_position_poll(ctrl);
+        ctrl->engage_force_update = FALSE;
+        ctrl->last_az_sent_valid = FALSE;
+        ctrl->last_cmd_cont_valid = FALSE;
+        ctrl->last_send_us = 0;
         rotctld_probe_cancel(ctrl);
         gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
         gtk_label_set_text(GTK_LABEL(ctrl->AzRead), "---");
@@ -5191,20 +6299,19 @@ rot_calibration_start_cb(GtkButton *button, gpointer data)
     /* Command AZ/EL = 0/0 through the normal client path. */
     if (g_mutex_trylock(&ctrl->client.mutex))
     {
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "MISSION_SOPHIE: calibration posting rotor target cmd=(0.00, 0.00) engaged=%d monitor=%d",
-                    ctrl->engaged ? 1 : 0,
-                    ctrl->monitor ? 1 : 0);
+        gdouble cmd_az = 0.0;
+        gdouble cmd_el = 0.0;
 
-        ctrl->client.azi_out = 0.0;
-        ctrl->client.ele_out = 0.0;
+        rot_transform_update(ctrl);
+        apply_transform(&ctrl->transform, 0.0, 0.0, &cmd_az, &cmd_el);
+
+        ctrl->client.azi_out = cmd_az;
+        ctrl->client.ele_out = cmd_el;
         ctrl->client.new_trg = TRUE;
         g_mutex_unlock(&ctrl->client.mutex);
     }
     else
     {
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "MISSION_SOPHIE: calibration skipped command post – client mutex busy");
     }
 
     /* Also update the knobs so the UI reflects the commanded position. */
@@ -5250,8 +6357,14 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
 
     /* Command AZ/EL = 0/90 through the normal client path. */
     if (g_mutex_trylock(&ctrl->client.mutex)) {
-        ctrl->client.azi_out = 0.0;
-        ctrl->client.ele_out = 90.0;
+        gdouble cmd_az = 0.0;
+        gdouble cmd_el = 0.0;
+
+        rot_transform_update(ctrl);
+        apply_transform(&ctrl->transform, 0.0, 90.0, &cmd_az, &cmd_el);
+
+        ctrl->client.azi_out = cmd_az;
+        ctrl->client.ele_out = cmd_el;
         ctrl->client.new_trg = TRUE;
         g_mutex_unlock(&ctrl->client.mutex);
     }
@@ -5336,7 +6449,7 @@ static void store_sats(gpointer key, gpointer value, gpointer user_data)
 }
 
 /** Check that we have at least one .rot file */
-static gboolean have_conf()
+static gboolean have_conf(void)
 {
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */
@@ -5410,6 +6523,22 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->offset_check = NULL;
     ctrl->az_offset_spin = NULL;
     ctrl->el_offset_spin = NULL;
+    memset(&ctrl->transform, 0, sizeof(ctrl->transform));
+    ctrl->az_hold_active = FALSE;
+    ctrl->az_hold_value = 0.0;
+    ctrl->last_debug_log_us = 0;
+    ctrl->last_az_sent = 0.0;
+    ctrl->last_az_sent_valid = FALSE;
+    ctrl->last_az_send_mode = ROT_AZ_SEND_ABS;
+    ctrl->last_cmd_az_cont = 0.0;
+    ctrl->last_cmd_el = 0.0;
+    ctrl->last_cmd_cont_valid = FALSE;
+    ctrl->last_send_us = 0;
+    ctrl->last_target_az = 0.0;
+    ctrl->last_target_el = 0.0;
+    ctrl->last_target_valid = FALSE;
+    ctrl->pos_timerid = 0;
+    ctrl->engage_force_update = FALSE;
     ctrl->out_of_range = FALSE;
     ctrl->last_oob_log_us = 0;
     ctrl->last_oob_raw_az = 0.0;
@@ -5421,8 +6550,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->manual_sync_pending = FALSE;
     memset(&ctrl->trajectory_plan, 0, sizeof(ctrl->trajectory_plan));
     rot_plan_reset(&ctrl->trajectory_plan);
-    /* Default to conservative send-only until rotctld probe says otherwise. */
-    ctrl->send_only_mode = TRUE;
+    /* Reserved flag; keep FALSE (no special SEND-ONLY mode). */
+    ctrl->send_only_mode = FALSE;
 
     g_mutex_init(&ctrl->client.mutex);
     ctrl->client.thread = NULL;
@@ -5435,9 +6564,14 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.reject_backoff_log_us = 0;
     ctrl->client.limits_valid = FALSE;
     ctrl->client.daemon_ok = FALSE;
+    ctrl->client.rxbuf = NULL;
+
+    rot_transform_update(ctrl);
 
     if (g_getenv("GPREDICT_ROT_PLAN_TEST"))
         rot_plan_debug_harness();
+    if (g_getenv("GPREDICT_ROT_TRAJ_TEST"))
+        rot_traj_debug_harness();
 }
 
 static void gtk_rot_ctrl_destroy(GtkWidget * widget)
@@ -5448,6 +6582,10 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     if (ctrl->timerid > 0) {
         g_source_remove(ctrl->timerid);
         ctrl->timerid = 0;
+    }
+    if (ctrl->pos_timerid > 0) {
+        g_source_remove(ctrl->pos_timerid);
+        ctrl->pos_timerid = 0;
     }
 
     /* free configuration */
@@ -5477,6 +6615,11 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
         ctrl->client.socket = -1;
+    }
+    if (ctrl->client.rxbuf != NULL)
+    {
+        g_string_free(ctrl->client.rxbuf, TRUE);
+        ctrl->client.rxbuf = NULL;
     }
 
     rotctld_probe_cancel(ctrl);
@@ -5510,7 +6653,7 @@ static void gtk_rot_ctrl_class_init(GtkRotCtrlClass * class,
     parent_class = g_type_class_peek_parent(class);
 }
 
-GType gtk_rot_ctrl_get_type()
+GType gtk_rot_ctrl_get_type(void)
 {
     static GType    gtk_rot_ctrl_type = 0;
 
@@ -5617,6 +6760,7 @@ static void offset_toggle_cb(GtkToggleButton *button, gpointer data)
     ctrl->use_offset = gtk_toggle_button_get_active(button);
     if (ctrl->conf)
         ctrl->conf->use_offset = ctrl->use_offset;
+    rot_transform_update(ctrl);
     rot_plan_reset(&ctrl->trajectory_plan);
     if (ctrl->tracking && ctrl->pass)
         rot_build_tracking_plan(ctrl);
@@ -5628,6 +6772,7 @@ static void az_offset_changed_cb(GtkSpinButton *spin, gpointer data)
     ctrl->az_offset_deg = gtk_spin_button_get_value(spin);
     if (ctrl->conf)
         ctrl->conf->az_offset = ctrl->az_offset_deg;
+    rot_transform_update(ctrl);
     rot_plan_reset(&ctrl->trajectory_plan);
     if (ctrl->tracking && ctrl->pass)
         rot_build_tracking_plan(ctrl);
@@ -5639,6 +6784,7 @@ static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data)
     ctrl->el_offset_deg = gtk_spin_button_get_value(spin);
     if (ctrl->conf)
         ctrl->conf->el_offset = ctrl->el_offset_deg;
+    rot_transform_update(ctrl);
     rot_plan_reset(&ctrl->trajectory_plan);
     if (ctrl->tracking && ctrl->pass)
         rot_build_tracking_plan(ctrl);

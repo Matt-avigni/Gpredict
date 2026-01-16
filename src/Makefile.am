@@ -48,6 +48,7 @@ gpredict_SOURCES = \
     gtk-polar-view-popup.c gtk-polar-view-popup.h \
     gtk-rig-ctrl.c gtk-rig-ctrl.h \
     rig-mode-dispatch.c rig-mode-dispatch.h \
+    rigctld-io.c rigctld-io.h \
     rigctld_mgr.c rigctld_mgr.h \
     rotctld_mgr.c rotctld_mgr.h \
     rotctld-parse.c rotctld-parse.h \
@@ -88,8 +89,10 @@ gpredict_SOURCES = \
     qth-editor.c qth-editor.h \
     radio-conf.c radio-conf.h \
     rotor-conf.c rotor-conf.h \
+    rot-trajectory.c rot-trajectory.h \
     rotor-cmd-map.c rotor-cmd-map.h \
     rotor-trajectory-planner.c rotor-trajectory-planner.h \
+    payload-profile.c payload-profile.h \
     trsp-conf.c trsp-conf.h \
     trsp-update.c trsp-update.h \
     win32-fetch.c win32-fetch.h \
@@ -135,8 +138,10 @@ gpredict_LDADD = @PACKAGE_LIBS@
 
 ## $(INTLLIBS)
 
-check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test rotctld-parse-test
-TESTS = rotor-cmd-map-test rig-mode-dispatch-test rotctld-parse-test
+check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test \
+    rotctld-parse-test rigctld-io-test
+TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
+    rotctld-parse-test rigctld-io-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -155,3 +160,9 @@ rotctld_parse_test_SOURCES = \
     rotctld-parse.c \
     rotctld-parse.h
 rotctld_parse_test_LDADD = @PACKAGE_LIBS@
+
+rigctld_io_test_SOURCES = \
+    rigctld-io-test.c \
+    rigctld-io.c \
+    rigctld-io.h
+rigctld_io_test_LDADD = @PACKAGE_LIBS@
