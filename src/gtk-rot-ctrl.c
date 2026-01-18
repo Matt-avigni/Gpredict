@@ -360,7 +360,6 @@ static void el_offset_changed_cb(GtkSpinButton *spin, gpointer data);
 static void rot_get_park_position(GtkRotCtrl *ctrl, gdouble *park_az, gdouble *park_el)
 {
     gdouble az = 0.0;
-    gdouble az_abs = 0.0;
     gdouble el = 0.0;
 
     const gchar *env_az = g_getenv("GPREDICT_ROT_PARK_AZ");
@@ -1838,7 +1837,7 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
  * \return TRUE if the position was successfully retrieved, FALSE if an
  *         error occurred.
  */
-static gboolean get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
+static gboolean G_GNUC_UNUSED get_pos(GtkRotCtrl * ctrl, gdouble * az, gdouble * el)
 {
     if ((az == NULL) || (el == NULL))
     {

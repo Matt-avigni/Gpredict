@@ -1404,7 +1404,7 @@ static void rigctrl_set_conn_state(GtkRigCtrl *ctrl,
                  reason ? reason : "no reason");
 }
 
-static void rig_show_conn_error(GtkRigCtrl *ctrl,
+static void G_GNUC_UNUSED rig_show_conn_error(GtkRigCtrl *ctrl,
                                 radio_conf_t *conf,
                                 const gchar *role)
 {
