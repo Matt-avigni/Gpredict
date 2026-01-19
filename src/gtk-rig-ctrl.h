@@ -15,6 +15,7 @@
 typedef struct _RigctldMgr RigctldMgr;
 typedef struct _GpTermView GpTermView;
 typedef struct _RigSession RigSession;
+typedef struct _RigctldClient RigctldClient;
 
 
 #define GTK_TYPE_RIG_CTRL          (gtk_rig_ctrl_get_type ())
@@ -175,6 +176,8 @@ struct _gtk_rig_ctrl {
     gint            rigctld_spawn_pid;  /*!< PID for spawned primary rigctld (if known) */
     gboolean        rigctld_spawned2;   /*!< TRUE if secondary rigctld was spawned by gpredict */
     gint            rigctld_spawn_pid2; /*!< PID for spawned secondary rigctld (if known) */
+    RigctldClient  *rig_client;        /*!< rigctld transport (primary) */
+    RigctldClient  *rig_client2;       /*!< rigctld transport (secondary) */
     RigSession     *rig_session;        /*!< Serialized rigctld session (primary) */
     RigSession     *rig_session2;       /*!< Serialized rigctld session (secondary) */
 

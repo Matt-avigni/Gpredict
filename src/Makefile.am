@@ -48,6 +48,9 @@ gpredict_SOURCES = \
     gtk-polar-view-popup.c gtk-polar-view-popup.h \
     gtk-rig-ctrl.c gtk-rig-ctrl.h \
     rig-mode-dispatch.c rig-mode-dispatch.h \
+    hamlib_transport.c hamlib_transport.h \
+    rigctld_client.c rigctld_client.h \
+    rotctld_client.c rotctld_client.h \
     rigctld-io.c rigctld-io.h \
     rigctld_mgr.c rigctld_mgr.h \
     rotctld_mgr.c rotctld_mgr.h \
@@ -90,8 +93,11 @@ gpredict_SOURCES = \
     radio-conf.c radio-conf.h \
     rotor-conf.c rotor-conf.h \
     rot-trajectory.c rot-trajectory.h \
+    azel_mapping.c azel_mapping.h \
     rotor-cmd-map.c rotor-cmd-map.h \
     rotor-trajectory-planner.c rotor-trajectory-planner.h \
+    tracking_policy.c tracking_policy.h \
+    safety_window.c safety_window.h \
     payload-profile.c payload-profile.h \
     trsp-conf.c trsp-conf.h \
     trsp-update.c trsp-update.h \
@@ -139,9 +145,11 @@ gpredict_LDADD = @PACKAGE_LIBS@
 ## $(INTLLIBS)
 
 check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test \
-    rotctld-parse-test rigctld-io-test
+    rotctld-parse-test rigctld-io-test \
+    azel-mapping-test safety-window-test hamlib-mock-test
 TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
-    rotctld-parse-test rigctld-io-test
+    rotctld-parse-test rigctld-io-test \
+    azel-mapping-test safety-window-test hamlib-mock-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -166,3 +174,29 @@ rigctld_io_test_SOURCES = \
     rigctld-io.c \
     rigctld-io.h
 rigctld_io_test_LDADD = @PACKAGE_LIBS@
+
+azel_mapping_test_SOURCES = \
+    azel-mapping-test.c \
+    azel_mapping.c \
+    azel_mapping.h
+azel_mapping_test_LDADD = @PACKAGE_LIBS@
+
+safety_window_test_SOURCES = \
+    safety-window-test.c \
+    safety_window.c \
+    safety_window.h
+safety_window_test_LDADD = @PACKAGE_LIBS@
+
+hamlib_mock_test_SOURCES = \
+    hamlib-mock-test.c \
+    rigctld_client.c \
+    rigctld_client.h \
+    rotctld_client.c \
+    rotctld_client.h \
+    hamlib_transport.c \
+    hamlib_transport.h \
+    rotctld-parse.c \
+    rotctld-parse.h \
+    radio-conf.h \
+    radio-conf-stub.c
+hamlib_mock_test_LDADD = @PACKAGE_LIBS@

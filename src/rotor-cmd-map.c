@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "rotor-trajectory-planner.h"
+#include "azel_mapping.h"
 
 #define ROT_CMD_EPS 1e-6
 
@@ -12,6 +13,21 @@ static gdouble rot_cmd_angular_distance_abs(gdouble a, gdouble b)
     if (diff > 180.0)
         diff = 360.0 - diff;
     return diff;
+}
+
+static gdouble rot_cmd_normalize_abs(const rotor_conf_t *conf, gdouble az)
+{
+    if (conf && conf->aztype == ROT_AZ_TYPE_480)
+    {
+        if (az >= 0.0 && az <= 480.0)
+            return az;
+        gdouble v = fmod(az, 480.0);
+        if (v < 0.0)
+            v += 480.0;
+        return v;
+    }
+
+    return normalize_az_0_360(az);
 }
 
 void rot_cmd_get_abs_az_limits(const rotor_conf_t *conf,
@@ -25,16 +41,24 @@ void rot_cmd_get_abs_az_limits(const rotor_conf_t *conf,
         maxaz = conf->maxaz;
     }
 
-    gdouble span = maxaz - minaz;
-    if (span <= 0.0)
-        span += 360.0;
+    if (conf != NULL && conf->aztype == ROT_AZ_TYPE_480)
+    {
+        if (maxaz <= minaz)
+            maxaz = minaz + 480.0;
+    }
+    else
+    {
+        gdouble span = maxaz - minaz;
+        if (span <= 0.0)
+            span += 360.0;
 
-    if (span >= 359.0) {
-        minaz = 0.0;
-        maxaz = 360.0;
-    } else {
-        minaz = normalize_az_0_360(minaz);
-        maxaz = normalize_az_0_360(maxaz);
+        if (span >= 359.0) {
+            minaz = 0.0;
+            maxaz = 360.0;
+        } else {
+            minaz = normalize_az_0_360(minaz);
+            maxaz = normalize_az_0_360(maxaz);
+        }
     }
 
     if (az_min)
@@ -45,6 +69,11 @@ void rot_cmd_get_abs_az_limits(const rotor_conf_t *conf,
 
 gdouble rot_cmd_az_to_conf(const rotor_conf_t *conf, gdouble az_abs)
 {
+    if (conf != NULL && conf->aztype == ROT_AZ_TYPE_480)
+    {
+        return az_abs_to_span(az_abs, AZSPAN_480);
+    }
+
     gdouble az = normalize_az_0_360(az_abs);
     if (conf != NULL && conf->aztype == ROT_AZ_TYPE_180 && az > 180.0)
         az -= 360.0;
@@ -60,6 +89,16 @@ gboolean rot_cmd_az_in_limits(gdouble az, gdouble min, gdouble max)
 
 gdouble rot_cmd_clamp_az_abs(gdouble az, gdouble min, gdouble max)
 {
+    gdouble span = max - min;
+    if (span > 360.0 + 1e-6)
+    {
+        if (az < min)
+            return min;
+        if (az > max)
+            return max;
+        return az;
+    }
+
     az = normalize_az_0_360(az);
     if (rot_cmd_az_in_limits(az, min, max))
         return az;
@@ -107,7 +146,7 @@ rot_cmd_map_status_t rot_cmd_map(const rotor_conf_t *conf,
     gdouble az_max = 360.0;
     rot_cmd_get_abs_az_limits(conf, &az_min, &az_max);
 
-    gdouble az_abs = normalize_az_0_360(az);
+    gdouble az_abs = rot_cmd_normalize_abs(conf, az);
     gdouble az_clamped_abs = rot_cmd_clamp_az_abs(az_abs, az_min, az_max);
     gdouble el_clamped = CLAMP(el, conf->minel, conf->maxel);
 

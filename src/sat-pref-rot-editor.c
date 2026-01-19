@@ -792,6 +792,12 @@ static void aztype_changed_cb(GtkComboBox * box, gpointer data)
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), -180.0);
         break;
 
+    case ROT_AZ_TYPE_480:
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0.0);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 480.0);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0.0);
+        break;
+
     default:
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s:%s: Invalid AZ rotator type."), __FILE__, __func__);
@@ -966,6 +972,8 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
                                    "0\302\260 \342\206\222 180\302\260 \342\206\222 360\302\260");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
                                    "-180\302\260 \342\206\222 0\302\260 \342\206\222 +180\302\260");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
+                                   "0\302\260 \342\206\222 480\302\260");
     gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), 0);
     gtk_widget_set_tooltip_text(aztype,
                                 _("Select your azimuth range here. Note that "
@@ -988,7 +996,7 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     label = gtk_label_new(_(" Max Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 2, 12, 1, 1);
-    maxaz = gtk_spin_button_new_with_range(0, 450, 1);
+    maxaz = gtk_spin_button_new_with_range(0, 480, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 360);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(maxaz), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(maxaz), FALSE);

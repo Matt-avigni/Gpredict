@@ -76,6 +76,7 @@
 #include "predict-tools.h"
 #include "radio-conf.h"
 #include "rigctld-io.h"
+#include "rigctld_client.h"
 #include "rigctld_mgr.h"
 #include "rotctld-parse.h"
 #include "serial-ports.h"
@@ -125,7 +126,17 @@
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
 #define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
 #define RIGCTRL_RESPONSE_SHOW_LOG 1003
-#define RIGCTRL_TRSP_POPUP_MAX_HEIGHT 400
+#define RIGCTRL_TRSP_POPUP_MAX_HEIGHT 360
+#define RIGCTRL_TRSP_POPUP_MAX_FACTOR 0.45
+#define RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD 20
+#define RIGCTRL_TRSP_POPUP_SCROLL_CHECK_THRESHOLD 50
+
+#ifdef RIGCTRL_TRSP_POPUP_DEBUG
+#define RIGCTRL_TRSP_POPUP_LOG(...) \
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#else
+#define RIGCTRL_TRSP_POPUP_LOG(...) do { } while (0)
+#endif
 
 static GHashTable *rigctld_device_cache = NULL;
 static GHashTable *rig_freq_cache = NULL;
@@ -147,18 +158,14 @@ typedef enum {
     RIG_SESSION_RECONNECTING
 } rig_session_state_t;
 
-typedef enum {
-    RIG_STRATEGY_PLAIN_FREQ = 0,
-    RIG_STRATEGY_SELECT_VFO,
-    RIG_STRATEGY_VFO_OPT_ARGS
-} rig_strategy_t;
-
 typedef struct _RigSession {
     rig_session_state_t state;
     rig_strategy_t strategy;
     gchar *state_reason;
     gchar *backend_version;
+    gchar *signature;
     gint rig_model;
+    guint quirks;
     gboolean has_get_vfo;
     gboolean has_set_vfo;
     gboolean has_set_vfo_opt;
@@ -198,6 +205,7 @@ static RigSession *rig_session_new(const gchar *label)
     session->state = RIG_SESSION_STOPPED;
     session->strategy = RIG_STRATEGY_PLAIN_FREQ;
     session->rig_model = 0;
+    session->quirks = RIG_QUIRK_NONE;
     session->has_get_vfo = FALSE;
     session->has_set_vfo = FALSE;
     session->has_set_vfo_opt = FALSE;
@@ -223,7 +231,10 @@ static void rig_session_reset(RigSession *session)
     session->state_reason = NULL;
     g_free(session->backend_version);
     session->backend_version = NULL;
+    g_free(session->signature);
+    session->signature = NULL;
     session->rig_model = 0;
+    session->quirks = RIG_QUIRK_NONE;
     session->has_get_vfo = FALSE;
     session->has_set_vfo = FALSE;
     session->has_set_vfo_opt = FALSE;
@@ -248,6 +259,7 @@ static void rig_session_free(RigSession **session_ptr)
     session = *session_ptr;
     g_free(session->state_reason);
     g_free(session->backend_version);
+    g_free(session->signature);
     g_free(session->default_vfo_token);
     g_free(session->label);
     if (session->vfo_candidates)
@@ -338,6 +350,59 @@ static void rig_session_set_state(GtkRigCtrl *ctrl, RigSession *session,
     session->state_reason = reason;
 }
 
+static void rig_session_apply_caps(RigSession *session, const RigCaps *caps)
+{
+    if (session == NULL || caps == NULL)
+        return;
+
+    session->strategy = caps->strategy;
+    g_free(session->backend_version);
+    session->backend_version = g_strdup(caps->backend_version);
+    g_free(session->signature);
+    session->signature = g_strdup(caps->signature);
+    session->rig_model = caps->rig_model;
+    session->quirks = caps->quirks;
+    session->has_get_vfo = caps->has_get_vfo;
+    session->has_set_vfo = caps->has_set_vfo;
+    session->has_set_vfo_opt = caps->has_set_vfo_opt;
+    session->vfo_opt_enabled = caps->vfo_opt_enabled;
+    session->vfo_opt_unsafe = caps->vfo_opt_unsafe;
+
+    g_free(session->default_vfo_token);
+    session->default_vfo_token = g_strdup(caps->default_vfo_token);
+
+    if (session->vfo_candidates)
+        g_ptr_array_set_size(session->vfo_candidates, 0);
+    if (caps->vfo_candidates)
+    {
+        for (guint i = 0; i < caps->vfo_candidates->len; i++)
+        {
+            const gchar *token = g_ptr_array_index(caps->vfo_candidates, i);
+            if (token != NULL && *token != '\0')
+                g_ptr_array_add(session->vfo_candidates, g_strdup(token));
+        }
+    }
+
+    if (session->vfo_working)
+        g_hash_table_remove_all(session->vfo_working);
+    if (caps->vfo_working)
+    {
+        GHashTableIter iter;
+        gpointer key = NULL;
+        gpointer value = NULL;
+
+        g_hash_table_iter_init(&iter, caps->vfo_working);
+        while (g_hash_table_iter_next(&iter, &key, &value))
+        {
+            const gchar *token = key;
+            if (token != NULL)
+                g_hash_table_replace(session->vfo_working,
+                                     g_strdup(token),
+                                     value);
+        }
+    }
+}
+
 /* radio control functions */
 static void     exec_rx_cycle(GtkRigCtrl * ctrl);
 static void     exec_tx_cycle(GtkRigCtrl * ctrl);
@@ -369,24 +434,10 @@ static void     update_rit_xit_offsets(GtkRigCtrl * ctrl);
 static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
 static RigSession *rig_session_for_socket(GtkRigCtrl *ctrl, gint sock);
 static rig_strategy_t rig_session_strategy(GtkRigCtrl *ctrl, gint sock);
+static RigctldClient *rigctld_client_for_socket(GtkRigCtrl *ctrl, gint sock);
 static const gchar *rig_session_default_vfo_token(RigSession *session);
 static gboolean rig_session_vfo_candidate_exists(const RigSession *session,
                                                  const gchar *token);
-static void     rig_session_add_vfo_candidate(RigSession *session,
-                                              const gchar *token);
-static void     rig_session_parse_vfo_list(RigSession *session,
-                                           const gchar *line);
-static void     rig_session_parse_dump_state(RigSession *session,
-                                             const gchar *text);
-static gboolean rig_session_try_get_freq(GtkRigCtrl *ctrl, gint sock,
-                                         const gchar *cmd,
-                                         gdouble *freq_out,
-                                         gchar *reply, gsize reply_len);
-static gboolean rig_session_try_set_ok(GtkRigCtrl *ctrl, gint sock,
-                                       const gchar *cmd,
-                                       gchar *reply, gsize reply_len);
-static gboolean rig_session_try_select_vfo(GtkRigCtrl *ctrl, gint sock,
-                                           const gchar *token);
 static gboolean rig_session_send_command(GtkRigCtrl *ctrl, gint sock,
                                          const gchar *cmd,
                                          gchar *buffout, gint sizeout);
@@ -481,8 +532,13 @@ static void     rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data);
 static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
                                                 GdkEventButton *event,
                                                 gpointer data);
+static gboolean rigctrl_trsp_combo_button_release(GtkWidget *widget,
+                                                  GdkEventButton *event,
+                                                  gpointer data);
 static void     rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data);
 static void     rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data);
+static gint     rigctrl_trsp_popup_get_max_height(GtkWidget *anchor);
+static gint     rigctrl_trsp_tree_row_count(GtkWidget *tree);
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
                                           GType child_type);
 static void     rigctrl_trsp_fix_expansion(GtkWidget *widget,
@@ -1644,6 +1700,8 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
     }
     rigctld_rxbuf_free(&ctrl->rigctld_rxbuf);
     rigctld_rxbuf_free(&ctrl->rigctld_rxbuf2);
+    rigctld_client_free(&ctrl->rig_client);
+    rigctld_client_free(&ctrl->rig_client2);
     rig_session_free(&ctrl->rig_session);
     rig_session_free(&ctrl->rig_session2);
     g_free(ctrl->rigctld_vfo_main_token);
@@ -1757,6 +1815,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_spawn_pid2 = 0;
     ctrl->rigctld_rxbuf = NULL;
     ctrl->rigctld_rxbuf2 = NULL;
+    ctrl->rig_client = rigctld_client_new(_("receiver"));
+    ctrl->rig_client2 = rigctld_client_new(_("uplink"));
     ctrl->rig_session = rig_session_new(_("receiver"));
     ctrl->rig_session2 = rig_session_new(_("uplink"));
     ctrl->rigctld_vfo_main_token = NULL;
@@ -2351,6 +2411,11 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
     if (popup_widget != NULL)
     {
         GtkWidget *tree = NULL;
+        gint max_height = rigctrl_trsp_popup_get_max_height(GTK_WIDGET(combo));
+        gint list_min = 0;
+        gint list_nat = 0;
+        gint rows = 0;
+        gboolean needs_scroll = FALSE;
 
         gtk_widget_set_hexpand(popup_widget, FALSE);
         gtk_widget_set_vexpand(popup_widget, FALSE);
@@ -2360,36 +2425,74 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
             scrolled = gtk_widget_get_parent(scrolled);
 
         tree = rigctrl_trsp_find_child(popup_widget, GTK_TYPE_TREE_VIEW);
+        if (GTK_IS_TREE_VIEW(tree))
+        {
+            gtk_widget_get_preferred_height(tree, &list_min, &list_nat);
+            if (list_nat <= 0 && list_min > 0)
+                list_nat = list_min;
+            rows = rigctrl_trsp_tree_row_count(tree);
+            if (list_nat > 0)
+                needs_scroll = (list_nat > max_height);
+            else
+                needs_scroll = (rows > RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD);
+        }
         if (GTK_IS_SCROLLED_WINDOW(scrolled))
         {
             gtk_widget_set_hexpand(scrolled, FALSE);
             gtk_widget_set_vexpand(scrolled, FALSE);
+            gtk_widget_add_events(scrolled, GDK_SCROLL_MASK);
             gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
                                            GTK_POLICY_NEVER,
                                            GTK_POLICY_AUTOMATIC);
             gtk_scrolled_window_set_propagate_natural_height(
-                GTK_SCROLLED_WINDOW(scrolled), FALSE);
+                GTK_SCROLLED_WINDOW(scrolled), !needs_scroll);
+#if GTK_CHECK_VERSION(3, 22, 0)
+            gtk_scrolled_window_set_max_content_height(
+                GTK_SCROLLED_WINDOW(scrolled), needs_scroll ? max_height : -1);
+#endif
             gtk_widget_set_size_request(scrolled, -1,
-                                        RIGCTRL_TRSP_POPUP_MAX_HEIGHT);
+                                        needs_scroll ? max_height : -1);
         }
+        gtk_widget_set_size_request(popup_widget, -1,
+                                    needs_scroll ? max_height : -1);
 
         if (GTK_IS_TREE_VIEW(tree))
         {
+            gtk_widget_add_events(tree, GDK_SCROLL_MASK);
             gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
             gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(tree), TRUE);
+            gtk_tree_view_set_search_column(GTK_TREE_VIEW(tree), 0);
+            gtk_tree_view_set_enable_search(GTK_TREE_VIEW(tree),
+                                            rows > RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD);
         }
 
         if (tree != NULL)
             rigctrl_trsp_fix_expansion(popup_widget, tree);
+
+        if (rows >= RIGCTRL_TRSP_POPUP_SCROLL_CHECK_THRESHOLD)
+        {
+            g_warn_if_fail(GTK_IS_SCROLLED_WINDOW(scrolled));
+            if (GTK_IS_SCROLLED_WINDOW(scrolled))
+            {
+                gint scrolled_min = 0;
+                gint scrolled_nat = 0;
+
+                gtk_widget_get_preferred_height(scrolled, &scrolled_min, &scrolled_nat);
+                if (scrolled_nat <= 0 && scrolled_min > 0)
+                    scrolled_nat = scrolled_min;
+                if (scrolled_nat > max_height)
+                    g_warn_if_fail(scrolled_nat <= max_height);
+            }
+        }
 
         if (g_object_get_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked") == NULL)
         {
             g_object_set_data(G_OBJECT(popup_widget), "rigctrl-popup-hooked",
                               GINT_TO_POINTER(1));
             g_signal_connect(popup_widget, "map",
-                             G_CALLBACK(rigctrl_trsp_popup_show), NULL);
+                             G_CALLBACK(rigctrl_trsp_popup_show), combo);
             g_signal_connect(popup_widget, "hide",
-                             G_CALLBACK(rigctrl_trsp_popup_hide), NULL);
+                             G_CALLBACK(rigctrl_trsp_popup_hide), combo);
         }
     }
 
@@ -2411,14 +2514,52 @@ static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
                                                 GdkEventButton *event,
                                                 gpointer data)
 {
-    (void)event;
     (void)data;
 
     if (widget == NULL)
         return FALSE;
 
-    g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
+    if (event != NULL && event->button == 1)
+    {
+        g_object_set_data(G_OBJECT(widget), "rigctrl-popup-pending",
+                          GINT_TO_POINTER(1));
+        RIGCTRL_TRSP_POPUP_LOG("%s: button press handled", __func__);
+        return TRUE;
+    }
+
     return FALSE;
+}
+
+static gboolean rigctrl_trsp_combo_button_release(GtkWidget *widget,
+                                                  GdkEventButton *event,
+                                                  gpointer data)
+{
+    gboolean pending;
+    gboolean opened;
+
+    (void)data;
+
+    if (widget == NULL)
+        return FALSE;
+
+    if (event == NULL || event->button != 1)
+        return FALSE;
+
+    pending = g_object_get_data(G_OBJECT(widget), "rigctrl-popup-pending") != NULL;
+    opened = g_object_get_data(G_OBJECT(widget), "rigctrl-popup-opened") != NULL;
+    g_object_set_data(G_OBJECT(widget), "rigctrl-popup-pending", NULL);
+
+    if (!pending || opened)
+    {
+        RIGCTRL_TRSP_POPUP_LOG("%s: release ignored pending=%d opened=%d",
+                               __func__, pending ? 1 : 0, opened ? 1 : 0);
+        return TRUE;
+    }
+
+    RIGCTRL_TRSP_POPUP_LOG("%s: popup on release", __func__);
+    gtk_combo_box_popup(GTK_COMBO_BOX(widget));
+    g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
+    return TRUE;
 }
 
 static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
@@ -2427,6 +2568,7 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
     GtkWidget *tree = NULL;
     GtkAdjustment *vadj;
     GtkTreePath *path;
+    GtkWidget *combo = GTK_IS_WIDGET(data) ? GTK_WIDGET(data) : NULL;
     gint popup_min = 0, popup_nat = 0;
     gint scrolled_min = 0, scrolled_nat = 0;
     gint list_min = 0, list_nat = 0;
@@ -2435,6 +2577,10 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
 
     if (widget == NULL)
         return;
+
+    if (combo != NULL)
+        g_object_set_data(G_OBJECT(combo), "rigctrl-popup-opened",
+                          GINT_TO_POINTER(1));
 
     while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
         scrolled = gtk_widget_get_parent(scrolled);
@@ -2457,9 +2603,6 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
         gtk_tree_path_free(path);
     }
 
-    gtk_widget_queue_resize(scrolled);
-    gtk_widget_queue_resize(widget);
-
     gtk_widget_get_preferred_height(widget, &popup_min, &popup_nat);
     gtk_widget_get_preferred_height(scrolled, &scrolled_min, &scrolled_nat);
     if (tree != NULL)
@@ -2476,16 +2619,88 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
                 popup_min, popup_nat,
                 scrolled_min, scrolled_nat,
                 list_min, list_nat);
+    RIGCTRL_TRSP_POPUP_LOG("%s: popup shown", __func__);
 }
 
 static void rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data)
 {
-    (void)data;
+    GtkWidget *combo = GTK_IS_WIDGET(data) ? GTK_WIDGET(data) : NULL;
 
     if (widget == NULL)
         return;
 
+    if (combo != NULL)
+        g_object_set_data(G_OBJECT(combo), "rigctrl-popup-opened", NULL);
+
     sat_log_log(SAT_LOG_LEVEL_DEBUG, _("%s: trsp popup hide"), __func__);
+    RIGCTRL_TRSP_POPUP_LOG("%s: popup hidden", __func__);
+}
+
+static gint rigctrl_trsp_popup_get_max_height(GtkWidget *anchor)
+{
+    gint max_height = RIGCTRL_TRSP_POPUP_MAX_HEIGHT;
+    GdkRectangle workarea;
+    gboolean have_workarea = FALSE;
+
+#if GTK_CHECK_VERSION(3, 22, 0)
+    GdkDisplay *display = gdk_display_get_default();
+    GdkMonitor *monitor = NULL;
+    GdkWindow *gdk_window = NULL;
+
+    if (anchor != NULL)
+        gdk_window = gtk_widget_get_window(anchor);
+    if (display != NULL)
+    {
+        if (gdk_window != NULL)
+            monitor = gdk_display_get_monitor_at_window(display, gdk_window);
+        if (monitor == NULL)
+            monitor = gdk_display_get_primary_monitor(display);
+    }
+
+    if (monitor != NULL)
+    {
+        gdk_monitor_get_workarea(monitor, &workarea);
+        have_workarea = (workarea.height > 0);
+    }
+#else
+    if (anchor != NULL)
+    {
+        GdkScreen *screen = gtk_widget_get_screen(anchor);
+        if (screen != NULL)
+        {
+            GdkWindow *gdk_window = gtk_widget_get_window(anchor);
+            gint monitor = 0;
+
+            if (gdk_window != NULL)
+                monitor = gdk_screen_get_monitor_at_window(screen, gdk_window);
+            gdk_screen_get_monitor_workarea(screen, monitor, &workarea);
+            have_workarea = (workarea.height > 0);
+        }
+    }
+#endif
+
+    if (have_workarea)
+    {
+        gint scaled = (gint)(workarea.height * RIGCTRL_TRSP_POPUP_MAX_FACTOR);
+        if (scaled > 0)
+            max_height = MIN(max_height, scaled);
+    }
+
+    return max_height;
+}
+
+static gint rigctrl_trsp_tree_row_count(GtkWidget *tree)
+{
+    GtkTreeModel *model;
+
+    if (!GTK_IS_TREE_VIEW(tree))
+        return 0;
+
+    model = gtk_tree_view_get_model(GTK_TREE_VIEW(tree));
+    if (model == NULL)
+        return 0;
+
+    return gtk_tree_model_iter_n_children(model, NULL);
 }
 
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget, GType child_type)
@@ -3537,6 +3752,8 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(rigctrl_trsp_combo_realize), NULL);
     g_signal_connect(ctrl->TrspSel, "button-press-event",
                      G_CALLBACK(rigctrl_trsp_combo_button_press), NULL);
+    g_signal_connect(ctrl->TrspSel, "button-release-event",
+                     G_CALLBACK(rigctrl_trsp_combo_button_release), NULL);
     g_signal_connect(ctrl->TrspSel, "changed", G_CALLBACK(trsp_selected_cb),
                      ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 1, 2, 1);
@@ -4002,183 +4219,69 @@ static void rigctld_clear_rxbuf_for_socket(GtkRigCtrl *ctrl, gint sock)
         rigctld_rxbuf_clear(buf);
 }
 
-static gboolean rigctld_command_is_dump_state(const gchar *cmd)
-{
-    const gchar *scan = cmd;
-
-    if (scan == NULL)
-        return FALSE;
-
-    while (*scan != '\0' && g_ascii_isspace(*scan))
-        scan++;
-
-    return g_str_has_prefix(scan, "\\dump_state");
-}
-
-static gboolean rigctld_command_is_multiline(const gchar *cmd)
-{
-    const gchar *scan = cmd;
-
-    if (scan == NULL)
-        return FALSE;
-
-    while (*scan != '\0' && g_ascii_isspace(*scan))
-        scan++;
-
-    if (g_str_has_prefix(scan, "\\dump_caps"))
-        return TRUE;
-
-    return FALSE;
-}
-
 static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                                       gchar * buff, gchar * buffout,
                                       gint sizeout)
 {
-    gint            written;
-    gint            size;
-    gint            rprt = 0;
-    gboolean        rprt_error = FALSE;
+    HamlibResponseInfo info = { 0 };
+    RigctldClient *client = rigctld_client_for_socket(ctrl, sock);
+    gint rprt = 0;
+    gboolean rprt_error = FALSE;
+    gboolean ok = FALSE;
 
-    size = strlen(buff);
+    if (client == NULL || buff == NULL)
+        return FALSE;
+
+    if (buffout && sizeout > 0)
+        buffout[0] = '\0';
 
     rig_term_log_tx(ctrl, buff);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: sending %d bytes to rigctld as \"%s\""),
-                __FILE__, __func__, size, buff);
-    /* send command */
+                __FILE__, __func__, (gint) strlen(buff), buff);
+
     rigctld_io_lock_acquire();
-    written = send(sock, buff, strlen(buff), 0);
-    if (written != size)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: SIZE ERROR %d / %d"), __func__, written, size);
-    }
-    if (written == -1)
+    ok = rigctld_client_request_raw(client, buff,
+                                    buffout, (gsize) sizeout, &info);
+    if (!ok)
     {
         gchar *trim_cmd = g_strdup(buff);
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rigctld port closed"), __func__);
-        rig_term_log(ctrl, "gpredict:err",
-                     "send failed (%s) cmd=%s",
-                     strerror(errno),
-                     trim_cmd ? g_strchomp(trim_cmd) : "(null)");
-        g_free(trim_cmd);
-        rigctrl_schedule_status(ctrl, _("Command send failed"), TRUE);
-        rigctrl_handle_socket_error(ctrl, sock, "send");
-        rigctld_io_lock_release();
-        return FALSE;
-    }
-    /* try to read answer */
-    {
-        gint err = 0;
-        gint drain_err = 0;
-        gboolean saw_rprt = FALSE;
-        gboolean used_multiline = FALSE;
-        gboolean expect_rprt = FALSE;
-        rigctld_read_mode_t read_mode = RIGCTLD_READ_SINGLE;
-        gint idle_timeout_ms = RIGCTLD_FOLLOW_IDLE_MS;
-        GString *rxbuf = rigctld_rxbuf_for_socket(ctrl, sock, TRUE);
+        gint err = info.err ? info.err : EIO;
 
-        if (rxbuf == NULL)
+        if (trim_cmd)
         {
-            err = EINVAL;
-            size = -1;
+            g_strchomp(trim_cmd);
+            g_strstrip(trim_cmd);
+        }
+
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: rigctld request failed"), __func__);
+
+        if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT)
+        {
+            rig_term_log(ctrl, "gpredict:err",
+                         "timeout waiting for rigctld reply cmd=%s",
+                         trim_cmd ? trim_cmd : "(null)");
+            rigctrl_schedule_status(ctrl,
+                                    _("Rig control timeout (rigctld did not reply)"),
+                                    TRUE);
         }
         else
         {
-            if (rigctld_command_is_dump_state(buff))
-                read_mode = RIGCTLD_READ_MULTILINE_IDLE;
-            else if (rigctld_command_is_multiline(buff))
-                read_mode = RIGCTLD_READ_MULTILINE_RPRT;
-
-            if (read_mode == RIGCTLD_READ_MULTILINE_IDLE)
-                rigctld_rxbuf_clear(rxbuf);
-            if (read_mode == RIGCTLD_READ_MULTILINE_IDLE)
-                idle_timeout_ms = RIGCTLD_DUMP_STATE_IDLE_MS;
-
-            size = (gint) rigctld_read_response(sock, rxbuf, read_mode,
-                                                buffout, (gsize) sizeout,
-                                                RIGCTLD_SOCKET_TIMEOUT_MS,
-                                                idle_timeout_ms,
-                                                &saw_rprt, &used_multiline,
-                                                &err);
-        }
-
-        if (size == -1)
-        {
-            gchar *trim_cmd = g_strdup(buff);
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s: rigctld port closed"), __func__);
-            if (err == EAGAIN || err == EWOULDBLOCK)
-            {
-                rig_term_log(ctrl, "gpredict:err",
-                             "timeout waiting for rigctld reply cmd=%s",
-                             trim_cmd ? g_strchomp(trim_cmd) : "(null)");
-                rigctrl_schedule_status(ctrl,
-                                        _("Rig control timeout (rigctld did not reply)"),
-                                        TRUE);
-            }
-            else
-            {
-                rig_term_log(ctrl, "gpredict:err",
-                             "recv failed (%s) cmd=%s",
-                             strerror(err),
-                             trim_cmd ? g_strchomp(trim_cmd) : "(null)");
-                rigctrl_schedule_status(ctrl, _("Command receive failed"), TRUE);
-            }
-            g_free(trim_cmd);
-            rigctrl_handle_socket_error(ctrl, sock, "recv");
-            rigctld_io_lock_release();
-            return FALSE;
-        }
-
-        if (read_mode == RIGCTLD_READ_SINGLE && used_multiline)
-        {
-            gchar *trim_cmd = g_strdup(buff);
-
-            if (trim_cmd)
-            {
-                g_strchomp(trim_cmd);
-                g_strstrip(trim_cmd);
-            }
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rigctld reply for cmd=%s contained extra lines; treating as multi-line",
-                        (trim_cmd && *trim_cmd) ? trim_cmd : "(null)");
-            g_free(trim_cmd);
-        }
-
-        expect_rprt = (read_mode == RIGCTLD_READ_MULTILINE_RPRT) ||
-            (read_mode == RIGCTLD_READ_SINGLE && used_multiline);
-
-        if (expect_rprt && !saw_rprt)
-        {
-            gchar *trim_cmd = g_strdup(buff);
-
-            if (trim_cmd)
-            {
-                g_strchomp(trim_cmd);
-                g_strstrip(trim_cmd);
-            }
-            sat_log_log(SAT_LOG_LEVEL_WARN,
-                        "rigctld reply missing RPRT terminator cmd=%s; draining",
-                        (trim_cmd && *trim_cmd) ? trim_cmd : "(null)");
             rig_term_log(ctrl, "gpredict:err",
-                         "rigctld reply missing RPRT terminator cmd=%s; draining",
-                         (trim_cmd && *trim_cmd) ? trim_cmd : "(null)");
-            g_free(trim_cmd);
-
-            rigctld_drain_idle(sock, rxbuf, RIGCTLD_DUMP_STATE_IDLE_MS,
-                               &drain_err);
-            if (drain_err != 0)
-            {
-                sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                            "rigctld drain failed: %s",
-                            strerror(drain_err));
-            }
+                         "rigctld request failed (%s) cmd=%s",
+                         strerror(err),
+                         trim_cmd ? trim_cmd : "(null)");
+            rigctrl_schedule_status(ctrl, _("Command failed"), TRUE);
         }
+
+        g_free(trim_cmd);
+        rigctrl_handle_socket_error(ctrl, sock, "request");
+        rigctld_io_lock_release();
+        return FALSE;
     }
-    if (size == 0)
+
+    if (buffout && sizeout > 0 && buffout[0] == '\0')
     {
         gchar *trim_cmd = g_strdup(buff);
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -4192,15 +4295,10 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
         rigctld_io_lock_release();
         return FALSE;
     }
-    else
-    {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    _("%s:%s: Read %d bytes from rigctld"),
-                    __FILE__, __func__, size);
-    }
-    ctrl->wrops++;
 
+    ctrl->wrops++;
     rig_term_log_rx(ctrl, buffout);
+
     if (rig_parse_rprt_code(buffout, &rprt) && rprt != 0)
     {
         gchar *trim_cmd = g_strdup(buff);
@@ -4498,7 +4596,7 @@ static gboolean rigctld_force_main_sub_tokens(const GtkRigCtrl *ctrl,
     if (!rigctld_prefer_main_sub_tokens(ctrl))
         return FALSE;
 
-    return session->rig_model == RIGCTLD_MODEL_IC9700;
+    return (session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0;
 }
 
 static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
@@ -6310,6 +6408,17 @@ static RigSession *rig_session_for_socket(GtkRigCtrl *ctrl, gint sock)
     return ctrl->rig_session;
 }
 
+static RigctldClient *rigctld_client_for_socket(GtkRigCtrl *ctrl, gint sock)
+{
+    if (ctrl == NULL)
+        return NULL;
+
+    if (ctrl->rig_client2 != NULL && sock == ctrl->sock2)
+        return ctrl->rig_client2;
+
+    return ctrl->rig_client;
+}
+
 static rig_strategy_t rig_session_strategy(GtkRigCtrl *ctrl, gint sock)
 {
     RigSession *session = rig_session_for_socket(ctrl, sock);
@@ -7958,320 +8067,59 @@ static gboolean rig_session_vfo_candidate_exists(const RigSession *session,
     return FALSE;
 }
 
-static void rig_session_add_vfo_candidate(RigSession *session,
-                                          const gchar *token)
-{
-    gchar *trimmed = NULL;
-
-    if (session == NULL || token == NULL || *token == '\0')
-        return;
-
-    trimmed = g_strdup(token);
-    g_strstrip(trimmed);
-    if (*trimmed == '\0')
-    {
-        g_free(trimmed);
-        return;
-    }
-
-    if (rig_session_vfo_candidate_exists(session, trimmed))
-    {
-        g_free(trimmed);
-        return;
-    }
-
-    g_ptr_array_add(session->vfo_candidates, trimmed);
-}
-
-static void rig_session_parse_vfo_list(RigSession *session, const gchar *line)
-{
-    const gchar *sep = NULL;
-    gchar *list = NULL;
-    gchar **parts = NULL;
-
-    if (session == NULL || line == NULL)
-        return;
-
-    sep = strchr(line, '=');
-    if (sep == NULL)
-        sep = strchr(line, ':');
-    if (sep == NULL || *(sep + 1) == '\0')
-        return;
-
-    list = g_strdup(sep + 1);
-    g_strstrip(list);
-    parts = g_strsplit_set(list, " \t,", -1);
-    for (gint i = 0; parts[i] != NULL; i++)
-    {
-        if (parts[i][0] == '\0')
-            continue;
-        rig_session_add_vfo_candidate(session, parts[i]);
-    }
-
-    g_strfreev(parts);
-    g_free(list);
-}
-
-static void rig_session_parse_dump_state(RigSession *session, const gchar *text)
-{
-    gchar **lines = NULL;
-
-    if (session == NULL || text == NULL || *text == '\0')
-        return;
-
-    (void) parse_dump_state_model_id(text, &session->rig_model);
-
-    lines = g_strsplit(text, "\n", -1);
-    for (gint i = 0; lines[i] != NULL; i++)
-    {
-        gchar *line = g_strstrip(lines[i]);
-        gchar *lower = NULL;
-
-        if (line[0] == '\0')
-            continue;
-
-        lower = g_ascii_strdown(line, -1);
-        if (g_str_has_prefix(lower, "has_get_vfo"))
-            session->has_get_vfo = g_strrstr(lower, "1") != NULL;
-        if (g_str_has_prefix(lower, "has_set_vfo"))
-            session->has_set_vfo = g_strrstr(lower, "1") != NULL;
-        if (g_str_has_prefix(lower, "has_set_vfo_opt"))
-            session->has_set_vfo_opt = g_strrstr(lower, "1") != NULL;
-
-        if (g_strrstr(lower, "vfo list") != NULL ||
-            g_strrstr(lower, "vfo_list") != NULL)
-        {
-            rig_session_parse_vfo_list(session, line);
-        }
-
-        if (session->backend_version == NULL &&
-            (g_strrstr(lower, "hamlib") != NULL ||
-             g_strrstr(lower, "rigctld") != NULL ||
-             g_strrstr(lower, "backend") != NULL))
-        {
-            session->backend_version = g_strdup(line);
-        }
-
-        g_free(lower);
-    }
-    g_strfreev(lines);
-}
-
-static gboolean rig_session_try_get_freq(GtkRigCtrl *ctrl, gint sock,
-                                         const gchar *cmd,
-                                         gdouble *freq_out,
-                                         gchar *reply, gsize reply_len)
-{
-    gboolean ok;
-
-    if (freq_out)
-        *freq_out = 0.0;
-    if (reply && reply_len > 0)
-        reply[0] = '\0';
-
-    ok = rig_session_send_command(ctrl, sock, cmd, reply, (gint) reply_len);
-    if (!ok)
-        return FALSE;
-
-    return rigctld_parse_frequency_response(reply, freq_out);
-}
-
-static gboolean rig_session_try_set_ok(GtkRigCtrl *ctrl, gint sock,
-                                       const gchar *cmd,
-                                       gchar *reply, gsize reply_len)
-{
-    gboolean ok;
-
-    if (reply && reply_len > 0)
-        reply[0] = '\0';
-
-    ok = rig_session_send_command(ctrl, sock, cmd, reply, (gint) reply_len);
-    if (!ok)
-        return FALSE;
-
-    return check_set_response(reply, ok, __func__);
-}
-
-static gboolean rig_session_try_select_vfo(GtkRigCtrl *ctrl, gint sock,
-                                           const gchar *token)
-{
-    gchar cmd[64];
-    gchar reply[128];
-
-    if (token == NULL || *token == '\0')
-        return FALSE;
-
-    g_snprintf(cmd, sizeof(cmd), "V %s\x0a", token);
-    return rig_session_try_set_ok(ctrl, sock, cmd, reply, sizeof(reply));
-}
-
 static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
                                                 RigSession *session,
                                                 gint sock,
                                                 const radio_conf_t *conf)
 {
-    gchar dump_state[4096];
-    gchar reply[256];
-    gdouble freq = 0.0;
+    RigctldClient *client = rigctld_client_for_socket(ctrl, sock);
+    const RigCaps *caps = NULL;
     gboolean freq_ok = FALSE;
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
-    gboolean vfo_opt_set = FALSE;
 
     if (ctrl == NULL || session == NULL || conf == NULL)
         return FALSE;
 
+    if (client == NULL)
+    {
+        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                              "missing rigctld client");
+        return FALSE;
+    }
+
     rig_session_set_state(ctrl, session, RIG_SESSION_PROBING,
                           "probe start");
 
-    if (!rig_session_send_command(ctrl, sock, "\\dump_state\n",
-                                  dump_state, sizeof(dump_state)))
+    if (!rigctld_client_probe(client, conf, 500))
     {
         rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
-                              "dump_state failed");
+                              "probe failed");
         return FALSE;
     }
 
-    rig_session_parse_dump_state(session, dump_state);
+    caps = rigctld_client_get_caps(client);
+    if (caps == NULL)
     {
-        gint expected_model = rigctld_expected_model(conf);
-        if (expected_model > 0 && session->rig_model > 0 &&
-            session->rig_model != expected_model)
-        {
-            rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
-                                  "model mismatch expected=%d got=%d",
-                                  expected_model, session->rig_model);
-            return FALSE;
-        }
+        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                              "caps missing");
+        return FALSE;
     }
 
-    if (session->vfo_candidates->len == 0)
-    {
-        rig_session_add_vfo_candidate(session, "VFOA");
-        rig_session_add_vfo_candidate(session, "VFOB");
-        rig_session_add_vfo_candidate(session, "Main");
-        rig_session_add_vfo_candidate(session, "MainA");
-        rig_session_add_vfo_candidate(session, "Sub");
-        rig_session_add_vfo_candidate(session, "SubA");
-        rig_session_add_vfo_candidate(session, "currVFO");
-    }
+    rig_session_apply_caps(session, caps);
 
     rig_term_log(ctrl, "gpredict",
-                 "rig session (%s) dump_state model=%d backend=%s vfo_candidates=%u",
+                 "rig session (%s) dump_state model=%d backend=%s signature=%s vfo_candidates=%u",
                  session->label ? session->label : "rig",
                  session->rig_model,
                  session->backend_version ? session->backend_version : "(unknown)",
-                 session->vfo_candidates->len);
+                 session->signature ? session->signature : "(unknown)",
+                 session->vfo_candidates ? session->vfo_candidates->len : 0);
 
-    freq_ok = rig_session_try_get_freq(ctrl, sock, "f\n",
-                                       &freq, reply, sizeof(reply));
-
-    for (guint i = 0; i < session->vfo_candidates->len; i++)
-    {
-        const gchar *token = g_ptr_array_index(session->vfo_candidates, i);
-
-        if (!rig_session_try_select_vfo(ctrl, sock, token))
-            continue;
-
-        if (rig_session_try_get_freq(ctrl, sock, "f\n",
-                                     &freq, reply, sizeof(reply)))
-        {
-            vfo_select_ok = TRUE;
-            g_hash_table_replace(session->vfo_working, g_strdup(token),
-                                 GINT_TO_POINTER(1));
-            if (session->default_vfo_token == NULL)
-                session->default_vfo_token = g_strdup(token);
-        }
-    }
-
-    if (session->has_set_vfo_opt || conf->vfo_opt)
-    {
-        vfo_opt_set = rig_session_try_set_ok(ctrl, sock,
-                                             "\\set_vfo_opt 1\x0a",
-                                             reply, sizeof(reply));
-        if (vfo_opt_set)
-        {
-            session->vfo_opt_enabled = TRUE;
-            if (!rig_session_try_get_freq(ctrl, sock, "f\n",
-                                          &freq, reply, sizeof(reply)))
-            {
-                session->vfo_opt_unsafe = TRUE;
-                rig_session_try_set_ok(ctrl, sock,
-                                       "\\set_vfo_opt 0\x0a",
-                                       reply, sizeof(reply));
-                session->vfo_opt_enabled = FALSE;
-                rig_term_log(ctrl, "gpredict",
-                             "rig session (%s) vfo_opt unsafe; reverting",
-                             session->label ? session->label : "rig");
-                sat_log_log(SAT_LOG_LEVEL_WARN,
-                            "rig session (%s) vfo_opt unsafe; reverting",
-                            session->label ? session->label : "rig");
-            }
-            else
-            {
-                for (guint i = 0; i < session->vfo_candidates->len; i++)
-                {
-                    const gchar *token =
-                        g_ptr_array_index(session->vfo_candidates, i);
-                    gchar cmd[64];
-
-                    g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-                    if (!rig_session_try_get_freq(ctrl, sock, cmd,
-                                                  &freq, reply, sizeof(reply)))
-                        continue;
-
-                    g_free(session->default_vfo_token);
-                    session->default_vfo_token = g_strdup(token);
-                    g_snprintf(cmd, sizeof(cmd), "F %s %.0f\x0a", token, freq);
-                    if (rig_session_try_set_ok(ctrl, sock, cmd,
-                                               reply, sizeof(reply)))
-                    {
-                        vfo_opt_args_ok = TRUE;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (vfo_opt_args_ok)
-    {
-        session->strategy = RIG_STRATEGY_VFO_OPT_ARGS;
-        if (session->default_vfo_token == NULL)
-            session->default_vfo_token = g_strdup("currVFO");
-    }
-    else if (vfo_select_ok)
-    {
-        session->strategy = RIG_STRATEGY_SELECT_VFO;
-        if (session->vfo_opt_enabled)
-        {
-            rig_session_try_set_ok(ctrl, sock, "\\set_vfo_opt 0\x0a",
-                                   reply, sizeof(reply));
-            session->vfo_opt_enabled = FALSE;
-        }
-        if (vfo_opt_set && !vfo_opt_args_ok)
-        {
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "rig session (%s) vfo_opt args unsupported; using VFO selection",
-                        session->label ? session->label : "rig");
-        }
-    }
-    else if (freq_ok)
-    {
-        session->strategy = RIG_STRATEGY_PLAIN_FREQ;
-        if (session->vfo_opt_enabled)
-        {
-            rig_session_try_set_ok(ctrl, sock, "\\set_vfo_opt 0\x0a",
-                                   reply, sizeof(reply));
-            session->vfo_opt_enabled = FALSE;
-        }
-    }
-    else
-    {
-        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
-                              "no usable control strategy");
-        return FALSE;
-    }
+    freq_ok = caps->has_get_freq;
+    vfo_opt_args_ok = (session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
+    vfo_select_ok = (session->strategy == RIG_STRATEGY_SELECT_VFO ||
+                     session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
 
     if (!session->strategy_logged)
     {
@@ -8294,40 +8142,34 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
 static gboolean close_rigctld_socket(GtkRigCtrl *ctrl, gint * sock,
                                      gboolean send_quit)
 {
-    gint            written;
-    GString        *rxbuf = NULL;
+    RigctldClient *client = NULL;
+    HamlibTransport *transport = NULL;
+    gchar reply[64];
 
     if (sock == NULL || *sock == -1)
         return TRUE;
 
-    rxbuf = rigctld_rxbuf_for_socket(ctrl, *sock, FALSE);
-    rigctld_drain_idle(*sock, rxbuf, RIGCTLD_DUMP_STATE_IDLE_MS, NULL);
+    client = rigctld_client_for_socket(ctrl, *sock);
+    transport = client ? rigctld_client_get_transport(client) : NULL;
+    if (transport != NULL)
+        (void)hamlib_transport_drain(transport, RIGCTLD_DUMP_STATE_IDLE_MS,
+                                     NULL);
+
     rigctld_clear_rxbuf_for_socket(ctrl, *sock);
     rigctld_clear_vfo_map_for_socket(ctrl, *sock);
     rigctld_reset_offset_state_for_socket(ctrl, *sock);
     rig_session_reset(rig_session_for_socket(ctrl, *sock));
 
-    written = 0;
-    if (send_quit)
-    {
-        written = send(*sock, "q\x0a", 2, 0);
-        if (written != 2)
-        {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        _("%s:%s: Sent 2 bytes but sent %d."),
-                        __FILE__, __func__, written);
-        }
-    }
-#ifndef WIN32
-    shutdown(*sock, SHUT_RDWR);
-    close(*sock);
-#else
-    shutdown(*sock, SD_BOTH);
-    closesocket(*sock);
-#endif
+    if (send_quit && client != NULL)
+        (void)rigctld_client_request_raw(client, "q\n",
+                                         reply, sizeof(reply), NULL);
+
+    if (client != NULL)
+        rigctld_client_close(client);
+    else
+        rigctld_close_fd(*sock);
 
     *sock = -1;
-
     return TRUE;
 }
 
@@ -9811,6 +9653,36 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
         if (error_reported)
             *error_reported = reported;
         return FALSE;
+    }
+
+    {
+        RigctldClient **client_ptr =
+            secondary ? &ctrl->rig_client2 : &ctrl->rig_client;
+        gchar *client_err = NULL;
+
+        if (*client_ptr == NULL)
+            *client_ptr = rigctld_client_new(role ? role : "rig");
+
+        if (!rigctld_client_attach_fd(*client_ptr, *sock, &client_err))
+        {
+            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                        _("%s: Failed to attach rigctld socket for %s:%d: %s"),
+                        __func__, host, conf->port,
+                        client_err ? client_err : "(unknown)");
+            rig_term_log(ctrl, "gpredict:err",
+                         "attach failed for %s:%d (%s)",
+                         host, conf->port,
+                         client_err ? client_err : "(unknown)");
+            g_free(client_err);
+            rigctld_close_fd(*sock);
+            *sock = -1;
+            g_free(host);
+            if (error_reported)
+                *error_reported = reported;
+            return FALSE;
+        }
+
+        g_free(client_err);
     }
 
     rig_term_log(ctrl, "gpredict", "connected to %s:%d", host, conf->port);
