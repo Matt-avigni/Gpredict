@@ -27,6 +27,7 @@ class RotctldHandler(socketserver.StreamRequestHandler):
                     "max_az: 360",
                     "min_el: 0",
                     "max_el: 180",
+                    "done",
                     "",
                 ]
                 self.wfile.write("\n".join(dump).encode("ascii"))

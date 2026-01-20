@@ -38,6 +38,17 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
                 continue
 
+            if cmd == "\\reset_set_freq_count":
+                state["set_freq_count"] = 0
+                self.wfile.write(b"RPRT 0\n")
+                self.wfile.flush()
+                continue
+
+            if cmd == "\\get_set_freq_count":
+                self.wfile.write(("%d\nRPRT 0\n" % state["set_freq_count"]).encode("ascii"))
+                self.wfile.flush()
+                continue
+
             if cmd == "f" or cmd.startswith("f "):
                 self.wfile.write(("%d\nRPRT 0\n" % state["freq"]).encode("ascii"))
                 self.wfile.flush()
@@ -51,6 +62,7 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                         state["freq"] = int(float(freq_str))
                     except ValueError:
                         pass
+                state["set_freq_count"] += 1
                 self.wfile.write(b"RPRT 0\n")
                 self.wfile.flush()
                 continue
@@ -88,7 +100,7 @@ def main():
     args = parser.parse_args()
 
     server = RigctldServer((args.host, args.port), RigctldHandler)
-    server.state = {"freq": 145800000, "vfo": "VFOA"}
+    server.state = {"freq": 145800000, "vfo": "VFOA", "set_freq_count": 0}
 
     try:
         if args.once:

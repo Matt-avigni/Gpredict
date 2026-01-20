@@ -100,6 +100,13 @@ struct _gtk_rig_ctrl {
     gint64          last_doppler_calc_us; /*!< Last Doppler calc time (monotonic). */
     gint64          last_send_down_us; /*!< Last downlink send time (monotonic). */
     gint64          last_send_up_us;   /*!< Last uplink send time (monotonic). */
+    gdouble         last_sent_down_hz; /*!< Last downlink frequency command sent. */
+    gdouble         last_sent_up_hz;   /*!< Last uplink frequency command sent. */
+    gdouble         last_target_down_hz; /*!< Last downlink target computed. */
+    gdouble         last_target_up_hz;   /*!< Last uplink target computed. */
+    gint64          last_doppler_log_us; /*!< Last doppler tick log (monotonic). */
+    gint            doppler_suppress_down; /*!< Last downlink suppression reason. */
+    gint            doppler_suppress_up;   /*!< Last uplink suppression reason. */
     gdouble         user_base_down_hz; /*!< User-entered downlink base frequency. */
     gdouble         user_base_up_hz;   /*!< User-entered uplink base frequency. */
     gdouble         doppler_down_hz;   /*!< Current downlink Doppler offset. */

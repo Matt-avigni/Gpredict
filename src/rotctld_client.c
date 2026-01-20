@@ -5,8 +5,10 @@
 #include <string.h>
 
 #include "rotctld-parse.h"
+#include "sat-log.h"
 
 #define ROTCTLD_PROBE_RETRY_DELAY_MS 150
+#define ROTCTLD_LOG_THROTTLE_US 2000000
 
 struct _RotctldClient {
     HamlibTransport        *transport;
@@ -14,6 +16,7 @@ struct _RotctldClient {
     gchar                  *state_reason;
     gchar                  *label;
     gint64                  last_probe_us;
+    gint64                  last_failure_log_us;
     RotCaps                 caps;
 };
 
@@ -274,6 +277,96 @@ static gboolean rotctld_client_parse_pos(const gchar *text,
     return TRUE;
 }
 
+static gboolean rotctld_dump_state_first_line_is_one(const gchar *text)
+{
+    gchar **lines = NULL;
+    gboolean ok = FALSE;
+
+    if (text == NULL || *text == '\0')
+        return FALSE;
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *line = g_strstrip(lines[i]);
+
+        if (line[0] == '\0')
+            continue;
+
+        ok = (strcmp(line, "1") == 0);
+        break;
+    }
+    g_strfreev(lines);
+
+    return ok;
+}
+
+static gboolean rotctld_dump_state_has_done(const gchar *text)
+{
+    gchar **lines = NULL;
+    gboolean ok = FALSE;
+
+    if (text == NULL || *text == '\0')
+        return FALSE;
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *line = g_strstrip(lines[i]);
+
+        if (line[0] == '\0')
+            continue;
+
+        if (g_ascii_strcasecmp(line, "done") == 0)
+        {
+            ok = TRUE;
+            break;
+        }
+    }
+    g_strfreev(lines);
+
+    return ok;
+}
+
+static void rotctld_client_log_failure(RotctldClient *client,
+                                       const gchar *label,
+                                       const gchar *cmd,
+                                       const gchar *reply)
+{
+    gsize bytes = reply ? strlen(reply) : 0;
+    gchar *snippet = NULL;
+    gint64 now_us = g_get_monotonic_time();
+
+    if (client != NULL &&
+        client->last_failure_log_us > 0 &&
+        (now_us - client->last_failure_log_us) < ROTCTLD_LOG_THROTTLE_US)
+        return;
+
+    if (client != NULL)
+        client->last_failure_log_us = now_us;
+
+    if (reply && *reply)
+    {
+        if (bytes > 240)
+            snippet = g_strdup_printf("%.*s...", 240, reply);
+        else
+            snippet = g_strdup(reply);
+    }
+    else
+    {
+        snippet = g_strdup("(none)");
+    }
+
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                "%s: cmd='%s' bytes=%" G_GSIZE_FORMAT " reply=%s",
+                label,
+                cmd ? cmd : "(null)",
+                bytes,
+                snippet ? snippet : "(null)");
+
+    g_free(snippet);
+}
+
 static void rotctld_client_set_state(RotctldClient *client,
                                      rotctld_client_state_t state,
                                      const gchar *fmt,
@@ -304,6 +397,7 @@ RotctldClient *rotctld_client_new(const gchar *label)
     client->state = ROTCTLD_CLIENT_STOPPED;
     client->label = g_strdup(label ? label : "rot");
     rotctld_client_caps_init(&client->caps);
+    client->last_failure_log_us = 0;
 
     return client;
 }
@@ -329,6 +423,7 @@ void rotctld_client_reset(RotctldClient *client)
     rotctld_client_caps_clear(&client->caps);
     rotctld_client_set_state(client, ROTCTLD_CLIENT_STOPPED, "reset");
     client->last_probe_us = 0;
+    client->last_failure_log_us = 0;
 }
 
 gboolean rotctld_client_connect(RotctldClient *client,
@@ -457,6 +552,153 @@ gboolean rotctld_client_probe(RotctldClient *client,
 
     rotctld_client_set_state(client, ROTCTLD_CLIENT_READY, "probe ok");
     return client->caps.has_get_pos;
+}
+
+gboolean rotctld_client_handshake(RotctldClient *client,
+                                  gint timeout_ms,
+                                  gdouble *az_out,
+                                  gdouble *el_out,
+                                  gchar *dump_state_out,
+                                  gsize dump_state_len)
+{
+    gchar dump_buf[4096];
+    gchar reply[256];
+    HamlibResponseInfo info = { 0 };
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+    gboolean ok = FALSE;
+
+    if (az_out)
+        *az_out = 0.0;
+    if (el_out)
+        *el_out = 0.0;
+    if (dump_state_out && dump_state_len > 0)
+        dump_state_out[0] = '\0';
+
+    if (client == NULL || client->transport == NULL ||
+        !hamlib_transport_is_ready(client->transport))
+        return FALSE;
+
+    rotctld_client_set_state(client, ROTCTLD_CLIENT_PROBING, "handshake");
+
+    (void)hamlib_transport_clear_rxbuf(client->transport);
+
+    if (dump_state_out == NULL || dump_state_len == 0)
+    {
+        dump_state_out = dump_buf;
+        dump_state_len = sizeof(dump_buf);
+        dump_state_out[0] = '\0';
+    }
+
+    ok = hamlib_transport_request(client->transport,
+                                  "\\dump_state\n",
+                                  HAMLIB_READ_MULTILINE_IDLE,
+                                  HAMLIB_TERM_RPRT_OR_DONE,
+                                  timeout_ms,
+                                  50,
+                                  1, ROTCTLD_PROBE_RETRY_DELAY_MS,
+                                  dump_state_out, dump_state_len,
+                                  &info);
+    if (!ok)
+    {
+        rotctld_client_log_failure(client,
+                                   "handshake dump_state failed",
+                                   "\\dump_state",
+                                   dump_state_out);
+        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                 "handshake dump_state failed");
+        (void)hamlib_transport_clear_rxbuf(client->transport);
+        hamlib_transport_close(client->transport);
+        return FALSE;
+    }
+
+    if (!rotctld_dump_state_first_line_is_one(dump_state_out))
+    {
+        rotctld_client_log_failure(client,
+                                   "handshake dump_state invalid (expected line1=1)",
+                                   "\\dump_state",
+                                   dump_state_out);
+        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                 "handshake dump_state invalid");
+        (void)hamlib_transport_clear_rxbuf(client->transport);
+        hamlib_transport_close(client->transport);
+        return FALSE;
+    }
+    if (!rotctld_dump_state_has_done(dump_state_out))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld handshake: dump_state missing done; accepting");
+    }
+
+    memset(&info, 0, sizeof(info));
+    ok = hamlib_transport_request(client->transport,
+                                  "p\n",
+                                  HAMLIB_READ_MULTILINE_RPRT,
+                                  HAMLIB_TERM_RPRT_OR_DONE,
+                                  timeout_ms,
+                                  50,
+                                  1, ROTCTLD_PROBE_RETRY_DELAY_MS,
+                                  reply, sizeof(reply),
+                                  &info);
+    if (!ok)
+    {
+        rotctld_client_log_failure(client,
+                                   "handshake get_pos failed",
+                                   "p",
+                                   reply);
+        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                 "handshake get_pos failed");
+        (void)hamlib_transport_clear_rxbuf(client->transport);
+        hamlib_transport_close(client->transport);
+        return FALSE;
+    }
+
+    if (info.saw_rprt && info.rprt_code != 0)
+    {
+        rotctld_client_log_failure(client,
+                                   "handshake get_pos rejected",
+                                   "p",
+                                   reply);
+        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                 "handshake get_pos rejected");
+        (void)hamlib_transport_clear_rxbuf(client->transport);
+        hamlib_transport_close(client->transport);
+        return FALSE;
+    }
+
+    if (!rotctld_client_parse_pos(reply, &az, &el))
+    {
+        rotctld_client_log_failure(client,
+                                   "handshake get_pos parse failed (expected az/el)",
+                                   "p",
+                                   reply);
+        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                 "handshake get_pos parse failed");
+        (void)hamlib_transport_clear_rxbuf(client->transport);
+        hamlib_transport_close(client->transport);
+        return FALSE;
+    }
+
+    if (az_out)
+        *az_out = az;
+    if (el_out)
+        *el_out = el;
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotor handshake OK az=%.2f el=%.2f RTT=%.1fms",
+                az, el,
+                hamlib_transport_last_rtt_us(client->transport) / 1000.0);
+
+    rotctld_client_set_state(client, ROTCTLD_CLIENT_READY, "handshake ok");
+    return TRUE;
+}
+
+gssize rotctld_client_clear_rxbuf(RotctldClient *client)
+{
+    if (client == NULL || client->transport == NULL)
+        return -1;
+
+    return hamlib_transport_clear_rxbuf(client->transport);
 }
 
 gboolean rotctld_client_get_pos(RotctldClient *client,

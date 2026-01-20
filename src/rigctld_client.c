@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "rotctld-parse.h"
+#include "sat-log.h"
 
 #define RIGCTLD_PROBE_RETRY_DELAY_MS 50
 #define RIGCTLD_VFO_TOKEN_MAX 64
@@ -341,6 +342,30 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
     return rigctld_client_parse_frequency(reply, freq_out);
 }
 
+static gboolean rigctld_client_try_get_freq_retry(RigctldClient *client,
+                                                  const gchar *cmd,
+                                                  gdouble *freq_out,
+                                                  gchar *reply,
+                                                  gsize reply_len,
+                                                  gint timeout_ms,
+                                                  gint retries)
+{
+    gint attempt = 0;
+
+    for (attempt = 0; attempt <= retries; attempt++)
+    {
+        if (rigctld_client_try_get_freq(client, cmd, freq_out,
+                                        reply, reply_len, timeout_ms))
+            return TRUE;
+
+        (void)hamlib_transport_drain(client->transport, 50, NULL);
+        if (attempt < retries)
+            g_usleep((gulong)RIGCTLD_PROBE_RETRY_DELAY_MS * 1000);
+    }
+
+    return FALSE;
+}
+
 static gboolean rigctld_client_try_set_ok(RigctldClient *client,
                                           const gchar *cmd,
                                           gchar *reply,
@@ -625,13 +650,16 @@ gboolean rigctld_client_probe(RigctldClient *client,
     if (!hamlib_transport_request(client->transport,
                                   "\\dump_state\n",
                                   HAMLIB_READ_MULTILINE_IDLE,
-                                  HAMLIB_TERM_RPRT,
+                                  HAMLIB_TERM_RPRT_OR_DONE,
                                   timeout_ms,
                                   50,
                                   1, RIGCTLD_PROBE_RETRY_DELAY_MS,
                                   dump_state, sizeof(dump_state),
                                   &info))
     {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctld probe dump_state failed err=%d rprt=%d done=%d",
+                    info.err, info.saw_rprt ? 1 : 0, info.saw_done ? 1 : 0);
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "dump_state failed");
         return FALSE;
@@ -669,9 +697,9 @@ gboolean rigctld_client_probe(RigctldClient *client,
         rigctld_client_add_vfo_candidate(&client->caps, "currVFO");
     }
 
-    freq_ok = rigctld_client_try_get_freq(client, "f\n",
-                                          &freq, reply, sizeof(reply),
-                                          timeout_ms);
+    freq_ok = rigctld_client_try_get_freq_retry(client, "f\n",
+                                                &freq, reply, sizeof(reply),
+                                                timeout_ms, 1);
     client->caps.has_get_freq = freq_ok;
 
     for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
@@ -682,9 +710,9 @@ gboolean rigctld_client_probe(RigctldClient *client,
         if (!rigctld_client_try_select_vfo(client, token, timeout_ms))
             continue;
 
-        if (rigctld_client_try_get_freq(client, "f\n",
-                                        &freq, reply, sizeof(reply),
-                                        timeout_ms))
+        if (rigctld_client_try_get_freq_retry(client, "f\n",
+                                              &freq, reply, sizeof(reply),
+                                              timeout_ms, 1))
         {
             vfo_select_ok = TRUE;
             g_hash_table_replace(client->caps.vfo_working,
@@ -704,9 +732,9 @@ gboolean rigctld_client_probe(RigctldClient *client,
         if (vfo_opt_set)
         {
             client->caps.vfo_opt_enabled = TRUE;
-            if (!rigctld_client_try_get_freq(client, "f\n",
-                                             &freq, reply, sizeof(reply),
-                                             timeout_ms))
+            if (!rigctld_client_try_get_freq_retry(client, "f\n",
+                                                   &freq, reply, sizeof(reply),
+                                                   timeout_ms, 1))
             {
                 client->caps.vfo_opt_unsafe = TRUE;
                 rigctld_client_try_set_ok(client, "\\set_vfo_opt 0\x0a",
@@ -723,10 +751,10 @@ gboolean rigctld_client_probe(RigctldClient *client,
                     gchar cmd[96];
 
                     g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-                    if (!rigctld_client_try_get_freq(client, cmd,
-                                                     &freq, reply,
-                                                     sizeof(reply),
-                                                     timeout_ms))
+                    if (!rigctld_client_try_get_freq_retry(client, cmd,
+                                                           &freq, reply,
+                                                           sizeof(reply),
+                                                           timeout_ms, 1))
                         continue;
 
                     g_free(client->caps.default_vfo_token);

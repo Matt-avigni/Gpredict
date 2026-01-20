@@ -48,6 +48,13 @@ HamlibTransport       *rotctld_client_get_transport(RotctldClient *client);
 
 gboolean              rotctld_client_probe(RotctldClient *client,
                                            gint timeout_ms);
+gboolean              rotctld_client_handshake(RotctldClient *client,
+                                               gint timeout_ms,
+                                               gdouble *az_out,
+                                               gdouble *el_out,
+                                               gchar *dump_state_out,
+                                               gsize dump_state_len);
+gssize                rotctld_client_clear_rxbuf(RotctldClient *client);
 
 gboolean              rotctld_client_get_pos(RotctldClient *client,
                                              gdouble *az_out,

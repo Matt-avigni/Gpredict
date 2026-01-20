@@ -54,6 +54,7 @@ gboolean         hamlib_transport_request(HamlibTransport *transport,
 gssize           hamlib_transport_drain(HamlibTransport *transport,
                                         gint idle_timeout_ms,
                                         gint *err_out);
+gssize           hamlib_transport_clear_rxbuf(HamlibTransport *transport);
 
 gint64           hamlib_transport_last_rtt_us(const HamlibTransport *transport);
 

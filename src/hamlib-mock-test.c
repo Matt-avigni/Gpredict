@@ -234,6 +234,48 @@ int main(void)
         goto cleanup;
     }
 
+    {
+        HamlibResponseInfo info = { 0 };
+        gchar reply[128] = { 0 };
+        gint count = 0;
+
+        if (!rigctld_client_request_raw(rig, "\\reset_set_freq_count\n",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld reset count failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        for (gint i = 0; i < 10; i++)
+        {
+            if (!rigctld_client_set_freq(rig, VFO_MAIN,
+                                         145900000.0 + (gdouble)(i * 10)))
+            {
+                g_printerr("rigctld set freq failed (counting)\n");
+                ok = FALSE;
+                goto cleanup;
+            }
+            g_usleep(50000);
+        }
+
+        if (!rigctld_client_request_raw(rig, "\\get_set_freq_count\n",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld count query failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        count = (gint)g_ascii_strtoll(reply, NULL, 10);
+        if (count < 2 || count > 10)
+        {
+            g_printerr("rigctld set freq count out of range: %d\n", count);
+            ok = FALSE;
+            goto cleanup;
+        }
+    }
+
     if (!connect_rotctld_with_retry(rot, "127.0.0.1", rot_port))
     {
         g_printerr("failed to connect to rotctld mock\n");
@@ -265,6 +307,29 @@ int main(void)
         g_printerr("rotctld set pos failed\n");
         ok = FALSE;
         goto cleanup;
+    }
+    {
+        gchar dump_state[4096];
+        gdouble hs_az = 0.0;
+        gdouble hs_el = 0.0;
+
+        if (!rotctld_client_handshake(rot, 500, &hs_az, &hs_el,
+                                      dump_state, sizeof(dump_state)))
+        {
+            g_printerr("rotctld handshake failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        for (gint i = 0; i < 3; i++)
+        {
+            if (!rotctld_client_get_pos(rot, &az, &el))
+            {
+                g_printerr("rotctld get pos failed (repeat)\n");
+                ok = FALSE;
+                goto cleanup;
+            }
+        }
     }
     if (!rotctld_client_get_pos(rot, &az, &el))
     {

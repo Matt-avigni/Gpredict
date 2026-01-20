@@ -5,6 +5,11 @@
 - Rotor: `rotctld_client_probe()` issues `\\dump_state` and probes `p`/`P`, parsing limits when available and caching results in `RotCaps`.
 - Both clients use `hamlib_transport` for request/response framing, prompt stripping, timeouts, and single in-flight command enforcement.
 
+## Doppler tick + rate limiting
+- Doppler updates are recomputed in the rig timer (`rig_ctrl_timeout_cb`) via `rigctrl_update_doppler()` and applied in the rig worker cycle.
+- Send gating is handled in `rigctrl_should_send_freq()` using payload profile `send_hz` (min interval), `deadband_hz` (min step), and `RIGCTRL_DOPPLER_MAX_INTERVAL_MS` (safety refresh).
+- Per-side state is tracked in `GtkRigCtrl` (`last_sent_*`, `last_send_*`, `last_target_*`) for coalescing and debug logs.
+
 ## Adding a payload policy
 - Start in `src/tracking_policy.h` and `src/tracking_policy.c`.
 - Extend `TrackingPolicyInput` with any new inputs you need, keep `TrackingPolicyOutput` pure (no side effects).

@@ -14,7 +14,6 @@
 
 #define HAMLIB_RXBUF_CHUNK 512
 #define HAMLIB_LINE_BUF 512
-#define HAMLIB_DUMP_STATE_MIN_LINES 2
 
 struct _HamlibTransport {
     GSocket *socket;
@@ -169,6 +168,23 @@ static gboolean hamlib_line_is_prompt(const gchar *line)
     return FALSE;
 }
 
+static gboolean hamlib_line_is_blank(const gchar *line)
+{
+    const gchar *scan = line;
+
+    if (scan == NULL)
+        return TRUE;
+
+    while (*scan != '\0')
+    {
+        if (!g_ascii_isspace(*scan))
+            return FALSE;
+        scan++;
+    }
+
+    return TRUE;
+}
+
 static gsize hamlib_append_out(gchar *out, gsize out_len, gsize used,
                                const gchar *data, gsize data_len)
 {
@@ -304,8 +320,12 @@ static gssize hamlib_read_dump_state(gint fd,
                                      gint *err_out)
 {
     gint64 deadline_us;
-    gboolean got_data = FALSE;
-    gint lines = 0;
+    gint err = 0;
+    gboolean saw_rprt = FALSE;
+    gboolean saw_done = FALSE;
+    gboolean done = FALSE;
+    gsize used = 0;
+    gchar line[HAMLIB_LINE_BUF];
 
     if (err_out)
         *err_out = 0;
@@ -325,90 +345,85 @@ static gssize hamlib_read_dump_state(gint fd,
     deadline_us = g_get_monotonic_time() +
         ((gint64)base_timeout_ms * 1000);
 
-    if (buf->len > 0)
-    {
-        got_data = TRUE;
-        for (gsize i = 0; i < buf->len; i++)
-        {
-            if (buf->str[i] == '\n')
-                lines++;
-        }
-    }
-
-    for (;;)
+    while (!done)
     {
         gint timeout_ms;
-        gint poll_rc;
-        gchar chunk[HAMLIB_RXBUF_CHUNK];
+        gint64 now_us;
+        gint64 remaining_us;
         gssize size;
 
-        if (got_data && lines >= HAMLIB_DUMP_STATE_MIN_LINES)
+        if (!saw_rprt)
         {
-            timeout_ms = idle_timeout_ms;
-        }
-        else
-        {
-            gint64 now_us = g_get_monotonic_time();
-            gint64 remaining_us = deadline_us - now_us;
-
+            now_us = g_get_monotonic_time();
+            remaining_us = deadline_us - now_us;
             if (remaining_us <= 0)
             {
                 if (err_out)
                     *err_out = EAGAIN;
                 return -1;
             }
-
             timeout_ms = (gint)(remaining_us / 1000);
             if (timeout_ms <= 0)
                 timeout_ms = 1;
         }
-
-        poll_rc = hamlib_poll_readable(fd, timeout_ms, err_out);
-        if (poll_rc == 0)
+        else
         {
-            if (got_data && lines >= HAMLIB_DUMP_STATE_MIN_LINES)
+            timeout_ms = idle_timeout_ms;
+        }
+
+        size = hamlib_read_reply_line(fd, buf, line, sizeof(line),
+                                      timeout_ms, &err);
+        if (size <= 0)
+        {
+            if (saw_rprt)
                 break;
             if (err_out)
-                *err_out = EAGAIN;
+                *err_out = err;
             return -1;
         }
-        if (poll_rc < 0)
-            return -1;
 
-        size = recv(fd, chunk, sizeof(chunk), 0);
-        if (size == 0)
+        if (hamlib_line_is_prompt(line))
+            continue;
+
+        if (hamlib_line_is_done(line))
         {
-            if (got_data)
+            saw_done = TRUE;
+            used = hamlib_append_out_line(out, out_len, used,
+                                          line, (gsize)size);
+            done = TRUE;
+            break;
+        }
+
+        if (hamlib_line_parse_rprt(line, NULL))
+        {
+            saw_rprt = TRUE;
+            continue;
+        }
+
+        if (saw_rprt)
+        {
+            if (hamlib_line_is_blank(line))
+            {
+                done = TRUE;
                 break;
-            return 0;
-        }
-        if (size < 0)
-        {
-            if (err_out)
-                *err_out = errno;
-            return -1;
+            }
         }
 
-        g_string_append_len(buf, chunk, (gsize)size);
-        got_data = TRUE;
-        for (gssize i = 0; i < size; i++)
-        {
-            if (chunk[i] == '\n')
-                lines++;
-        }
+        used = hamlib_append_out_line(out, out_len, used,
+                                      line, (gsize)size);
     }
 
+    if (!saw_rprt && !saw_done)
     {
-        gsize copy_len = buf->len;
-
-        if (copy_len >= out_len)
-            copy_len = out_len - 1;
-        if (copy_len > 0)
-            memcpy(out, buf->str, copy_len);
-        out[copy_len] = '\0';
-        g_string_set_size(buf, 0);
-        return (gssize)copy_len;
+        if (err_out)
+            *err_out = EAGAIN;
+        return -1;
     }
+
+    if (buf)
+        g_string_set_size(buf, 0);
+
+    return (gssize)used;
 }
 
 static gssize hamlib_read_response(gint fd,
@@ -852,6 +867,41 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
         size = recv(transport->fd, chunk, sizeof(chunk), 0);
         if (size <= 0)
             break;
+
+        total += size;
+    }
+
+    return total;
+}
+
+gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
+{
+    gssize total = 0;
+
+    if (transport == NULL || !hamlib_transport_is_ready(transport))
+        return -1;
+
+    if (transport->rxbuf)
+        g_string_set_size(transport->rxbuf, 0);
+
+    for (;;)
+    {
+        gint err = 0;
+        gint poll_rc;
+        gchar chunk[HAMLIB_RXBUF_CHUNK];
+        gssize size;
+
+        poll_rc = hamlib_poll_readable(transport->fd, 0, &err);
+        if (poll_rc <= 0)
+            break;
+
+        size = recv(transport->fd, chunk, sizeof(chunk), 0);
+        if (size <= 0)
+        {
+            if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break;
+            break;
+        }
 
         total += size;
     }
