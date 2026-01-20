@@ -227,12 +227,8 @@ static gboolean rotctld_client_parse_pos(const gchar *text,
                                          gdouble *az_out,
                                          gdouble *el_out)
 {
-    const gchar *p = text;
-    gchar *endptr = NULL;
-    gdouble first = 0.0;
-    gdouble second = 0.0;
-    gboolean have_first = FALSE;
-    gboolean have_second = FALSE;
+    gboolean have_az = FALSE;
+    gboolean have_el = FALSE;
 
     if (az_out)
         *az_out = 0.0;
@@ -242,39 +238,52 @@ static gboolean rotctld_client_parse_pos(const gchar *text,
     if (text == NULL || *text == '\0')
         return FALSE;
 
-    while (*p != '\0')
+    gchar **lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
     {
-        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+')
+        gchar *line = g_strstrip(lines[i]);
+        gdouble a = 0.0;
+        gdouble b = 0.0;
+
+        if (line[0] == '\0')
+            continue;
+
+        if (g_str_has_prefix(line, "RPRT") ||
+            g_ascii_strcasecmp(line, "done") == 0)
         {
-            gdouble val = g_ascii_strtod(p, &endptr);
-            if (endptr != p)
-            {
-                if (!have_first)
-                {
-                    first = val;
-                    have_first = TRUE;
-                }
-                else
-                {
-                    second = val;
-                    have_second = TRUE;
-                    break;
-                }
-                p = endptr;
-                continue;
-            }
+            continue;
         }
-        p++;
+
+        if (!have_az &&
+            rotctld_client_parse_first_two_numbers(line, &a, &b))
+        {
+            if (az_out)
+                *az_out = a;
+            if (el_out)
+                *el_out = b;
+            have_az = TRUE;
+            have_el = TRUE;
+            break;
+        }
+
+        if (!have_az && rotctld_client_parse_first_number(line, &a))
+        {
+            if (az_out)
+                *az_out = a;
+            have_az = TRUE;
+            continue;
+        }
+
+        if (have_az && !have_el && rotctld_client_parse_first_number(line, &b))
+        {
+            if (el_out)
+                *el_out = b;
+            have_el = TRUE;
+        }
     }
+    g_strfreev(lines);
 
-    if (!have_first || !have_second)
-        return FALSE;
-
-    if (az_out)
-        *az_out = first;
-    if (el_out)
-        *el_out = second;
-    return TRUE;
+    return have_az && have_el;
 }
 
 static gboolean rotctld_dump_state_first_line_is_one(const gchar *text)
@@ -293,7 +302,7 @@ static gboolean rotctld_dump_state_first_line_is_one(const gchar *text)
         if (line[0] == '\0')
             continue;
 
-        ok = (strcmp(line, "1") == 0);
+        ok = g_str_has_prefix(line, "1");
         break;
     }
     g_strfreev(lines);
@@ -559,7 +568,9 @@ gboolean rotctld_client_handshake(RotctldClient *client,
                                   gdouble *az_out,
                                   gdouble *el_out,
                                   gchar *dump_state_out,
-                                  gsize dump_state_len)
+                                  gsize dump_state_len,
+                                  gchar *pos_reply_out,
+                                  gsize pos_reply_len)
 {
     gchar dump_buf[4096];
     gchar reply[256];
@@ -574,6 +585,8 @@ gboolean rotctld_client_handshake(RotctldClient *client,
         *el_out = 0.0;
     if (dump_state_out && dump_state_len > 0)
         dump_state_out[0] = '\0';
+    if (pos_reply_out && pos_reply_len > 0)
+        pos_reply_out[0] = '\0';
 
     if (client == NULL || client->transport == NULL ||
         !hamlib_transport_is_ready(client->transport))
@@ -631,6 +644,7 @@ gboolean rotctld_client_handshake(RotctldClient *client,
     }
 
     memset(&info, 0, sizeof(info));
+    reply[0] = '\0';
     ok = hamlib_transport_request(client->transport,
                                   "p\n",
                                   HAMLIB_READ_MULTILINE_RPRT,
@@ -640,6 +654,8 @@ gboolean rotctld_client_handshake(RotctldClient *client,
                                   1, ROTCTLD_PROBE_RETRY_DELAY_MS,
                                   reply, sizeof(reply),
                                   &info);
+    if (pos_reply_out && pos_reply_len > 0)
+        g_strlcpy(pos_reply_out, reply, pos_reply_len);
     if (!ok)
     {
         rotctld_client_log_failure(client,
@@ -653,7 +669,11 @@ gboolean rotctld_client_handshake(RotctldClient *client,
         return FALSE;
     }
 
-    if (info.saw_rprt && info.rprt_code != 0)
+    if (rotctld_client_parse_pos(reply, &az, &el))
+    {
+        /* Parsed az/el is sufficient even if a trailing RPRT is missing. */
+    }
+    else if (info.saw_rprt && info.rprt_code != 0)
     {
         rotctld_client_log_failure(client,
                                    "handshake get_pos rejected",
@@ -665,8 +685,7 @@ gboolean rotctld_client_handshake(RotctldClient *client,
         hamlib_transport_close(client->transport);
         return FALSE;
     }
-
-    if (!rotctld_client_parse_pos(reply, &az, &el))
+    else
     {
         rotctld_client_log_failure(client,
                                    "handshake get_pos parse failed (expected az/el)",
@@ -729,10 +748,13 @@ gboolean rotctld_client_get_pos(RotctldClient *client,
     if (!ok)
         return FALSE;
 
+    if (rotctld_client_parse_pos(reply, az_out, el_out))
+        return TRUE;
+
     if (info.saw_rprt && info.rprt_code != 0)
         return FALSE;
 
-    return rotctld_client_parse_pos(reply, az_out, el_out);
+    return FALSE;
 }
 
 gboolean rotctld_client_set_pos(RotctldClient *client,
@@ -760,7 +782,10 @@ gboolean rotctld_client_set_pos(RotctldClient *client,
     if (!ok)
         return FALSE;
 
-    if (info.saw_rprt && info.rprt_code != 0)
+    if (!info.saw_rprt)
+        return FALSE;
+
+    if (info.rprt_code != 0)
         return FALSE;
 
     return TRUE;

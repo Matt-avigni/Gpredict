@@ -47,6 +47,7 @@ int main(void)
     assert(out.el_clamped);
 
     expect_close(az_norm_span(181.0, AZSPAN_PM180), -179.0);
+    expect_close(az_norm_span(190.0, AZSPAN_PM180), -170.0);
     expect_close(az_norm_span(-181.0, AZSPAN_PM180), 179.0);
     expect_close(az_unwrap_to_abs(179.0, -179.0, AZSPAN_PM180), 181.0);
     expect_close(az_abs_to_span(181.0, AZSPAN_PM180), -179.0);

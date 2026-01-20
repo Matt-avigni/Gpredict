@@ -104,6 +104,9 @@
 #define ROTCTLD_IDLE_TIMEOUT_MS 100
 #define ROTCTLD_FOLLOW_IDLE_MS 50
 #define ROTCTLD_HANDSHAKE_RETRY_MS 250
+#define ROTCTLD_BASELINE_POLL_MS 200
+#define ROTCTLD_BASELINE_TIMEOUT_MS 1200
+#define ROTCTLD_BASELINE_DEADBAND_DEG 1.0
 #define ROTCTLD_IO_STALE_MS 2000
 #define ROTCTLD_MAX_CONSEC_FAIL 3
 #define ROTCTLD_FAILURE_LOG_INTERVAL_US 2000000
@@ -115,6 +118,8 @@ typedef struct {
     gint            socket;
     RotctldClient  *client;
     gboolean        running, new_trg;
+    gboolean        send_quit;
+    gboolean        thread_done;
     gdouble         azi_out, ele_out;
     gdouble         azi_in, ele_in;
     gboolean        io_error;
@@ -150,6 +155,14 @@ typedef enum {
     ROTCTLD_ENSURE_PENDING,
     ROTCTLD_ENSURE_FAILED
 } rotctld_ensure_result_t;
+
+typedef enum {
+    ROT_SESSION_DISCONNECTED = 0,
+    ROT_SESSION_CONNECTING,
+    ROT_SESSION_ENGAGING,
+    ROT_SESSION_READY,
+    ROT_SESSION_DEGRADED
+} rot_session_state_t;
 
 typedef enum {
     ROT_PLAN_MODE_NORMAL = 0,
@@ -216,6 +229,8 @@ struct _GtkRotCtrl {
     gint            errcnt;
 
     gboolean        tracking, engaged, monitor, flipped;
+    gboolean        engage_pending;
+    rot_session_state_t session_state;
     gboolean        tracking_active;
     double          az_abs_cur;
     double          az_abs_last_cmd;
@@ -273,6 +288,10 @@ static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data);
+static void rot_session_set_state(GtkRotCtrl *ctrl,
+                                  rot_session_state_t state,
+                                  const gchar *reason,
+                                  gboolean send_quit);
 static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl);
 static gboolean rotctrl_resize_idle(gpointer data);
 static void rotctrl_schedule_resize(GtkRotCtrl *ctrl);
@@ -291,11 +310,14 @@ static gboolean rotctrl_sync_manual_from_position(GtkRotCtrl *ctrl,
                                                   gdouble *setaz,
                                                   gdouble *setel);
 static AzSpan   rotctrl_span_from_conf(const rotor_conf_t *conf);
+static void     rotctrl_span_bounds(AzSpan span,
+                                    gdouble *min_out,
+                                    gdouble *max_out);
 static gboolean rotctrl_stop_crosses(const RotorSafety *s,
                                      double az_abs_cur,
                                      double az_abs_candidate);
 static gboolean rotctrl_get_pos_valid(GtkRotCtrl *ctrl, gint64 *last_pos_us);
-static gboolean rotctrl_wait_for_baseline(GtkRotCtrl *ctrl);
+static G_GNUC_UNUSED gboolean rotctrl_wait_for_baseline(GtkRotCtrl *ctrl);
 static void     rotctrl_update_safety(GtkRotCtrl *ctrl,
                                       gboolean caps_valid,
                                       gdouble caps_az_min,
@@ -658,6 +680,97 @@ static void rot_term_log_rx(GtkRotCtrl *ctrl, const gchar *cmd,
 
     g_free(trim_cmd);
     g_free(trim_reply);
+}
+
+static const gchar *rot_session_state_name(rot_session_state_t state)
+{
+    switch (state)
+    {
+    case ROT_SESSION_DISCONNECTED:
+        return "DISCONNECTED";
+    case ROT_SESSION_CONNECTING:
+        return "CONNECTING";
+    case ROT_SESSION_ENGAGING:
+        return "ENGAGING";
+    case ROT_SESSION_READY:
+        return "READY";
+    case ROT_SESSION_DEGRADED:
+        return "DEGRADED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void rot_session_set_state(GtkRotCtrl *ctrl,
+                                  rot_session_state_t state,
+                                  const gchar *reason,
+                                  gboolean send_quit)
+{
+    const gchar *from;
+    const gchar *to;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->session_state == state)
+        return;
+
+    from = rot_session_state_name(ctrl->session_state);
+    to = rot_session_state_name(state);
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotor_state %s->%s reason=%s quit=%s",
+                from, to,
+                reason ? reason : "none",
+                send_quit ? "yes" : "no");
+    rot_term_log_verbose(ctrl, "gpredict:state",
+                         "rotor_state %s->%s reason=%s quit=%s",
+                         from, to,
+                         reason ? reason : "none",
+                         send_quit ? "yes" : "no");
+
+    ctrl->session_state = state;
+}
+
+static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
+                                         gboolean rotpos_valid,
+                                         gboolean io_error)
+{
+    rotctld_client_state_t client_state = ROTCTLD_CLIENT_STOPPED;
+    const gchar *reason = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    if (!ctrl->engaged)
+    {
+        if (!ctrl->engage_pending)
+            rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED, "idle", FALSE);
+        return;
+    }
+
+    if (ctrl->client.client)
+    {
+        client_state = rotctld_client_get_state(ctrl->client.client);
+        reason = rotctld_client_get_state_reason(ctrl->client.client);
+    }
+
+    if (client_state == ROTCTLD_CLIENT_DEGRADED || io_error)
+    {
+        rot_session_set_state(ctrl, ROT_SESSION_DEGRADED,
+                              reason ? reason : (io_error ? "io error" : "degraded"),
+                              FALSE);
+        return;
+    }
+
+    if (rotpos_valid)
+    {
+        rot_session_set_state(ctrl, ROT_SESSION_READY, "pos ok", FALSE);
+        return;
+    }
+
+    rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
+                          reason ? reason : "waiting position", FALSE);
 }
 
 static void rotctld_log_cb(RotctldMgr *mgr,
@@ -1827,6 +1940,33 @@ static AzSpan rotctrl_span_from_conf(const rotor_conf_t *conf)
     }
 }
 
+static void rotctrl_span_bounds(AzSpan span, gdouble *min_out, gdouble *max_out)
+{
+    gdouble minv = 0.0;
+    gdouble maxv = 360.0;
+
+    switch (span) {
+    case AZSPAN_PM180:
+        minv = -180.0;
+        maxv = 180.0;
+        break;
+    case AZSPAN_480:
+        minv = 0.0;
+        maxv = 480.0;
+        break;
+    case AZSPAN_360:
+    default:
+        minv = 0.0;
+        maxv = 360.0;
+        break;
+    }
+
+    if (min_out)
+        *min_out = minv;
+    if (max_out)
+        *max_out = maxv;
+}
+
 static gboolean rotctrl_stop_crosses(const RotorSafety *s,
                                      double az_abs_cur,
                                      double az_abs_candidate)
@@ -1866,7 +2006,7 @@ static gboolean rotctrl_get_pos_valid(GtkRotCtrl *ctrl, gint64 *last_pos_us)
     return ok;
 }
 
-static gboolean rotctrl_wait_for_baseline(GtkRotCtrl *ctrl)
+static G_GNUC_UNUSED gboolean rotctrl_wait_for_baseline(GtkRotCtrl *ctrl)
 {
     guint delay_ms = 100;
 
@@ -2257,7 +2397,7 @@ struct RotctldProbeState {
     gchar       *autodetect_device;
 };
 
-static gboolean rotctld_line_is_numeric(const gchar *line)
+static G_GNUC_UNUSED gboolean rotctld_line_is_numeric(const gchar *line)
 {
     const gchar *p = line;
 
@@ -2337,10 +2477,9 @@ static void rotctld_extract_first_lines(const gchar *text,
 static gboolean rotctld_response_is_valid(const gchar *text,
                                           gchar **first_line_out)
 {
-    gboolean has_done = FALSE;
-    gboolean has_marker = FALSE;
     gchar **lines = NULL;
     gchar *first_line = NULL;
+    gboolean ok = FALSE;
 
     if (first_line_out)
         *first_line_out = NULL;
@@ -2352,28 +2491,16 @@ static gboolean rotctld_response_is_valid(const gchar *text,
     for (gint i = 0; lines[i] != NULL; i++)
     {
         gchar *line = g_strstrip(lines[i]);
-        gchar *lower = NULL;
 
         if (line[0] == '\0')
             continue;
 
         if (first_line == NULL)
-            first_line = g_strdup(line);
-
-        if (g_ascii_strcasecmp(line, "done") == 0)
-            has_done = TRUE;
-
-        lower = g_ascii_strdown(line, -1);
-        if (lower != NULL)
         {
-            if (g_strrstr(lower, "rot_type=") != NULL ||
-                g_strrstr(lower, "min_az=") != NULL)
-                has_marker = TRUE;
+            first_line = g_strdup(line);
+            ok = g_str_has_prefix(line, "1");
+            break;
         }
-        g_free(lower);
-
-        if (!has_marker && rotctld_line_is_numeric(line))
-            has_marker = TRUE;
     }
     g_strfreev(lines);
 
@@ -2382,7 +2509,7 @@ static gboolean rotctld_response_is_valid(const gchar *text,
     else
         g_free(first_line);
 
-    return has_done && has_marker;
+    return ok;
 }
 
 static const gchar *rotctld_probe_result_name(rotctld_probe_result_t result)
@@ -2679,8 +2806,13 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
         return ROT_SET_REJECTED;
     }
 
-    /* Legacy / non-Hamlib style replies (e.g. numeric echoes) are treated as OK. */
-    return ROT_SET_OK;
+    sat_log_log(SAT_LOG_LEVEL_WARN,
+                _("%s: rotctld reply missing RPRT for cmd '%s'"),
+                __func__, txbuf);
+    rot_term_log(ctrl, "gpredict:err",
+                 "set_position missing RPRT for %s:%d cmd=%s reply=%s",
+                 host, port, txbuf, buffback);
+    return ROT_SET_REJECTED;
 }
 
 /* Rotctl client thread */
@@ -2707,6 +2839,10 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.timer = g_timer_new();
     ctrl->client.new_trg = FALSE;
     ctrl->client.running = TRUE;
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.send_quit = FALSE;
+    ctrl->client.thread_done = FALSE;
+    g_mutex_unlock(&ctrl->client.mutex);
     ctrl->client.socket = -1;
     ctrl->client.last_cmd_us = 0;
     if (ctrl->client.client == NULL)
@@ -2788,6 +2924,7 @@ static gpointer rotctld_client_thread(gpointer data)
 
             {
                 gchar dump_state[4096];
+                gchar pos_reply[256];
                 gdouble hs_az = 0.0;
                 gdouble hs_el = 0.0;
                 gboolean handshake_ok = FALSE;
@@ -2799,11 +2936,23 @@ static gpointer rotctld_client_thread(gpointer data)
                     if (attempt > 0)
                         g_usleep(ROTCTLD_HANDSHAKE_RETRY_MS * 1000);
                     dump_state[0] = '\0';
-                    if (rotctld_client_handshake(ctrl->client.client,
-                                                 ROTCTLD_SOCKET_TIMEOUT_MS,
-                                                 &hs_az, &hs_el,
-                                                 dump_state,
-                                                 sizeof(dump_state)))
+                    pos_reply[0] = '\0';
+                    gboolean hs_ok = rotctld_client_handshake(ctrl->client.client,
+                                                              ROTCTLD_SOCKET_TIMEOUT_MS,
+                                                              &hs_az, &hs_el,
+                                                              dump_state,
+                                                              sizeof(dump_state),
+                                                              pos_reply,
+                                                              sizeof(pos_reply));
+                    if (ctrl->verbose_logging && dump_state[0] != '\0')
+                        rot_term_log_verbose(ctrl, "gpredict:rx",
+                                             "rotctld handshake dump_state:\n%s",
+                                             dump_state);
+                    if (ctrl->verbose_logging && pos_reply[0] != '\0')
+                        rot_term_log_verbose(ctrl, "gpredict:rx",
+                                             "rotctld handshake p reply:\n%s",
+                                             pos_reply);
+                    if (hs_ok)
                     {
                         handshake_ok = TRUE;
                         break;
@@ -2829,11 +2978,23 @@ static gpointer rotctld_client_thread(gpointer data)
                             if (attempt > 0)
                                 g_usleep(ROTCTLD_HANDSHAKE_RETRY_MS * 1000);
                             dump_state[0] = '\0';
-                            if (rotctld_client_handshake(ctrl->client.client,
-                                                         ROTCTLD_SOCKET_TIMEOUT_MS,
-                                                         &hs_az, &hs_el,
-                                                         dump_state,
-                                                         sizeof(dump_state)))
+                            pos_reply[0] = '\0';
+                            gboolean hs_ok = rotctld_client_handshake(ctrl->client.client,
+                                                                      ROTCTLD_SOCKET_TIMEOUT_MS,
+                                                                      &hs_az, &hs_el,
+                                                                      dump_state,
+                                                                      sizeof(dump_state),
+                                                                      pos_reply,
+                                                                      sizeof(pos_reply));
+                            if (ctrl->verbose_logging && dump_state[0] != '\0')
+                                rot_term_log_verbose(ctrl, "gpredict:rx",
+                                                     "rotctld handshake dump_state:\n%s",
+                                                     dump_state);
+                            if (ctrl->verbose_logging && pos_reply[0] != '\0')
+                                rot_term_log_verbose(ctrl, "gpredict:rx",
+                                                     "rotctld handshake p reply:\n%s",
+                                                     pos_reply);
+                            if (hs_ok)
                             {
                                 handshake_ok = TRUE;
                                 break;
@@ -2885,13 +3046,14 @@ static gpointer rotctld_client_thread(gpointer data)
                     }
                     else
                     {
+                        (void)rotctld_note_io_failure(ctrl, "handshake");
                         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                    "%s: rotctld handshake failed on %s:%d",
+                                    "%s: rotctld handshake failed on %s:%d; retrying",
                                     __func__,
                                     ctrl->conf ? ctrl->conf->host : "(null)",
                                     ctrl->conf ? ctrl->conf->port : 0);
                         rot_term_log(ctrl, "gpredict:err",
-                                     "rotctld handshake failed on %s:%d",
+                                     "rotctld handshake failed on %s:%d; retrying",
                                      ctrl->conf ? ctrl->conf->host : "(null)",
                                      ctrl->conf ? ctrl->conf->port : 0);
                         rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
@@ -2900,44 +3062,101 @@ static gpointer rotctld_client_thread(gpointer data)
                         ctrl->client.daemon_ok = FALSE;
                         ctrl->client.io_error = TRUE;
                         g_mutex_unlock(&ctrl->client.mutex);
-                        if (ctrl->rotctld_mgr)
-                            rotctld_process_stop(ctrl);
-                        ctrl->client.running = FALSE;
-                        break;
+                        g_usleep((gulong)(backoff_sec * 1e6));
+                        backoff_sec = MIN(backoff_sec * 2.0, backoff_max);
+                        continue;
                     }
                 }
 
                 if (ctrl != NULL)
                 {
+                    AzSpan span_mode;
+                    gdouble span_min = 0.0;
+                    gdouble span_max = 0.0;
+                    gdouble raw_az = hs_az;
+                    gdouble raw_el = hs_el;
+                    gdouble mapped_az = 0.0;
+                    gdouble mapped_el = hs_el;
+                    gboolean el_clamped = FALSE;
+                    gboolean needs_correction = FALSE;
+
                     rot_transform_update(ctrl);
+                    span_mode = rotctrl_span_from_conf(ctrl->conf);
+                    rotctrl_span_bounds(span_mode, &span_min, &span_max);
+
+                    mapped_az = az_norm_span(raw_az, span_mode);
+
+                    if (ctrl->conf &&
+                        ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
                     {
-                        AzSpan span_mode = rotctrl_span_from_conf(ctrl->conf);
-                        gdouble az_abs = az_abs_to_span(hs_az, span_mode);
-                        if (!rot_az_in_limits(az_abs,
-                                              ctrl->transform.az_min_deg,
-                                              ctrl->transform.az_max_deg) ||
-                            hs_el < (ctrl->transform.el_min_deg - 1e-2) ||
-                            hs_el > (ctrl->transform.el_max_deg + 1e-2))
+                        mapped_el = ctrl->transform.el_min_deg;
+                    }
+                    else
+                    {
+                        if (mapped_el < ctrl->transform.el_min_deg)
                         {
-                            sat_log_log(SAT_LOG_LEVEL_WARN,
-                                        "%s: rotctld position out of range az=%.2f el=%.2f (az=%.2f..%.2f el=%.2f..%.2f)",
-                                        __func__, hs_az, hs_el,
-                                        ctrl->transform.az_min_deg,
-                                        ctrl->transform.az_max_deg,
-                                        ctrl->transform.el_min_deg,
-                                        ctrl->transform.el_max_deg);
-                            rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
-                            rotctld_clear_rxbuf(ctrl);
-                            g_mutex_lock(&ctrl->client.mutex);
-                            ctrl->client.daemon_ok = FALSE;
-                            ctrl->client.io_error = TRUE;
-                            g_mutex_unlock(&ctrl->client.mutex);
-                            if (ctrl->rotctld_mgr)
-                                rotctld_process_stop(ctrl);
-                            ctrl->client.running = FALSE;
-                            break;
+                            mapped_el = ctrl->transform.el_min_deg;
+                            el_clamped = TRUE;
+                        }
+                        else if (mapped_el > ctrl->transform.el_max_deg)
+                        {
+                            mapped_el = ctrl->transform.el_max_deg;
+                            el_clamped = TRUE;
                         }
                     }
+
+                    if (raw_az < (span_min - 1e-3) ||
+                        raw_az > (span_max + 1e-3))
+                        needs_correction = TRUE;
+                    if (fabs(mapped_az - raw_az) > 1e-3 || el_clamped)
+                        needs_correction = TRUE;
+
+                    if (needs_correction)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_WARN,
+                                    "%s: rotor initial position outside selected span: "
+                                    "raw az=%.2f => mapped az=%.2f (span=%.0f..%.0f); issuing corrective P",
+                                    __func__, raw_az, mapped_az,
+                                    span_min, span_max);
+
+                        if (!rotctld_client_set_pos(ctrl->client.client,
+                                                    mapped_az, mapped_el))
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_WARN,
+                                        "%s: corrective set_position failed; continuing",
+                                        __func__);
+                        }
+                        else
+                        {
+                            gint waited_ms = 0;
+
+                            while (waited_ms < ROTCTLD_BASELINE_TIMEOUT_MS)
+                            {
+                                gdouble cur_az = 0.0;
+                                gdouble cur_el = 0.0;
+
+                                if (rotctld_client_get_pos(ctrl->client.client,
+                                                           &cur_az, &cur_el))
+                                {
+                                    gdouble cur_span = az_norm_span(cur_az,
+                                                                    span_mode);
+                                    hs_az = cur_az;
+                                    hs_el = cur_el;
+                                    if (fabs(cur_span - mapped_az) <=
+                                            ROTCTLD_BASELINE_DEADBAND_DEG &&
+                                        fabs(cur_el - mapped_el) <=
+                                            ROTCTLD_BASELINE_DEADBAND_DEG)
+                                        break;
+                                }
+
+                                g_usleep((gulong)ROTCTLD_BASELINE_POLL_MS * 1000);
+                                waited_ms += ROTCTLD_BASELINE_POLL_MS;
+                            }
+                        }
+                    }
+
+                    hs_az = az_norm_span(hs_az, span_mode);
+                    hs_el = mapped_el;
 
                     g_mutex_lock(&ctrl->client.mutex);
                     ctrl->az_hold_active = FALSE;
@@ -2970,13 +3189,14 @@ static gpointer rotctld_client_thread(gpointer data)
                     }
                     else
                     {
+                        (void)rotctld_note_io_failure(ctrl, "cap probe");
                         sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                    "%s: rotctld capability probe failed on %s:%d",
+                                    "%s: rotctld capability probe failed on %s:%d; retrying",
                                     __func__,
                                     ctrl->conf ? ctrl->conf->host : "(null)",
                                     ctrl->conf ? ctrl->conf->port : 0);
                         rot_term_log(ctrl, "gpredict:err",
-                                     "rotctld capability probe failed on %s:%d",
+                                     "rotctld capability probe failed on %s:%d; retrying",
                                      ctrl->conf ? ctrl->conf->host : "(null)",
                                      ctrl->conf ? ctrl->conf->port : 0);
                         rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
@@ -2986,10 +3206,9 @@ static gpointer rotctld_client_thread(gpointer data)
                         ctrl->client.io_error = TRUE;
                         ctrl->client.limits_valid = FALSE;
                         g_mutex_unlock(&ctrl->client.mutex);
-                        if (ctrl->rotctld_mgr)
-                            rotctld_process_stop(ctrl);
-                        ctrl->client.running = FALSE;
-                        break;
+                        g_usleep((gulong)(backoff_sec * 1e6));
+                        backoff_sec = MIN(backoff_sec * 2.0, backoff_max);
+                        continue;
                     }
                 }
 
@@ -3248,7 +3467,18 @@ static gpointer rotctld_client_thread(gpointer data)
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: stopping rotctld client thread"), __func__);
     g_timer_destroy(ctrl->client.timer);
-    rotctld_socket_close(ctrl, &ctrl->client.socket);
+    {
+        gboolean send_quit = FALSE;
+
+        g_mutex_lock(&ctrl->client.mutex);
+        send_quit = ctrl->client.send_quit;
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        if (send_quit)
+            rotctld_socket_close(ctrl, &ctrl->client.socket);
+        else
+            rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
+    }
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if (c_locale) {
@@ -3256,6 +3486,10 @@ static gpointer rotctld_client_thread(gpointer data)
         freelocale(c_locale);
     }
 #endif
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.thread_done = TRUE;
+    g_mutex_unlock(&ctrl->client.mutex);
 
     return GINT_TO_POINTER(0);
 }
@@ -3616,16 +3850,32 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     ctrl->out_of_range = FALSE;
     ctrl->tracking_active = FALSE;
 
-    if (ctrl->engaged && !ctrl->client.running && ctrl->client.thread != NULL)
+    if (ctrl->client.thread != NULL)
     {
-        g_thread_join(ctrl->client.thread);
-        ctrl->client.thread = NULL;
-        ctrl->client.socket = -1;
-        ctrl->engaged = FALSE;
-        if (ctrl->LockBut)
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
-        if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
+        gboolean thread_done = FALSE;
+
+        g_mutex_lock(&ctrl->client.mutex);
+        thread_done = ctrl->client.thread_done;
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        if (thread_done)
+        {
+            g_thread_join(ctrl->client.thread);
+            ctrl->client.thread = NULL;
+            ctrl->client.socket = -1;
+            ctrl->client.running = FALSE;
+            if (ctrl->engaged)
+            {
+                ctrl->engaged = FALSE;
+                if (ctrl->LockBut)
+                    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+            }
+            if (!ctrl->engage_pending)
+                rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
+                                      "client stopped", FALSE);
+            if (status_label)
+                gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
+        }
     }
 
     /* parameters for path predictions */
@@ -4094,13 +4344,21 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 gtk_label_set_text(GTK_LABEL(status_label), _("LINK DOWN"));
         }
 
+        rotctrl_update_session_state(ctrl, rotpos_valid, error);
+
         /* update status label if present, based on data and feedback mode */
         if (status_label)
         {
             const gchar *status_text = NULL;
             gboolean has_error = error || (ctrl->errcnt > 0);
 
-            if (!ctrl->engaged)
+            if (ctrl->session_state == ROT_SESSION_CONNECTING)
+                status_text = _("CONNECTING");
+            else if (ctrl->session_state == ROT_SESSION_ENGAGING)
+                status_text = _("ENGAGING");
+            else if (ctrl->session_state == ROT_SESSION_DEGRADED)
+                status_text = _("DEGRADED");
+            else if (!ctrl->engaged)
                 status_text = _("DISENGAGED");
             else if (ctrl->out_of_range)
                 status_text = _("OUT OF RANGE");
@@ -4153,7 +4411,22 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot), -10.0, -10.0);
 
         if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
+        {
+            const gchar *status_text = NULL;
+
+            rotctrl_update_session_state(ctrl, FALSE, FALSE);
+
+            if (ctrl->session_state == ROT_SESSION_CONNECTING)
+                status_text = _("CONNECTING");
+            else if (ctrl->session_state == ROT_SESSION_ENGAGING)
+                status_text = _("ENGAGING");
+            else if (ctrl->session_state == ROT_SESSION_DEGRADED)
+                status_text = _("DEGRADED");
+            else
+                status_text = _("DISENGAGED");
+
+            gtk_label_set_text(GTK_LABEL(status_label), status_text);
+        }
     }
 
     /* update target object on polar plot */
@@ -4872,6 +5145,7 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     g_mutex_lock(&ctrl->client.mutex);
     ctrl->client.io_error  = FALSE;
     ctrl->client.cmd_rejected = FALSE;
+    ctrl->client.send_quit = FALSE;
     ctrl->client.reject_backoff_until_us = 0;
     ctrl->client.reject_backoff_sec = 0.5;
     ctrl->client.reject_backoff_log_us = 0;
@@ -4897,6 +5171,24 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->client.last_cmd_us = 0;
     g_mutex_unlock(&ctrl->client.mutex);
 
+    ctrl->engage_pending = FALSE;
+
+    if (ctrl->client.thread != NULL)
+    {
+        gboolean thread_done = FALSE;
+
+        g_mutex_lock(&ctrl->client.mutex);
+        thread_done = ctrl->client.thread_done;
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        if (thread_done)
+        {
+            g_thread_join(ctrl->client.thread);
+            ctrl->client.thread = NULL;
+            ctrl->client.socket = -1;
+        }
+    }
+
     if (ctrl->client.thread != NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
@@ -4904,64 +5196,28 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
                     __func__);
         gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
         ctrl->engaged = TRUE;
+        rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
+                              "thread reuse", FALSE);
+        if (status_label)
+            gtk_label_set_text(GTK_LABEL(status_label), _("ENGAGING"));
         return;
     }
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.thread_done = FALSE;
+    g_mutex_unlock(&ctrl->client.mutex);
 
     ctrl->client.thread =
         g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
 
-    /* Give the client thread a brief moment to attempt its initial connect. */
-    g_usleep(100000);
-
-    if (!ctrl->client.running)
-    {
-        gpointer ret = g_thread_join(ctrl->client.thread);
-        ctrl->client.thread = NULL;
-        ctrl->client.socket = -1;
-        gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
-        ctrl->engaged = FALSE;
-        if (ctrl->LockBut)
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
-
-        if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
-
-        if (GPOINTER_TO_INT(ret) == -1)
-            rot_show_no_rotor_dialog(ctrl);
-
-        return;
-    }
-
-    if (!rotctrl_wait_for_baseline(ctrl))
-    {
-        const gchar *reason =
-            ctrl->client.client ? rotctld_client_get_state_reason(ctrl->client.client)
-                                : NULL;
-        rot_term_log_verbose(ctrl, "gpredict:err",
-                             "engage baseline failed: %s",
-                             reason ? reason : "no position readback");
-        if (ctrl->client.thread)
-        {
-            ctrl->client.running = FALSE;
-            if (ctrl->client.client != NULL)
-                rotctld_client_close(ctrl->client.client);
-            g_thread_join(ctrl->client.thread);
-            ctrl->client.thread = NULL;
-            ctrl->client.socket = -1;
-        }
-        gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
-        ctrl->engaged = FALSE;
-        if (ctrl->LockBut)
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
-        if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
-        return;
-    }
-
     gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
     ctrl->engaged = TRUE;
+    rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
+                          "thread started", FALSE);
+    if (status_label)
+        gtk_label_set_text(GTK_LABEL(status_label), _("ENGAGING"));
     rot_term_log(ctrl, "gpredict:rx",
-                 "rotctld connected %s:%d",
+                 "rotctld engage started %s:%d",
                  ctrl->conf ? ctrl->conf->host : "(null)",
                  ctrl->conf ? ctrl->conf->port : 0);
 }
@@ -4974,10 +5230,16 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     if (ctrl == NULL)
         return;
 
+    ctrl->engage_pending = FALSE;
     ctrl->engaged = FALSE;
     ctrl->tracking_active = FALSE;
     ctrl->az_hold_active = FALSE;
     ctrl->az_hold_value = 0.0;
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.send_quit = FALSE;
+    g_mutex_unlock(&ctrl->client.mutex);
+    rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
+                          "engage failed", FALSE);
     gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
     if (ctrl->LockBut)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
@@ -6003,10 +6265,16 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 
     if (!gtk_toggle_button_get_active(button))
     {
+        gboolean will_send_quit = FALSE;
+
         ctrl->engaged = FALSE;
+        ctrl->engage_pending = FALSE;
         ctrl->tracking_active = FALSE;
         rotctld_probe_cancel(ctrl);
         gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
+        will_send_quit = ctrl->client.thread != NULL || ctrl->client.running;
+        rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
+                              "user disengage", will_send_quit);
 
         if (!ctrl->client.running && ctrl->client.thread == NULL)
         {
@@ -6020,12 +6288,18 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 
         g_mutex_lock(&ctrl->client.mutex);
         ctrl->client.new_trg = FALSE;
+        if (will_send_quit)
+            ctrl->client.send_quit = TRUE;
+        ctrl->client.running = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
         if (status_label)
             gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
     }
     else
     {
+        if (ctrl->engaged || ctrl->engage_pending)
+            return;
+
         {
             gchar *conf_err = NULL;
             if (!rot_conf_validate(ctrl->conf, &conf_err)) {
@@ -6054,6 +6328,9 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->monitor = FALSE;
 
         {
+            ctrl->engage_pending = TRUE;
+            rot_session_set_state(ctrl, ROT_SESSION_CONNECTING,
+                                  "engage requested", FALSE);
             rotctld_ensure_result_t ensure = rotctld_ensure_running(ctrl);
             if (ensure == ROTCTLD_ENSURE_FAILED)
             {
@@ -6691,6 +6968,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->tracking_active = FALSE;
     ctrl->monitor  = FALSE;
     ctrl->engaged = FALSE;
+    ctrl->engage_pending = FALSE;
+    ctrl->session_state = ROT_SESSION_DISCONNECTED;
     ctrl->delay = 300;      /* default: 300 ms control cycle */
     ctrl->timerid = 0;
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
@@ -6741,6 +7020,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.socket = -1;
     ctrl->client.running = FALSE;
     ctrl->client.new_trg = FALSE;
+    ctrl->client.send_quit = FALSE;
+    ctrl->client.thread_done = TRUE;
     ctrl->client.azi_out = 0.0;
     ctrl->client.ele_out = 0.0;
     ctrl->client.azi_in = 0.0;
@@ -6793,9 +7074,10 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     if (ctrl->client.thread)
     {
         /* Signal the thread to stop, then wait for it */
+        g_mutex_lock(&ctrl->client.mutex);
+        ctrl->client.send_quit = TRUE;
         ctrl->client.running = FALSE;
-        if (ctrl->client.client != NULL)
-            rotctld_client_close(ctrl->client.client);
+        g_mutex_unlock(&ctrl->client.mutex);
         g_thread_join(ctrl->client.thread);
         ctrl->client.thread = NULL;
         ctrl->client.socket = -1;

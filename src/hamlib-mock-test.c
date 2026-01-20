@@ -189,6 +189,27 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
+    {
+        HamlibResponseInfo info = { 0 };
+        gchar reply[64] = { 0 };
+        gint count = 0;
+
+        if (!rigctld_client_request_raw(rig, "\\get_conn_count\n",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld conn count query failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        count = (gint)g_ascii_strtoll(reply, NULL, 10);
+        if (count > 1)
+        {
+            g_printerr("rigctld unexpected connection count: %d\n", count);
+            ok = FALSE;
+            goto cleanup;
+        }
+    }
     caps = rigctld_client_get_caps(rig);
     if (caps == NULL || !caps->has_get_freq || !caps->has_set_freq)
     {
@@ -314,7 +335,8 @@ int main(void)
         gdouble hs_el = 0.0;
 
         if (!rotctld_client_handshake(rot, 500, &hs_az, &hs_el,
-                                      dump_state, sizeof(dump_state)))
+                                      dump_state, sizeof(dump_state),
+                                      NULL, 0))
         {
             g_printerr("rotctld handshake failed\n");
             ok = FALSE;
@@ -329,6 +351,36 @@ int main(void)
                 ok = FALSE;
                 goto cleanup;
             }
+        }
+
+        if (!rotctld_client_handshake(rot, 500, &hs_az, &hs_el,
+                                      dump_state, sizeof(dump_state),
+                                      NULL, 0))
+        {
+            g_printerr("rotctld handshake failed (repeat)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+    }
+    {
+        HamlibResponseInfo info = { 0 };
+        gchar reply[64] = { 0 };
+        gint count = 0;
+
+        if (!rotctld_client_request_raw(rot, "\\get_conn_count\n",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rotctld conn count query failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        count = (gint)g_ascii_strtoll(reply, NULL, 10);
+        if (count > 1)
+        {
+            g_printerr("rotctld unexpected connection count: %d\n", count);
+            ok = FALSE;
+            goto cleanup;
         }
     }
     if (!rotctld_client_get_pos(rot, &az, &el))

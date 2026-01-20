@@ -53,7 +53,9 @@ gboolean              rotctld_client_handshake(RotctldClient *client,
                                                gdouble *az_out,
                                                gdouble *el_out,
                                                gchar *dump_state_out,
-                                               gsize dump_state_len);
+                                               gsize dump_state_len,
+                                               gchar *pos_reply_out,
+                                               gsize pos_reply_len);
 gssize                rotctld_client_clear_rxbuf(RotctldClient *client);
 
 gboolean              rotctld_client_get_pos(RotctldClient *client,

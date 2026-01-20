@@ -417,6 +417,12 @@ static gssize hamlib_read_dump_state(gint fd,
     {
         if (err_out)
             *err_out = EAGAIN;
+        if (used > 0)
+        {
+            if (buf)
+                g_string_set_size(buf, 0);
+            return (gssize)used;
+        }
         return -1;
     }
 

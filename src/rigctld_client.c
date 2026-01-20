@@ -16,6 +16,7 @@ struct _RigctldClient {
     gchar                 *state_reason;
     gchar                 *label;
     gint64                 last_probe_us;
+    vfo_t                  last_selected_vfo;
     RigCaps                caps;
 };
 
@@ -142,6 +143,22 @@ static void rigctld_client_extract_first_lines(const gchar *text,
         *line2_out = line2;
     else
         g_free(line2);
+}
+
+static gboolean rigctld_dump_state_line1_ok(const gchar *text)
+{
+    gchar *line1 = NULL;
+    gboolean ok = FALSE;
+
+    if (text == NULL || *text == '\0')
+        return FALSE;
+
+    rigctld_client_extract_first_lines(text, &line1, NULL);
+    if (line1 != NULL && g_str_has_prefix(line1, "1"))
+        ok = TRUE;
+    g_free(line1);
+
+    return ok;
 }
 
 static gchar *rigctld_client_build_signature(const gchar *text,
@@ -497,6 +514,7 @@ RigctldClient *rigctld_client_new(const gchar *label)
     client->transport = hamlib_transport_new();
     client->state = RIGCTLD_CLIENT_STOPPED;
     client->label = g_strdup(label ? label : "rig");
+    client->last_selected_vfo = VFO_NONE;
     rigctld_client_caps_init(&client->caps);
 
     return client;
@@ -527,6 +545,7 @@ void rigctld_client_reset(RigctldClient *client)
     rigctld_client_caps_clear(&client->caps);
     rigctld_client_set_state(client, RIGCTLD_CLIENT_STOPPED, "reset");
     client->last_probe_us = 0;
+    client->last_selected_vfo = VFO_NONE;
 }
 
 gboolean rigctld_client_connect(RigctldClient *client,
@@ -542,6 +561,7 @@ gboolean rigctld_client_connect(RigctldClient *client,
 
     rigctld_client_caps_clear(&client->caps);
     client->last_probe_us = 0;
+    client->last_selected_vfo = VFO_NONE;
 
     rigctld_client_set_state(client, RIGCTLD_CLIENT_CONNECTING, "connect");
     ok = hamlib_transport_connect(client->transport, host, port,
@@ -569,6 +589,7 @@ gboolean rigctld_client_attach_fd(RigctldClient *client,
 
     rigctld_client_caps_clear(&client->caps);
     client->last_probe_us = 0;
+    client->last_selected_vfo = VFO_NONE;
 
     rigctld_client_set_state(client, RIGCTLD_CLIENT_CONNECTING, "attach");
     ok = hamlib_transport_attach_fd(client->transport, fd, error_out);
@@ -590,6 +611,7 @@ void rigctld_client_close(RigctldClient *client)
 
     hamlib_transport_close(client->transport);
     rigctld_client_set_state(client, RIGCTLD_CLIENT_STOPPED, "closed");
+    client->last_selected_vfo = VFO_NONE;
 }
 
 rigctld_client_state_t rigctld_client_get_state(const RigctldClient *client)
@@ -627,6 +649,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gchar dump_state[4096];
     gchar reply[256];
     gdouble freq = 0.0;
+    gboolean dump_ok = FALSE;
     gboolean freq_ok = FALSE;
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
@@ -647,6 +670,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
     client->last_probe_us = now_us;
     rigctld_client_set_state(client, RIGCTLD_CLIENT_PROBING, "probe start");
 
+    rigctld_client_caps_clear(&client->caps);
     if (!hamlib_transport_request(client->transport,
                                   "\\dump_state\n",
                                   HAMLIB_READ_MULTILINE_IDLE,
@@ -660,27 +684,30 @@ gboolean rigctld_client_probe(RigctldClient *client,
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rigctld probe dump_state failed err=%d rprt=%d done=%d",
                     info.err, info.saw_rprt ? 1 : 0, info.saw_done ? 1 : 0);
-        rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
-                                 "dump_state failed");
-        return FALSE;
     }
-
-    rigctld_client_caps_clear(&client->caps);
-    rigctld_client_parse_dump_state(&client->caps, dump_state);
-
-    client->caps.signature =
-        rigctld_client_build_signature(dump_state,
-                                       client->caps.rig_model,
-                                       client->caps.backend_version);
-    rigctld_client_apply_quirks(&client->caps);
-
-    if (expected_model > 0 && client->caps.rig_model > 0 &&
-        client->caps.rig_model != expected_model)
+    else
     {
-        rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
-                                 "model mismatch expected=%d got=%d",
-                                 expected_model, client->caps.rig_model);
-        return FALSE;
+        dump_ok = rigctld_dump_state_line1_ok(dump_state);
+        if (!dump_ok)
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rigctld probe dump_state missing line1=1");
+
+        rigctld_client_parse_dump_state(&client->caps, dump_state);
+
+        client->caps.signature =
+            rigctld_client_build_signature(dump_state,
+                                           client->caps.rig_model,
+                                           client->caps.backend_version);
+        rigctld_client_apply_quirks(&client->caps);
+
+        if (expected_model > 0 && client->caps.rig_model > 0 &&
+            client->caps.rig_model != expected_model)
+        {
+            rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
+                                     "model mismatch expected=%d got=%d",
+                                     expected_model, client->caps.rig_model);
+            return FALSE;
+        }
     }
 
     client->caps.prefer_main_sub_tokens =
@@ -798,6 +825,10 @@ gboolean rigctld_client_probe(RigctldClient *client,
             client->caps.vfo_opt_enabled = FALSE;
         }
     }
+    else if (dump_ok)
+    {
+        client->caps.strategy = RIG_STRATEGY_PLAIN_FREQ;
+    }
     else
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
@@ -814,6 +845,13 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                       reply, sizeof(reply), timeout_ms);
     }
 
+    if (!dump_ok && !freq_ok && !vfo_select_ok && !vfo_opt_args_ok)
+    {
+        rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
+                                 "probe failed");
+        return FALSE;
+    }
+
     rigctld_client_set_state(client, RIGCTLD_CLIENT_READY,
                              "strategy=%d", client->caps.strategy);
     return TRUE;
@@ -825,7 +863,6 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
 {
     gchar cmd[96];
     gchar reply[256];
-    const gchar *token = NULL;
     RigCaps *caps = NULL;
 
     if (freq_out)
@@ -838,6 +875,7 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
 
     if (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
+        const gchar *token = NULL;
         token = rigctld_client_vfo_token(client, vfo);
         g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
         return rigctld_client_try_get_freq(client, cmd,
@@ -847,8 +885,7 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
 
     if (caps->strategy == RIG_STRATEGY_SELECT_VFO)
     {
-        token = rigctld_client_vfo_token(client, vfo);
-        if (!rigctld_client_try_select_vfo(client, token, 500))
+        if (!rigctld_client_ensure_vfo(client, vfo))
             return FALSE;
     }
 
@@ -856,6 +893,34 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
     return rigctld_client_try_get_freq(client, cmd,
                                        freq_out, reply, sizeof(reply),
                                        500);
+}
+
+gboolean rigctld_client_ensure_vfo(RigctldClient *client,
+                                   vfo_t vfo)
+{
+    RigCaps *caps = NULL;
+    const gchar *token = NULL;
+    gboolean ok = FALSE;
+
+    if (client == NULL)
+        return FALSE;
+
+    caps = &client->caps;
+    if (caps->strategy != RIG_STRATEGY_SELECT_VFO)
+        return TRUE;
+
+    if (vfo != VFO_MAIN && vfo != VFO_SUB)
+        return TRUE;
+
+    if (client->last_selected_vfo == vfo)
+        return TRUE;
+
+    token = rigctld_client_vfo_token(client, vfo);
+    ok = rigctld_client_try_select_vfo(client, token, 500);
+    if (ok)
+        client->last_selected_vfo = vfo;
+
+    return ok;
 }
 
 gboolean rigctld_client_set_freq(RigctldClient *client,
@@ -866,6 +931,7 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
     gchar reply[128];
     const gchar *token = NULL;
     RigCaps *caps = NULL;
+    gboolean ok = FALSE;
 
     if (client == NULL)
         return FALSE;
@@ -882,9 +948,23 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
 
     if (caps->strategy == RIG_STRATEGY_SELECT_VFO)
     {
+        gboolean can_select = (vfo == VFO_MAIN || vfo == VFO_SUB);
+
+        if (can_select && !rigctld_client_ensure_vfo(client, vfo))
+            return FALSE;
+
+        g_snprintf(cmd, sizeof(cmd), "F %.0f\x0a", freq_hz);
+        ok = rigctld_client_try_set_ok(client, cmd,
+                                       reply, sizeof(reply), 500);
+        if (ok || !can_select)
+            return ok;
+
         token = rigctld_client_vfo_token(client, vfo);
         if (!rigctld_client_try_select_vfo(client, token, 500))
             return FALSE;
+        client->last_selected_vfo = vfo;
+        return rigctld_client_try_set_ok(client, cmd,
+                                         reply, sizeof(reply), 500);
     }
 
     g_snprintf(cmd, sizeof(cmd), "F %.0f\x0a", freq_hz);

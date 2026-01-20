@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import socketserver
+import threading
 
 
 class RotctldHandler(socketserver.StreamRequestHandler):
+    def setup(self):
+        super().setup()
+        with self.server.conn_lock:
+            self.server.state["conn_count"] += 1
+
     def handle(self):
         state = self.server.state
         while True:
@@ -34,8 +40,21 @@ class RotctldHandler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
                 continue
 
+            if cmd == "\\reset_conn_count":
+                state["conn_count"] = 0
+                self.wfile.write(b"RPRT 0\n")
+                self.wfile.flush()
+                continue
+
+            if cmd == "\\get_conn_count":
+                self.wfile.write(
+                    ("%d\nRPRT 0\n" % state["conn_count"]).encode("ascii")
+                )
+                self.wfile.flush()
+                continue
+
             if cmd == "p":
-                reply = "%0.1f\n%0.1f\nRPRT 0\n" % (
+                reply = "%0.1f\n%0.1f\n" % (
                     state["az"],
                     state["el"],
                 )
@@ -77,7 +96,8 @@ def main():
     args = parser.parse_args()
 
     server = RotctldServer((args.host, args.port), RotctldHandler)
-    server.state = {"az": 0.0, "el": 0.0}
+    server.state = {"az": 0.0, "el": 0.0, "conn_count": 0}
+    server.conn_lock = threading.Lock()
 
     try:
         if args.once:

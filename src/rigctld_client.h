@@ -77,6 +77,8 @@ gboolean              rigctld_client_get_freq(RigctldClient *client,
 gboolean              rigctld_client_set_freq(RigctldClient *client,
                                               vfo_t vfo,
                                               gdouble freq_hz);
+gboolean              rigctld_client_ensure_vfo(RigctldClient *client,
+                                                vfo_t vfo);
 gboolean              rigctld_client_set_vfo(RigctldClient *client,
                                              const gchar *token);
 gboolean              rigctld_client_set_vfo_opt(RigctldClient *client,
