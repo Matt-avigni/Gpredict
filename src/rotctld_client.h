@@ -13,6 +13,13 @@ typedef enum {
     ROTCTLD_CLIENT_DEGRADED
 } rotctld_client_state_t;
 
+typedef enum {
+    ROTCTLD_POS_OK = 0,
+    ROTCTLD_POS_PARSE_FAIL,
+    ROTCTLD_POS_RPRT_ERR,
+    ROTCTLD_POS_IO_ERR
+} rotctld_pos_result_t;
+
 typedef struct RotCaps {
     gchar     *signature;
     gint       model_id;
@@ -63,6 +70,12 @@ gssize                rotctld_client_clear_rxbuf(RotctldClient *client);
 gboolean              rotctld_client_get_pos(RotctldClient *client,
                                              gdouble *az_out,
                                              gdouble *el_out);
+rotctld_pos_result_t  rotctld_client_get_pos_ex(RotctldClient *client,
+                                                gdouble *az_out,
+                                                gdouble *el_out,
+                                                HamlibResponseInfo *info,
+                                                gchar *reply_out,
+                                                gsize reply_len);
 gboolean              rotctld_client_set_pos(RotctldClient *client,
                                              gdouble az,
                                              gdouble el);

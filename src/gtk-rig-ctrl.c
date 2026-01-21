@@ -136,6 +136,7 @@
 #define RIGCTRL_DOPPLER_MAX_INTERVAL_MS 1500
 #define RIGCTRL_DOPPLER_LOG_INTERVAL_US 2000000
 #define RIGCTRL_PROBE_LOG_INTERVAL_US 5000000
+#define RIGCTRL_VERIFY_LOG_INTERVAL_US 5000000
 
 #ifdef RIGCTRL_TRSP_POPUP_DEBUG
 #define RIGCTRL_TRSP_POPUP_LOG(...) \
@@ -558,6 +559,18 @@ static gboolean unset_toggle(GtkRigCtrl * ctrl, gint sock);
 static gboolean get_freq_toggle(GtkRigCtrl * ctrl, gint sock, gint64 * freq);
 static gboolean get_freq_toggle_strict(GtkRigCtrl * ctrl, gint sock,
                                        gint64 * freq);
+static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
+                                     gint64 freq, vfo_t vfo);
+static gboolean get_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
+                                     gint64 *freq, vfo_t vfo);
+static gboolean get_freq_simplex_vfo_strict(GtkRigCtrl *ctrl, gint sock,
+                                            gint64 *freq, vfo_t vfo);
+static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
+                                    gint64 freq, vfo_t vfo);
+static gboolean get_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
+                                    gint64 *freq, vfo_t vfo);
+static gboolean get_freq_toggle_vfo_strict(GtkRigCtrl *ctrl, gint sock,
+                                           gint64 *freq, vfo_t vfo);
 static gboolean get_ptt(GtkRigCtrl * ctrl, gint sock);
 static gboolean set_ptt(GtkRigCtrl * ctrl, gint sock, gboolean ptt);
 static gboolean set_rit(GtkRigCtrl * ctrl, gint sock, gdouble hz);
@@ -569,6 +582,23 @@ static gint64   rigctrl_round_hz(gdouble hz);
 static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
 static vfo_t    rigctrl_target_vfo_for_role(const radio_conf_t *conf,
                                             vfo_role_t role);
+static vfo_t    rigctrl_vfo_for_side(GtkRigCtrl *ctrl, gboolean downlink);
+static const gchar *rigctrl_vfo_label(GtkRigCtrl *ctrl,
+                                      gboolean downlink,
+                                      vfo_t vfo);
+static gboolean rigctrl_set_freq_for_role(GtkRigCtrl *ctrl,
+                                          gint sock,
+                                          gboolean downlink,
+                                          gboolean toggle_mode,
+                                          gint64 freq_hz,
+                                          vfo_t *vfo_out);
+static gboolean rigctrl_get_freq_for_role(GtkRigCtrl *ctrl,
+                                          gint sock,
+                                          gboolean downlink,
+                                          gboolean toggle_mode,
+                                          gboolean strict,
+                                          gint64 *freq_out,
+                                          vfo_t *vfo_out);
 static const radio_conf_t *rigctrl_conf_for_role(const GtkRigCtrl *ctrl,
                                                  gboolean downlink);
 static RigSession *rigctrl_session_for_role(GtkRigCtrl *ctrl, gboolean downlink);
@@ -1261,7 +1291,7 @@ static void rig_term_log_raw(GtkRigCtrl *ctrl, const gchar *prefix,
     if (ctrl == NULL || line == NULL || prefix == NULL)
         return;
 
-    if (!force && !rigctrl_log_at_least(ctrl, RIG_LOG_TRACE))
+    if (!force && !rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
         return;
 
     trim = g_strdup(line);
@@ -1368,6 +1398,48 @@ static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out)
     return TRUE;
 }
 
+static gboolean rig_parse_rprt_code_any(const gchar *reply, gint *code_out)
+{
+    const gchar *line = reply;
+
+    if (reply == NULL)
+        return FALSE;
+
+    while (*line != '\0')
+    {
+        const gchar *eol = strchr(line, '\n');
+        const gchar *scan = line;
+        const gchar *line_end = eol ? eol : line + strlen(line);
+
+        while (scan < line_end && g_ascii_isspace(*scan))
+            scan++;
+
+        if ((line_end - scan) >= 4 && g_str_has_prefix(scan, "RPRT"))
+        {
+            const gchar *start = scan + 4;
+            gchar *endp = NULL;
+            glong code;
+
+            while (*start == ' ')
+                start++;
+
+            code = g_ascii_strtoll(start, &endp, 10);
+            if (endp == start)
+                return FALSE;
+
+            if (code_out)
+                *code_out = (gint) code;
+            return TRUE;
+        }
+
+        if (eol == NULL)
+            break;
+        line = eol + 1;
+    }
+
+    return FALSE;
+}
+
 static gboolean G_GNUC_UNUSED rigctld_reply_indicates_stale_device(const gchar *reply)
 {
     gint code = 0;
@@ -1375,7 +1447,7 @@ static gboolean G_GNUC_UNUSED rigctld_reply_indicates_stale_device(const gchar *
     if (reply == NULL)
         return FALSE;
 
-    if (rig_parse_rprt_code(reply, &code) && code == -6)
+    if (rig_parse_rprt_code_any(reply, &code) && code == -6)
         return TRUE;
 
     if (g_strrstr(reply, "No such file or directory") != NULL)
@@ -1900,6 +1972,11 @@ static void rigctrl_reset_error_gates(GtkRigCtrl *ctrl)
         g_hash_table_remove_all(ctrl->autostart_error_reported);
     if (ctrl->missing_model_reported != NULL)
         g_hash_table_remove_all(ctrl->missing_model_reported);
+
+    ctrl->last_verify_log_down_us = 0;
+    ctrl->last_verify_log_up_us = 0;
+    ctrl->verify_degraded_down = FALSE;
+    ctrl->verify_degraded_up = FALSE;
 }
 
 typedef struct {
@@ -2249,6 +2326,10 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->last_calc_log_down_us = 0;
     ctrl->last_calc_log_up_us = 0;
     ctrl->last_invalid_log_us = 0;
+    ctrl->last_verify_log_down_us = 0;
+    ctrl->last_verify_log_up_us = 0;
+    ctrl->verify_degraded_down = FALSE;
+    ctrl->verify_degraded_up = FALSE;
     ctrl->pending_manual_down = FALSE;
     ctrl->pending_manual_up = FALSE;
     ctrl->pending_preset_down = FALSE;
@@ -2608,6 +2689,10 @@ static void rigctrl_reset_doppler_smoothing(GtkRigCtrl *ctrl)
     ctrl->last_doppler_log_us = 0;
     ctrl->doppler_suppress_down = 0;
     ctrl->doppler_suppress_up = 0;
+    ctrl->last_verify_log_down_us = 0;
+    ctrl->last_verify_log_up_us = 0;
+    ctrl->verify_degraded_down = FALSE;
+    ctrl->verify_degraded_up = FALSE;
 }
 
 static void rigctrl_log_payload_profile(GtkRigCtrl *ctrl,
@@ -2868,84 +2953,144 @@ static gint64 rigctrl_round_hz(gdouble hz)
     return (gint64) llround(hz);
 }
 
-static G_GNUC_UNUSED gint64 parse_ui_freq_to_hz(const gchar *text,
-                                                gboolean *ok_out)
+static gboolean rigctrl_parse_freq_text(const gchar *text, gint64 *hz_out)
 {
-    gchar *trim = NULL;
+    GString *normalized = NULL;
+    gchar *numeric = NULL;
+    gchar *suffix = NULL;
     gchar *endptr = NULL;
     gdouble value = 0.0;
     gdouble scale = 1.0;
     gboolean ok = FALSE;
-    gboolean had_decimal = FALSE;
+    gint dot_count = 0;
+    gint comma_count = 0;
 
-    if (ok_out)
-        *ok_out = FALSE;
+    if (hz_out)
+        *hz_out = 0;
 
     if (text == NULL)
-        return 0;
+        return FALSE;
 
-    trim = g_strdup(text);
-    g_strstrip(trim);
-    if (*trim == '\0')
+    normalized = g_string_sized_new(strlen(text));
+    for (const gchar *p = text; *p != '\0'; p++)
     {
-        g_free(trim);
-        return 0;
+        if (g_ascii_isspace(*p) || *p == '_')
+            continue;
+        g_string_append_c(normalized, *p);
     }
 
-    had_decimal = (strchr(trim, '.') != NULL) || (strchr(trim, ',') != NULL);
-    if (strchr(trim, '.') == NULL && strchr(trim, ',') != NULL)
+    if (normalized->len == 0)
     {
-        for (gchar *p = trim; *p != '\0'; p++)
+        g_string_free(normalized, TRUE);
+        return FALSE;
+    }
+
+    for (gsize i = 0; i < normalized->len; i++)
+    {
+        if (normalized->str[i] == '.')
+            dot_count++;
+        else if (normalized->str[i] == ',')
+            comma_count++;
+    }
+
+    if ((dot_count > 0 && comma_count > 0) || dot_count > 1 || comma_count > 1)
+    {
+        g_string_free(normalized, TRUE);
+        return FALSE;
+    }
+
+    if (comma_count == 1 && dot_count == 0)
+    {
+        for (gsize i = 0; i < normalized->len; i++)
         {
-            if (*p == ',')
-                *p = '.';
+            if (normalized->str[i] == ',')
+                normalized->str[i] = '.';
         }
     }
 
-    value = g_ascii_strtod(trim, &endptr);
-    if (endptr != trim)
-        ok = TRUE;
-
-    if (ok_out)
-        *ok_out = ok;
-
-    if (!ok || value <= 0.0)
     {
-        g_free(trim);
-        return 0;
+        gsize len = normalized->len;
+        gsize suffix_len = 0;
+
+        while (len > 0 && g_ascii_isalpha(normalized->str[len - 1]))
+        {
+            suffix_len++;
+            len--;
+        }
+
+        if (suffix_len > 0)
+        {
+            suffix = g_ascii_strdown(normalized->str + len, -1);
+            numeric = g_strndup(normalized->str, len);
+        }
+        else
+        {
+            numeric = g_strdup(normalized->str);
+        }
     }
 
+    g_string_free(normalized, TRUE);
+    g_strstrip(numeric);
+    if (*numeric == '\0')
+        goto done;
+
+    value = g_ascii_strtod(numeric, &endptr);
     if (endptr != NULL)
     {
         while (g_ascii_isspace(*endptr))
             endptr++;
-        if (*endptr != '\0')
-        {
-            if (g_ascii_strncasecmp(endptr, "ghz", 3) == 0)
-                scale = 1.0e9;
-            else if (g_ascii_strncasecmp(endptr, "mhz", 3) == 0)
-                scale = 1.0e6;
-            else if (g_ascii_strncasecmp(endptr, "khz", 3) == 0)
-                scale = 1.0e3;
-            else if (g_ascii_strncasecmp(endptr, "hz", 2) == 0)
-                scale = 1.0;
-            else
-            {
-                if (ok_out)
-                    *ok_out = FALSE;
-                g_free(trim);
-                return 0;
-            }
-        }
-        else if (had_decimal)
-        {
+    }
+    if (endptr == numeric || (endptr != NULL && *endptr != '\0'))
+        goto done;
+
+    if (suffix != NULL)
+    {
+        if (g_strcmp0(suffix, "ghz") == 0)
+            scale = 1.0e9;
+        else if (g_strcmp0(suffix, "mhz") == 0)
             scale = 1.0e6;
-        }
+        else if (g_strcmp0(suffix, "khz") == 0)
+            scale = 1.0e3;
+        else if (g_strcmp0(suffix, "hz") == 0)
+            scale = 1.0;
+        else
+            goto done;
+    }
+    else if (dot_count == 1 || comma_count == 1)
+    {
+        scale = 1.0e6;
     }
 
-    g_free(trim);
+    if (value <= 0.0)
+        goto done;
 
-    return rigctrl_round_hz(value * scale);
+    if (value > (gdouble)G_MAXINT64 / scale)
+    {
+        if (hz_out)
+            *hz_out = G_MAXINT64;
+        goto done;
+    }
+
+    if (hz_out)
+        *hz_out = rigctrl_round_hz(value * scale);
+    ok = TRUE;
+
+done:
+    g_free(numeric);
+    g_free(suffix);
+    return ok;
+}
+
+static G_GNUC_UNUSED gint64 parse_ui_freq_to_hz(const gchar *text,
+                                                gboolean *ok_out)
+{
+    gint64 hz = 0;
+    gboolean ok = rigctrl_parse_freq_text(text, &hz);
+
+    if (ok_out)
+        *ok_out = ok;
+
+    return ok ? hz : 0;
 }
 
 static gint64 rigctrl_knob_to_hz(GtkWidget *knob)
@@ -2968,6 +3113,8 @@ static gboolean rigctrl_freq_valid_for_send(GtkRigCtrl *ctrl,
 {
     const gint64 min_hz = 10000;
     const gint64 max_hz = 10000000000LL;
+    vfo_t vfo = rigctrl_vfo_for_side(ctrl, downlink);
+    const gchar *vfo_label = rigctrl_vfo_label(ctrl, downlink, vfo);
 
     if (hz >= min_hz && hz <= max_hz)
         return TRUE;
@@ -2976,8 +3123,9 @@ static gboolean rigctrl_freq_valid_for_send(GtkRigCtrl *ctrl,
                               G_USEC_PER_SEC))
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
-                    "rig update: side=%s invalid target_hz=%" G_GINT64_FORMAT,
+                    "rig update: side=%s vfo=%s invalid target_hz=%" G_GINT64_FORMAT,
                     downlink ? "RX" : "TX",
+                    vfo_label ? vfo_label : "Unknown",
                     hz);
     }
 
@@ -3106,6 +3254,11 @@ static void rigctrl_log_send(GtkRigCtrl *ctrl,
                 rigctrl_role_label(downlink),
                 vfo_label,
                 target_hz);
+    rig_term_log(ctrl, "gpredict",
+                 "send role=%s vfo=%s hz=%" G_GINT64_FORMAT,
+                 rigctrl_role_label(downlink),
+                 vfo_label,
+                 target_hz);
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 "rig send side=%s vfo=%s base_hz=%" G_GINT64_FORMAT
@@ -3146,6 +3299,85 @@ static void rigctrl_log_calc(GtkRigCtrl *ctrl,
                 doppler_hz,
                 final_hz,
                 doppler_enabled ? 1 : 0);
+}
+
+static gint64 rigctrl_verify_tolerance_hz(const GtkRigCtrl *ctrl)
+{
+    gint64 tol = 1;
+
+    if (ctrl != NULL && ctrl->payload_profile_valid)
+    {
+        tol = rigctrl_round_hz(ctrl->payload_profile.deadband_hz);
+        if (tol < 1)
+            tol = 1;
+    }
+
+    return tol;
+}
+
+static void rigctrl_verify_mark_ok(GtkRigCtrl *ctrl, gboolean downlink)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (downlink)
+        ctrl->verify_degraded_down = FALSE;
+    else
+        ctrl->verify_degraded_up = FALSE;
+}
+
+static void rigctrl_verify_log_mismatch(GtkRigCtrl *ctrl,
+                                        gboolean downlink,
+                                        vfo_t vfo,
+                                        gint64 target_hz,
+                                        gint64 readback_hz,
+                                        gint rprt_code)
+{
+    gint64 *last_log_us = NULL;
+    gboolean *degraded = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    last_log_us = downlink ? &ctrl->last_verify_log_down_us
+                           : &ctrl->last_verify_log_up_us;
+    degraded = downlink ? &ctrl->verify_degraded_down
+                        : &ctrl->verify_degraded_up;
+
+    if (*degraded &&
+        !rigctrl_log_throttled(ctrl, last_log_us, RIGCTRL_VERIFY_LOG_INTERVAL_US))
+        return;
+
+    *degraded = TRUE;
+
+    sat_log_log(SAT_LOG_LEVEL_ERROR,
+                "set_freq verify failed side=%s vfo=%s target=%" G_GINT64_FORMAT
+                " readback=%" G_GINT64_FORMAT " rprt=%d",
+                downlink ? "RX" : "TX",
+                vfo_name(vfo),
+                target_hz,
+                readback_hz,
+                rprt_code);
+}
+
+static gboolean rigctrl_verify_match(GtkRigCtrl *ctrl,
+                                     gboolean downlink,
+                                     vfo_t vfo,
+                                     gint64 target_hz,
+                                     gint64 readback_hz,
+                                     gint rprt_code)
+{
+    gint64 tol = rigctrl_verify_tolerance_hz(ctrl);
+
+    if (llabs(readback_hz - target_hz) <= tol)
+    {
+        rigctrl_verify_mark_ok(ctrl, downlink);
+        return TRUE;
+    }
+
+    rigctrl_verify_log_mismatch(ctrl, downlink, vfo, target_hz,
+                                readback_hz, rprt_code);
+    return FALSE;
 }
 
 static void rigctrl_log_doppler_tick(GtkRigCtrl *ctrl)
@@ -3445,11 +3677,9 @@ static gint64 rigctrl_compute_target(GtkRigCtrl *ctrl,
         return 0;
     }
 
-    doppler_enabled = ctrl->tracking &&
-                      !use_rit_xit &&
-                      (downlink ? profile->apply_doppler_downlink
-                                : profile->apply_doppler_uplink);
-    if (doppler_enabled)
+    doppler_enabled = downlink ? profile->apply_doppler_downlink
+                               : profile->apply_doppler_uplink;
+    if (ctrl->tracking && !use_rit_xit && doppler_enabled)
         doppler = rigctrl_get_cached_doppler(ctrl, downlink);
     if_offset = downlink ? profile->downlink_if_offset_hz
                          : profile->uplink_if_offset_hz;
@@ -3465,6 +3695,8 @@ static gint64 rigctrl_compute_target(GtkRigCtrl *ctrl,
 
     target_rig = rigctrl_adjust_target(ctrl, downlink, base_sat,
                                        doppler, target_rig, target_ok_out);
+    if (target_rig > 0)
+        (void) rigctrl_freq_valid_for_send(ctrl, downlink, target_rig);
 
     session = rigctrl_session_for_role(ctrl, downlink);
     if (session != NULL)
@@ -5384,6 +5616,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     HamlibResponseInfo info = { 0 };
     RigctldClient *client = rigctld_client_for_socket(ctrl, sock);
     gint rprt = 0;
+    gboolean saw_rprt = FALSE;
     gboolean rprt_error = FALSE;
     gboolean ok = FALSE;
 
@@ -5463,7 +5696,17 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     ctrl->wrops++;
     rig_term_log_rx(ctrl, buffout);
 
-    if (rig_parse_rprt_code(buffout, &rprt) && rprt != 0)
+    if (info.saw_rprt)
+    {
+        saw_rprt = TRUE;
+        rprt = info.rprt_code;
+    }
+    else if (rig_parse_rprt_code_any(buffout, &rprt))
+    {
+        saw_rprt = TRUE;
+    }
+
+    if (saw_rprt && rprt != 0)
     {
         gchar *trim_cmd = g_strdup(buff);
         gchar *trim_reply = g_strdup(buffout);
@@ -5501,11 +5744,11 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
         g_free(trim_reply);
     }
 
-    if (!rprt_error)
+    if (saw_rprt && !rprt_error)
         rigctrl_schedule_status(ctrl, _("OK"), FALSE);
 
     rigctld_io_lock_release();
-    return TRUE;
+    return ok && !rprt_error;
 }
 
 static gboolean send_rigctld_command_internal(GtkRigCtrl * ctrl, gint sock,
@@ -5571,7 +5814,10 @@ static inline gboolean check_set_response(gchar * buffback, gboolean retcode,
 {
     if (retcode == TRUE)
     {
-        if (strncmp(buffback, "RPRT 0", 6) != 0)
+        gint code = 0;
+        gboolean has_rprt = rig_parse_rprt_code_any(buffback, &code);
+
+        if (!has_rprt || code != 0)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         _("%s:%s: %s rigctld returned error (%s)"),
@@ -5589,7 +5835,9 @@ static inline gboolean check_get_response(gchar * buffback, gboolean retcode,
 {
     if (retcode == TRUE)
     {
-        if (strncmp(buffback, "RPRT", 4) == 0)
+        gint code = 0;
+
+        if (rig_parse_rprt_code_any(buffback, &code) && code != 0)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         _("%s:%s: %s rigctld returned error (%s)"),
@@ -6196,10 +6444,94 @@ static vfo_t rigctrl_target_vfo_for_role(const radio_conf_t *conf,
     if (conf == NULL)
         return VFO_NONE;
 
-    if (is_full_duplex_main_sub_configured(conf))
-        return (role == VFO_ROLE_DOWNLINK) ? VFO_SUB : VFO_MAIN;
-
     return (role == VFO_ROLE_DOWNLINK) ? conf->downlink_vfo : conf->uplink_vfo;
+}
+
+static vfo_t rigctrl_vfo_for_side(GtkRigCtrl *ctrl, gboolean downlink)
+{
+    const radio_conf_t *conf = rigctrl_conf_for_role(ctrl, downlink);
+
+    return rigctrl_target_vfo_for_role(conf,
+                                       downlink ? VFO_ROLE_DOWNLINK
+                                                : VFO_ROLE_UPLINK);
+}
+
+static const gchar *rigctrl_vfo_label(GtkRigCtrl *ctrl,
+                                      gboolean downlink,
+                                      vfo_t vfo)
+{
+    const radio_conf_t *conf = rigctrl_conf_for_role(ctrl, downlink);
+
+    if (vfo != VFO_NONE)
+        return vfo_name(vfo);
+
+    if (conf != NULL && conf->vfo_opt)
+        return "currVFO";
+
+    return "default";
+}
+
+static gboolean rigctrl_set_freq_for_role(GtkRigCtrl *ctrl,
+                                          gint sock,
+                                          gboolean downlink,
+                                          gboolean toggle_mode,
+                                          gint64 freq_hz,
+                                          vfo_t *vfo_out)
+{
+    vfo_t vfo = rigctrl_vfo_for_side(ctrl, downlink);
+
+    if (vfo_out)
+        *vfo_out = vfo;
+
+    if (vfo != VFO_NONE)
+    {
+        return toggle_mode ?
+            set_freq_toggle_vfo(ctrl, sock, freq_hz, vfo) :
+            set_freq_simplex_vfo(ctrl, sock, freq_hz, vfo);
+    }
+
+    return toggle_mode ?
+        set_freq_toggle(ctrl, sock, freq_hz) :
+        set_freq_simplex(ctrl, sock, freq_hz);
+}
+
+static gboolean rigctrl_get_freq_for_role(GtkRigCtrl *ctrl,
+                                          gint sock,
+                                          gboolean downlink,
+                                          gboolean toggle_mode,
+                                          gboolean strict,
+                                          gint64 *freq_out,
+                                          vfo_t *vfo_out)
+{
+    vfo_t vfo = rigctrl_vfo_for_side(ctrl, downlink);
+
+    if (vfo_out)
+        *vfo_out = vfo;
+
+    if (vfo != VFO_NONE)
+    {
+        if (toggle_mode)
+        {
+            return strict ?
+                get_freq_toggle_vfo_strict(ctrl, sock, freq_out, vfo) :
+                get_freq_toggle_vfo(ctrl, sock, freq_out, vfo);
+        }
+
+        return strict ?
+            get_freq_simplex_vfo_strict(ctrl, sock, freq_out, vfo) :
+            get_freq_simplex_vfo(ctrl, sock, freq_out, vfo);
+    }
+
+    if (toggle_mode)
+    {
+        return strict ?
+            get_freq_toggle_strict(ctrl, sock, freq_out) :
+            get_freq_toggle(ctrl, sock, freq_out);
+    }
+
+    return strict ?
+        get_freq_simplex_strict(ctrl, sock, freq_out) :
+        get_freq_simplex(ctrl, sock, freq_out);
 }
 
 static gboolean satmode_vfo_for_role(const radio_conf_t *conf,
@@ -6212,7 +6544,7 @@ static gboolean satmode_vfo_for_role(const radio_conf_t *conf,
     return *vfo != VFO_NONE;
 }
 
-static gboolean select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
+static gboolean G_GNUC_UNUSED select_satmode_vfo(GtkRigCtrl *ctrl, gint sock,
                                    vfo_role_t role, const gchar *action,
                                    gint64 freq, gboolean log_freq)
 {
@@ -6355,10 +6687,9 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 "FULL-DUPLEX MAIN/SUB: set %s %" G_GINT64_FORMAT " -> %s",
                 vfo_name(vfo), freq, buffback);
-    if (retcode)
-        has_rprt = rig_parse_rprt_code(buffback, &rprt_code);
+    has_rprt = rig_parse_rprt_code_any(buffback, &rprt_code);
 
-    if (retcode && has_rprt &&
+    if (has_rprt &&
         rigctld_should_retry_main_sub(ctrl, session, vfo, rprt_code))
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
@@ -6792,9 +7123,7 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     gboolean        ptt = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
-    vfo_t           sat_vfo = VFO_MAIN;
-    gboolean        use_sat_vfo =
-        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_DOWNLINK, &sat_vfo);
+    vfo_t           vfo = VFO_NONE;
     gint64          doppler_hz = 0;
     gint64          sent_freq = 0;
     gint64          target_up = 0;
@@ -6817,15 +7146,8 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
      */
     if ((ctrl->engaged) && (ctrl->lastrxf > 0) && (ptt == FALSE))
     {
-        if (!select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
-                                "reading downlink freq", 0, FALSE))
-            ctrl->errcnt++;
-        if (use_sat_vfo)
-        {
-            if (!get_freq_simplex_vfo(ctrl, ctrl->sock, &readfreq, sat_vfo))
-                readfreq = ctrl->lastrxf;
-        }
-        else if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
+        if (!rigctrl_get_freq_for_role(ctrl, ctrl->sock, TRUE,
+                                       FALSE, FALSE, &readfreq, &vfo))
         {
             /* error => use a passive value */
             readfreq = ctrl->lastrxf;
@@ -6866,19 +7188,15 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
             gboolean set_ok;
             gboolean read_ok;
             gint64   readback = 0;
-            const gchar *vfo_label =
-                use_sat_vfo ? vfo_name(sat_vfo) :
-                (ctrl->conf->vfo_opt ? "currVFO" : "default");
+            vfo_t   set_vfo = rigctrl_vfo_for_side(ctrl, TRUE);
+            const gchar *vfo_label = rigctrl_vfo_label(ctrl, TRUE, set_vfo);
 
             rigctrl_log_send(ctrl, TRUE, vfo_label,
                              base_sat, doppler_hz, sent_freq);
             ctrl->last_send_down_us = g_get_monotonic_time();
 
-            set_ok = select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_DOWNLINK,
-                                        "setting downlink freq", tmpfreq, TRUE) &&
-                (use_sat_vfo ?
-                 set_freq_simplex_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
-                 set_freq_simplex(ctrl, ctrl->sock, tmpfreq));
+            set_ok = rigctrl_set_freq_for_role(ctrl, ctrl->sock, TRUE,
+                                               FALSE, tmpfreq, NULL);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: side=RX set=%s", set_ok ? "ok" : "fail");
 
@@ -6891,8 +7209,8 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                    the tuning step is larger than what we work with (e.g. FT-817 has a
                    smallest tuning step of 10 Hz). Therefore we read back the actual
                    frequency from the rig. */
-                read_ok = use_sat_vfo ?
-                    get_freq_simplex_vfo_strict(ctrl, ctrl->sock, &readback, sat_vfo) :
+                read_ok = (set_vfo != VFO_NONE) ?
+                    get_freq_simplex_vfo_strict(ctrl, ctrl->sock, &readback, set_vfo) :
                     get_freq_simplex_strict(ctrl, ctrl->sock, &readback);
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=RX readback=%" G_GINT64_FORMAT " ok=%d",
@@ -6904,7 +7222,8 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                                 "rig update: side=RX readback failed; keeping last");
                     rigctrl_update_last_sent(ctrl, TRUE, sent_freq);
                 }
-                else if (llabs(readback - sent_freq) <= 100)
+                else if (rigctrl_verify_match(ctrl, TRUE, set_vfo,
+                                              sent_freq, readback, 0))
                 {
                     ctrl->errcnt = 0;
                     ctrl->lastrxf = readback;
@@ -6927,10 +7246,6 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                 }
                 else
                 {
-                    sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                "rig update: side=RX readback mismatch (sent=%" G_GINT64_FORMAT
-                                " read=%" G_GINT64_FORMAT "); tracking unsynced",
-                                sent_freq, readback);
                     ctrl->errcnt++;
                     ctrl->lastrxf = 0;
                     rigctrl_update_last_sent(ctrl, TRUE, 0);
@@ -6961,6 +7276,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
     gint64          sent_freq = 0;
     gint64          target_down = 0;
     gboolean        target_ok = TRUE;
+    vfo_t           vfo = VFO_NONE;
 
     /* get PTT status */
     if (ctrl->engaged && ctrl->conf->ptt)
@@ -6981,7 +7297,8 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
      */
     if ((ctrl->engaged) && (ctrl->lasttxf > 0) && (ptt == TRUE))
     {
-        if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
+        if (!rigctrl_get_freq_for_role(ctrl, ctrl->sock, FALSE,
+                                       FALSE, FALSE, &readfreq, &vfo))
         {
             /* error => use a passive value */
             readfreq = ctrl->lasttxf;
@@ -7021,14 +7338,15 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
             gboolean set_ok;
             gboolean read_ok;
             gint64   readback = 0;
-            const gchar *vfo_label =
-                ctrl->conf->vfo_opt ? "currVFO" : "default";
+            vfo_t   set_vfo = rigctrl_vfo_for_side(ctrl, FALSE);
+            const gchar *vfo_label = rigctrl_vfo_label(ctrl, FALSE, set_vfo);
 
             rigctrl_log_send(ctrl, FALSE, vfo_label,
                              base_sat, doppler_hz, sent_freq);
             ctrl->last_send_up_us = g_get_monotonic_time();
 
-            set_ok = set_freq_simplex(ctrl, ctrl->sock, tmpfreq);
+            set_ok = rigctrl_set_freq_for_role(ctrl, ctrl->sock, FALSE,
+                                               FALSE, tmpfreq, NULL);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: side=TX set=%s", set_ok ? "ok" : "fail");
 
@@ -7041,7 +7359,9 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                    the tuning step is larger than what we work with (e.g. FT-817 has a
                    smallest tuning step of 10 Hz). Therefore we read back the actual
                    frequency from the rig. */
-                read_ok = get_freq_simplex_strict(ctrl, ctrl->sock, &readback);
+                read_ok = (set_vfo != VFO_NONE) ?
+                    get_freq_simplex_vfo_strict(ctrl, ctrl->sock, &readback, set_vfo) :
+                    get_freq_simplex_strict(ctrl, ctrl->sock, &readback);
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=TX readback=%" G_GINT64_FORMAT " ok=%d",
                             readback, read_ok ? 1 : 0);
@@ -7052,7 +7372,8 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                                 "rig update: side=TX readback failed; keeping last");
                     rigctrl_update_last_sent(ctrl, FALSE, sent_freq);
                 }
-                else if (llabs(readback - sent_freq) <= 100)
+                else if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
+                                              sent_freq, readback, 0))
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
@@ -7076,10 +7397,6 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                 }
                 else
                 {
-                    sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                "rig update: side=TX readback mismatch (sent=%" G_GINT64_FORMAT
-                                " read=%" G_GINT64_FORMAT "); tracking unsynced",
-                                sent_freq, readback);
                     ctrl->errcnt++;
                     ctrl->lasttxf = 0;
                     rigctrl_update_last_sent(ctrl, FALSE, 0);
@@ -7182,13 +7499,14 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
     if ((ctrl->engaged) && target_ok &&
         rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
     {
-        const gchar *vfo_label =
-            ctrl->conf->vfo_opt ? "currVFO" : "default";
+        vfo_t set_vfo = rigctrl_vfo_for_side(ctrl, FALSE);
+        const gchar *vfo_label = rigctrl_vfo_label(ctrl, FALSE, set_vfo);
 
         rigctrl_log_send(ctrl, FALSE, vfo_label,
                          base_sat, doppler_hz, tmpfreq);
         ctrl->last_send_up_us = g_get_monotonic_time();
-        if (set_freq_toggle(ctrl, ctrl->sock, tmpfreq))
+        if (rigctrl_set_freq_for_role(ctrl, ctrl->sock, FALSE,
+                                      TRUE, tmpfreq, NULL))
         {
             /* reset error counter */
             ctrl->errcnt = 0;
@@ -7288,7 +7606,8 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                                 "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX readback failed; keeping last");
                     rigctrl_update_last_sent(ctrl, TRUE, rigfreqd);
                 }
-                else if (llabs(readback - rigfreqd) <= 100)
+                else if (rigctrl_verify_match(ctrl, TRUE, plan.downlink_vfo,
+                                              rigfreqd, readback, 0))
                 {
                     ctrl->errcnt = 0;
                     ctrl->lastrxf = readback;
@@ -7353,7 +7672,8 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                                 "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX readback failed; keeping last");
                     rigctrl_update_last_sent(ctrl, FALSE, rigfrequ);
                 }
-                else if (llabs(readback - rigfrequ) <= 100)
+                else if (rigctrl_verify_match(ctrl, FALSE, plan.uplink_vfo,
+                                              rigfrequ, readback, 0))
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
@@ -7385,13 +7705,11 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     gboolean        dialchanged = FALSE;
     gboolean        use_rit_xit =
         (ctrl->conf != NULL) ? ctrl->conf->supports_rit_xit : FALSE;
-    vfo_t           sat_vfo = VFO_SUB;
-    gboolean        use_sat_vfo =
-        satmode_vfo_for_role(ctrl->conf, VFO_ROLE_UPLINK, &sat_vfo);
     gint64          doppler_hz = 0;
     gint64          sent_freq = 0;
     gint64          target_down = 0;
     gboolean        target_ok = TRUE;
+    vfo_t           vfo = VFO_NONE;
 
     if (is_full_duplex_main_sub_active(ctrl))
         use_rit_xit = FALSE;
@@ -7406,15 +7724,8 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
      */
     if ((ctrl->engaged) && (ctrl->lasttxf > 0))
     {
-        if (!select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
-                                "reading uplink freq", 0, FALSE))
-            ctrl->errcnt++;
-        if (use_sat_vfo)
-        {
-            if (!get_freq_toggle_vfo(ctrl, ctrl->sock, &readfreq, sat_vfo))
-                readfreq = ctrl->lasttxf;
-        }
-        else if (!get_freq_toggle(ctrl, ctrl->sock, &readfreq))
+        if (!rigctrl_get_freq_for_role(ctrl, ctrl->sock, FALSE,
+                                       TRUE, FALSE, &readfreq, &vfo))
         {
             /* error => use a passive value */
             readfreq = ctrl->lasttxf;
@@ -7460,19 +7771,15 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
             gboolean set_ok;
             gboolean read_ok;
             gint64   readback = 0;
-            const gchar *vfo_label =
-                use_sat_vfo ? vfo_name(sat_vfo) :
-                (ctrl->conf->vfo_opt ? "currVFO" : "default");
+            vfo_t   set_vfo = rigctrl_vfo_for_side(ctrl, FALSE);
+            const gchar *vfo_label = rigctrl_vfo_label(ctrl, FALSE, set_vfo);
 
             rigctrl_log_send(ctrl, FALSE, vfo_label,
                              base_sat, doppler_hz, sent_freq);
             ctrl->last_send_up_us = g_get_monotonic_time();
 
-            set_ok = select_satmode_vfo(ctrl, ctrl->sock, VFO_ROLE_UPLINK,
-                                        "setting uplink freq", tmpfreq, TRUE) &&
-                (use_sat_vfo ?
-                 set_freq_toggle_vfo(ctrl, ctrl->sock, tmpfreq, sat_vfo) :
-                 set_freq_toggle(ctrl, ctrl->sock, tmpfreq));
+            set_ok = rigctrl_set_freq_for_role(ctrl, ctrl->sock, FALSE,
+                                               TRUE, tmpfreq, NULL);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "rig update: side=TX set=%s", set_ok ? "ok" : "fail");
 
@@ -7485,8 +7792,8 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                    the tuning step is larger than what we work with (e.g. FT-817 has a
                    smallest tuning step of 10 Hz). Therefore we read back the actual
                    frequency from the rig. */
-                read_ok = use_sat_vfo ?
-                    get_freq_toggle_vfo_strict(ctrl, ctrl->sock, &readback, sat_vfo) :
+                read_ok = (set_vfo != VFO_NONE) ?
+                    get_freq_toggle_vfo_strict(ctrl, ctrl->sock, &readback, set_vfo) :
                     get_freq_toggle_strict(ctrl, ctrl->sock, &readback);
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=TX readback=%" G_GINT64_FORMAT " ok=%d",
@@ -7498,7 +7805,8 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                                 "rig update: side=TX readback failed; keeping last");
                     rigctrl_update_last_sent(ctrl, FALSE, sent_freq);
                 }
-                else if (llabs(readback - sent_freq) <= 100)
+                else if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
+                                              sent_freq, readback, 0))
                 {
                     ctrl->errcnt = 0;
                     ctrl->lasttxf = readback;
@@ -7509,10 +7817,6 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                 }
                 else
                 {
-                    sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                "rig update: side=TX readback mismatch (sent=%" G_GINT64_FORMAT
-                                " read=%" G_GINT64_FORMAT "); tracking unsynced",
-                                sent_freq, readback);
                     ctrl->errcnt++;
                     ctrl->lasttxf = 0;
                     rigctrl_update_last_sent(ctrl, FALSE, 0);
@@ -7548,10 +7852,13 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
         (ctrl->conf2 != NULL) ? ctrl->conf2->supports_rit_xit : FALSE;
     gboolean        down_ok = TRUE;
     gboolean        up_ok = TRUE;
+    vfo_t           down_vfo = VFO_NONE;
+    vfo_t           up_vfo = VFO_NONE;
 
     if (ctrl->engaged && (ctrl->lastrxf > 0))
     {
-        if (!get_freq_simplex(ctrl, ctrl->sock, &readfreq))
+        if (!rigctrl_get_freq_for_role(ctrl, ctrl->sock, TRUE,
+                                       FALSE, FALSE, &readfreq, &down_vfo))
             readfreq = ctrl->lastrxf;
 
         if (llabs(readfreq - ctrl->lastrxf) >= 1)
@@ -7578,29 +7885,44 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
         if ((ctrl->engaged) && up_ok &&
             rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
         {
-            const gchar *vfo_label =
-                ctrl->conf2->vfo_opt ? "currVFO" : "default";
+            vfo_t set_vfo = rigctrl_vfo_for_side(ctrl, FALSE);
+            const gchar *vfo_label = rigctrl_vfo_label(ctrl, FALSE, set_vfo);
+            gint64 readback = 0;
+            gint64 target_freq = tmpfreq;
 
             rigctrl_log_send(ctrl, FALSE, vfo_label,
-                             base_sat_up, doppler_up, tmpfreq);
+                             base_sat_up, doppler_up, target_freq);
             ctrl->last_send_up_us = g_get_monotonic_time();
-            if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
+            if (rigctrl_set_freq_for_role(ctrl, ctrl->sock2, FALSE,
+                                          FALSE, target_freq, NULL))
             {
                 ctrl->errcnt = 0;
                 g_usleep(WR_DEL);
-                if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
+                if ((set_vfo != VFO_NONE) ?
+                    get_freq_simplex_vfo_strict(ctrl, ctrl->sock2, &readback, set_vfo) :
+                    get_freq_simplex_strict(ctrl, ctrl->sock2, &readback))
                 {
-                    ctrl->lasttxf = tmpfreq;
-                    ctrl->rig_actual_up_hz = tmpfreq;
-                    rigctrl_update_last_sent(ctrl, FALSE, tmpfreq);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                            (gdouble)tmpfreq);
+                    if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
+                                             target_freq, readback, 0))
+                    {
+                        ctrl->lasttxf = readback;
+                        ctrl->rig_actual_up_hz = readback;
+                        rigctrl_update_last_sent(ctrl, FALSE, readback);
+                        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                                                (gdouble)readback);
+                    }
+                    else
+                    {
+                        ctrl->errcnt++;
+                        ctrl->lasttxf = 0;
+                        rigctrl_update_last_sent(ctrl, FALSE, 0);
+                    }
                 }
                 else
                 {
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                                 "rig update: side=TX readback failed; keeping last");
-                    rigctrl_update_last_sent(ctrl, FALSE, tmpfreq);
+                    rigctrl_update_last_sent(ctrl, FALSE, target_freq);
                 }
             }
             else
@@ -7623,29 +7945,44 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
     if ((ctrl->engaged) && down_ok &&
         rigctrl_should_send_freq(ctrl, TRUE, tmpfreq))
     {
-        const gchar *vfo_label =
-            ctrl->conf->vfo_opt ? "currVFO" : "default";
+        vfo_t set_vfo = rigctrl_vfo_for_side(ctrl, TRUE);
+        const gchar *vfo_label = rigctrl_vfo_label(ctrl, TRUE, set_vfo);
+        gint64 readback = 0;
+        gint64 target_freq = tmpfreq;
 
         rigctrl_log_send(ctrl, TRUE, vfo_label,
-                         base_sat_down, doppler_down, tmpfreq);
+                         base_sat_down, doppler_down, target_freq);
         ctrl->last_send_down_us = g_get_monotonic_time();
-        if (set_freq_simplex(ctrl, ctrl->sock, tmpfreq))
+        if (rigctrl_set_freq_for_role(ctrl, ctrl->sock, TRUE,
+                                      FALSE, target_freq, NULL))
         {
             ctrl->errcnt = 0;
             g_usleep(WR_DEL);
-            if (get_freq_simplex_strict(ctrl, ctrl->sock, &tmpfreq))
+            if ((set_vfo != VFO_NONE) ?
+                get_freq_simplex_vfo_strict(ctrl, ctrl->sock, &readback, set_vfo) :
+                get_freq_simplex_strict(ctrl, ctrl->sock, &readback))
             {
-                ctrl->lastrxf = tmpfreq;
-                ctrl->rig_actual_down_hz = tmpfreq;
-                rigctrl_update_last_sent(ctrl, TRUE, tmpfreq);
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
-                                        (gdouble)tmpfreq);
+                if (rigctrl_verify_match(ctrl, TRUE, set_vfo,
+                                         target_freq, readback, 0))
+                {
+                    ctrl->lastrxf = readback;
+                    ctrl->rig_actual_down_hz = readback;
+                    rigctrl_update_last_sent(ctrl, TRUE, readback);
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                                            (gdouble)readback);
+                }
+                else
+                {
+                    ctrl->errcnt++;
+                    ctrl->lastrxf = 0;
+                    rigctrl_update_last_sent(ctrl, TRUE, 0);
+                }
             }
             else
             {
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=RX readback failed; keeping last");
-                rigctrl_update_last_sent(ctrl, TRUE, tmpfreq);
+                rigctrl_update_last_sent(ctrl, TRUE, target_freq);
             }
         }
         else
@@ -7659,7 +7996,8 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
 
     if (ctrl->engaged && (ctrl->lasttxf > 0))
     {
-        if (!get_freq_simplex(ctrl, ctrl->sock2, &readfreq))
+        if (!rigctrl_get_freq_for_role(ctrl, ctrl->sock2, FALSE,
+                                       FALSE, FALSE, &readfreq, &up_vfo))
             readfreq = ctrl->lasttxf;
 
         if (llabs(readfreq - ctrl->lasttxf) >= 1)
@@ -7683,29 +8021,44 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
     if ((ctrl->engaged) && up_ok &&
         rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
     {
-        const gchar *vfo_label =
-            ctrl->conf2->vfo_opt ? "currVFO" : "default";
+        vfo_t set_vfo = rigctrl_vfo_for_side(ctrl, FALSE);
+        const gchar *vfo_label = rigctrl_vfo_label(ctrl, FALSE, set_vfo);
+        gint64 readback = 0;
+        gint64 target_freq = tmpfreq;
 
         rigctrl_log_send(ctrl, FALSE, vfo_label,
-                         base_sat_up, doppler_up, tmpfreq);
+                         base_sat_up, doppler_up, target_freq);
         ctrl->last_send_up_us = g_get_monotonic_time();
-        if (set_freq_simplex(ctrl, ctrl->sock2, tmpfreq))
+        if (rigctrl_set_freq_for_role(ctrl, ctrl->sock2, FALSE,
+                                      FALSE, target_freq, NULL))
         {
             ctrl->errcnt = 0;
             g_usleep(WR_DEL);
-            if (get_freq_simplex_strict(ctrl, ctrl->sock2, &tmpfreq))
+            if ((set_vfo != VFO_NONE) ?
+                get_freq_simplex_vfo_strict(ctrl, ctrl->sock2, &readback, set_vfo) :
+                get_freq_simplex_strict(ctrl, ctrl->sock2, &readback))
             {
-                ctrl->lasttxf = tmpfreq;
-                ctrl->rig_actual_up_hz = tmpfreq;
-                rigctrl_update_last_sent(ctrl, FALSE, tmpfreq);
-                gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
-                                        (gdouble)tmpfreq);
+                if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
+                                         target_freq, readback, 0))
+                {
+                    ctrl->lasttxf = readback;
+                    ctrl->rig_actual_up_hz = readback;
+                    rigctrl_update_last_sent(ctrl, FALSE, readback);
+                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                                            (gdouble)readback);
+                }
+                else
+                {
+                    ctrl->errcnt++;
+                    ctrl->lasttxf = 0;
+                    rigctrl_update_last_sent(ctrl, FALSE, 0);
+                }
             }
             else
             {
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rig update: side=TX readback failed; keeping last");
-                rigctrl_update_last_sent(ctrl, FALSE, tmpfreq);
+                rigctrl_update_last_sent(ctrl, FALSE, target_freq);
             }
         }
         else
@@ -7943,7 +8296,7 @@ static gboolean set_xit(GtkRigCtrl * ctrl, gint sock, gdouble hz)
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
 
-    if (retcode && rig_parse_rprt_code(buffback, &rprt) && rprt == -11)
+    if (retcode && rig_parse_rprt_code_any(buffback, &rprt) && rprt == -11)
     {
         rigctld_disable_xit_for_socket(ctrl, sock);
         return FALSE;

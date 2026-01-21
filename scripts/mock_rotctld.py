@@ -54,6 +54,10 @@ class RotctldHandler(socketserver.StreamRequestHandler):
                 continue
 
             if cmd == "p":
+                if state.get("fail_get_pos"):
+                    self.wfile.write(b"RPRT -6\n")
+                    self.wfile.flush()
+                    continue
                 reply = "%0.1f\n%0.1f\n" % (
                     state["az"],
                     state["el"],
@@ -63,6 +67,12 @@ class RotctldHandler(socketserver.StreamRequestHandler):
                 continue
 
             if cmd.startswith("P "):
+                if state.get("drop_set_pos"):
+                    continue
+                if state.get("fail_set_pos"):
+                    self.wfile.write(b"RPRT -6\n")
+                    self.wfile.flush()
+                    continue
                 parts = cmd.split()
                 if len(parts) >= 3:
                     try:
@@ -93,10 +103,20 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4533)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--fail-get-pos", action="store_true")
+    parser.add_argument("--fail-set-pos", action="store_true")
+    parser.add_argument("--drop-set-pos", action="store_true")
     args = parser.parse_args()
 
     server = RotctldServer((args.host, args.port), RotctldHandler)
-    server.state = {"az": 0.0, "el": 0.0, "conn_count": 0}
+    server.state = {
+        "az": 0.0,
+        "el": 0.0,
+        "conn_count": 0,
+        "fail_get_pos": args.fail_get_pos,
+        "fail_set_pos": args.fail_set_pos,
+        "drop_set_pos": args.drop_set_pos,
+    }
     server.conn_lock = threading.Lock()
 
     try:

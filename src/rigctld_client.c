@@ -360,7 +360,7 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
 
     ok = hamlib_transport_request(client->transport,
                                   cmd,
-                                  HAMLIB_READ_SINGLE,
+                                  HAMLIB_READ_MULTILINE_RPRT,
                                   HAMLIB_TERM_RPRT,
                                   timeout_ms,
                                   50,
@@ -1048,6 +1048,9 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
     hamlib_read_mode_t mode = HAMLIB_READ_MULTILINE_RPRT;
     HamlibResponseInfo local = { 0 };
     gboolean ok = FALSE;
+    const gchar *send_cmd = NULL;
+    gchar *tmp_cmd = NULL;
+    gsize cmd_len = 0;
 
     if (info)
         memset(info, 0, sizeof(*info));
@@ -1055,13 +1058,22 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
     if (client == NULL || cmd == NULL)
         return FALSE;
 
-    if (g_str_has_prefix(cmd, "\\dump_state"))
+    cmd_len = strlen(cmd);
+    if (cmd_len > 0 && cmd[cmd_len - 1] != '\n')
+    {
+        tmp_cmd = g_strdup_printf("%s\n", cmd);
+        send_cmd = tmp_cmd;
+    }
+    else
+    {
+        send_cmd = cmd;
+    }
+
+    if (g_str_has_prefix(send_cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
-    else if (g_str_has_prefix(cmd, "f") || g_str_has_prefix(cmd, "v"))
-        mode = HAMLIB_READ_SINGLE;
 
     ok = hamlib_transport_request(client->transport,
-                                  cmd,
+                                  send_cmd,
                                   mode,
                                   HAMLIB_TERM_RPRT,
                                   1000,
@@ -1069,6 +1081,7 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
                                   0, 0,
                                   out, out_len,
                                   &local);
+    g_free(tmp_cmd);
     if (info)
         *info = local;
     if (!ok)

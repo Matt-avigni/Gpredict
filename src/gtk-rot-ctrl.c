@@ -110,6 +110,7 @@
 #define ROTCTLD_IO_STALE_MS 2000
 #define ROTCTLD_MAX_CONSEC_FAIL 3
 #define ROTCTLD_FAILURE_LOG_INTERVAL_US 2000000
+#define ROTCTLD_POS_UNKNOWN_BACKOFF_US 2000000
 #define ROTCTLD_HANDSHAKE_GRACE_MS 2000
 
 typedef struct {
@@ -140,8 +141,13 @@ typedef struct {
     gint64          last_cmd_us;
     gboolean        pos_valid;
     gboolean        pos_unknown;
+    gboolean        pos_cmd_ok;
     gint64          last_pos_us;
     gint64          last_pos_attempt_us;
+    gint64          last_set_attempt_us;
+    gint64          transport_backoff_until_us;
+    gdouble         transport_backoff_sec;
+    gchar           io_error_reason[64];
     gint64          last_io_ok_us;
     guint           consecutive_failures;
     gint64          last_failure_log_us;
@@ -215,6 +221,11 @@ typedef struct {
     guint64              version;
     gboolean             ready;
 } RotTransformSnapshotState;
+
+typedef struct {
+    gint64          last_log_us;
+    guint           suppressed;
+} RotLogRate;
 
 typedef struct {
     gdouble         az_abs;
@@ -602,6 +613,53 @@ static void rot_term_log_verbose(GtkRotCtrl *ctrl, const gchar *prefix,
     g_free(msg);
 }
 
+static void rot_log_rate_limited(GtkRotCtrl *ctrl,
+                                 RotLogRate *rate,
+                                 gint64 interval_us,
+                                 sat_log_level_t level,
+                                 const gchar *prefix,
+                                 const gchar *fmt, ...)
+{
+    va_list ap;
+    gint64 now_us;
+    gchar *msg = NULL;
+    gchar *with_count = NULL;
+    guint count = 1;
+
+    if (fmt == NULL || rate == NULL)
+        return;
+
+    now_us = g_get_monotonic_time();
+    if (rate->last_log_us > 0 &&
+        (now_us - rate->last_log_us) < interval_us)
+    {
+        rate->suppressed++;
+        return;
+    }
+
+    va_start(ap, fmt);
+    msg = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+
+    if (msg == NULL)
+        return;
+
+    if (rate->suppressed > 0)
+        count += rate->suppressed;
+
+    if (count > 1)
+        with_count = g_strdup_printf("%s (x%u)", msg, count);
+
+    sat_log_log(level, "%s", with_count ? with_count : msg);
+    if (prefix != NULL)
+        rot_term_log(ctrl, prefix, "%s", with_count ? with_count : msg);
+
+    rate->last_log_us = now_us;
+    rate->suppressed = 0;
+    g_free(with_count);
+    g_free(msg);
+}
+
 static const gchar *rot_rprt_error_string(gint code)
 {
     switch (code)
@@ -658,11 +716,53 @@ static gboolean rot_parse_rprt_code(const gchar *reply, gint *code_out)
     return TRUE;
 }
 
+static gboolean rot_parse_rprt_code_any(const gchar *reply, gint *code_out)
+{
+    const gchar *line = reply;
+
+    if (reply == NULL)
+        return FALSE;
+
+    while (*line != '\0')
+    {
+        const gchar *eol = strchr(line, '\n');
+        const gchar *scan = line;
+        const gchar *line_end = eol ? eol : line + strlen(line);
+
+        while (scan < line_end && g_ascii_isspace(*scan))
+            scan++;
+
+        if ((line_end - scan) >= 4 && g_str_has_prefix(scan, "RPRT"))
+        {
+            const gchar *start = scan + 4;
+            gchar *endp = NULL;
+            glong code;
+
+            while (*start == ' ')
+                start++;
+
+            code = g_ascii_strtoll(start, &endp, 10);
+            if (endp == start)
+                return FALSE;
+
+            if (code_out)
+                *code_out = (gint) code;
+            return TRUE;
+        }
+
+        if (eol == NULL)
+            break;
+        line = eol + 1;
+    }
+
+    return FALSE;
+}
+
 static void rot_term_log_tx(GtkRotCtrl *ctrl, const gchar *cmd)
 {
     gchar *trim;
 
-    if (ctrl == NULL || cmd == NULL)
+    if (ctrl == NULL || cmd == NULL || !ctrl->verbose_logging)
         return;
 
     trim = g_strdup(cmd);
@@ -717,9 +817,30 @@ static void rot_term_log_rx(GtkRotCtrl *ctrl, const gchar *cmd,
     g_strchomp(trim_reply);
     g_strstrip(trim_reply);
 
+    if (!ctrl->verbose_logging)
+    {
+        if (g_str_has_prefix(trim_cmd, "P "))
+        {
+            if (rot_parse_rprt_code_any(trim_reply, &code) && code != 0)
+                rot_term_log(ctrl, "gpredict:err",
+                             "set_position failed: %s (%d)",
+                             rot_rprt_error_string(code), code);
+        }
+        else if (g_ascii_strcasecmp(trim_cmd, "p") == 0)
+        {
+            if (rot_parse_rprt_code_any(trim_reply, &code) && code != 0)
+                rot_term_log(ctrl, "gpredict:err",
+                             "get_position failed: %s (%d)",
+                             rot_rprt_error_string(code), code);
+        }
+        g_free(trim_cmd);
+        g_free(trim_reply);
+        return;
+    }
+
     if (g_str_has_prefix(trim_cmd, "P "))
     {
-        if (rot_parse_rprt_code(trim_reply, &code))
+        if (rot_parse_rprt_code_any(trim_reply, &code))
         {
             if (code == 0)
                 rot_term_log(ctrl, "gpredict:rx", "set_position ok");
@@ -736,7 +857,7 @@ static void rot_term_log_rx(GtkRotCtrl *ctrl, const gchar *cmd,
     }
     else if (g_ascii_strcasecmp(trim_cmd, "p") == 0)
     {
-        if (rot_parse_rprt_code(trim_reply, &code))
+        if (rot_parse_rprt_code_any(trim_reply, &code))
         {
             if (code == 0)
                 rot_term_log(ctrl, "gpredict:rx", "get_position ok");
@@ -845,10 +966,13 @@ static void rot_session_set_state(GtkRotCtrl *ctrl,
 static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
                                          gboolean rotpos_valid,
                                          gboolean pos_unknown,
+                                         gboolean pos_cmd_ok,
                                          gboolean io_error)
 {
     rotctld_client_state_t client_state = ROTCTLD_CLIENT_STOPPED;
     const gchar *reason = NULL;
+    const gchar *io_reason = NULL;
+    gchar io_reason_buf[64] = { 0 };
     RotTransformSnapshotState snap_state;
 
     if (ctrl == NULL)
@@ -869,8 +993,18 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
 
     if (client_state == ROTCTLD_CLIENT_DEGRADED || io_error)
     {
+        if (io_error && g_mutex_trylock(&ctrl->client.mutex))
+        {
+            g_strlcpy(io_reason_buf, ctrl->client.io_error_reason,
+                      sizeof(io_reason_buf));
+            g_mutex_unlock(&ctrl->client.mutex);
+            if (io_reason_buf[0] != '\0')
+                io_reason = io_reason_buf;
+        }
         rot_session_set_state(ctrl, ROT_SESSION_DEGRADED,
-                              reason ? reason : (io_error ? "io error" : "degraded"),
+                              reason ? reason : (io_reason ? io_reason
+                                                           : (io_error ? "io error"
+                                                                       : "degraded")),
                               FALSE);
         return;
     }
@@ -889,7 +1023,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
         return;
     }
 
-    if (pos_unknown)
+    if (pos_unknown && pos_cmd_ok)
     {
         rot_session_set_state(ctrl, ROT_SESSION_READY, "pos unknown", FALSE);
         return;
@@ -909,6 +1043,9 @@ static void rotctld_log_cb(RotctldMgr *mgr,
     (void)mgr;
 
     if (ctrl == NULL || prefix == NULL || line == NULL)
+        return;
+
+    if (!ctrl->verbose_logging)
         return;
 
     rot_term_log(ctrl, prefix, "%s", line);
@@ -3134,7 +3271,7 @@ static gboolean G_GNUC_UNUSED rotctld_handshake(GtkRotCtrl *ctrl,
         return FALSE;
 
     g_strstrip(reply);
-    if (rot_parse_rprt_code(reply, &rprt_code) && rprt_code != 0) {
+    if (rot_parse_rprt_code_any(reply, &rprt_code) && rprt_code != 0) {
         if (rejected)
             *rejected = TRUE;
         return FALSE;
@@ -3145,6 +3282,7 @@ static gboolean G_GNUC_UNUSED rotctld_handshake(GtkRotCtrl *ctrl,
     ctrl->client.ele_in = el;
     ctrl->client.pos_valid = TRUE;
     ctrl->client.pos_unknown = FALSE;
+    ctrl->client.pos_cmd_ok = TRUE;
     ctrl->client.last_pos_us = g_get_monotonic_time();
     g_mutex_unlock(&ctrl->client.mutex);
     ctrl->manual_sync_pending = TRUE;
@@ -3155,7 +3293,8 @@ static gboolean G_GNUC_UNUSED rotctld_handshake(GtkRotCtrl *ctrl,
 typedef enum {
     ROT_SET_OK = 0,
     ROT_SET_REJECTED = 1,
-    ROT_SET_IO_ERROR = 2
+    ROT_SET_BACKEND_IO = 2,
+    ROT_SET_IO_ERROR = 3
 } rot_set_result_t;
 
 static void format_rotctld_setpos(GtkRotCtrl *ctrl,
@@ -3233,7 +3372,8 @@ static void format_rotctld_setpos(GtkRotCtrl *ctrl,
  * \note The function does not perform any range check since the GtkRotKnob
  * should always keep its value within range.
  */
-static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
+static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el,
+                                gint *rprt_out)
 {
     gchar           txbuf[64];
     gchar           buffback[128];
@@ -3242,10 +3382,7 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
     gchar           send_el_str[32];
     gdouble         az_send = az;
     gdouble         el_send = el;
-    const gchar    *host = (ctrl && ctrl->conf && ctrl->conf->host)
-                           ? ctrl->conf->host
-                           : "(null)";
-    gint            port = (ctrl && ctrl->conf) ? ctrl->conf->port : 0;
+    gint            rprt_code = 0;
 
     /* send command (ASCII-safe, locale independent) */
     format_rotctld_setpos(ctrl, az_send, el_send,
@@ -3254,58 +3391,41 @@ static rot_set_result_t set_pos(GtkRotCtrl * ctrl, gdouble az, gdouble el)
 
     rot_format_deg_2(send_az_str, sizeof(send_az_str), az_send);
     rot_format_deg_2(send_el_str, sizeof(send_el_str), el_send);
-    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s: set_pos send=(%s, %s)"),
-                __func__, send_az_str, send_el_str);
-    g_printerr("MISSION_SOPHIE: set_pos send=(%s, %s)\n",
-               send_az_str, send_el_str);
-
-    g_message("ROTCTLD TX: '%s'", txbuf);
+    rot_term_log_verbose(ctrl, "gpredict:tx",
+                         "set_position send=(%s, %s)",
+                         send_az_str, send_el_str);
     
     retcode = rotctld_socket_rw(ctrl, ctrl->client.socket, txbuf, buffback,
                                 128);
 
     if (!retcode) {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rotctld I/O error while sending P command"), __func__);
-        g_printerr("MISSION_SOPHIE: set_pos I/O error\n");
         return ROT_SET_IO_ERROR;
     }
 
-    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                _("%s: rotctld replied '%s'"), __func__, buffback);
-    g_printerr("MISSION_SOPHIE: set_pos reply '%s'\n", buffback);
+    rot_term_log_verbose(ctrl, "gpredict:rx",
+                         "set_position reply=%s", buffback);
 
     /* Interpret reply:
-     *  - If it starts with "RPRT 0"  → success.
-     *  - If it starts with "RPRT "   → treat as rejected.
-     *  - Otherwise (numeric az/el echo, or something else) → assume success.
+     *  - RPRT 0                → success.
+     *  - RPRT -5/-6            → backend I/O issue (rotctld stays up).
+     *  - Other RPRT non-zero   → rejected.
+     *  - Otherwise             → treat as rejected.
      */
     g_strstrip(buffback);
 
-    gint rprt_code = 0;
-    if (rot_parse_rprt_code(buffback, &rprt_code)) {
+    if (rprt_out)
+        *rprt_out = 0;
+
+    if (rot_parse_rprt_code_any(buffback, &rprt_code)) {
+        if (rprt_out)
+            *rprt_out = rprt_code;
         if (rprt_code == 0)
             return ROT_SET_OK;
-
-        gchar *cmd = g_strdup(txbuf);
-        g_strchomp(cmd);
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s: rotctld rejected cmd '%s' reply '%s'"),
-                    __func__, cmd, buffback);
-        rot_term_log(ctrl, "gpredict:err",
-                     "set_position rejected for %s:%d cmd=%s reply=%s",
-                     host, port, cmd, buffback);
-        g_free(cmd);
+        if (rprt_code == -5 || rprt_code == -6)
+            return ROT_SET_BACKEND_IO;
         return ROT_SET_REJECTED;
     }
 
-    sat_log_log(SAT_LOG_LEVEL_WARN,
-                _("%s: rotctld reply missing RPRT for cmd '%s'"),
-                __func__, txbuf);
-    rot_term_log(ctrl, "gpredict:err",
-                 "set_position missing RPRT for %s:%d cmd=%s reply=%s",
-                 host, port, txbuf, buffback);
     return ROT_SET_REJECTED;
 }
 
@@ -3319,6 +3439,11 @@ static gpointer rotctld_client_thread(gpointer data)
     gdouble         backoff_sec = 0.5;
     const gdouble   backoff_max = 10.0;
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
+    RotLogRate      getpos_err_rate = { 0 };
+    RotLogRate      setpos_err_rate = { 0 };
+    RotLogRate      pos_skip_rate = { 0 };
+    RotLogRate      pos_backoff_rate = { 0 };
+    RotLogRate      transport_err_rate = { 0 };
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s: rotctld_client_thread started"), __func__);
@@ -3352,28 +3477,40 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.daemon_ok = FALSE;
     ctrl->client.pos_valid = FALSE;
     ctrl->client.pos_unknown = FALSE;
+    ctrl->client.pos_cmd_ok = FALSE;
     ctrl->client.last_pos_us = 0;
     ctrl->client.last_pos_attempt_us = 0;
-
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "MISSION_SOPHIE: rotctld_client_thread started for %s:%d",
-                ctrl->conf ? ctrl->conf->host : "(null)",
-                ctrl->conf ? ctrl->conf->port : 0);
+    ctrl->client.last_set_attempt_us = 0;
+    ctrl->client.transport_backoff_until_us = 0;
+    ctrl->client.transport_backoff_sec = 0.5;
+    ctrl->client.io_error_reason[0] = '\0';
 
     rot_term_log_verbose(ctrl, "gpredict:rx",
                          "rotctld client thread started for %s:%d",
                          ctrl->conf ? ctrl->conf->host : "(null)",
                          ctrl->conf ? ctrl->conf->port : 0);
-
-    g_printerr("MISSION_SOPHIE: rotctld_client_thread started for %s:%d\n",
-                ctrl->conf ? ctrl->conf->host : "(null)",
-                ctrl->conf ? ctrl->conf->port : 0);
+    if (ctrl->verbose_logging)
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rotctld client thread started for %s:%d",
+                    ctrl->conf ? ctrl->conf->host : "(null)",
+                    ctrl->conf ? ctrl->conf->port : 0);
 
     while (ctrl->client.running && !rotctld_stop_requested(ctrl))
     {
         g_timer_start(ctrl->client.timer);
 
         if (ctrl->client.socket == -1) {
+            if (ctrl->client.transport_backoff_until_us > 0)
+            {
+                gint64 now_us = g_get_monotonic_time();
+                if (now_us < ctrl->client.transport_backoff_until_us)
+                {
+                    rotctld_sleep_us(ctrl,
+                                     ctrl->client.transport_backoff_until_us - now_us);
+                    continue;
+                }
+                ctrl->client.transport_backoff_until_us = 0;
+            }
             ctrl->client.socket = rotctld_socket_open(ctrl,
                                                       ctrl->conf->host,
                                                       ctrl->conf->port);
@@ -3408,13 +3545,23 @@ static gpointer rotctld_client_thread(gpointer data)
             ctrl->client.last_failure_log_us = 0;
             ctrl->client.pos_valid = FALSE;
             ctrl->client.pos_unknown = FALSE;
+            ctrl->client.pos_cmd_ok = FALSE;
             ctrl->client.last_pos_us = 0;
             ctrl->client.last_pos_attempt_us = 0;
+            ctrl->client.last_set_attempt_us = 0;
+            ctrl->client.transport_backoff_until_us = 0;
+            ctrl->client.transport_backoff_sec = 0.5;
+            ctrl->client.io_error_reason[0] = '\0';
             g_mutex_unlock(&ctrl->client.mutex);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "%s: rotctld link re-established", __func__);
             rot_term_log_verbose(ctrl, "gpredict:rx",
                                  "rotctld link re-established");
+            memset(&getpos_err_rate, 0, sizeof(getpos_err_rate));
+            memset(&setpos_err_rate, 0, sizeof(setpos_err_rate));
+            memset(&pos_skip_rate, 0, sizeof(pos_skip_rate));
+            memset(&pos_backoff_rate, 0, sizeof(pos_backoff_rate));
+            memset(&transport_err_rate, 0, sizeof(transport_err_rate));
 
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->client.limits_valid = FALSE;
@@ -3423,8 +3570,10 @@ static gpointer rotctld_client_thread(gpointer data)
             ctrl->client.daemon_ok = FALSE;
             ctrl->client.pos_valid = FALSE;
             ctrl->client.pos_unknown = FALSE;
+            ctrl->client.pos_cmd_ok = FALSE;
             ctrl->client.last_pos_us = 0;
             ctrl->client.last_pos_attempt_us = 0;
+            ctrl->client.last_set_attempt_us = 0;
             g_mutex_unlock(&ctrl->client.mutex);
 
             {
@@ -3582,6 +3731,14 @@ static gpointer rotctld_client_thread(gpointer data)
 
                 if (ctrl != NULL)
                 {
+                    gint pos_rprt = 0;
+                    gboolean pos_allow_cmd = FALSE;
+
+                    if (!pos_ok && pos_reply[0] != '\0' &&
+                        rot_parse_rprt_code_any(pos_reply, &pos_rprt) &&
+                        (pos_rprt == -6 || pos_rprt == -5))
+                        pos_allow_cmd = TRUE;
+
                     if (pos_ok)
                     {
                         RotTransformSnapshotState snap_state;
@@ -3693,6 +3850,7 @@ static gpointer rotctld_client_thread(gpointer data)
                         ctrl->client.raw_ele_out = hs_el;
                         ctrl->client.pos_valid = TRUE;
                         ctrl->client.pos_unknown = FALSE;
+                        ctrl->client.pos_cmd_ok = TRUE;
                         ctrl->client.last_pos_us = g_get_monotonic_time();
                         g_mutex_unlock(&ctrl->client.mutex);
                         rotctld_note_io_ok(ctrl);
@@ -3702,6 +3860,7 @@ static gpointer rotctld_client_thread(gpointer data)
                         g_mutex_lock(&ctrl->client.mutex);
                         ctrl->client.pos_valid = FALSE;
                         ctrl->client.pos_unknown = TRUE;
+                        ctrl->client.pos_cmd_ok = pos_allow_cmd;
                         ctrl->client.last_pos_us = 0;
                         ctrl->client.last_pos_attempt_us = 0;
                         g_mutex_unlock(&ctrl->client.mutex);
@@ -3790,6 +3949,7 @@ static gpointer rotctld_client_thread(gpointer data)
                                 ctrl->client.raw_ele_out = cur_el;
                                 ctrl->client.pos_valid = TRUE;
                                 ctrl->client.pos_unknown = FALSE;
+                                ctrl->client.pos_cmd_ok = TRUE;
                                 ctrl->client.last_pos_us = g_get_monotonic_time();
                                 g_mutex_unlock(&ctrl->client.mutex);
                                 rotctld_note_io_ok(ctrl);
@@ -3807,6 +3967,7 @@ static gpointer rotctld_client_thread(gpointer data)
                                 ctrl->client.raw_ele_out = cur_el;
                                 ctrl->client.pos_valid = TRUE;
                                 ctrl->client.pos_unknown = FALSE;
+                                ctrl->client.pos_cmd_ok = TRUE;
                                 ctrl->client.last_pos_us = g_get_monotonic_time();
                                 g_mutex_unlock(&ctrl->client.mutex);
                                 rotctld_note_io_ok(ctrl);
@@ -3834,6 +3995,11 @@ static gpointer rotctld_client_thread(gpointer data)
         gint64 backoff_log_us = 0;
         gdouble raw_azi = 0.0;
         gdouble raw_ele = 0.0;
+        gboolean pos_valid = FALSE;
+        gboolean pos_unknown = FALSE;
+        gboolean pos_cmd_ok = FALSE;
+        gboolean daemon_ok = FALSE;
+        gint64 last_set_attempt_us = 0;
 
         g_mutex_lock(&ctrl->client.mutex);
         azi = ctrl->client.azi_out;
@@ -3845,15 +4011,50 @@ static gpointer rotctld_client_thread(gpointer data)
             raw_ele = ctrl->client.raw_ele_out;
             backoff_until = ctrl->client.reject_backoff_until_us;
             backoff_log_us = ctrl->client.reject_backoff_log_us;
+            pos_valid = ctrl->client.pos_valid;
+            pos_unknown = ctrl->client.pos_unknown;
+            pos_cmd_ok = ctrl->client.pos_cmd_ok;
+            daemon_ok = ctrl->client.daemon_ok;
+            last_set_attempt_us = ctrl->client.last_set_attempt_us;
         }
         g_mutex_unlock(&ctrl->client.mutex);
 
         if (have_trg)
+            send_cmd = TRUE;
+
+        if (send_cmd && now_us < backoff_until)
+            backoff_active = TRUE;
+
+        if (send_cmd)
         {
-            if (now_us < backoff_until)
-                backoff_active = TRUE;
-            else
-                send_cmd = TRUE;
+            if (!daemon_ok)
+            {
+                send_cmd = FALSE;
+                rot_log_rate_limited(ctrl, &pos_skip_rate,
+                                     ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                     SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                     "rotctld connection not verified; skipping set_position");
+            }
+            else if (!pos_valid && (!pos_unknown || !pos_cmd_ok))
+            {
+                send_cmd = FALSE;
+                rot_log_rate_limited(ctrl, &pos_skip_rate,
+                                     ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                     SAT_LOG_LEVEL_WARN, "gpredict:warn",
+                                     "set_position deferred: position unknown");
+            }
+            else if (pos_unknown &&
+                     (now_us - last_set_attempt_us) <
+                     ROTCTLD_POS_UNKNOWN_BACKOFF_US)
+            {
+                send_cmd = FALSE;
+                rot_log_rate_limited(ctrl, &pos_backoff_rate,
+                                     ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                     SAT_LOG_LEVEL_WARN, "gpredict:warn",
+                                     "set_position backoff active; retrying in %.1fs",
+                                     (ROTCTLD_POS_UNKNOWN_BACKOFF_US -
+                                      (now_us - last_set_attempt_us)) / 1e6);
+            }
         }
 
         if (backoff_active)
@@ -3875,7 +4076,6 @@ static gpointer rotctld_client_thread(gpointer data)
             gboolean snapshot_ready = FALSE;
             gboolean target_ok = FALSE;
             gboolean clear_trg = FALSE;
-            gboolean daemon_ok = FALSE;
             gchar azs[32];
             gchar els[32];
 
@@ -3907,19 +4107,9 @@ static gpointer rotctld_client_thread(gpointer data)
 
                 rot_format_deg_2(azs, sizeof(azs), azi);
                 rot_format_deg_2(els, sizeof(els), ele);
-                sat_log_log(SAT_LOG_LEVEL_INFO,
-                            "MISSION_SOPHIE: client thread sending position to rotctld cmd=(%s, %s) engaged=%d monitor=%d",
-                            azs, els,
-                            ctrl->engaged ? 1 : 0,
-                            ctrl->monitor ? 1 : 0);
-                g_printerr("MISSION_SOPHIE: client thread sending position to rotctld cmd=(%s, %s) engaged=%d monitor=%d\n",
-                           azs, els,
-                           ctrl->engaged ? 1 : 0,
-                           ctrl->monitor ? 1 : 0);
-
-                g_mutex_lock(&ctrl->client.mutex);
-                daemon_ok = ctrl->client.daemon_ok;
-                g_mutex_unlock(&ctrl->client.mutex);
+                rot_term_log_verbose(ctrl, "gpredict:tx",
+                                     "set_position az=%s el=%s",
+                                     azs, els);
 
                 if (!daemon_ok) {
                     io_error = TRUE;
@@ -3940,34 +4130,85 @@ static gpointer rotctld_client_thread(gpointer data)
                     continue;
                 }
 
-                rot_set_result_t set_res = set_pos(ctrl, azi, ele);
+                g_mutex_lock(&ctrl->client.mutex);
+                ctrl->client.last_set_attempt_us = now_us;
+                g_mutex_unlock(&ctrl->client.mutex);
+
+                gint rprt_code = 0;
+                rot_set_result_t set_res = set_pos(ctrl, azi, ele, &rprt_code);
                 if (set_res == ROT_SET_IO_ERROR)
                 {
-                    io_error = rotctld_note_io_failure(ctrl, "set_position");
-                    sat_log_log(SAT_LOG_LEVEL_ERROR,
-                                _("%s: set_pos failed"), __func__);
-                    rot_term_log(ctrl, "gpredict:err",
-                                 "%s failed: set_position", __func__);
+                    (void)rotctld_note_io_failure(ctrl, "set_position");
+                    io_error = TRUE;
+                    rot_log_rate_limited(ctrl, &transport_err_rate,
+                                         ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                         SAT_LOG_LEVEL_ERROR, "gpredict:err",
+                                         "set_position failed: transport error");
+                    g_mutex_lock(&ctrl->client.mutex);
+                    if (ctrl->client.transport_backoff_sec <= 0.0)
+                        ctrl->client.transport_backoff_sec = 0.5;
+                    ctrl->client.transport_backoff_until_us =
+                        now_us +
+                        (gint64)(ctrl->client.transport_backoff_sec * 1e6);
+                    ctrl->client.transport_backoff_sec =
+                        MIN(ctrl->client.transport_backoff_sec * 2.0, backoff_max);
+                    g_strlcpy(ctrl->client.io_error_reason, "transport error",
+                              sizeof(ctrl->client.io_error_reason));
+                    g_mutex_unlock(&ctrl->client.mutex);
+                }
+                else if (set_res == ROT_SET_BACKEND_IO)
+                {
+                    rotctld_note_io_ok(ctrl);
+                    rot_log_rate_limited(ctrl, &setpos_err_rate,
+                                         ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                         SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                         "set_position backend error: %s (RPRT %d). "
+                                         "Check rotor model, serial device path, baud rate, and rotctld -m/-r.",
+                                         rot_rprt_error_string(rprt_code),
+                                         rprt_code);
+                    g_mutex_lock(&ctrl->client.mutex);
+                    ctrl->client.pos_valid = FALSE;
+                    ctrl->client.pos_unknown = TRUE;
+                    ctrl->client.pos_cmd_ok = TRUE;
+                    ctrl->client.last_pos_us = 0;
+                    g_mutex_unlock(&ctrl->client.mutex);
                 }
                 else if (set_res == ROT_SET_REJECTED)
                 {
                     rotctld_note_io_ok(ctrl);
-                    sat_log_log(SAT_LOG_LEVEL_WARN,
-                                _("%s: set_pos rejected by rotctld"), __func__);
-                    rot_term_log(ctrl, "gpredict:err",
-                                 "%s failed: set_position rejected", __func__);
+                    if (rprt_code != 0)
+                    {
+                        rot_log_rate_limited(ctrl, &setpos_err_rate,
+                                             ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                             SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                             "set_position rejected by rotctld: %s (RPRT %d)",
+                                             rot_rprt_error_string(rprt_code),
+                                             rprt_code);
+                    }
+                    else
+                    {
+                        rot_log_rate_limited(ctrl, &setpos_err_rate,
+                                             ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                             SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                             "set_position rejected by rotctld");
+                    }
                 }
                 else
                 {
                     rotctld_note_io_ok(ctrl);
-                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                _("%s: set_pos success"), __func__);
                     rot_term_log_verbose(ctrl, "gpredict:rx",
                                          "set_position accepted");
                 }
 
                 g_mutex_lock(&ctrl->client.mutex);
-                if (set_res == ROT_SET_REJECTED) {
+                if (set_res == ROT_SET_BACKEND_IO) {
+                    ctrl->client.pos_unknown = TRUE;
+                    ctrl->client.pos_cmd_ok = TRUE;
+                } else if (set_res == ROT_SET_REJECTED) {
+                    if (rprt_code != 0) {
+                        ctrl->client.pos_unknown = TRUE;
+                        ctrl->client.pos_cmd_ok = TRUE;
+                    }
                     ctrl->client.cmd_rejected = TRUE;
                     if (ctrl->client.reject_backoff_sec <= 0.0)
                         ctrl->client.reject_backoff_sec = 0.5;
@@ -3979,6 +4220,7 @@ static gpointer rotctld_client_thread(gpointer data)
                     ctrl->client.cmd_rejected = FALSE;
                     ctrl->client.reject_backoff_until_us = 0;
                     ctrl->client.reject_backoff_sec = 0.5;
+                    ctrl->client.pos_cmd_ok = TRUE;
                 }
                 if (clear_trg)
                     ctrl->client.new_trg = FALSE;
@@ -3999,11 +4241,6 @@ static gpointer rotctld_client_thread(gpointer data)
             gchar els[32];
             rot_format_deg_2(azs, sizeof(azs), azi);
             rot_format_deg_2(els, sizeof(els), ele);
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: client thread idle – no new target (last_out=(%s, %s))",
-                        azs, els);
-            g_printerr("MISSION_SOPHIE: idle – no new target (last_out=(%s, %s))\n",
-                       azs, els);
             rot_term_log_verbose(ctrl, "gpredict:rx",
                                  "idle: no new target (last_out=%s,%s)",
                                  azs, els);
@@ -4016,8 +4253,14 @@ static gpointer rotctld_client_thread(gpointer data)
             gboolean pos_unknown = FALSE;
             gint64 now_us = g_get_monotonic_time();
             gint64 last_attempt = 0;
-            const gint64 retry_us = 2000000;
+            const gint64 retry_us = ROTCTLD_POS_UNKNOWN_BACKOFF_US;
             gboolean do_retry = TRUE;
+            HamlibResponseInfo info = { 0 };
+            rotctld_pos_result_t pos_res = ROTCTLD_POS_IO_ERR;
+            gboolean pos_timeout = FALSE;
+            gboolean pos_rprt_err = FALSE;
+            gboolean pos_rprt_io = FALSE;
+            gboolean pos_rprt_ok = FALSE;
 
             g_mutex_lock(&ctrl->client.mutex);
             pos_unknown = ctrl->client.pos_unknown;
@@ -4033,29 +4276,89 @@ static gpointer rotctld_client_thread(gpointer data)
             {
                 /* defer get_position retry while pos is unknown */
             }
-            else if (rotctld_client_get_pos(ctrl->client.client, &cur_az, &cur_el))
-            {
-                if (pos_unknown)
-                {
-                    sat_log_log(SAT_LOG_LEVEL_INFO,
-                                "get_position recovered: az=%.2f el=%.2f",
-                                cur_az, cur_el);
-                }
-                g_mutex_lock(&ctrl->client.mutex);
-                ctrl->client.azi_in = cur_az;
-                ctrl->client.ele_in = cur_el;
-                ctrl->client.pos_valid = TRUE;
-                ctrl->client.pos_unknown = FALSE;
-                ctrl->client.last_pos_us = g_get_monotonic_time();
-                g_mutex_unlock(&ctrl->client.mutex);
-                rotctld_note_io_ok(ctrl);
-            }
             else
             {
-                if (!pos_unknown)
+                pos_res = rotctld_client_get_pos_ex(ctrl->client.client,
+                                                    &cur_az, &cur_el,
+                                                    &info, NULL, 0);
+                pos_timeout = (pos_res == ROTCTLD_POS_IO_ERR) &&
+                              (info.err == EAGAIN ||
+                               info.err == EWOULDBLOCK ||
+                               info.err == ETIMEDOUT);
+                pos_rprt_err = (pos_res == ROTCTLD_POS_RPRT_ERR && info.saw_rprt);
+                pos_rprt_io = pos_rprt_err &&
+                              (info.rprt_code == -6 || info.rprt_code == -5);
+                pos_rprt_ok = (info.saw_rprt && info.rprt_code == 0);
+
+                if (pos_res == ROTCTLD_POS_OK)
                 {
-                    if (rotctld_note_io_failure(ctrl, "get_position"))
-                        io_error = TRUE;
+                    if (pos_unknown)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    "get_position recovered: az=%.2f el=%.2f",
+                                    cur_az, cur_el);
+                    }
+                    g_mutex_lock(&ctrl->client.mutex);
+                    ctrl->client.azi_in = cur_az;
+                    ctrl->client.ele_in = cur_el;
+                    ctrl->client.pos_valid = TRUE;
+                    ctrl->client.pos_unknown = FALSE;
+                    ctrl->client.pos_cmd_ok = TRUE;
+                    ctrl->client.last_pos_us = g_get_monotonic_time();
+                    g_mutex_unlock(&ctrl->client.mutex);
+                    rotctld_note_io_ok(ctrl);
+                }
+                else if (pos_timeout || pos_rprt_err || pos_rprt_ok)
+                {
+                    if (!pos_timeout)
+                        rotctld_note_io_ok(ctrl);
+                    if (pos_rprt_io)
+                    {
+                        rot_log_rate_limited(ctrl, &getpos_err_rate,
+                                             ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                             SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                             "get_position backend error: %s (RPRT %d). "
+                                             "Check rotor model, serial device path, baud rate, and rotctld -m/-r.",
+                                             rot_rprt_error_string(info.rprt_code),
+                                             info.rprt_code);
+                    }
+                    else if (pos_rprt_err)
+                    {
+                        rot_log_rate_limited(ctrl, &getpos_err_rate,
+                                             ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                             SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                             "get_position failed: %s (RPRT %d), continuing without position",
+                                             rot_rprt_error_string(info.rprt_code),
+                                             info.rprt_code);
+                    }
+                    else if (pos_timeout)
+                    {
+                        rot_log_rate_limited(ctrl, &getpos_err_rate,
+                                             ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                             SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                             "get_position timeout, continuing without position");
+                    }
+                    else
+                    {
+                        rot_log_rate_limited(ctrl, &getpos_err_rate,
+                                             ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                             SAT_LOG_LEVEL_WARN, "gpredict:err",
+                                             "get_position reply missing az/el, continuing without position");
+                    }
+                    g_mutex_lock(&ctrl->client.mutex);
+                    ctrl->client.pos_valid = FALSE;
+                    ctrl->client.pos_unknown = TRUE;
+                    ctrl->client.pos_cmd_ok = TRUE;
+                    ctrl->client.last_pos_us = 0;
+                    g_mutex_unlock(&ctrl->client.mutex);
+                }
+                else
+                {
+                    if (!pos_unknown)
+                    {
+                        if (rotctld_note_io_failure(ctrl, "get_position"))
+                            io_error = TRUE;
+                    }
                 }
             }
         }
@@ -4072,8 +4375,13 @@ static gpointer rotctld_client_thread(gpointer data)
             ctrl->client.reject_backoff_until_us = 0;
             ctrl->client.pos_valid = FALSE;
             ctrl->client.pos_unknown = FALSE;
+            ctrl->client.pos_cmd_ok = FALSE;
             ctrl->client.last_pos_us = 0;
             ctrl->client.last_pos_attempt_us = 0;
+            ctrl->client.last_set_attempt_us = 0;
+            if (ctrl->client.io_error_reason[0] == '\0')
+                g_strlcpy(ctrl->client.io_error_reason, "io error",
+                          sizeof(ctrl->client.io_error_reason));
             g_mutex_unlock(&ctrl->client.mutex);
         }
 
@@ -4094,11 +4402,6 @@ static gpointer rotctld_client_thread(gpointer data)
         elapsed_time = MAX(g_timer_elapsed(ctrl->client.timer, NULL), 0.7);
         rotctld_sleep_us(ctrl, (gint64)(elapsed_time * 1e6));
     }
-
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "MISSION_SOPHIE: rotctld_client_thread stopping");
-
-    g_printerr("MISSION_SOPHIE: rotctld_client_thread stopping\n");
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 _("%s: stopping rotctld client thread"), __func__);
@@ -4471,6 +4774,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean rotpos_valid = FALSE;
     gboolean pos_valid = FALSE;
     gboolean pos_unknown = FALSE;
+    gboolean pos_cmd_ok = FALSE;
     gboolean pos_send_ok = FALSE;
     gboolean az_clamped = FALSE;
     gboolean el_clamped = FALSE;
@@ -4643,6 +4947,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             rotel = ctrl->client.ele_in;
             pos_valid = ctrl->client.pos_valid;
             pos_unknown = ctrl->client.pos_unknown;
+            pos_cmd_ok = ctrl->client.pos_cmd_ok;
             if (ctrl->client.limits_valid)
             {
                 caps_valid = TRUE;
@@ -4680,7 +4985,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->span_extended = span_extended;
             ctrl->span_mode = rotctrl_span_from_conf(ctrl->conf);
             rotpos_valid = pos_valid;
-            pos_send_ok = pos_valid || pos_unknown;
+            pos_send_ok = pos_valid || (pos_unknown && pos_cmd_ok);
 
             if (rotpos_valid)
             {
@@ -5160,7 +5465,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 gtk_label_set_text(GTK_LABEL(status_label), _("LINK DOWN"));
         }
 
-        rotctrl_update_session_state(ctrl, rotpos_valid, pos_unknown, error);
+        rotctrl_update_session_state(ctrl, rotpos_valid, pos_unknown,
+                                     pos_cmd_ok, error);
 
         /* update status label if present, based on data and feedback mode */
         if (status_label)
@@ -5214,17 +5520,13 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             rot_format_deg_2(rotaz_str, sizeof(rotaz_str), rotaz_display);
             rot_format_deg_2(rotel_str, sizeof(rotel_str), rotel);
 
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "MISSION_SOPHIE: status=%s set=(%s, %s) rot=(%s, %s) error=%d",
-                        status_text,
-                        cmdaz_str, cmdel_str,
-                        rotaz_str, rotel_str,
-                        error ? 1 : 0);
-            g_printerr("MISSION_SOPHIE: status=%s set=(%s, %s) rot=(%s, %s) error=%d\n",
-                       status_text,
-                       cmdaz_str, cmdel_str,
-                       rotaz_str, rotel_str,
-                       error ? 1 : 0);
+            if (ctrl->verbose_logging)
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            "rotor status=%s set=(%s, %s) rot=(%s, %s) error=%d",
+                            status_text,
+                            cmdaz_str, cmdel_str,
+                            rotaz_str, rotel_str,
+                            error ? 1 : 0);
         }
     }
     else
@@ -5237,7 +5539,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         {
             const gchar *status_text = NULL;
 
-            rotctrl_update_session_state(ctrl, FALSE, FALSE, FALSE);
+            rotctrl_update_session_state(ctrl, FALSE, FALSE, FALSE, FALSE);
 
             if (ctrl->session_state == ROT_SESSION_CONNECTING)
                 status_text = _("CONNECTING");
@@ -5980,8 +6282,10 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     {
         ctrl->client.pos_valid = FALSE;
         ctrl->client.pos_unknown = FALSE;
+        ctrl->client.pos_cmd_ok = FALSE;
         ctrl->client.last_pos_us = 0;
         ctrl->client.last_pos_attempt_us = 0;
+        ctrl->client.last_set_attempt_us = 0;
     }
     g_mutex_unlock(&ctrl->client.mutex);
 
@@ -6183,6 +6487,9 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
                                 bind_host ? bind_host : "",
                                 ctrl->conf->port);
         }
+        if (spawn_summary_out && *spawn_summary_out)
+            rot_term_log_verbose(ctrl, "gpredict:tx",
+                                 "spawn rotctld: %s", *spawn_summary_out);
 
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rotctld spawn: protocol=%s model=%s",
@@ -7585,11 +7892,12 @@ static gboolean rot_calibration_try_post(GtkRotCtrl *ctrl,
     ctrl->client.last_cmd_us = now_us;
     g_mutex_unlock(&ctrl->client.mutex);
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "MISSION_SOPHIE: calibration posting rotor target cmd=(%.2f, %.2f) engaged=%d monitor=%d",
-                target_az, target_el,
-                ctrl->engaged ? 1 : 0,
-                ctrl->monitor ? 1 : 0);
+    if (ctrl->verbose_logging)
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "calibration posting rotor target cmd=(%.2f, %.2f) engaged=%d monitor=%d",
+                    target_az, target_el,
+                    ctrl->engaged ? 1 : 0,
+                    ctrl->monitor ? 1 : 0);
 
     return TRUE;
 }
@@ -7991,8 +8299,13 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.last_cmd_us = 0;
     ctrl->client.pos_valid = FALSE;
     ctrl->client.pos_unknown = FALSE;
+    ctrl->client.pos_cmd_ok = FALSE;
     ctrl->client.last_pos_us = 0;
     ctrl->client.last_pos_attempt_us = 0;
+    ctrl->client.last_set_attempt_us = 0;
+    ctrl->client.transport_backoff_until_us = 0;
+    ctrl->client.transport_backoff_sec = 0.5;
+    ctrl->client.io_error_reason[0] = '\0';
     ctrl->client.last_io_ok_us = 0;
     ctrl->client.consecutive_failures = 0;
     ctrl->client.last_failure_log_us = 0;

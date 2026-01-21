@@ -17,7 +17,8 @@ class RigctldHandler(socketserver.StreamRequestHandler):
             if not line:
                 break
 
-            cmd = line.decode("ascii", "ignore").strip()
+            cmd_raw = line.decode("ascii", "ignore").rstrip("\n")
+            cmd = cmd_raw.strip()
             if not cmd:
                 continue
 
@@ -31,7 +32,7 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                     "Hamlib Mock rigctld",
                     "has_get_vfo: 1",
                     "has_set_vfo: 1",
-                    "has_set_vfo_opt: 1",
+                    "has_set_vfo_opt: %d" % (1 if state["has_set_vfo_opt"] else 0),
                     "vfo list: VFOA VFOB Main Sub currVFO",
                     "",
                 ]
@@ -68,6 +69,22 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
                 continue
 
+            if cmd == "\\reset_cmd_log":
+                state["cmd_log"] = []
+                self.wfile.write(b"RPRT 0\n")
+                self.wfile.flush()
+                continue
+
+            if cmd == "\\get_cmd_log":
+                body = "\n".join(state["cmd_log"])
+                if body:
+                    body += "\n"
+                self.wfile.write((body + "RPRT 0\n").encode("ascii"))
+                self.wfile.flush()
+                continue
+
+            state["cmd_log"].append(cmd)
+
             if cmd == "f" or cmd.startswith("f "):
                 self.wfile.write(("%d\nRPRT 0\n" % state["freq"]).encode("ascii"))
                 self.wfile.flush()
@@ -98,7 +115,10 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                 continue
 
             if cmd.startswith("\\set_vfo_opt"):
-                self.wfile.write(b"RPRT 0\n")
+                if state["has_set_vfo_opt"]:
+                    self.wfile.write(b"RPRT 0\n")
+                else:
+                    self.wfile.write(b"RPRT -11\n")
                 self.wfile.flush()
                 continue
 
@@ -116,6 +136,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4532)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--no-vfo-opt", action="store_true")
     args = parser.parse_args()
 
     server = RigctldServer((args.host, args.port), RigctldHandler)
@@ -124,6 +145,8 @@ def main():
         "vfo": "VFOA",
         "set_freq_count": 0,
         "conn_count": 0,
+        "has_set_vfo_opt": not args.no_vfo_opt,
+        "cmd_log": [],
     }
     server.conn_lock = threading.Lock()
 

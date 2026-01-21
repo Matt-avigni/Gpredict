@@ -918,29 +918,52 @@ gboolean rotctld_client_get_pos(RotctldClient *client,
                                 gdouble *az_out,
                                 gdouble *el_out)
 {
-    gchar reply[256];
-    HamlibResponseInfo info = { 0 };
+    return rotctld_client_get_pos_ex(client, az_out, el_out, NULL, NULL, 0) ==
+        ROTCTLD_POS_OK;
+}
+
+rotctld_pos_result_t rotctld_client_get_pos_ex(RotctldClient *client,
+                                               gdouble *az_out,
+                                               gdouble *el_out,
+                                               HamlibResponseInfo *info,
+                                               gchar *reply_out,
+                                               gsize reply_len)
+{
+    gchar reply_local[256];
+    gchar *reply = reply_local;
+    gsize reply_cap = sizeof(reply_local);
+    HamlibResponseInfo local = { 0 };
     gboolean ok = FALSE;
 
     if (az_out)
         *az_out = 0.0;
     if (el_out)
         *el_out = 0.0;
+    if (info)
+        memset(info, 0, sizeof(*info));
+
+    if (reply_out && reply_len > 0)
+    {
+        reply = reply_out;
+        reply_cap = reply_len;
+    }
+
+    if (reply && reply_cap > 0)
+        reply[0] = '\0';
 
     if (client == NULL)
-        return FALSE;
+        return ROTCTLD_POS_IO_ERR;
 
-    ok = hamlib_transport_request(client->transport,
-                                  "p\n",
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT_OR_DONE,
-                                  500,
-                                  50,
-                                  0, 0,
-                                  reply, sizeof(reply),
-                                  &info);
+    ok = rotctld_client_request_raw(client, "p",
+                                    reply, reply_cap, &local);
+    if (info)
+        *info = local;
+
     if (!ok)
-        return FALSE;
+        return ROTCTLD_POS_IO_ERR;
+
+    if (local.saw_rprt && local.rprt_code != 0)
+        return ROTCTLD_POS_RPRT_ERR;
 
     if (rotctld_client_parse_pos(reply, az_out, el_out))
     {
@@ -948,15 +971,12 @@ gboolean rotctld_client_get_pos(RotctldClient *client,
         {
             rot_limits_t limits = rotctld_client_limits_from_caps(&client->caps);
             if (!normalize_gs232b_pos(az_out, el_out, &limits))
-                return FALSE;
+                return ROTCTLD_POS_PARSE_FAIL;
         }
-        return TRUE;
+        return ROTCTLD_POS_OK;
     }
 
-    if (info.saw_rprt && info.rprt_code != 0)
-        return FALSE;
-
-    return FALSE;
+    return ROTCTLD_POS_PARSE_FAIL;
 }
 
 gboolean rotctld_client_set_pos(RotctldClient *client,
@@ -971,16 +991,9 @@ gboolean rotctld_client_set_pos(RotctldClient *client,
     if (client == NULL)
         return FALSE;
 
-    g_snprintf(cmd, sizeof(cmd), "P %.2f %.2f\x0a", az, el);
-    ok = hamlib_transport_request(client->transport,
-                                  cmd,
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT_OR_DONE,
-                                  500,
-                                  50,
-                                  0, 0,
-                                  reply, sizeof(reply),
-                                  &info);
+    g_snprintf(cmd, sizeof(cmd), "P %.2f %.2f", az, el);
+    ok = rotctld_client_request_raw(client, cmd,
+                                    reply, sizeof(reply), &info);
     if (!ok)
         return FALSE;
 
@@ -1001,21 +1014,11 @@ gboolean rotctld_client_stop(RotctldClient *client)
     if (client == NULL)
         return FALSE;
 
-    if (!hamlib_transport_request(client->transport,
-                                  "S\n",
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT_OR_DONE,
-                                  500,
-                                  50,
-                                  0, 0,
-                                  reply, sizeof(reply),
-                                  &info))
+    if (!rotctld_client_request_raw(client, "S",
+                                    reply, sizeof(reply), &info))
         return FALSE;
 
-    if (info.saw_rprt && info.rprt_code != 0)
-        return FALSE;
-
-    return TRUE;
+    return !(info.saw_rprt && info.rprt_code != 0);
 }
 
 gboolean rotctld_client_request_raw(RotctldClient *client,
@@ -1027,6 +1030,9 @@ gboolean rotctld_client_request_raw(RotctldClient *client,
     hamlib_read_mode_t mode = HAMLIB_READ_MULTILINE_RPRT;
     HamlibResponseInfo local = { 0 };
     gboolean ok = FALSE;
+    const gchar *send_cmd = NULL;
+    gchar *tmp_cmd = NULL;
+    gsize cmd_len = 0;
 
     if (info)
         memset(info, 0, sizeof(*info));
@@ -1034,11 +1040,22 @@ gboolean rotctld_client_request_raw(RotctldClient *client,
     if (client == NULL || cmd == NULL)
         return FALSE;
 
-    if (g_str_has_prefix(cmd, "\\dump_state"))
+    cmd_len = strlen(cmd);
+    if (cmd_len > 0 && cmd[cmd_len - 1] != '\n')
+    {
+        tmp_cmd = g_strdup_printf("%s\n", cmd);
+        send_cmd = tmp_cmd;
+    }
+    else
+    {
+        send_cmd = cmd;
+    }
+
+    if (g_str_has_prefix(send_cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
 
     ok = hamlib_transport_request(client->transport,
-                                  cmd,
+                                  send_cmd,
                                   mode,
                                   HAMLIB_TERM_RPRT_OR_DONE,
                                   1000,
@@ -1046,12 +1063,10 @@ gboolean rotctld_client_request_raw(RotctldClient *client,
                                   0, 0,
                                   out, out_len,
                                   &local);
+    g_free(tmp_cmd);
     if (info)
         *info = local;
     if (!ok)
-        return FALSE;
-
-    if (local.saw_rprt && local.rprt_code != 0)
         return FALSE;
 
     return TRUE;

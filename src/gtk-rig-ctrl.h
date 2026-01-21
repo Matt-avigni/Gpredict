@@ -123,6 +123,10 @@ struct _gtk_rig_ctrl {
     gint64          last_calc_log_down_us; /*!< Last calc log time (downlink). */
     gint64          last_calc_log_up_us;   /*!< Last calc log time (uplink). */
     gint64          last_invalid_log_us;   /*!< Last invalid frequency log time. */
+    gint64          last_verify_log_down_us; /*!< Last verify log time (downlink). */
+    gint64          last_verify_log_up_us;   /*!< Last verify log time (uplink). */
+    gboolean        verify_degraded_down; /*!< Downlink verify mismatch flag. */
+    gboolean        verify_degraded_up;   /*!< Uplink verify mismatch flag. */
     gboolean        pending_manual_down;  /*!< Pending manual send (downlink). */
     gboolean        pending_manual_up;    /*!< Pending manual send (uplink). */
     gboolean        pending_preset_down;  /*!< Pending preset send (downlink). */

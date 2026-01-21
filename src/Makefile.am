@@ -146,10 +146,12 @@ gpredict_LDADD = @PACKAGE_LIBS@
 
 check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
-    azel-mapping-test safety-window-test hamlib-mock-test
+    azel-mapping-test safety-window-test hamlib-mock-test \
+    payload-profile-test
 TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
-    azel-mapping-test safety-window-test hamlib-mock-test
+    azel-mapping-test safety-window-test hamlib-mock-test \
+    payload-profile-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -200,3 +202,9 @@ hamlib_mock_test_SOURCES = \
     radio-conf.h \
     radio-conf-stub.c
 hamlib_mock_test_LDADD = @PACKAGE_LIBS@
+
+payload_profile_test_SOURCES = \
+    payload-profile-test.c \
+    payload-profile.c \
+    payload-profile.h
+payload_profile_test_LDADD = @PACKAGE_LIBS@
