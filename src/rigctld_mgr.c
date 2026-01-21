@@ -798,27 +798,42 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         g_ptr_array_add(argv, g_strdup("-C"));
         g_ptr_array_add(argv, g_strdup("auto_power_on=1"));
     }
-    g_ptr_array_add(argv, g_strdup("-vvvv"));
-    if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
     {
+        gboolean extra_verbose = FALSE;
         gchar **extra_argv = NULL;
         gint    extra_argc = 0;
 
-        if (!g_shell_parse_argv(conf->rigctld_extra_args, &extra_argc,
-                                &extra_argv, &error))
+        if (conf->rigctld_extra_args && *conf->rigctld_extra_args)
         {
-            if (error_out)
-                *error_out = g_strdup(error->message);
-            g_clear_error(&error);
-            g_strfreev(extra_argv);
-            g_ptr_array_free(argv, TRUE);
-            g_free(path);
-            return NULL;
+            if (!g_shell_parse_argv(conf->rigctld_extra_args, &extra_argc,
+                                    &extra_argv, &error))
+            {
+                if (error_out)
+                    *error_out = g_strdup(error->message);
+                g_clear_error(&error);
+                g_strfreev(extra_argv);
+                g_ptr_array_free(argv, TRUE);
+                g_free(path);
+                return NULL;
+            }
+
+            for (gint i = 0; i < extra_argc; i++)
+            {
+                if (g_str_has_prefix(extra_argv[i], "-v") ||
+                    g_str_has_prefix(extra_argv[i], "--verbose"))
+                    extra_verbose = TRUE;
+            }
         }
 
-        for (gint i = 0; i < extra_argc; i++)
-            g_ptr_array_add(argv, g_strdup(extra_argv[i]));
-        g_strfreev(extra_argv);
+        if (!extra_verbose)
+            g_ptr_array_add(argv, g_strdup("-v"));
+
+        if (extra_argv != NULL)
+        {
+            for (gint i = 0; i < extra_argc; i++)
+                g_ptr_array_add(argv, g_strdup(extra_argv[i]));
+            g_strfreev(extra_argv);
+        }
     }
 
     g_ptr_array_add(argv, NULL);

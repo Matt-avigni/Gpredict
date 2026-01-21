@@ -73,10 +73,10 @@ gboolean              rigctld_client_probe(RigctldClient *client,
 
 gboolean              rigctld_client_get_freq(RigctldClient *client,
                                               vfo_t vfo,
-                                              gdouble *freq_out);
+                                              gint64 *freq_out);
 gboolean              rigctld_client_set_freq(RigctldClient *client,
                                               vfo_t vfo,
-                                              gdouble freq_hz);
+                                              gint64 freq_hz);
 gboolean              rigctld_client_ensure_vfo(RigctldClient *client,
                                                 vfo_t vfo);
 gboolean              rigctld_client_set_vfo(RigctldClient *client,

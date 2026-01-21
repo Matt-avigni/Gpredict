@@ -1,6 +1,7 @@
 #include "rotctld_client.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -42,6 +43,7 @@ static void rotctld_client_caps_clear(RotCaps *caps)
     caps->az_max = 360.0;
     caps->el_min = 0.0;
     caps->el_max = 180.0;
+    caps->south_zero = FALSE;
     caps->quirks = 0;
 }
 
@@ -55,6 +57,7 @@ static void rotctld_client_caps_init(RotCaps *caps)
     caps->az_max = 360.0;
     caps->el_min = 0.0;
     caps->el_max = 180.0;
+    caps->south_zero = FALSE;
 }
 
 static gboolean rotctld_client_parse_first_two_numbers(const gchar *line,
@@ -215,12 +218,97 @@ static void rotctld_client_parse_limits(RotCaps *caps, const gchar *text)
             have_el_max = TRUE;
         }
 
+        if (g_strrstr(lower, "south_zero") ||
+            g_strrstr(lower, "south zero"))
+        {
+            if (rotctld_client_parse_first_number(line, &a))
+                caps->south_zero = (fabs(a) > 0.5);
+        }
+
         g_free(lower);
     }
     g_strfreev(lines);
 
     if (have_az_min && have_az_max && have_el_min && have_el_max)
         caps->limits_valid = TRUE;
+}
+
+typedef struct {
+    gboolean valid;
+    gdouble  az_min;
+    gdouble  az_max;
+    gdouble  el_min;
+    gdouble  el_max;
+} rot_limits_t;
+
+static rot_limits_t rotctld_client_limits_from_caps(const RotCaps *caps)
+{
+    rot_limits_t lim;
+
+    lim.valid = FALSE;
+    lim.az_min = 0.0;
+    lim.az_max = 360.0;
+    lim.el_min = 0.0;
+    lim.el_max = 180.0;
+
+    if (caps != NULL && caps->limits_valid)
+    {
+        lim.valid = TRUE;
+        lim.az_min = caps->az_min;
+        lim.az_max = caps->az_max;
+        lim.el_min = caps->el_min;
+        lim.el_max = caps->el_max;
+    }
+
+    return lim;
+}
+
+static gboolean rotctld_client_is_gs232b_model(gint model_id)
+{
+    return model_id == 603;
+}
+
+static gboolean normalize_gs232b_pos(gdouble *az, gdouble *el,
+                                     const rot_limits_t *lim)
+{
+    gdouble az_norm = 0.0;
+    gdouble el_norm = 0.0;
+    gdouble el_min = 0.0;
+    gdouble el_max = 180.0;
+
+    if (az == NULL || el == NULL)
+        return FALSE;
+
+    if (!isfinite(*az) || !isfinite(*el))
+        return FALSE;
+
+    az_norm = *az;
+    el_norm = *el;
+
+    if (fabs(az_norm - 360.0) < 1e-6)
+        az_norm = 0.0;
+    az_norm = fmod(az_norm, 360.0);
+    if (az_norm < 0.0)
+        az_norm += 360.0;
+    if (az_norm >= 360.0)
+        az_norm = 0.0;
+
+    if (lim != NULL && lim->valid)
+    {
+        el_min = MAX(el_min, lim->el_min);
+        el_max = MIN(el_max, lim->el_max);
+        if (el_min > el_max)
+        {
+            el_min = 0.0;
+            el_max = 180.0;
+        }
+    }
+
+    el_norm = CLAMP(el_norm, el_min, el_max);
+
+    *az = az_norm;
+    *el = el_norm;
+    return TRUE;
 }
 
 static gboolean rotctld_client_parse_pos(const gchar *text,
@@ -540,6 +628,13 @@ gboolean rotctld_client_probe(RotctldClient *client,
     rotctld_parse_model(dump_state, &client->caps.model_id);
     client->caps.signature = g_strdup(dump_state);
     rotctld_client_parse_limits(&client->caps, dump_state);
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotctld dump_state caps: model=%d az=%.2f..%.2f el=%.2f..%.2f south_zero=%d limits=%d",
+                client->caps.model_id,
+                client->caps.az_min, client->caps.az_max,
+                client->caps.el_min, client->caps.el_max,
+                client->caps.south_zero ? 1 : 0,
+                client->caps.limits_valid ? 1 : 0);
 
     for (gint attempt = 0; attempt < 3; attempt++)
     {
@@ -560,7 +655,9 @@ gboolean rotctld_client_probe(RotctldClient *client,
     }
 
     rotctld_client_set_state(client, ROTCTLD_CLIENT_READY, "probe ok");
-    return client->caps.has_get_pos;
+    if (client->caps.has_get_pos)
+        return TRUE;
+    return rotctld_client_is_gs232b_model(client->caps.model_id);
 }
 
 gboolean rotctld_client_handshake(RotctldClient *client,
@@ -570,7 +667,8 @@ gboolean rotctld_client_handshake(RotctldClient *client,
                                   gchar *dump_state_out,
                                   gsize dump_state_len,
                                   gchar *pos_reply_out,
-                                  gsize pos_reply_len)
+                                  gsize pos_reply_len,
+                                  gboolean *pos_ok_out)
 {
     gchar dump_buf[4096];
     gchar reply[256];
@@ -578,7 +676,13 @@ gboolean rotctld_client_handshake(RotctldClient *client,
     gdouble az = 0.0;
     gdouble el = 0.0;
     gboolean ok = FALSE;
+    gint model_id = 0;
+    gboolean is_gs232b = FALSE;
+    RotCaps dump_caps;
+    rot_limits_t limits;
 
+    if (pos_ok_out)
+        *pos_ok_out = FALSE;
     if (az_out)
         *az_out = 0.0;
     if (el_out)
@@ -625,17 +729,12 @@ gboolean rotctld_client_handshake(RotctldClient *client,
         return FALSE;
     }
 
+    sat_log_log(SAT_LOG_LEVEL_INFO, "handshake: dump_state ok");
+
     if (!rotctld_dump_state_first_line_is_one(dump_state_out))
     {
-        rotctld_client_log_failure(client,
-                                   "handshake dump_state invalid (expected line1=1)",
-                                   "\\dump_state",
-                                   dump_state_out);
-        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
-                                 "handshake dump_state invalid");
-        (void)hamlib_transport_clear_rxbuf(client->transport);
-        hamlib_transport_close(client->transport);
-        return FALSE;
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "rotctld handshake: dump_state first line not '1'; accepting");
     }
     if (!rotctld_dump_state_has_done(dump_state_out))
     {
@@ -643,59 +742,154 @@ gboolean rotctld_client_handshake(RotctldClient *client,
                     "rotctld handshake: dump_state missing done; accepting");
     }
 
+    rotctld_client_caps_init(&dump_caps);
+    if (rotctld_parse_model(dump_state_out, &model_id))
+        dump_caps.model_id = model_id;
+    rotctld_client_parse_limits(&dump_caps, dump_state_out);
+    limits = rotctld_client_limits_from_caps(&dump_caps);
+    if (client != NULL && model_id != 0)
+        client->caps.model_id = model_id;
+    is_gs232b = rotctld_client_is_gs232b_model(model_id);
+
     memset(&info, 0, sizeof(info));
     reply[0] = '\0';
-    ok = hamlib_transport_request(client->transport,
-                                  "p\n",
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT_OR_DONE,
-                                  timeout_ms,
-                                  50,
-                                  1, ROTCTLD_PROBE_RETRY_DELAY_MS,
-                                  reply, sizeof(reply),
-                                  &info);
-    if (pos_reply_out && pos_reply_len > 0)
-        g_strlcpy(pos_reply_out, reply, pos_reply_len);
-    if (!ok)
+    if (is_gs232b)
     {
-        rotctld_client_log_failure(client,
-                                   "handshake get_pos failed",
-                                   "p",
-                                   reply);
-        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
-                                 "handshake get_pos failed");
-        (void)hamlib_transport_clear_rxbuf(client->transport);
-        hamlib_transport_close(client->transport);
-        return FALSE;
-    }
+        const gint max_attempts = 3;
+        gboolean pos_ok = FALSE;
+        gboolean accept_no_pos = FALSE;
 
-    if (rotctld_client_parse_pos(reply, &az, &el))
-    {
-        /* Parsed az/el is sufficient even if a trailing RPRT is missing. */
-    }
-    else if (info.saw_rprt && info.rprt_code != 0)
-    {
-        rotctld_client_log_failure(client,
-                                   "handshake get_pos rejected",
-                                   "p",
-                                   reply);
-        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
-                                 "handshake get_pos rejected");
-        (void)hamlib_transport_clear_rxbuf(client->transport);
-        hamlib_transport_close(client->transport);
-        return FALSE;
+        for (gint attempt = 1; attempt <= max_attempts; attempt++)
+        {
+            const gchar *reason = "parse";
+
+            memset(&info, 0, sizeof(info));
+            reply[0] = '\0';
+            ok = hamlib_transport_request(client->transport,
+                                          "p\n",
+                                          HAMLIB_READ_MULTILINE_RPRT,
+                                          HAMLIB_TERM_RPRT_OR_DONE,
+                                          timeout_ms,
+                                          50,
+                                          1, ROTCTLD_PROBE_RETRY_DELAY_MS,
+                                          reply, sizeof(reply),
+                                          &info);
+            if (pos_reply_out && pos_reply_len > 0)
+                g_strlcpy(pos_reply_out, reply, pos_reply_len);
+
+            if (!ok)
+            {
+                reason = "io";
+            }
+            else if (rotctld_client_parse_pos(reply, &az, &el))
+            {
+                gdouble raw_az = az;
+                gdouble raw_el = el;
+
+                if (normalize_gs232b_pos(&az, &el, &limits))
+                {
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "rotctld GS232B handshake get_pos raw=(%.2f, %.2f) normalized=(%.2f, %.2f) -> accepted",
+                                raw_az, raw_el, az, el);
+                    pos_ok = TRUE;
+                    break;
+                }
+                reason = "invalid";
+            }
+            else if (info.saw_rprt && info.rprt_code != 0)
+            {
+                if (info.rprt_code == -6)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "handshake: get_position failed (-6), continuing without position");
+                    accept_no_pos = TRUE;
+                    break;
+                }
+                reason = "rprt";
+            }
+
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rotctld GS232B handshake get_pos failed attempt %d/%d (reason=%s)",
+                        attempt, max_attempts, reason);
+
+            if (attempt < max_attempts)
+            {
+                (void)hamlib_transport_drain(client->transport, 50, NULL);
+                g_usleep((gulong)ROTCTLD_PROBE_RETRY_DELAY_MS * 1000);
+            }
+        }
+
+        if (!pos_ok && !accept_no_pos)
+        {
+            rotctld_client_log_failure(client,
+                                       "handshake get_pos failed",
+                                       "p",
+                                       reply);
+            rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                     "handshake get_pos failed");
+            (void)hamlib_transport_clear_rxbuf(client->transport);
+            hamlib_transport_close(client->transport);
+            return FALSE;
+        }
+        if (pos_ok_out)
+            *pos_ok_out = pos_ok;
     }
     else
     {
-        rotctld_client_log_failure(client,
-                                   "handshake get_pos parse failed (expected az/el)",
-                                   "p",
-                                   reply);
-        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
-                                 "handshake get_pos parse failed");
-        (void)hamlib_transport_clear_rxbuf(client->transport);
-        hamlib_transport_close(client->transport);
-        return FALSE;
+        ok = hamlib_transport_request(client->transport,
+                                      "p\n",
+                                      HAMLIB_READ_MULTILINE_RPRT,
+                                      HAMLIB_TERM_RPRT_OR_DONE,
+                                      timeout_ms,
+                                      50,
+                                      1, ROTCTLD_PROBE_RETRY_DELAY_MS,
+                                      reply, sizeof(reply),
+                                      &info);
+        if (pos_reply_out && pos_reply_len > 0)
+            g_strlcpy(pos_reply_out, reply, pos_reply_len);
+        if (!ok)
+        {
+            rotctld_client_log_failure(client,
+                                       "handshake get_pos failed",
+                                       "p",
+                                       reply);
+            rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                     "handshake get_pos failed");
+            (void)hamlib_transport_clear_rxbuf(client->transport);
+            hamlib_transport_close(client->transport);
+            return FALSE;
+        }
+
+        if (rotctld_client_parse_pos(reply, &az, &el))
+        {
+            /* Parsed az/el is sufficient even if a trailing RPRT is missing. */
+            if (pos_ok_out)
+                *pos_ok_out = TRUE;
+        }
+        else if (info.saw_rprt && info.rprt_code != 0)
+        {
+            rotctld_client_log_failure(client,
+                                       "handshake get_pos rejected",
+                                       "p",
+                                       reply);
+            rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                     "handshake get_pos rejected");
+            (void)hamlib_transport_clear_rxbuf(client->transport);
+            hamlib_transport_close(client->transport);
+            return FALSE;
+        }
+        else
+        {
+            rotctld_client_log_failure(client,
+                                       "handshake get_pos parse failed (expected az/el)",
+                                       "p",
+                                       reply);
+            rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                     "handshake get_pos parse failed");
+            (void)hamlib_transport_clear_rxbuf(client->transport);
+            hamlib_transport_close(client->transport);
+            return FALSE;
+        }
     }
 
     if (az_out)
@@ -749,7 +943,15 @@ gboolean rotctld_client_get_pos(RotctldClient *client,
         return FALSE;
 
     if (rotctld_client_parse_pos(reply, az_out, el_out))
+    {
+        if (rotctld_client_is_gs232b_model(client->caps.model_id))
+        {
+            rot_limits_t limits = rotctld_client_limits_from_caps(&client->caps);
+            if (!normalize_gs232b_pos(az_out, el_out, &limits))
+                return FALSE;
+        }
         return TRUE;
+    }
 
     if (info.saw_rprt && info.rprt_code != 0)
         return FALSE;

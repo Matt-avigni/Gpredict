@@ -181,14 +181,14 @@ static gchar *rigctld_client_build_signature(const gchar *text,
 }
 
 static gboolean rigctld_client_parse_frequency(const gchar *text,
-                                               gdouble *freq_out)
+                                               gint64 *freq_out)
 {
     const gchar *p = text;
     gchar *endptr = NULL;
-    gdouble value = 0.0;
+    gint64 value = 0;
 
     if (freq_out)
-        *freq_out = 0.0;
+        *freq_out = 0;
 
     if (text == NULL || *text == '\0')
         return FALSE;
@@ -197,7 +197,7 @@ static gboolean rigctld_client_parse_frequency(const gchar *text,
     {
         if (g_ascii_isdigit(*p) || *p == '-' || *p == '+')
         {
-            value = g_ascii_strtod(p, &endptr);
+            value = g_ascii_strtoll(p, &endptr, 10);
             if (endptr != p)
             {
                 if (freq_out)
@@ -328,7 +328,7 @@ static void rigctld_client_parse_dump_state(RigCaps *caps, const gchar *text)
 
 static gboolean rigctld_client_try_get_freq(RigctldClient *client,
                                             const gchar *cmd,
-                                            gdouble *freq_out,
+                                            gint64 *freq_out,
                                             gchar *reply,
                                             gsize reply_len,
                                             gint timeout_ms)
@@ -337,7 +337,7 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
     gboolean ok = FALSE;
 
     if (freq_out)
-        *freq_out = 0.0;
+        *freq_out = 0;
     if (reply && reply_len > 0)
         reply[0] = '\0';
 
@@ -361,7 +361,7 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
 
 static gboolean rigctld_client_try_get_freq_retry(RigctldClient *client,
                                                   const gchar *cmd,
-                                                  gdouble *freq_out,
+                                                  gint64 *freq_out,
                                                   gchar *reply,
                                                   gsize reply_len,
                                                   gint timeout_ms,
@@ -648,7 +648,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
 {
     gchar dump_state[4096];
     gchar reply[256];
-    gdouble freq = 0.0;
+    gint64 freq = 0;
     gboolean dump_ok = FALSE;
     gboolean freq_ok = FALSE;
     gboolean vfo_select_ok = FALSE;
@@ -786,7 +786,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
                     g_free(client->caps.default_vfo_token);
                     client->caps.default_vfo_token = g_strdup(token);
-                    g_snprintf(cmd, sizeof(cmd), "F %s %.0f\x0a", token, freq);
+                    g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
+                               token, freq);
                     if (rigctld_client_try_set_ok(client, cmd,
                                                   reply, sizeof(reply),
                                                   timeout_ms))
@@ -839,7 +840,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
     if (freq_ok)
     {
         gchar cmd[96];
-        g_snprintf(cmd, sizeof(cmd), "F %.0f\x0a", freq);
+        g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq);
         client->caps.has_set_freq =
             rigctld_client_try_set_ok(client, cmd,
                                       reply, sizeof(reply), timeout_ms);
@@ -859,14 +860,14 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
 gboolean rigctld_client_get_freq(RigctldClient *client,
                                  vfo_t vfo,
-                                 gdouble *freq_out)
+                                 gint64 *freq_out)
 {
     gchar cmd[96];
     gchar reply[256];
     RigCaps *caps = NULL;
 
     if (freq_out)
-        *freq_out = 0.0;
+        *freq_out = 0;
 
     if (client == NULL)
         return FALSE;
@@ -925,7 +926,7 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
 
 gboolean rigctld_client_set_freq(RigctldClient *client,
                                  vfo_t vfo,
-                                 gdouble freq_hz)
+                                 gint64 freq_hz)
 {
     gchar cmd[96];
     gchar reply[128];
@@ -941,7 +942,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
     if (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
         token = rigctld_client_vfo_token(client, vfo);
-        g_snprintf(cmd, sizeof(cmd), "F %s %.0f\x0a", token, freq_hz);
+        g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
+                   token, freq_hz);
         return rigctld_client_try_set_ok(client, cmd,
                                          reply, sizeof(reply), 500);
     }
@@ -953,7 +955,7 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
         if (can_select && !rigctld_client_ensure_vfo(client, vfo))
             return FALSE;
 
-        g_snprintf(cmd, sizeof(cmd), "F %.0f\x0a", freq_hz);
+        g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
         ok = rigctld_client_try_set_ok(client, cmd,
                                        reply, sizeof(reply), 500);
         if (ok || !can_select)
@@ -967,7 +969,7 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
                                          reply, sizeof(reply), 500);
     }
 
-    g_snprintf(cmd, sizeof(cmd), "F %.0f\x0a", freq_hz);
+    g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
     return rigctld_client_try_set_ok(client, cmd,
                                      reply, sizeof(reply), 500);
 }

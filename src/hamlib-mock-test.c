@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <gio/gio.h>
@@ -116,7 +117,7 @@ int main(void)
     radio_conf_t conf;
     const RigCaps *caps = NULL;
     const RotCaps *rcaps = NULL;
-    gdouble freq = 0.0;
+    gint64 freq = 0;
     gdouble az = 0.0;
     gdouble el = 0.0;
     GError *error = NULL;
@@ -230,13 +231,13 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
-    if (fabs(freq - 145800000.0) >= 1.0)
+    if (llabs(freq - 145800000) >= 1)
     {
-        g_printerr("rigctld initial freq mismatch: %.0f\n", freq);
+        g_printerr("rigctld initial freq mismatch: %" G_GINT64_FORMAT "\n", freq);
         ok = FALSE;
         goto cleanup;
     }
-    if (!rigctld_client_set_freq(rig, VFO_MAIN, 145900000.0))
+    if (!rigctld_client_set_freq(rig, VFO_MAIN, 145900000))
     {
         g_printerr("rigctld set freq failed\n");
         ok = FALSE;
@@ -248,9 +249,9 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
-    if (fabs(freq - 145900000.0) >= 1.0)
+    if (llabs(freq - 145900000) >= 1)
     {
-        g_printerr("rigctld post-set freq mismatch: %.0f\n", freq);
+        g_printerr("rigctld post-set freq mismatch: %" G_GINT64_FORMAT "\n", freq);
         ok = FALSE;
         goto cleanup;
     }
@@ -271,7 +272,7 @@ int main(void)
         for (gint i = 0; i < 10; i++)
         {
             if (!rigctld_client_set_freq(rig, VFO_MAIN,
-                                         145900000.0 + (gdouble)(i * 10)))
+                                         145900000 + (gint64)(i * 10)))
             {
                 g_printerr("rigctld set freq failed (counting)\n");
                 ok = FALSE;

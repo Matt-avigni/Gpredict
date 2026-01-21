@@ -25,6 +25,7 @@ typedef struct RotCaps {
     gdouble    az_max;
     gdouble    el_min;
     gdouble    el_max;
+    gboolean   south_zero;
     guint      quirks;
 } RotCaps;
 
@@ -55,7 +56,8 @@ gboolean              rotctld_client_handshake(RotctldClient *client,
                                                gchar *dump_state_out,
                                                gsize dump_state_len,
                                                gchar *pos_reply_out,
-                                               gsize pos_reply_len);
+                                               gsize pos_reply_len,
+                                               gboolean *pos_ok_out);
 gssize                rotctld_client_clear_rxbuf(RotctldClient *client);
 
 gboolean              rotctld_client_get_pos(RotctldClient *client,

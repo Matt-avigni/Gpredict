@@ -88,9 +88,9 @@ struct _gtk_rig_ctrl {
     gboolean        lastrxptt;  /*!< PTT state of last rx cycle. */
     gboolean        lasttxptt;  /*!< PTT state of last tx cycle. */
 
-    gdouble         lastrxf;    /*!< Last frequency sent to receiver. */
-    gdouble         lasttxf;    /*!< Last frequency sent to tranmitter. */
-    gdouble         du, dd;     /*!< Last computed up/down Doppler shift; computed in update() */
+    gint64          lastrxf;    /*!< Last frequency sent to receiver (Hz). */
+    gint64          lasttxf;    /*!< Last frequency sent to transmitter (Hz). */
+    gint64          du, dd;     /*!< Last computed up/down Doppler shift (Hz). */
     PayloadProfile  payload_profile; /*!< Payload profile derived from menu selection. */
     gboolean        payload_profile_valid; /*!< TRUE when payload profile is initialized. */
     gboolean        payload_profile_logged; /*!< Avoid repeated payload profile logs. */
@@ -100,23 +100,33 @@ struct _gtk_rig_ctrl {
     gint64          last_doppler_calc_us; /*!< Last Doppler calc time (monotonic). */
     gint64          last_send_down_us; /*!< Last downlink send time (monotonic). */
     gint64          last_send_up_us;   /*!< Last uplink send time (monotonic). */
-    gdouble         last_sent_down_hz; /*!< Last downlink frequency command sent. */
-    gdouble         last_sent_up_hz;   /*!< Last uplink frequency command sent. */
-    gdouble         last_target_down_hz; /*!< Last downlink target computed. */
-    gdouble         last_target_up_hz;   /*!< Last uplink target computed. */
+    gint64          last_sent_down_hz; /*!< Last downlink frequency command sent. */
+    gint64          last_sent_up_hz;   /*!< Last uplink frequency command sent. */
+    gint64          last_target_down_hz; /*!< Last downlink target computed. */
+    gint64          last_target_up_hz;   /*!< Last uplink target computed. */
     gint64          last_doppler_log_us; /*!< Last doppler tick log (monotonic). */
+    gint64          last_probe_log_us;   /*!< Last probe log time (monotonic). */
     gint            doppler_suppress_down; /*!< Last downlink suppression reason. */
     gint            doppler_suppress_up;   /*!< Last uplink suppression reason. */
-    gdouble         user_base_down_hz; /*!< User-entered downlink base frequency. */
-    gdouble         user_base_up_hz;   /*!< User-entered uplink base frequency. */
-    gdouble         doppler_down_hz;   /*!< Current downlink Doppler offset. */
-    gdouble         doppler_up_hz;     /*!< Current uplink Doppler offset. */
-    gdouble         rig_target_down_hz; /*!< Target rig downlink frequency. */
-    gdouble         rig_target_up_hz;   /*!< Target rig uplink frequency. */
-    gdouble         rig_actual_down_hz; /*!< Last observed rig downlink frequency. */
-    gdouble         rig_actual_up_hz;   /*!< Last observed rig uplink frequency. */
-    gdouble         last_valid_target_down_hz; /*!< Last valid downlink target sent. */
-    gdouble         last_valid_target_up_hz;   /*!< Last valid uplink target sent. */
+    gint64          user_base_down_hz; /*!< User-entered downlink base frequency. */
+    gint64          user_base_up_hz;   /*!< User-entered uplink base frequency. */
+    gint64          doppler_down_hz;   /*!< Current downlink Doppler offset. */
+    gint64          doppler_up_hz;     /*!< Current uplink Doppler offset. */
+    gint64          rig_target_down_hz; /*!< Target rig downlink frequency. */
+    gint64          rig_target_up_hz;   /*!< Target rig uplink frequency. */
+    gint64          rig_actual_down_hz; /*!< Last observed rig downlink frequency. */
+    gint64          rig_actual_up_hz;   /*!< Last observed rig uplink frequency. */
+    gint64          last_valid_target_down_hz; /*!< Last valid downlink target sent. */
+    gint64          last_valid_target_up_hz;   /*!< Last valid uplink target sent. */
+    gint64          last_send_log_down_us; /*!< Last send log time (downlink). */
+    gint64          last_send_log_up_us;   /*!< Last send log time (uplink). */
+    gint64          last_calc_log_down_us; /*!< Last calc log time (downlink). */
+    gint64          last_calc_log_up_us;   /*!< Last calc log time (uplink). */
+    gint64          last_invalid_log_us;   /*!< Last invalid frequency log time. */
+    gboolean        pending_manual_down;  /*!< Pending manual send (downlink). */
+    gboolean        pending_manual_up;    /*!< Pending manual send (uplink). */
+    gboolean        pending_preset_down;  /*!< Pending preset send (downlink). */
+    gboolean        pending_preset_up;    /*!< Pending preset send (uplink). */
     gboolean        user_edit_down; /*!< User edited downlink base freq in session. */
     gboolean        user_edit_up;   /*!< User edited uplink base freq in session. */
     gboolean        suppress_user_base; /*!< Guard for programmatic base updates. */
@@ -128,6 +138,7 @@ struct _gtk_rig_ctrl {
     gint            last_rit_offset;    /*!< Last RIT offset sent (Hz) */
     gint            last_xit_offset;    /*!< Last XIT offset sent (Hz, primary) */
     gint            last_xit_offset2;   /*!< Last XIT offset sent (Hz, secondary) */
+    GMutex          freq_cache_lock;   /*!< Protects cached base/doppler values */
 
     gint64          last_toggle_tx;     /*!< Last time when exec_toggle_tx_cycle() was executed (seconds)
                                            -1 indicates that an update should be performed ASAP */
@@ -190,6 +201,7 @@ struct _gtk_rig_ctrl {
 
     GpTermView     *term_view;          /*!< Embedded radio debug terminal */
     GtkWidget      *log_toggle;         /*!< Logs toggle button */
+    gboolean        verbose_logging;    /*!< Verbose log toggle state */
     guint           resize_idle_id;     /*!< Pending resize idle source id */
     gchar          *primary_rig_id;     /*!< Selected primary rig ID */
     gchar          *secondary_rig_id;   /*!< Selected secondary rig ID */
