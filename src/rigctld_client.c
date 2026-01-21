@@ -10,6 +10,8 @@
 #define RIGCTLD_PROBE_RETRY_DELAY_MS 50
 #define RIGCTLD_VFO_TOKEN_MAX 64
 
+static gint rig_log_level = RIG_LOG_QUIET;
+
 struct _RigctldClient {
     HamlibTransport       *transport;
     rigctld_client_state_t state;
@@ -30,6 +32,21 @@ static const RigQuirkEntry rig_quirks[] = {
     { "3081", RIG_QUIRK_FORCE_MAIN_SUB },
     { NULL, 0 }
 };
+
+void rigctld_client_set_log_level(rig_log_level_t level)
+{
+    if (level < RIG_LOG_QUIET)
+        level = RIG_LOG_QUIET;
+    if (level > RIG_LOG_TRACE)
+        level = RIG_LOG_TRACE;
+
+    g_atomic_int_set(&rig_log_level, (gint)level);
+}
+
+rig_log_level_t rigctld_client_get_log_level(void)
+{
+    return (rig_log_level_t)g_atomic_int_get(&rig_log_level);
+}
 
 static void rigctld_client_set_state(RigctldClient *client,
                                      rigctld_client_state_t state,
@@ -681,16 +698,20 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                   dump_state, sizeof(dump_state),
                                   &info))
     {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rigctld probe dump_state failed err=%d rprt=%d done=%d",
-                    info.err, info.saw_rprt ? 1 : 0, info.saw_done ? 1 : 0);
+        if (rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rigctld probe dump_state failed err=%d rprt=%d done=%d",
+                        info.err, info.saw_rprt ? 1 : 0, info.saw_done ? 1 : 0);
     }
     else
     {
         dump_ok = rigctld_dump_state_line1_ok(dump_state);
         if (!dump_ok)
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rigctld probe dump_state missing line1=1");
+        {
+            if (rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "rigctld probe dump_state missing line1=1");
+        }
 
         rigctld_client_parse_dump_state(&client->caps, dump_state);
 

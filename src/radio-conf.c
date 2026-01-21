@@ -59,6 +59,7 @@
 #define KEY_RIGCTLD_CIVADDR     "RIGCTLD_CIVADDR"
 #define KEY_RIGCTLD_EXTRA_ARGS  "RIGCTLD_EXTRA_ARGS"
 #define KEY_RIGCTLD_AUTODETECT_MATCH "RIGCTLD_AUTODETECT_MATCH"
+#define KEY_RIG_LOG_LEVEL       "RIG_LOG_LEVEL"
 #define KEY_IC9700_SATMODE      "IC9700_SATMODE"
 
 #define DEFAULT_CYCLE_MS    1000
@@ -299,6 +300,7 @@ gboolean radio_conf_read(radio_conf_t * conf)
     conf->rigctld_civaddr = NULL;
     conf->rigctld_extra_args = NULL;
     conf->rigctld_autodetect_match = NULL;
+    conf->rig_log_level = RIG_LOG_QUIET;
 
     /* open .rig file */
     cfg = g_key_file_new();
@@ -576,6 +578,13 @@ gboolean radio_conf_read(radio_conf_t * conf)
     if (g_key_file_has_key(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH, NULL))
         conf->rigctld_autodetect_match =
             g_key_file_get_string(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH, NULL);
+    if (g_key_file_has_key(cfg, GROUP, KEY_RIG_LOG_LEVEL, NULL))
+    {
+        gint level = g_key_file_get_integer(cfg, GROUP, KEY_RIG_LOG_LEVEL, NULL);
+
+        if (level >= RIG_LOG_QUIET && level <= RIG_LOG_TRACE)
+            conf->rig_log_level = (rig_log_level_t) level;
+    }
 
     conf->supports_dual_vfo_sat =
         (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
@@ -682,6 +691,8 @@ void radio_conf_save(radio_conf_t * conf)
                               conf->rigctld_autodetect_match);
     else
         g_key_file_remove_key(cfg, GROUP, KEY_RIGCTLD_AUTODETECT_MATCH, NULL);
+    g_key_file_set_integer(cfg, GROUP, KEY_RIG_LOG_LEVEL,
+                           conf->rig_log_level);
 
     confdir = get_hwconf_dir();
     fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rig", NULL);

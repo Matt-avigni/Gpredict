@@ -800,6 +800,8 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     }
     {
         gboolean extra_verbose = FALSE;
+        gboolean want_verbose = (conf != NULL &&
+                                 conf->rig_log_level >= RIG_LOG_VERBOSE);
         gchar **extra_argv = NULL;
         gint    extra_argc = 0;
 
@@ -825,7 +827,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
             }
         }
 
-        if (!extra_verbose)
+        if (!extra_verbose && want_verbose)
             g_ptr_array_add(argv, g_strdup("-v"));
 
         if (extra_argv != NULL)

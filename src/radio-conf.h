@@ -67,6 +67,12 @@ typedef enum {
 } rigctld_conn_t;
 
 typedef enum {
+    RIG_LOG_QUIET = 0,
+    RIG_LOG_VERBOSE,
+    RIG_LOG_TRACE
+} rig_log_level_t;
+
+typedef enum {
     VFO_NONE = 0,
     VFO_A,
     VFO_B,
@@ -109,6 +115,7 @@ typedef struct {
     gchar          *rigctld_civaddr; /*!< Optional CI-V address string */
     gchar          *rigctld_extra_args; /*!< Optional extra rigctld args */
     gchar          *rigctld_autodetect_match; /*!< Optional substring allowlist for rig auto-detect */
+    rig_log_level_t rig_log_level; /*!< Rig logging verbosity */
 } radio_conf_t;
 
 typedef struct {

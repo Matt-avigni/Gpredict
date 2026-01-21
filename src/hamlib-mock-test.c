@@ -337,7 +337,7 @@ int main(void)
 
         if (!rotctld_client_handshake(rot, 500, &hs_az, &hs_el,
                                       dump_state, sizeof(dump_state),
-                                      NULL, 0))
+                                      NULL, 0, NULL))
         {
             g_printerr("rotctld handshake failed\n");
             ok = FALSE;
@@ -356,7 +356,7 @@ int main(void)
 
         if (!rotctld_client_handshake(rot, 500, &hs_az, &hs_el,
                                       dump_state, sizeof(dump_state),
-                                      NULL, 0))
+                                      NULL, 0, NULL))
         {
             g_printerr("rotctld handshake failed (repeat)\n");
             ok = FALSE;

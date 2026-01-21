@@ -625,13 +625,22 @@ static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
+static void     rig_verbose_toggle_cb(GtkToggleButton *button, gpointer data);
+static void     rig_trace_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
 static void     rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply);
+static void     rig_term_log_raw(GtkRigCtrl *ctrl, const gchar *prefix,
+                                 const gchar *line, gboolean force);
 static void     rig_term_log_verbose(GtkRigCtrl *ctrl,
                                      const gchar *prefix,
                                      const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
 static void     rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
                                       const gchar *reply, gint code);
+static gboolean rigctrl_log_at_least(const GtkRigCtrl *ctrl,
+                                     rig_log_level_t level);
+static void     rigctrl_set_log_level(GtkRigCtrl *ctrl,
+                                      rig_log_level_t level);
+static void     rigctrl_sync_log_toggles(GtkRigCtrl *ctrl);
 static void     rigctrl_set_user_base_freq(GtkRigCtrl *ctrl,
                                            gboolean downlink,
                                            gint64 hz,
@@ -771,6 +780,8 @@ static gboolean rigctrl_autostart_error_allowed(GtkRigCtrl *ctrl,
                                                 const radio_conf_t *conf);
 static gboolean rigctrl_missing_model_dialog_allowed(GtkRigCtrl *ctrl,
                                                      const radio_conf_t *conf);
+static void     rigctrl_apply_log_level_from_conf(GtkRigCtrl *ctrl,
+                                                  const radio_conf_t *conf);
 static void     rigctrl_set_editing(GtkRigCtrl *ctrl,
                                     const gchar *rig_id,
                                     gboolean editing);
@@ -1054,6 +1065,7 @@ static void rigctrl_apply_conf_update(radio_conf_t *dst,
     dst->rigctld_extra_args = g_strdup(src->rigctld_extra_args);
     g_free(dst->rigctld_autodetect_match);
     dst->rigctld_autodetect_match = g_strdup(src->rigctld_autodetect_match);
+    dst->rig_log_level = src->rig_log_level;
 }
 
 static void rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
@@ -1232,34 +1244,48 @@ static void rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
     g_free(msg);
 }
 
-static void rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd)
+static gboolean rigctrl_log_at_least(const GtkRigCtrl *ctrl,
+                                     rig_log_level_t level)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    return ctrl->log_level >= level;
+}
+
+static void rig_term_log_raw(GtkRigCtrl *ctrl, const gchar *prefix,
+                             const gchar *line, gboolean force)
 {
     gchar *trim;
 
-    if (ctrl == NULL || cmd == NULL || !ctrl->verbose_logging)
+    if (ctrl == NULL || line == NULL || prefix == NULL)
         return;
 
-    trim = g_strdup(cmd);
+    if (!force && !rigctrl_log_at_least(ctrl, RIG_LOG_TRACE))
+        return;
+
+    trim = g_strdup(line);
     g_strchomp(trim);
     g_strstrip(trim);
     if (*trim != '\0')
-        rig_term_log_verbose(ctrl, "gpredict:tx", "%s", trim);
+        rig_term_log(ctrl, prefix, "%s", trim);
     g_free(trim);
+}
+
+static void rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd)
+{
+    if (ctrl == NULL || cmd == NULL)
+        return;
+
+    rig_term_log_raw(ctrl, "gpredict:tx", cmd, FALSE);
 }
 
 static void rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply)
 {
-    gchar *trim;
-
-    if (ctrl == NULL || reply == NULL || !ctrl->verbose_logging)
+    if (ctrl == NULL || reply == NULL)
         return;
 
-    trim = g_strdup(reply);
-    g_strchomp(trim);
-    g_strstrip(trim);
-    if (*trim != '\0')
-        rig_term_log_verbose(ctrl, "gpredict:rx", "%s", trim);
-    g_free(trim);
+    rig_term_log_raw(ctrl, "gpredict:rx", reply, FALSE);
 }
 
 static void rig_term_log_verbose(GtkRigCtrl *ctrl,
@@ -1272,7 +1298,7 @@ static void rig_term_log_verbose(GtkRigCtrl *ctrl,
     if (ctrl == NULL || fmt == NULL || prefix == NULL)
         return;
 
-    if (!ctrl->verbose_logging)
+    if (!rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
         return;
 
     va_start(ap, fmt);
@@ -1422,7 +1448,10 @@ static void rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
     if (ctrl == NULL || line == NULL || prefix == NULL)
         return;
 
-    rig_term_log_verbose(ctrl, prefix, "%s", line);
+    if (!rigctrl_log_at_least(ctrl, RIG_LOG_TRACE))
+        return;
+
+    rig_term_log(ctrl, prefix, "%s", line);
 }
 
 static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
@@ -1434,9 +1463,144 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
         return;
 
     visible = gtk_toggle_button_get_active(button);
-    ctrl->verbose_logging = visible;
     gp_term_view_set_visible(ctrl->term_view, visible);
     rigctrl_schedule_resize(ctrl);
+}
+
+static void rigctrl_set_log_level(GtkRigCtrl *ctrl, rig_log_level_t level)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (level < RIG_LOG_QUIET)
+        level = RIG_LOG_QUIET;
+    if (level > RIG_LOG_TRACE)
+        level = RIG_LOG_TRACE;
+
+    if (ctrl->log_level == level)
+        return;
+
+    ctrl->log_level = level;
+    rigctld_client_set_log_level(level);
+    if (ctrl->conf)
+        ctrl->conf->rig_log_level = level;
+    if (ctrl->conf2)
+        ctrl->conf2->rig_log_level = level;
+}
+
+static void rigctrl_sync_log_toggles(GtkRigCtrl *ctrl)
+{
+    gboolean verbose = FALSE;
+    gboolean trace = FALSE;
+
+    if (ctrl == NULL)
+        return;
+
+    verbose = rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE);
+    trace = rigctrl_log_at_least(ctrl, RIG_LOG_TRACE);
+
+    if (ctrl->log_verbose_toggle != NULL)
+    {
+        g_signal_handlers_block_by_func(ctrl->log_verbose_toggle,
+                                        (gpointer)rig_verbose_toggle_cb,
+                                        ctrl);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_verbose_toggle),
+                                     verbose);
+        g_signal_handlers_unblock_by_func(ctrl->log_verbose_toggle,
+                                          (gpointer)rig_verbose_toggle_cb,
+                                          ctrl);
+    }
+
+    if (ctrl->log_trace_toggle != NULL)
+    {
+        g_signal_handlers_block_by_func(ctrl->log_trace_toggle,
+                                        (gpointer)rig_trace_toggle_cb,
+                                        ctrl);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_trace_toggle),
+                                     trace);
+        gtk_widget_set_sensitive(ctrl->log_trace_toggle, verbose);
+        g_signal_handlers_unblock_by_func(ctrl->log_trace_toggle,
+                                          (gpointer)rig_trace_toggle_cb,
+                                          ctrl);
+    }
+}
+
+static void rig_verbose_toggle_cb(GtkToggleButton *button, gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+    gboolean verbose;
+    gboolean trace = FALSE;
+
+    if (ctrl == NULL)
+        return;
+
+    verbose = gtk_toggle_button_get_active(button);
+    if (ctrl->log_trace_toggle != NULL)
+    {
+        trace = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->log_trace_toggle));
+        if (!verbose && trace)
+        {
+            g_signal_handlers_block_by_func(ctrl->log_trace_toggle,
+                                            (gpointer)rig_trace_toggle_cb,
+                                            ctrl);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_trace_toggle), FALSE);
+            g_signal_handlers_unblock_by_func(ctrl->log_trace_toggle,
+                                              (gpointer)rig_trace_toggle_cb,
+                                              ctrl);
+            trace = FALSE;
+        }
+        gtk_widget_set_sensitive(ctrl->log_trace_toggle, verbose);
+    }
+
+    rigctrl_set_log_level(ctrl,
+                          trace ? RIG_LOG_TRACE :
+                          (verbose ? RIG_LOG_VERBOSE : RIG_LOG_QUIET));
+}
+
+static void rig_trace_toggle_cb(GtkToggleButton *button, gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+    gboolean trace;
+    gboolean verbose = FALSE;
+
+    if (ctrl == NULL)
+        return;
+
+    trace = gtk_toggle_button_get_active(button);
+    if (ctrl->log_verbose_toggle != NULL)
+    {
+        verbose = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->log_verbose_toggle));
+        if (trace && !verbose)
+        {
+            g_signal_handlers_block_by_func(ctrl->log_verbose_toggle,
+                                            (gpointer)rig_verbose_toggle_cb,
+                                            ctrl);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_verbose_toggle), TRUE);
+            g_signal_handlers_unblock_by_func(ctrl->log_verbose_toggle,
+                                              (gpointer)rig_verbose_toggle_cb,
+                                              ctrl);
+            verbose = TRUE;
+        }
+    }
+
+    rigctrl_set_log_level(ctrl,
+                          trace ? RIG_LOG_TRACE :
+                          (verbose ? RIG_LOG_VERBOSE : RIG_LOG_QUIET));
+}
+
+static void rigctrl_apply_log_level_from_conf(GtkRigCtrl *ctrl,
+                                              const radio_conf_t *conf)
+{
+    rig_log_level_t level = RIG_LOG_QUIET;
+
+    if (ctrl == NULL)
+        return;
+
+    if (conf != NULL)
+        level = conf->rig_log_level;
+
+    rigctrl_set_log_level(ctrl, level);
+    rigctrl_sync_log_toggles(ctrl);
 }
 
 static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
@@ -1918,7 +2082,9 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
     ctrl->rigctld_vfo_map_logged = FALSE;
     ctrl->rigctld_vfo_map_logged2 = FALSE;
     ctrl->log_toggle = NULL;
-    ctrl->verbose_logging = FALSE;
+    ctrl->log_verbose_toggle = NULL;
+    ctrl->log_trace_toggle = NULL;
+    ctrl->log_level = RIG_LOG_QUIET;
     if (ctrl->resize_idle_id != 0)
     {
         g_source_remove(ctrl->resize_idle_id);
@@ -2031,7 +2197,10 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_vfo_map_logged2 = FALSE;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
-    ctrl->verbose_logging = FALSE;
+    ctrl->log_verbose_toggle = NULL;
+    ctrl->log_trace_toggle = NULL;
+    ctrl->log_level = RIG_LOG_QUIET;
+    rigctld_client_set_log_level(ctrl->log_level);
     ctrl->resize_idle_id = 0;
     ctrl->primary_rig_id = NULL;
     ctrl->secondary_rig_id = NULL;
@@ -2922,7 +3091,14 @@ static void rigctrl_log_send(GtkRigCtrl *ctrl,
                              gint64 doppler_hz,
                              gint64 target_hz)
 {
+    gint64 *last_log_us = NULL;
+
     if (ctrl == NULL || vfo_label == NULL)
+        return;
+
+    last_log_us = downlink ? &ctrl->last_send_log_down_us
+                           : &ctrl->last_send_log_up_us;
+    if (!rigctrl_log_throttled(ctrl, last_log_us, G_USEC_PER_SEC))
         return;
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -2951,6 +3127,8 @@ static void rigctrl_log_calc(GtkRigCtrl *ctrl,
     gint64 *last_log_us = NULL;
 
     if (ctrl == NULL)
+        return;
+    if (!rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
         return;
 
     last_log_us = downlink ? &ctrl->last_calc_log_down_us
@@ -3324,6 +3502,9 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
     GtkWidget *popup_widget = NULL;
     GtkWidget *scrolled = NULL;
     gint attempt = 0;
+    gint anchor_width = 0;
+    gint anchor_min = 0;
+    gint anchor_nat = 0;
 
     if (combo == NULL)
         return G_SOURCE_REMOVE;
@@ -3359,6 +3540,7 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
         gint list_nat = 0;
         gint rows = 0;
         gboolean needs_scroll = FALSE;
+        gint popup_width = -1;
 
         gtk_widget_set_hexpand(popup_widget, FALSE);
         gtk_widget_set_vexpand(popup_widget, FALSE);
@@ -3381,22 +3563,39 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
         }
         if (GTK_IS_SCROLLED_WINDOW(scrolled))
         {
+            anchor_width = gtk_widget_get_allocated_width(GTK_WIDGET(combo));
+            if (anchor_width <= 1)
+            {
+                gtk_widget_get_preferred_width(GTK_WIDGET(combo),
+                                               &anchor_min, &anchor_nat);
+                anchor_width = (anchor_nat > 0) ? anchor_nat : anchor_min;
+            }
+            if (anchor_width > 0)
+                popup_width = anchor_width;
+
             gtk_widget_set_hexpand(scrolled, FALSE);
             gtk_widget_set_vexpand(scrolled, FALSE);
             gtk_widget_add_events(scrolled, GDK_SCROLL_MASK);
             gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
                                            GTK_POLICY_NEVER,
                                            GTK_POLICY_AUTOMATIC);
+#if GTK_CHECK_VERSION(3, 16, 0)
+            gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(scrolled),
+                                                      FALSE);
+#endif
             gtk_scrolled_window_set_propagate_natural_height(
                 GTK_SCROLLED_WINDOW(scrolled), !needs_scroll);
 #if GTK_CHECK_VERSION(3, 22, 0)
             gtk_scrolled_window_set_max_content_height(
                 GTK_SCROLLED_WINDOW(scrolled), needs_scroll ? max_height : -1);
+            if (popup_width > 0)
+                gtk_scrolled_window_set_min_content_width(
+                    GTK_SCROLLED_WINDOW(scrolled), popup_width);
 #endif
-            gtk_widget_set_size_request(scrolled, -1,
+            gtk_widget_set_size_request(scrolled, popup_width,
                                         needs_scroll ? max_height : -1);
         }
-        gtk_widget_set_size_request(popup_widget, -1,
+        gtk_widget_set_size_request(popup_widget, popup_width,
                                     needs_scroll ? max_height : -1);
 
         if (GTK_IS_TREE_VIEW(tree))
@@ -3405,6 +3604,7 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
             gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
             gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(tree), TRUE);
             gtk_tree_view_set_search_column(GTK_TREE_VIEW(tree), 0);
+            gtk_tree_view_set_activate_on_single_click(GTK_TREE_VIEW(tree), TRUE);
             gtk_tree_view_set_enable_search(GTK_TREE_VIEW(tree),
                                             rows > RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD);
         }
@@ -3458,17 +3658,10 @@ static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
                                                 gpointer data)
 {
     (void)data;
+    (void)event;
 
     if (widget == NULL)
         return FALSE;
-
-    if (event != NULL && event->button == 1)
-    {
-        g_object_set_data(G_OBJECT(widget), "rigctrl-popup-pending",
-                          GINT_TO_POINTER(1));
-        RIGCTRL_TRSP_POPUP_LOG("%s: button press handled", __func__);
-        return TRUE;
-    }
 
     return FALSE;
 }
@@ -3477,32 +3670,13 @@ static gboolean rigctrl_trsp_combo_button_release(GtkWidget *widget,
                                                   GdkEventButton *event,
                                                   gpointer data)
 {
-    gboolean pending;
-    gboolean opened;
-
     (void)data;
+    (void)event;
 
     if (widget == NULL)
         return FALSE;
 
-    if (event == NULL || event->button != 1)
-        return FALSE;
-
-    pending = g_object_get_data(G_OBJECT(widget), "rigctrl-popup-pending") != NULL;
-    opened = g_object_get_data(G_OBJECT(widget), "rigctrl-popup-opened") != NULL;
-    g_object_set_data(G_OBJECT(widget), "rigctrl-popup-pending", NULL);
-
-    if (!pending || opened)
-    {
-        RIGCTRL_TRSP_POPUP_LOG("%s: release ignored pending=%d opened=%d",
-                               __func__, pending ? 1 : 0, opened ? 1 : 0);
-        return TRUE;
-    }
-
-    RIGCTRL_TRSP_POPUP_LOG("%s: popup on release", __func__);
-    gtk_combo_box_popup(GTK_COMBO_BOX(widget));
-    g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
-    return TRUE;
+    return FALSE;
 }
 
 static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
@@ -3524,6 +3698,8 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
     if (combo != NULL)
         g_object_set_data(G_OBJECT(combo), "rigctrl-popup-opened",
                           GINT_TO_POINTER(1));
+    if (combo != NULL)
+        g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(combo));
 
     while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
         scrolled = gtk_widget_get_parent(scrolled);
@@ -4160,6 +4336,10 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
     rigctrl_update_payload_profile(ctrl, "load_trsp_list");
     if (gtk_combo_box_get_active(GTK_COMBO_BOX(ctrl->TrspSel)) != 0)
         gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->TrspSel), 0);
+
+    if (ctrl->TrspSel != NULL)
+        g_idle_add(rigctrl_configure_trsp_popup_idle,
+                   g_object_ref(ctrl->TrspSel));
 }
 
 static gboolean have_conf(void)
@@ -4420,6 +4600,7 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
 
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->cycle_spin),
                                   ctrl->conf->cycle);
+        rigctrl_apply_log_level_from_conf(ctrl, ctrl->conf);
 
         /* update LO widgets */
         buff = g_strdup_printf(_("%.0f MHz"), ctrl->conf->lo / 1.0e6);
@@ -5017,6 +5198,7 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
 static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 {
     GtkWidget      *frame, *table, *label;
+    GtkWidget      *log_box;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -5063,6 +5245,27 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     if (ctrl->term_view != NULL)
         gp_term_view_set_visible(ctrl->term_view, FALSE);
     gtk_grid_attach(GTK_GRID(table), ctrl->log_toggle, 2, 1, 1, 1);
+
+    /* Verbose rig logging toggle */
+    log_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    ctrl->log_verbose_toggle =
+        gtk_check_button_new_with_label(_("Verbose rig logging"));
+    gtk_widget_set_tooltip_text(ctrl->log_verbose_toggle,
+                                _("Enable detailed rig logging summaries"));
+    g_signal_connect(ctrl->log_verbose_toggle, "toggled",
+                     G_CALLBACK(rig_verbose_toggle_cb), ctrl);
+    gtk_box_pack_start(GTK_BOX(log_box), ctrl->log_verbose_toggle, FALSE, FALSE, 0);
+
+    ctrl->log_trace_toggle =
+        gtk_check_button_new_with_label(_("Trace rig logging"));
+    gtk_widget_set_tooltip_text(ctrl->log_trace_toggle,
+                                _("Include raw rigctl TX/RX lines"));
+    g_signal_connect(ctrl->log_trace_toggle, "toggled",
+                     G_CALLBACK(rig_trace_toggle_cb), ctrl);
+    gtk_box_pack_start(GTK_BOX(log_box), ctrl->log_trace_toggle, FALSE, FALSE, 0);
+    gtk_grid_attach(GTK_GRID(table), log_box, 1, 2, 2, 1);
+
+    rigctrl_sync_log_toggles(ctrl);
 
     /* Engage button */
     ctrl->LockBut = gtk_toggle_button_new_with_label(_("Engage"));
@@ -5191,7 +5394,7 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
         buffout[0] = '\0';
 
     rig_term_log_tx(ctrl, buff);
-    if (ctrl->verbose_logging)
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_TRACE))
     {
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     _("%s:%s: sending %d bytes to rigctld as \"%s\""),
@@ -5205,6 +5408,9 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
     {
         gchar *trim_cmd = g_strdup(buff);
         gint err = info.err ? info.err : EIO;
+
+        if (!rigctrl_log_at_least(ctrl, RIG_LOG_TRACE))
+            rig_term_log_raw(ctrl, "gpredict:tx", buff, TRUE);
 
         if (trim_cmd)
         {
@@ -5265,6 +5471,11 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
 
         rprt_error = TRUE;
         rig_term_log_err_rprt(ctrl, buff, buffout, rprt);
+        if (!rigctrl_log_at_least(ctrl, RIG_LOG_TRACE))
+        {
+            rig_term_log_raw(ctrl, "gpredict:tx", buff, TRUE);
+            rig_term_log_raw(ctrl, "gpredict:rx", buffout, TRUE);
+        }
 
         if (trim_cmd)
         {
@@ -9364,6 +9575,29 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
                  session->backend_version ? session->backend_version : "(unknown)",
                  session->signature ? session->signature : "(unknown)",
                  session->vfo_candidates ? session->vfo_candidates->len : 0);
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE) &&
+        session->vfo_candidates != NULL &&
+        session->vfo_candidates->len > 0)
+    {
+        GString *list = g_string_new(NULL);
+
+        for (guint i = 0; i < session->vfo_candidates->len; i++)
+        {
+            const gchar *entry = g_ptr_array_index(session->vfo_candidates, i);
+            if (entry == NULL || *entry == '\0')
+                continue;
+            if (list->len > 0)
+                g_string_append(list, ", ");
+            g_string_append(list, entry);
+        }
+
+        if (list->len > 0)
+            rig_term_log_verbose(ctrl, "gpredict",
+                                 "rig session (%s) vfo_candidates=%s",
+                                 session->label ? session->label : "rig",
+                                 list->str);
+        g_string_free(list, TRUE);
+    }
 
     freq_ok = caps->has_get_freq;
     vfo_opt_args_ok = (session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
@@ -9483,11 +9717,12 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
 
     rigctld_extract_first_lines(buffer, &line1, &line2);
     parsed = parse_dump_state_model_id(buffer, &model);
-    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "rigctld dump_state: line1=%s line2=%s model=%d",
-                line1 ? line1 : "(none)",
-                line2 ? line2 : "(none)",
-                model);
+    if (rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctld dump_state: line1=%s line2=%s model=%d",
+                    line1 ? line1 : "(none)",
+                    line2 ? line2 : "(none)",
+                    model);
 
     if (!parsed)
     {

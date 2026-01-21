@@ -579,7 +579,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
         .rigctld_extra_args = NULL,
-        .rigctld_autodetect_match = NULL
+        .rigctld_autodetect_match = NULL,
+        .rig_log_level = RIG_LOG_QUIET
     };
 
     gtk_tree_model_get(model, &iter,
@@ -858,7 +859,8 @@ static void add_cb(GtkWidget * button, gpointer data)
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
         .rigctld_extra_args = NULL,
-        .rigctld_autodetect_match = NULL
+        .rigctld_autodetect_match = NULL,
+        .rig_log_level = RIG_LOG_QUIET
     };
 
     ctx->store =
@@ -976,7 +978,8 @@ void sat_pref_rig_ok()
         .rigctld_baud = 0,
         .rigctld_civaddr = NULL,
         .rigctld_extra_args = NULL,
-        .rigctld_autodetect_match = NULL
+        .rigctld_autodetect_match = NULL,
+        .rig_log_level = RIG_LOG_QUIET
     };
 
     /* delete all .rig files */

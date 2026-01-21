@@ -48,6 +48,9 @@ typedef struct RigCaps {
 
 typedef struct _RigctldClient RigctldClient;
 
+void                  rigctld_client_set_log_level(rig_log_level_t level);
+rig_log_level_t       rigctld_client_get_log_level(void);
+
 RigctldClient        *rigctld_client_new(const gchar *label);
 void                  rigctld_client_free(RigctldClient **client);
 void                  rigctld_client_reset(RigctldClient *client);

@@ -844,6 +844,7 @@ static void rot_session_set_state(GtkRotCtrl *ctrl,
 
 static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
                                          gboolean rotpos_valid,
+                                         gboolean pos_unknown,
                                          gboolean io_error)
 {
     rotctld_client_state_t client_state = ROTCTLD_CLIENT_STOPPED;
@@ -885,6 +886,12 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     if (rotpos_valid)
     {
         rot_session_set_state(ctrl, ROT_SESSION_READY, "pos ok", FALSE);
+        return;
+    }
+
+    if (pos_unknown)
+    {
+        rot_session_set_state(ctrl, ROT_SESSION_READY, "pos unknown", FALSE);
         return;
     }
 
@@ -3575,118 +3582,130 @@ static gpointer rotctld_client_thread(gpointer data)
 
                 if (ctrl != NULL)
                 {
-                    RotTransformSnapshotState snap_state;
-                    const RotTransformSnapshot *snap = NULL;
-                    AzSpan span_mode;
-                    gdouble span_min = 0.0;
-                    gdouble span_max = 0.0;
-                    gdouble raw_az = hs_az;
-                    gdouble mapped_az = 0.0;
-                    gdouble mapped_el = hs_el;
-                    gboolean el_clamped = FALSE;
-                    gboolean needs_correction = FALSE;
-
-                    rot_transform_snapshot_state_init(&snap_state);
-                    (void)rot_transform_snapshot_state_get(ctrl, &snap_state);
-                    snap = &snap_state.transform;
-                    span_mode = rotctrl_span_from_az_type(snap->az_norm_mode);
-                    rotctrl_span_bounds(span_mode, &span_min, &span_max);
-
-                    mapped_az = az_norm_span(raw_az, span_mode);
-
-                    if (ctrl->conf &&
-                        ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+                    if (pos_ok)
                     {
-                        mapped_el = snap->el_min_deg;
-                    }
-                    else
-                    {
-                        if (mapped_el < snap->el_min_deg)
+                        RotTransformSnapshotState snap_state;
+                        const RotTransformSnapshot *snap = NULL;
+                        AzSpan span_mode;
+                        gdouble span_min = 0.0;
+                        gdouble span_max = 0.0;
+                        gdouble raw_az = hs_az;
+                        gdouble mapped_az = 0.0;
+                        gdouble mapped_el = hs_el;
+                        gboolean el_clamped = FALSE;
+                        gboolean needs_correction = FALSE;
+
+                        rot_transform_snapshot_state_init(&snap_state);
+                        (void)rot_transform_snapshot_state_get(ctrl, &snap_state);
+                        snap = &snap_state.transform;
+                        span_mode = rotctrl_span_from_az_type(snap->az_norm_mode);
+                        rotctrl_span_bounds(span_mode, &span_min, &span_max);
+
+                        mapped_az = az_norm_span(raw_az, span_mode);
+
+                        if (ctrl->conf &&
+                            ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
                         {
                             mapped_el = snap->el_min_deg;
-                            el_clamped = TRUE;
-                        }
-                        else if (mapped_el > snap->el_max_deg)
-                        {
-                            mapped_el = snap->el_max_deg;
-                            el_clamped = TRUE;
-                        }
-                    }
-
-                    if (raw_az < (span_min - 1e-3) ||
-                        raw_az > (span_max + 1e-3))
-                        needs_correction = TRUE;
-                    if (fabs(mapped_az - raw_az) > 1e-3 || el_clamped)
-                        needs_correction = TRUE;
-
-                    if (needs_correction)
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_WARN,
-                                    "%s: rotor initial position outside selected span: "
-                                    "raw az=%.2f => mapped az=%.2f (span=%.0f..%.0f); issuing corrective P",
-                                    __func__, raw_az, mapped_az,
-                                    span_min, span_max);
-
-                        if (!rotctld_client_set_pos(ctrl->client.client,
-                                                    mapped_az, mapped_el))
-                        {
-                            sat_log_log(SAT_LOG_LEVEL_WARN,
-                                        "%s: corrective set_position failed; continuing",
-                                        __func__);
                         }
                         else
                         {
-                            gint waited_ms = 0;
-
-                            while (waited_ms < ROTCTLD_BASELINE_TIMEOUT_MS)
+                            if (mapped_el < snap->el_min_deg)
                             {
-                                gdouble cur_az = 0.0;
-                                gdouble cur_el = 0.0;
-
-                                if (rotctld_stop_requested(ctrl))
-                                    break;
-                                if (rotctld_client_get_pos(ctrl->client.client,
-                                                           &cur_az, &cur_el))
-                                {
-                                    gdouble cur_span = az_norm_span(cur_az,
-                                                                    span_mode);
-                                    hs_az = cur_az;
-                                    hs_el = cur_el;
-                                    if (fabs(cur_span - mapped_az) <=
-                                            ROTCTLD_BASELINE_DEADBAND_DEG &&
-                                        fabs(cur_el - mapped_el) <=
-                                            ROTCTLD_BASELINE_DEADBAND_DEG)
-                                        break;
-                                }
-
-                                rotctld_sleep_us(ctrl, (gint64)ROTCTLD_BASELINE_POLL_MS * 1000);
-                                waited_ms += ROTCTLD_BASELINE_POLL_MS;
+                                mapped_el = snap->el_min_deg;
+                                el_clamped = TRUE;
+                            }
+                            else if (mapped_el > snap->el_max_deg)
+                            {
+                                mapped_el = snap->el_max_deg;
+                                el_clamped = TRUE;
                             }
                         }
+
+                        if (raw_az < (span_min - 1e-3) ||
+                            raw_az > (span_max + 1e-3))
+                            needs_correction = TRUE;
+                        if (fabs(mapped_az - raw_az) > 1e-3 || el_clamped)
+                            needs_correction = TRUE;
+
+                        if (needs_correction)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_WARN,
+                                        "%s: rotor initial position outside selected span: "
+                                        "raw az=%.2f => mapped az=%.2f (span=%.0f..%.0f); issuing corrective P",
+                                        __func__, raw_az, mapped_az,
+                                        span_min, span_max);
+
+                            if (!rotctld_client_set_pos(ctrl->client.client,
+                                                        mapped_az, mapped_el))
+                            {
+                                sat_log_log(SAT_LOG_LEVEL_WARN,
+                                            "%s: corrective set_position failed; continuing",
+                                            __func__);
+                            }
+                            else
+                            {
+                                gint waited_ms = 0;
+
+                                while (waited_ms < ROTCTLD_BASELINE_TIMEOUT_MS)
+                                {
+                                    gdouble cur_az = 0.0;
+                                    gdouble cur_el = 0.0;
+
+                                    if (rotctld_stop_requested(ctrl))
+                                        break;
+                                    if (rotctld_client_get_pos(ctrl->client.client,
+                                                               &cur_az, &cur_el))
+                                    {
+                                        gdouble cur_span = az_norm_span(cur_az,
+                                                                        span_mode);
+                                        hs_az = cur_az;
+                                        hs_el = cur_el;
+                                        if (fabs(cur_span - mapped_az) <=
+                                                ROTCTLD_BASELINE_DEADBAND_DEG &&
+                                            fabs(cur_el - mapped_el) <=
+                                                ROTCTLD_BASELINE_DEADBAND_DEG)
+                                            break;
+                                    }
+
+                                    rotctld_sleep_us(ctrl, (gint64)ROTCTLD_BASELINE_POLL_MS * 1000);
+                                    waited_ms += ROTCTLD_BASELINE_POLL_MS;
+                                }
+                            }
+                        }
+
+                        hs_az = az_norm_span(hs_az, span_mode);
+                        hs_el = mapped_el;
+
+                        g_mutex_lock(&ctrl->client.mutex);
+                        ctrl->az_hold_active = FALSE;
+                        if (snap->zenith_guard_enable &&
+                            hs_el >= snap->zenith_guard_el_deg)
+                        {
+                            ctrl->az_hold_active = TRUE;
+                            ctrl->az_hold_value = hs_az;
+                        }
+                        ctrl->client.azi_in = hs_az;
+                        ctrl->client.ele_in = hs_el;
+                        ctrl->client.azi_out = hs_az;
+                        ctrl->client.ele_out = hs_el;
+                        ctrl->client.raw_azi_out = hs_az;
+                        ctrl->client.raw_ele_out = hs_el;
+                        ctrl->client.pos_valid = TRUE;
+                        ctrl->client.pos_unknown = FALSE;
+                        ctrl->client.last_pos_us = g_get_monotonic_time();
+                        g_mutex_unlock(&ctrl->client.mutex);
+                        rotctld_note_io_ok(ctrl);
                     }
-
-                    hs_az = az_norm_span(hs_az, span_mode);
-                    hs_el = mapped_el;
-
-                    g_mutex_lock(&ctrl->client.mutex);
-                    ctrl->az_hold_active = FALSE;
-                    if (snap->zenith_guard_enable &&
-                        hs_el >= snap->zenith_guard_el_deg)
+                    else
                     {
-                        ctrl->az_hold_active = TRUE;
-                        ctrl->az_hold_value = hs_az;
+                        g_mutex_lock(&ctrl->client.mutex);
+                        ctrl->client.pos_valid = FALSE;
+                        ctrl->client.pos_unknown = TRUE;
+                        ctrl->client.last_pos_us = 0;
+                        ctrl->client.last_pos_attempt_us = 0;
+                        g_mutex_unlock(&ctrl->client.mutex);
                     }
-                    ctrl->client.azi_in = hs_az;
-                    ctrl->client.ele_in = hs_el;
-                    ctrl->client.azi_out = hs_az;
-                    ctrl->client.ele_out = hs_el;
-                    ctrl->client.raw_azi_out = hs_az;
-                    ctrl->client.raw_ele_out = hs_el;
-                    ctrl->client.pos_valid = TRUE;
-                    ctrl->client.pos_unknown = FALSE;
-                    ctrl->client.last_pos_us = g_get_monotonic_time();
-                    g_mutex_unlock(&ctrl->client.mutex);
-                    rotctld_note_io_ok(ctrl);
                 }
 
                 gboolean caps_ok = rotctld_client_probe(ctrl->client.client,
@@ -3754,44 +3773,47 @@ static gpointer rotctld_client_thread(gpointer data)
                     }
                     g_mutex_unlock(&ctrl->client.mutex);
 
-                    for (gint attempt = 0; attempt < 2; attempt++)
+                    if (pos_ok)
                     {
-                        if (attempt == 0)
+                        for (gint attempt = 0; attempt < 2; attempt++)
                         {
-                            cur_az = hs_az;
-                            cur_el = hs_el;
-                            g_mutex_lock(&ctrl->client.mutex);
-                            ctrl->client.azi_in = cur_az;
-                            ctrl->client.ele_in = cur_el;
-                            ctrl->client.azi_out = cur_az;
-                            ctrl->client.ele_out = cur_el;
-                            ctrl->client.raw_azi_out = cur_az;
-                            ctrl->client.raw_ele_out = cur_el;
-                            ctrl->client.pos_valid = TRUE;
-                            ctrl->client.pos_unknown = FALSE;
-                            ctrl->client.last_pos_us = g_get_monotonic_time();
-                            g_mutex_unlock(&ctrl->client.mutex);
-                            rotctld_note_io_ok(ctrl);
-                            break;
+                            if (attempt == 0)
+                            {
+                                cur_az = hs_az;
+                                cur_el = hs_el;
+                                g_mutex_lock(&ctrl->client.mutex);
+                                ctrl->client.azi_in = cur_az;
+                                ctrl->client.ele_in = cur_el;
+                                ctrl->client.azi_out = cur_az;
+                                ctrl->client.ele_out = cur_el;
+                                ctrl->client.raw_azi_out = cur_az;
+                                ctrl->client.raw_ele_out = cur_el;
+                                ctrl->client.pos_valid = TRUE;
+                                ctrl->client.pos_unknown = FALSE;
+                                ctrl->client.last_pos_us = g_get_monotonic_time();
+                                g_mutex_unlock(&ctrl->client.mutex);
+                                rotctld_note_io_ok(ctrl);
+                                break;
+                            }
+                            if (rotctld_client_get_pos(ctrl->client.client,
+                                                       &cur_az, &cur_el))
+                            {
+                                g_mutex_lock(&ctrl->client.mutex);
+                                ctrl->client.azi_in = cur_az;
+                                ctrl->client.ele_in = cur_el;
+                                ctrl->client.azi_out = cur_az;
+                                ctrl->client.ele_out = cur_el;
+                                ctrl->client.raw_azi_out = cur_az;
+                                ctrl->client.raw_ele_out = cur_el;
+                                ctrl->client.pos_valid = TRUE;
+                                ctrl->client.pos_unknown = FALSE;
+                                ctrl->client.last_pos_us = g_get_monotonic_time();
+                                g_mutex_unlock(&ctrl->client.mutex);
+                                rotctld_note_io_ok(ctrl);
+                                break;
+                            }
+                            rotctld_sleep_us(ctrl, (gint64)ROTCTLD_HANDSHAKE_RETRY_MS * 1000);
                         }
-                        if (rotctld_client_get_pos(ctrl->client.client,
-                                                   &cur_az, &cur_el))
-                        {
-                            g_mutex_lock(&ctrl->client.mutex);
-                            ctrl->client.azi_in = cur_az;
-                            ctrl->client.ele_in = cur_el;
-                            ctrl->client.azi_out = cur_az;
-                            ctrl->client.ele_out = cur_el;
-                            ctrl->client.raw_azi_out = cur_az;
-                            ctrl->client.raw_ele_out = cur_el;
-                            ctrl->client.pos_valid = TRUE;
-                            ctrl->client.pos_unknown = FALSE;
-                            ctrl->client.last_pos_us = g_get_monotonic_time();
-                            g_mutex_unlock(&ctrl->client.mutex);
-                            rotctld_note_io_ok(ctrl);
-                            break;
-                        }
-                        rotctld_sleep_us(ctrl, (gint64)ROTCTLD_HANDSHAKE_RETRY_MS * 1000);
                     }
                 }
             }
@@ -3991,8 +4013,34 @@ static gpointer rotctld_client_thread(gpointer data)
         {
             gdouble cur_az = 0.0;
             gdouble cur_el = 0.0;
-            if (rotctld_client_get_pos(ctrl->client.client, &cur_az, &cur_el))
+            gboolean pos_unknown = FALSE;
+            gint64 now_us = g_get_monotonic_time();
+            gint64 last_attempt = 0;
+            const gint64 retry_us = 2000000;
+            gboolean do_retry = TRUE;
+
+            g_mutex_lock(&ctrl->client.mutex);
+            pos_unknown = ctrl->client.pos_unknown;
+            last_attempt = ctrl->client.last_pos_attempt_us;
+            if (pos_unknown && last_attempt > 0 &&
+                (now_us - last_attempt) < retry_us)
+                do_retry = FALSE;
+            else
+                ctrl->client.last_pos_attempt_us = now_us;
+            g_mutex_unlock(&ctrl->client.mutex);
+
+            if (!do_retry)
             {
+                /* defer get_position retry while pos is unknown */
+            }
+            else if (rotctld_client_get_pos(ctrl->client.client, &cur_az, &cur_el))
+            {
+                if (pos_unknown)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "get_position recovered: az=%.2f el=%.2f",
+                                cur_az, cur_el);
+                }
                 g_mutex_lock(&ctrl->client.mutex);
                 ctrl->client.azi_in = cur_az;
                 ctrl->client.ele_in = cur_el;
@@ -4004,8 +4052,11 @@ static gpointer rotctld_client_thread(gpointer data)
             }
             else
             {
-                if (rotctld_note_io_failure(ctrl, "get_position"))
-                    io_error = TRUE;
+                if (!pos_unknown)
+                {
+                    if (rotctld_note_io_failure(ctrl, "get_position"))
+                        io_error = TRUE;
+                }
             }
         }
 
@@ -4020,7 +4071,9 @@ static gpointer rotctld_client_thread(gpointer data)
             ctrl->client.cmd_rejected = FALSE;
             ctrl->client.reject_backoff_until_us = 0;
             ctrl->client.pos_valid = FALSE;
+            ctrl->client.pos_unknown = FALSE;
             ctrl->client.last_pos_us = 0;
+            ctrl->client.last_pos_attempt_us = 0;
             g_mutex_unlock(&ctrl->client.mutex);
         }
 
@@ -5107,7 +5160,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 gtk_label_set_text(GTK_LABEL(status_label), _("LINK DOWN"));
         }
 
-        rotctrl_update_session_state(ctrl, rotpos_valid, error);
+        rotctrl_update_session_state(ctrl, rotpos_valid, pos_unknown, error);
 
         /* update status label if present, based on data and feedback mode */
         if (status_label)
@@ -5184,7 +5237,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         {
             const gchar *status_text = NULL;
 
-            rotctrl_update_session_state(ctrl, FALSE, FALSE);
+            rotctrl_update_session_state(ctrl, FALSE, FALSE, FALSE);
 
             if (ctrl->session_state == ROT_SESSION_CONNECTING)
                 status_text = _("CONNECTING");
