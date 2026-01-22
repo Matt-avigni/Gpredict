@@ -159,13 +159,23 @@ static gdouble azel_select_extended(const SpanConfig *config,
         {
             best = cand;
             found = TRUE;
-            best_diff = have_current ? fabs(cand - current_az) : 0.0;
+            best_diff = have_current ? fabs(cand - current_az)
+                                     : fabs(cand - az_norm);
             continue;
         }
 
-        if (config->prefer_shortest_path && have_current)
+        if (have_current && config->prefer_shortest_path)
         {
             gdouble diff = fabs(cand - current_az);
+            if (diff < best_diff)
+            {
+                best = cand;
+                best_diff = diff;
+            }
+        }
+        else if (!have_current)
+        {
+            gdouble diff = fabs(cand - az_norm);
             if (diff < best_diff)
             {
                 best = cand;

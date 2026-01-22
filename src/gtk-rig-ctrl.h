@@ -16,6 +16,8 @@ typedef struct _RigctldMgr RigctldMgr;
 typedef struct _GpTermView GpTermView;
 typedef struct _RigSession RigSession;
 typedef struct _RigctldClient RigctldClient;
+typedef struct _GTask GTask;
+typedef struct _GCancellable GCancellable;
 
 
 #define GTK_TYPE_RIG_CTRL          (gtk_rig_ctrl_get_type ())
@@ -80,6 +82,12 @@ struct _gtk_rig_ctrl {
     guint           timerid;    /*!< Timer ID */
 
     gboolean        tracking;   /*!< Flag set when we are tracking a target. */
+    gboolean        rx_track_enabled; /*!< RX tracking toggle */
+    gboolean        tx_track_enabled; /*!< TX tracking toggle */
+    gint64          menu_rx_hz; /*!< RX menu/base frequency (Hz) */
+    gint64          menu_tx_hz; /*!< TX menu/base frequency (Hz) */
+    gint64          target_radio_rx_hz; /*!< RX target rig frequency (Hz) */
+    gint64          target_radio_tx_hz; /*!< TX target rig frequency (Hz) */
     GMutex          busy;       /*!< Flag set when control algorithm is busy. */
     gboolean        engaged;    /*!< Flag indicating that rig device is engaged. */
     gboolean        engage_pending; /*!< True while initial engage attempt is unresolved. */
@@ -152,6 +160,8 @@ struct _gtk_rig_ctrl {
     rigctrl_conn_state_t conn_state2;   /*!< Secondary connection state */
     gboolean        opening;            /*!< Guard against re-entrant open */
     gboolean        opening2;           /*!< Guard against re-entrant open (secondary) */
+    GTask          *open_task;          /*!< Async engage/open task */
+    GCancellable   *open_cancellable;   /*!< Engage/open cancellation */
     guint           reconnect_source_id;  /*!< Scheduled reconnect source (primary) */
     guint           reconnect_source_id2; /*!< Scheduled reconnect source (secondary) */
     guint           close_pending_id;     /*!< Pending close handler source id */
