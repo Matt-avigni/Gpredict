@@ -5207,7 +5207,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(table), 5);
     gtk_grid_set_row_spacing(GTK_GRID(table), 5);
 
-    section_label = gtk_label_new(_("Target selection"));
+    section_label = gtk_label_new(_("Target preset"));
     g_object_set(section_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), section_label, 0, 0, 4, 1);
 

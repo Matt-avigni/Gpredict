@@ -55,6 +55,8 @@ static GtkWidget *minaz;
 static GtkWidget *maxaz;
 static GtkWidget *minel;
 static GtkWidget *maxel;
+static GtkWidget *minel_label;
+static GtkWidget *maxel_label;
 static GtkWidget *azstoppos;
 static GtkWidget *axismode;
 static GtkWidget *invert_az;
@@ -72,6 +74,9 @@ typedef struct {
     gpointer               user_data;
     gboolean               finished;
 } RotPrefDialogState;
+
+static void update_el_limits_sensitivity(void);
+static void axismode_changed_cb(GtkComboBox *box, gpointer data);
 
 static void rot_pref_message_response(GtkDialog *dialog,
                                       gint response,
@@ -627,7 +632,10 @@ static void update_widgets(rotor_conf_t * conf)
     rot_pref_scan_devices_async(conf->device, FALSE);
     rot_pref_update_device_ui_state();
 
-    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), conf->aztype);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype),
+                             (conf->aztype == ROT_AZ_TYPE_180)
+                             ? ROT_AZ_TYPE_180
+                             : ROT_AZ_TYPE_360);
 
     /* az and el limits */
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), conf->minaz);
@@ -636,6 +644,7 @@ static void update_widgets(rotor_conf_t * conf)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), conf->maxel);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), conf->azstoppos);
     gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), conf->axis_mode);
+    update_el_limits_sensitivity();
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_az), conf->invert_az);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_el), conf->invert_el);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(use_offset), conf->use_offset);
@@ -665,6 +674,7 @@ static void clear_widgets(void)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), 90);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0);
     gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
+    update_el_limits_sensitivity();
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_az), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_el), FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(use_offset), FALSE);
@@ -772,6 +782,31 @@ static void device_combo_changed_cb(GtkComboBox *box, gpointer data)
     rot_pref_update_device_ui_state();
 }
 
+static void update_el_limits_sensitivity(void)
+{
+    gboolean az_el = TRUE;
+
+    if (axismode)
+        az_el = (gtk_combo_box_get_active(GTK_COMBO_BOX(axismode)) == ROT_AXIS_MODE_AZ_EL);
+
+    if (minel)
+        gtk_widget_set_sensitive(minel, az_el);
+    if (maxel)
+        gtk_widget_set_sensitive(maxel, az_el);
+    if (minel_label)
+        gtk_widget_set_sensitive(minel_label, az_el);
+    if (maxel_label)
+        gtk_widget_set_sensitive(maxel_label, az_el);
+}
+
+static void axismode_changed_cb(GtkComboBox *box, gpointer data)
+{
+    (void)box;
+    (void)data;
+
+    update_el_limits_sensitivity();
+}
+
 static void aztype_changed_cb(GtkComboBox * box, gpointer data)
 {
     gint            type = gtk_combo_box_get_active(box);
@@ -790,12 +825,6 @@ static void aztype_changed_cb(GtkComboBox * box, gpointer data)
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), -180.0);
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), +180.0);
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), -180.0);
-        break;
-
-    case ROT_AZ_TYPE_480:
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 480.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0.0);
         break;
 
     default:
@@ -962,67 +991,85 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
                     0, 10, 4, 1);
 
-    /* Az-type */
-    label = gtk_label_new(_("Az type"));
+    /* Axis mode */
+    label = gtk_label_new(_("Axis mode"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
 
+    axismode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
+                                   _("Azimuth + Elevation"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
+                                   _("Azimuth only"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
+    gtk_widget_set_tooltip_text(axismode,
+                                _("Select whether this rotor supports both azimuth and elevation."));
+    gtk_grid_attach(GTK_GRID(table), axismode, 1, 11, 2, 1);
+    g_signal_connect(G_OBJECT(axismode), "changed",
+                     G_CALLBACK(axismode_changed_cb), NULL);
+
+    /* Tracking geometry */
+    label = gtk_label_new(_("Tracking geometry"));
+    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 4, 1);
+
+    label = gtk_label_new(_("Az wrap type"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
+
     aztype = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
-                                   "0\302\260 \342\206\222 180\302\260 \342\206\222 360\302\260");
+                                   _("0\302\260 \342\206\222 360\302\260"));
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
-                                   "-180\302\260 \342\206\222 0\302\260 \342\206\222 +180\302\260");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
-                                   "0\302\260 \342\206\222 480\302\260");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), 0);
+                                   _("North-centered (-180\302\260..+180\302\260)"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), ROT_AZ_TYPE_360);
     gtk_widget_set_tooltip_text(aztype,
-                                _("Select your azimuth range here. Note that "
-                                  "gpredict assumes that 0\302\260 is at North "
-                                  "and + direction is clockwise for both types"));
-    gtk_grid_attach(GTK_GRID(table), aztype, 1, 11, 2, 1);
+                                _("Select the azimuth wrap convention. "
+                                  "0\302\260 is at North, clockwise is positive."));
+    gtk_grid_attach(GTK_GRID(table), aztype, 1, 13, 2, 1);
     g_signal_connect(G_OBJECT(aztype), "changed",
                      G_CALLBACK(aztype_changed_cb), NULL);
 
     /* Az and El limits */
     label = gtk_label_new(_(" Min Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
     minaz = gtk_spin_button_new_with_range(-200, 100, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(minaz), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(minaz), FALSE);
-    gtk_grid_attach(GTK_GRID(table), minaz, 1, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), minaz, 1, 14, 1, 1);
 
     label = gtk_label_new(_(" Max Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 14, 1, 1);
     maxaz = gtk_spin_button_new_with_range(0, 480, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 360);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(maxaz), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(maxaz), FALSE);
-    gtk_grid_attach(GTK_GRID(table), maxaz, 3, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), maxaz, 3, 14, 1, 1);
 
-    label = gtk_label_new(_(" Min El"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
+    minel_label = gtk_label_new(_(" Min El"));
+    g_object_set(minel_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), minel_label, 0, 15, 1, 1);
     minel = gtk_spin_button_new_with_range(-10, 180, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(minel), 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(minel), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(minel), FALSE);
-    gtk_grid_attach(GTK_GRID(table), minel, 1, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), minel, 1, 15, 1, 1);
 
-    label = gtk_label_new(_(" Max El"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 13, 1, 1);
+    maxel_label = gtk_label_new(_(" Max El"));
+    g_object_set(maxel_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), maxel_label, 2, 15, 1, 1);
     maxel = gtk_spin_button_new_with_range(-10, 180, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), 90);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(maxel), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(maxel), FALSE);
-    gtk_grid_attach(GTK_GRID(table), maxel, 3, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), maxel, 3, 15, 1, 1);
 
     label = gtk_label_new(_(" Azimuth end stop position"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 1, 14, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 1, 16, 2, 1);
     azstoppos = gtk_spin_button_new_with_range(-180, 360, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(azstoppos), TRUE);
@@ -1036,65 +1083,50 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
                                   "is 0\302\260, and the default for a "
                                   "-180\302\260 \342\206\222 0\302\260 "
                                   "\342\206\222 +180\302\260 rotor is -180\302\260."));
-    gtk_grid_attach(GTK_GRID(table), azstoppos, 3, 14, 1, 1);
-
-    /* Axis mode */
-    label = gtk_label_new(_("Axis mode"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
-
-    axismode = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
-                                   _("Azimuth + Elevation"));
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
-                                   _("Azimuth only"));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
-    gtk_widget_set_tooltip_text(axismode,
-                                _("Select whether this rotor supports both azimuth and elevation."));
-    gtk_grid_attach(GTK_GRID(table), axismode, 1, 15, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), azstoppos, 3, 16, 1, 1);
 
     /* Axis inversion */
     label = gtk_label_new(_("Invert"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 16, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
 
     invert_az = gtk_check_button_new_with_label(_("Az"));
-    gtk_grid_attach(GTK_GRID(table), invert_az, 1, 16, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), invert_az, 1, 17, 1, 1);
     invert_el = gtk_check_button_new_with_label(_("El"));
-    gtk_grid_attach(GTK_GRID(table), invert_el, 2, 16, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), invert_el, 2, 17, 1, 1);
 
     /* Offsets */
     label = gtk_label_new(_("Offsets"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 18, 1, 1);
 
     use_offset = gtk_check_button_new_with_label(_("Enable"));
     gtk_widget_set_tooltip_text(use_offset,
                                 _("Apply fixed software offsets to azimuth/elevation.\n"
                                   "Near-zenith tracking (>=85°) automatically holds azimuth."));
-    gtk_grid_attach(GTK_GRID(table), use_offset, 1, 17, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), use_offset, 1, 18, 1, 1);
 
     label = gtk_label_new(_(" Az offset"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 18, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 19, 1, 1);
     az_offset = gtk_spin_button_new_with_range(-360, 360, 0.1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(az_offset), 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), 0.0);
-    gtk_grid_attach(GTK_GRID(table), az_offset, 1, 18, 1, 1);
-    label = gtk_label_new(_("deg"));
-    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 18, 1, 1);
-
-    label = gtk_label_new(_(" El offset"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 19, 1, 1);
-    el_offset = gtk_spin_button_new_with_range(-90, 90, 0.1);
-    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_offset), 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), 0.0);
-    gtk_grid_attach(GTK_GRID(table), el_offset, 1, 19, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), az_offset, 1, 19, 1, 1);
     label = gtk_label_new(_("deg"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 2, 19, 1, 1);
+
+    label = gtk_label_new(_(" El offset"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 20, 1, 1);
+    el_offset = gtk_spin_button_new_with_range(-90, 90, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_offset), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), 0.0);
+    gtk_grid_attach(GTK_GRID(table), el_offset, 1, 20, 1, 1);
+    label = gtk_label_new(_("deg"));
+    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 20, 1, 1);
 
     if (conf->name != NULL)
         update_widgets(conf);
@@ -1103,6 +1135,8 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
         rot_pref_scan_devices_async(NULL, FALSE);
         rot_pref_update_device_ui_state();
     }
+
+    update_el_limits_sensitivity();
 
     gtk_widget_show_all(table);
 

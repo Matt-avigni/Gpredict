@@ -76,6 +76,10 @@ typedef struct {
     gdouble         el_offset;  /*!< Elevation offset (degrees) */
     gboolean        invert_az;  /*!< Invert azimuth axis */
     gboolean        invert_el;  /*!< Invert elevation axis */
+    gdouble         pretrack_seconds; /*!< Slew-to-AOS lookahead window (seconds) */
+    gboolean        slew_to_aos_while_below_horizon; /*!< Allow pretrack while below horizon */
+    gchar          *last_good_device; /*!< Last validated serial device */
+    gint            last_good_baud; /*!< Last validated baud rate */
 } rotor_conf_t;
 
 

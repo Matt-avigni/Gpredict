@@ -15,6 +15,7 @@ typedef enum {
 
 typedef enum {
     ROTCTLD_POS_OK = 0,
+    ROTCTLD_POS_TIMEOUT,
     ROTCTLD_POS_PARSE_FAIL,
     ROTCTLD_POS_RPRT_ERR,
     ROTCTLD_POS_IO_ERR
@@ -74,6 +75,21 @@ rotctld_pos_result_t  rotctld_client_get_pos_ex(RotctldClient *client,
                                                 gdouble *az_out,
                                                 gdouble *el_out,
                                                 HamlibResponseInfo *info,
+                                                gchar *reply_out,
+                                                gsize reply_len);
+rotctld_pos_result_t  rotctld_client_get_pos_ex_timeout(RotctldClient *client,
+                                                        gdouble *az_out,
+                                                        gdouble *el_out,
+                                                        HamlibResponseInfo *info,
+                                                        gchar *reply_out,
+                                                        gsize reply_len,
+                                                        gint timeout_ms,
+                                                        gint retries);
+gboolean              rotctld_client_set_pos_ex(RotctldClient *client,
+                                                gdouble az,
+                                                gdouble el,
+                                                gint *rprt_code_out,
+                                                HamlibResponseInfo *info_out,
                                                 gchar *reply_out,
                                                 gsize reply_len);
 gboolean              rotctld_client_set_pos(RotctldClient *client,

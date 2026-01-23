@@ -58,12 +58,18 @@
 #define KEY_EL_OFFSET   "ElOffset"
 #define KEY_AZ_INVERT   "AzInvert"
 #define KEY_EL_INVERT   "ElInvert"
+#define KEY_PRETRACK_SECONDS "PretrackSeconds"
+#define KEY_PRETRACK_SLEW "SlewToAOSWhileBelowHorizon"
+#define KEY_LAST_GOOD_DEVICE "LastGoodDevice"
+#define KEY_LAST_GOOD_BAUD "LastGoodBaud"
 
 #define DEFAULT_CYCLE_MS    1000
 #define DEFAULT_THLD_DEG    5.0
 #define DEFAULT_PROTOCOL    ROT_PROTOCOL_GS232B
 #define DEFAULT_AUTOSTART   TRUE
 #define DEFAULT_DEVICE_AUTOPICK TRUE
+#define DEFAULT_PRETRACK_SECONDS 300.0
+#define DEFAULT_PRETRACK_SLEW TRUE
 
 /* Hamlib rotator model IDs from hamlib/rotlist.h. */
 #define ROT_HAMLIB_MODEL_GS232B    ROT_MODEL_GS232B
@@ -223,9 +229,6 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
             conf->baud = 0;
         }
     }
-
-    if (conf->baud <= 0)
-        conf->baud = rot_protocol_default_baud(conf->protocol);
 
     conf->device = NULL;
     if (g_key_file_has_key(cfg, GROUP, KEY_DEVICE, NULL))
@@ -481,6 +484,68 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
         }
     }
 
+    conf->pretrack_seconds = DEFAULT_PRETRACK_SECONDS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_PRETRACK_SECONDS, NULL))
+    {
+        conf->pretrack_seconds =
+            g_key_file_get_double(cfg, GROUP, KEY_PRETRACK_SECONDS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: PretrackSeconds not defined for %s. Assuming %.0f."),
+                        __func__, conf->name, DEFAULT_PRETRACK_SECONDS);
+            g_clear_error(&error);
+            conf->pretrack_seconds = DEFAULT_PRETRACK_SECONDS;
+        }
+    }
+    if (conf->pretrack_seconds <= 0.0)
+        conf->pretrack_seconds = DEFAULT_PRETRACK_SECONDS;
+
+    conf->slew_to_aos_while_below_horizon = DEFAULT_PRETRACK_SLEW;
+    if (g_key_file_has_key(cfg, GROUP, KEY_PRETRACK_SLEW, NULL))
+    {
+        conf->slew_to_aos_while_below_horizon =
+            g_key_file_get_boolean(cfg, GROUP, KEY_PRETRACK_SLEW, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: SlewToAOSWhileBelowHorizon not defined for %s. Assuming true."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->slew_to_aos_while_below_horizon = DEFAULT_PRETRACK_SLEW;
+        }
+    }
+
+    conf->last_good_device = NULL;
+    if (g_key_file_has_key(cfg, GROUP, KEY_LAST_GOOD_DEVICE, NULL))
+    {
+        conf->last_good_device =
+            g_key_file_get_string(cfg, GROUP, KEY_LAST_GOOD_DEVICE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: LastGoodDevice not defined for %s."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->last_good_device = NULL;
+        }
+    }
+
+    conf->last_good_baud = 0;
+    if (g_key_file_has_key(cfg, GROUP, KEY_LAST_GOOD_BAUD, NULL))
+    {
+        conf->last_good_baud =
+            g_key_file_get_integer(cfg, GROUP, KEY_LAST_GOOD_BAUD, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: LastGoodBaud not defined for %s."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->last_good_baud = 0;
+        }
+    }
+
     g_key_file_free(cfg);
 
     return TRUE;
@@ -525,6 +590,10 @@ void rotor_conf_save(rotor_conf_t * conf)
     g_key_file_set_double(cfg, GROUP, KEY_EL_OFFSET, conf->el_offset);
     g_key_file_set_boolean(cfg, GROUP, KEY_AZ_INVERT, conf->invert_az);
     g_key_file_set_boolean(cfg, GROUP, KEY_EL_INVERT, conf->invert_el);
+    g_key_file_set_double(cfg, GROUP, KEY_PRETRACK_SECONDS,
+                          conf->pretrack_seconds);
+    g_key_file_set_boolean(cfg, GROUP, KEY_PRETRACK_SLEW,
+                           conf->slew_to_aos_while_below_horizon);
 
     if (conf->device && *conf->device)
         g_key_file_set_string(cfg, GROUP, KEY_DEVICE, conf->device);
@@ -535,6 +604,18 @@ void rotor_conf_save(rotor_conf_t * conf)
         g_key_file_set_string(cfg, GROUP, KEY_DEVICE_MANUAL, conf->device_manual);
     else
         g_key_file_remove_key(cfg, GROUP, KEY_DEVICE_MANUAL, NULL);
+
+    if (conf->last_good_device && *conf->last_good_device)
+        g_key_file_set_string(cfg, GROUP, KEY_LAST_GOOD_DEVICE,
+                              conf->last_good_device);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_LAST_GOOD_DEVICE, NULL);
+
+    if (conf->last_good_baud > 0)
+        g_key_file_set_integer(cfg, GROUP, KEY_LAST_GOOD_BAUD,
+                               conf->last_good_baud);
+    else
+        g_key_file_remove_key(cfg, GROUP, KEY_LAST_GOOD_BAUD, NULL);
 
     if (conf->cycle == DEFAULT_CYCLE_MS)
         g_key_file_remove_key(cfg, GROUP, KEY_CYCLE, NULL);

@@ -83,6 +83,7 @@ static void rot_pref_free_conf(rotor_conf_t *conf)
     g_free(conf->host);
     g_free(conf->device);
     g_free(conf->device_manual);
+    g_free(conf->last_good_device);
     g_free(conf);
 }
 
@@ -143,6 +144,10 @@ static void add_cb(GtkWidget * button, gpointer data)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .pretrack_seconds = 300.0,
+        .slew_to_aos_while_below_horizon = TRUE,
+        .last_good_device = NULL,
+        .last_good_baud = 0,
     };
 
     conf->baud = rot_protocol_default_baud(conf->protocol);
@@ -225,6 +230,10 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .pretrack_seconds = 300.0,
+        .slew_to_aos_while_below_horizon = TRUE,
+        .last_good_device = NULL,
+        .last_good_baud = 0,
     };
 
     conf->baud = rot_protocol_default_baud(conf->protocol);
@@ -409,6 +418,8 @@ static GtkTreeModel *create_and_fill_model(void)
                         g_free(conf.device);
                     if (conf.device_manual)
                         g_free(conf.device_manual);
+                    if (conf.last_good_device)
+                        g_free(conf.last_good_device);
                 }
                 else
                 {
@@ -699,6 +710,10 @@ void sat_pref_rot_ok(void)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .pretrack_seconds = 300.0,
+        .slew_to_aos_while_below_horizon = TRUE,
+        .last_good_device = NULL,
+        .last_good_baud = 0,
     };
 
     conf.baud = rot_protocol_default_baud(conf.protocol);
@@ -773,6 +788,8 @@ void sat_pref_rot_ok(void)
                 g_free(conf.device);
             if (conf.device_manual)
                 g_free(conf.device_manual);
+            if (conf.last_good_device)
+                g_free(conf.last_good_device);
 
         }
         else
