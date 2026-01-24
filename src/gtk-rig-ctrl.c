@@ -662,7 +662,6 @@ static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_verbose_toggle_cb(GtkToggleButton *button, gpointer data);
-static void     rig_trace_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
 static void     rig_term_log_rx(GtkRigCtrl *ctrl, const gchar *reply);
 static void     rig_term_log_raw(GtkRigCtrl *ctrl, const gchar *prefix,
@@ -1631,13 +1630,11 @@ static void rigctrl_set_log_level(GtkRigCtrl *ctrl, rig_log_level_t level)
 static void rigctrl_sync_log_toggles(GtkRigCtrl *ctrl)
 {
     gboolean verbose = FALSE;
-    gboolean trace = FALSE;
 
     if (ctrl == NULL)
         return;
 
     verbose = rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE);
-    trace = rigctrl_log_at_least(ctrl, RIG_LOG_TRACE);
 
     if (ctrl->log_verbose_toggle != NULL)
     {
@@ -1650,82 +1647,19 @@ static void rigctrl_sync_log_toggles(GtkRigCtrl *ctrl)
                                           (gpointer)rig_verbose_toggle_cb,
                                           ctrl);
     }
-
-    if (ctrl->log_trace_toggle != NULL)
-    {
-        g_signal_handlers_block_by_func(ctrl->log_trace_toggle,
-                                        (gpointer)rig_trace_toggle_cb,
-                                        ctrl);
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_trace_toggle),
-                                     trace);
-        gtk_widget_set_sensitive(ctrl->log_trace_toggle, verbose);
-        g_signal_handlers_unblock_by_func(ctrl->log_trace_toggle,
-                                          (gpointer)rig_trace_toggle_cb,
-                                          ctrl);
-    }
 }
 
 static void rig_verbose_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
     gboolean verbose;
-    gboolean trace = FALSE;
 
     if (ctrl == NULL)
         return;
 
     verbose = gtk_toggle_button_get_active(button);
-    if (ctrl->log_trace_toggle != NULL)
-    {
-        trace = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->log_trace_toggle));
-        if (!verbose && trace)
-        {
-            g_signal_handlers_block_by_func(ctrl->log_trace_toggle,
-                                            (gpointer)rig_trace_toggle_cb,
-                                            ctrl);
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_trace_toggle), FALSE);
-            g_signal_handlers_unblock_by_func(ctrl->log_trace_toggle,
-                                              (gpointer)rig_trace_toggle_cb,
-                                              ctrl);
-            trace = FALSE;
-        }
-        gtk_widget_set_sensitive(ctrl->log_trace_toggle, verbose);
-    }
-
     rigctrl_set_log_level(ctrl,
-                          trace ? RIG_LOG_TRACE :
-                          (verbose ? RIG_LOG_VERBOSE : RIG_LOG_QUIET));
-}
-
-static void rig_trace_toggle_cb(GtkToggleButton *button, gpointer data)
-{
-    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
-    gboolean trace;
-    gboolean verbose = FALSE;
-
-    if (ctrl == NULL)
-        return;
-
-    trace = gtk_toggle_button_get_active(button);
-    if (ctrl->log_verbose_toggle != NULL)
-    {
-        verbose = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->log_verbose_toggle));
-        if (trace && !verbose)
-        {
-            g_signal_handlers_block_by_func(ctrl->log_verbose_toggle,
-                                            (gpointer)rig_verbose_toggle_cb,
-                                            ctrl);
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_verbose_toggle), TRUE);
-            g_signal_handlers_unblock_by_func(ctrl->log_verbose_toggle,
-                                              (gpointer)rig_verbose_toggle_cb,
-                                              ctrl);
-            verbose = TRUE;
-        }
-    }
-
-    rigctrl_set_log_level(ctrl,
-                          trace ? RIG_LOG_TRACE :
-                          (verbose ? RIG_LOG_VERBOSE : RIG_LOG_QUIET));
+                          verbose ? RIG_LOG_VERBOSE : RIG_LOG_QUIET);
 }
 
 static void rigctrl_apply_log_level_from_conf(GtkRigCtrl *ctrl,
@@ -1738,6 +1672,9 @@ static void rigctrl_apply_log_level_from_conf(GtkRigCtrl *ctrl,
 
     if (conf != NULL)
         level = conf->rig_log_level;
+
+    if (level == RIG_LOG_TRACE)
+        level = RIG_LOG_VERBOSE;
 
     rigctrl_set_log_level(ctrl, level);
     rigctrl_sync_log_toggles(ctrl);
@@ -2231,7 +2168,6 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
     ctrl->rigctld_vfo_map_logged2 = FALSE;
     ctrl->log_toggle = NULL;
     ctrl->log_verbose_toggle = NULL;
-    ctrl->log_trace_toggle = NULL;
     ctrl->log_level = RIG_LOG_QUIET;
     if (ctrl->resize_idle_id != 0)
     {
@@ -2354,7 +2290,6 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
     ctrl->log_verbose_toggle = NULL;
-    ctrl->log_trace_toggle = NULL;
     ctrl->log_level = RIG_LOG_QUIET;
     rigctld_client_set_log_level(ctrl->log_level);
     ctrl->resize_idle_id = 0;
@@ -2460,51 +2395,14 @@ GType gtk_rig_ctrl_get_type(void)
 
 static void update_count_down(GtkRigCtrl * ctrl, gdouble t)
 {
-    gdouble         targettime;
-    gdouble         delta;
     gchar          *buff;
-    guint           h, m, s;
-    gchar          *aoslos;
 
-    /* select AOS or LOS time depending on target elevation */
-    if (ctrl->target->el < 0.0)
-    {
-        targettime = ctrl->target->aos;
-        aoslos = g_strdup_printf(_("AOS in"));
-    }
-    else
-    {
-        targettime = ctrl->target->los;
-        aoslos = g_strdup_printf(_("LOS in"));
-    }
-
-    delta = targettime - t;
-
-    /* convert julian date to seconds */
-    s = (guint) (delta * 86400);
-
-    /* extract hours */
-    h = (guint) floor(s / 3600);
-    s -= 3600 * h;
-
-    /* extract minutes */
-    m = (guint) floor(s / 60);
-    s -= 60 * m;
-
-    if (h > 0)
-        buff =
-            g_strdup_printf
-            ("<span size='xx-large'><b>%s %02d:%02d:%02d</b></span>", aoslos,
-             h, m, s);
-    else
-        buff =
-            g_strdup_printf("<span size='xx-large'><b>%s %02d:%02d</b></span>",
-                            aoslos, m, s);
+    buff = predict_format_aoslos_countdown(ctrl->target, t, TRUE, TRUE);
+    if (buff == NULL)
+        buff = g_strdup("<span size='xx-large'><b>--</b></span>");
 
     gtk_label_set_markup(GTK_LABEL(ctrl->SatCnt), buff);
-
     g_free(buff);
-    g_free(aoslos);
 }
 
 static void rigctrl_set_user_base_freq(GtkRigCtrl *ctrl,
@@ -5194,7 +5092,6 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     GtkWidget      *frame, *table, *label;
     GtkWidget      *rx_track, *tx_track, *track_box;
     GtkWidget      *trsp_label;
-    GtkWidget      *section_label;
     GtkSizeGroup   *combo_group;
     gchar          *buff;
     guint           i, n;
@@ -5207,9 +5104,9 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(table), 5);
     gtk_grid_set_row_spacing(GTK_GRID(table), 5);
 
-    section_label = gtk_label_new(_("Target preset"));
-    g_object_set(section_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), section_label, 0, 0, 4, 1);
+    label = gtk_label_new(_("Target preset"));
+    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 0, 1, 1);
 
     combo_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
 
@@ -5232,13 +5129,13 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_tooltip_text(ctrl->SatSel, _("Select target object"));
     g_signal_connect(ctrl->SatSel, "changed", G_CALLBACK(sat_selected_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->SatSel, 1, 1, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->SatSel, 1, 0, 3, 1);
     gtk_size_group_add_widget(combo_group, ctrl->SatSel);
 
     /* Service/payload preset selector, apply, and lock buttons */
     trsp_label = gtk_label_new(_("Payload preset"));
     g_object_set(trsp_label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), trsp_label, 0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), trsp_label, 0, 1, 1, 1);
 
     ctrl->TrspSel = gtk_combo_box_text_new();
     gtk_combo_box_set_popup_fixed_width(GTK_COMBO_BOX(ctrl->TrspSel), TRUE);
@@ -5256,7 +5153,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(rigctrl_trsp_combo_button_release), NULL);
     g_signal_connect(ctrl->TrspSel, "changed", G_CALLBACK(trsp_selected_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 2, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 1, 3, 1);
     gtk_size_group_add_widget(combo_group, ctrl->TrspSel);
 
     /* tracking toggles */
@@ -5277,31 +5174,31 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_box_pack_start(GTK_BOX(track_box), tx_track, TRUE, TRUE, 0);
     gtk_widget_set_hexpand(track_box, TRUE);
     gtk_widget_set_halign(track_box, GTK_ALIGN_FILL);
-    gtk_grid_attach(GTK_GRID(table), track_box, 1, 3, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), track_box, 1, 2, 3, 1);
 
     /* Azimuth */
     label = gtk_label_new(_("Az:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 3, 1, 1);
     ctrl->SatAz = gtk_label_new(buff);
     g_object_set(ctrl->SatAz, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->SatAz, 1, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->SatAz, 1, 3, 1, 1);
 
     /* Elevation */
     label = gtk_label_new(_("El:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
     ctrl->SatEl = gtk_label_new(buff);
     g_object_set(ctrl->SatEl, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->SatEl, 1, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->SatEl, 1, 4, 1, 1);
 
     /* Range */
     label = gtk_label_new(_(" Range:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 3, 1, 1);
     ctrl->SatRng = gtk_label_new("0 km");
     g_object_set(ctrl->SatRng, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->SatRng, 3, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->SatRng, 3, 3, 1, 1);
 
     gtk_widget_set_tooltip_text(label,
                                 _("This is the current distance between the "
@@ -5313,10 +5210,10 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     /* Range rate */
     label = gtk_label_new(_(" Rate:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 4, 1, 1);
     ctrl->SatRngRate = gtk_label_new("0.0 km/s");
     g_object_set(ctrl->SatRngRate, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->SatRngRate, 3, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->SatRngRate, 3, 4, 1, 1);
 
     gtk_widget_set_tooltip_text(label,
                                 _("The rate of change for the distance between"
@@ -5552,7 +5449,6 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
 static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 {
     GtkWidget      *frame, *table, *label;
-    GtkWidget      *log_box;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -5560,7 +5456,7 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_grid_set_row_spacing(GTK_GRID(table), 5);
 
     /* Primary device */
-    label = gtk_label_new(_("1. Device:"));
+    label = gtk_label_new(_("Downlink device"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 0, 1, 1);
 
@@ -5572,7 +5468,7 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                   " for uplink"));
 
     /* Secondary device */
-    label = gtk_label_new(_("2. Device (TX):"));
+    label = gtk_label_new(_("Uplink device"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 1, 1, 1);
 
@@ -5601,23 +5497,17 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), ctrl->log_toggle, 2, 1, 1, 1);
 
     /* Verbose rig logging toggle */
-    log_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    label = gtk_label_new(_("Logging:"));
+    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 2, 1, 1);
+
     ctrl->log_verbose_toggle =
-        gtk_check_button_new_with_label(_("Verbose rig logging"));
+        gtk_check_button_new_with_label(_("Verbose"));
     gtk_widget_set_tooltip_text(ctrl->log_verbose_toggle,
                                 _("Enable detailed rig logging summaries"));
     g_signal_connect(ctrl->log_verbose_toggle, "toggled",
                      G_CALLBACK(rig_verbose_toggle_cb), ctrl);
-    gtk_box_pack_start(GTK_BOX(log_box), ctrl->log_verbose_toggle, FALSE, FALSE, 0);
-
-    ctrl->log_trace_toggle =
-        gtk_check_button_new_with_label(_("Trace rig logging"));
-    gtk_widget_set_tooltip_text(ctrl->log_trace_toggle,
-                                _("Include raw rigctl TX/RX lines"));
-    g_signal_connect(ctrl->log_trace_toggle, "toggled",
-                     G_CALLBACK(rig_trace_toggle_cb), ctrl);
-    gtk_box_pack_start(GTK_BOX(log_box), ctrl->log_trace_toggle, FALSE, FALSE, 0);
-    gtk_grid_attach(GTK_GRID(table), log_box, 1, 2, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ctrl->log_verbose_toggle, 1, 2, 1, 1);
 
     rigctrl_sync_log_toggles(ctrl);
 

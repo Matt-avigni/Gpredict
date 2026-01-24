@@ -29,6 +29,7 @@
 #include <gtk/gtk.h>
 #include <glib/gi18n.h>
 #include <hamlib/rotlist.h>
+#include <math.h>
 #include "sat-log.h"
 #include "compat.h"
 
@@ -52,6 +53,11 @@
 #define KEY_MAXEL       "MaxEl"
 #define KEY_AZSTOPPOS   "AzStopPos"
 #define KEY_THLD        "Threshold"
+#define KEY_POLL_PERIOD_MS "PollPeriodMs"
+#define KEY_POS_STALE_MS "PositionStaleMs"
+#define KEY_STALE_DEBOUNCE "StaleDebounceCount"
+#define KEY_ANGLE_EPSILON "AngleEpsilonDeg"
+#define KEY_ELEV_FLOOR "ElevFloorDeg"
 #define KEY_AXIS_MODE   "AxisMode"
 #define KEY_USE_OFFSET  "UseOffset"
 #define KEY_AZ_OFFSET   "AzOffset"
@@ -70,6 +76,11 @@
 #define DEFAULT_DEVICE_AUTOPICK TRUE
 #define DEFAULT_PRETRACK_SECONDS 300.0
 #define DEFAULT_PRETRACK_SLEW TRUE
+#define DEFAULT_POLL_PERIOD_MS 1000
+#define DEFAULT_POS_STALE_MS 6000
+#define DEFAULT_STALE_DEBOUNCE 2
+#define DEFAULT_ANGLE_EPSILON_DEG 1.5
+#define DEFAULT_ELEV_FLOOR_DEG 1.0
 
 /* Hamlib rotator model IDs from hamlib/rotlist.h. */
 #define ROT_HAMLIB_MODEL_GS232B    ROT_MODEL_GS232B
@@ -329,6 +340,91 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     {
         conf->threshold = DEFAULT_THLD_DEG;
     }
+
+    conf->rotor_poll_period_ms = DEFAULT_POLL_PERIOD_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_POLL_PERIOD_MS, NULL))
+    {
+        conf->rotor_poll_period_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_POLL_PERIOD_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: PollPeriodMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_POLL_PERIOD_MS);
+            g_clear_error(&error);
+            conf->rotor_poll_period_ms = DEFAULT_POLL_PERIOD_MS;
+        }
+    }
+    if (conf->rotor_poll_period_ms < 100)
+        conf->rotor_poll_period_ms = 100;
+
+    conf->rotor_position_stale_ms = DEFAULT_POS_STALE_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_POS_STALE_MS, NULL))
+    {
+        conf->rotor_position_stale_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_POS_STALE_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: PositionStaleMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_POS_STALE_MS);
+            g_clear_error(&error);
+            conf->rotor_position_stale_ms = DEFAULT_POS_STALE_MS;
+        }
+    }
+    if (conf->rotor_position_stale_ms < 1000)
+        conf->rotor_position_stale_ms = 1000;
+
+    conf->rotor_stale_debounce_count = DEFAULT_STALE_DEBOUNCE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_STALE_DEBOUNCE, NULL))
+    {
+        conf->rotor_stale_debounce_count =
+            (guint)g_key_file_get_integer(cfg, GROUP, KEY_STALE_DEBOUNCE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: StaleDebounceCount not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_STALE_DEBOUNCE);
+            g_clear_error(&error);
+            conf->rotor_stale_debounce_count = DEFAULT_STALE_DEBOUNCE;
+        }
+    }
+    if (conf->rotor_stale_debounce_count < 1)
+        conf->rotor_stale_debounce_count = 1;
+
+    conf->rotor_angle_epsilon_deg = DEFAULT_ANGLE_EPSILON_DEG;
+    if (g_key_file_has_key(cfg, GROUP, KEY_ANGLE_EPSILON, NULL))
+    {
+        conf->rotor_angle_epsilon_deg =
+            g_key_file_get_double(cfg, GROUP, KEY_ANGLE_EPSILON, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: AngleEpsilonDeg not defined for %s. Assuming %.1f."),
+                        __func__, conf->name, DEFAULT_ANGLE_EPSILON_DEG);
+            g_clear_error(&error);
+            conf->rotor_angle_epsilon_deg = DEFAULT_ANGLE_EPSILON_DEG;
+        }
+    }
+    if (conf->rotor_angle_epsilon_deg < 0.1)
+        conf->rotor_angle_epsilon_deg = 0.1;
+
+    conf->rotor_elev_floor_deg = DEFAULT_ELEV_FLOOR_DEG;
+    if (g_key_file_has_key(cfg, GROUP, KEY_ELEV_FLOOR, NULL))
+    {
+        conf->rotor_elev_floor_deg =
+            g_key_file_get_double(cfg, GROUP, KEY_ELEV_FLOOR, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: ElevFloorDeg not defined for %s. Assuming %.1f."),
+                        __func__, conf->name, DEFAULT_ELEV_FLOOR_DEG);
+            g_clear_error(&error);
+            conf->rotor_elev_floor_deg = DEFAULT_ELEV_FLOOR_DEG;
+        }
+    }
+    if (conf->rotor_elev_floor_deg < 0.0)
+        conf->rotor_elev_floor_deg = 0.0;
 
     conf->aztype = g_key_file_get_integer(cfg, GROUP, KEY_AZTYPE, &error);
     if (error != NULL)
@@ -626,6 +722,36 @@ void rotor_conf_save(rotor_conf_t * conf)
         g_key_file_remove_key(cfg, GROUP, KEY_THLD, NULL);
     else
         g_key_file_set_double(cfg, GROUP, KEY_THLD, conf->threshold);
+
+    if (conf->rotor_poll_period_ms == DEFAULT_POLL_PERIOD_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_POLL_PERIOD_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_POLL_PERIOD_MS,
+                               conf->rotor_poll_period_ms);
+
+    if (conf->rotor_position_stale_ms == DEFAULT_POS_STALE_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_POS_STALE_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_POS_STALE_MS,
+                               conf->rotor_position_stale_ms);
+
+    if (conf->rotor_stale_debounce_count == DEFAULT_STALE_DEBOUNCE)
+        g_key_file_remove_key(cfg, GROUP, KEY_STALE_DEBOUNCE, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_STALE_DEBOUNCE,
+                               (gint)conf->rotor_stale_debounce_count);
+
+    if (fabs(conf->rotor_angle_epsilon_deg - DEFAULT_ANGLE_EPSILON_DEG) < 1e-6)
+        g_key_file_remove_key(cfg, GROUP, KEY_ANGLE_EPSILON, NULL);
+    else
+        g_key_file_set_double(cfg, GROUP, KEY_ANGLE_EPSILON,
+                              conf->rotor_angle_epsilon_deg);
+
+    if (fabs(conf->rotor_elev_floor_deg - DEFAULT_ELEV_FLOOR_DEG) < 1e-6)
+        g_key_file_remove_key(cfg, GROUP, KEY_ELEV_FLOOR, NULL);
+    else
+        g_key_file_set_double(cfg, GROUP, KEY_ELEV_FLOOR,
+                              conf->rotor_elev_floor_deg);
 
     /* build filename */
     confdir = get_hwconf_dir();

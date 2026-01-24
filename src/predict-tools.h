@@ -100,6 +100,11 @@ GSList *get_passes         (sat_t *sat, qth_t *qth, gdouble start, gdouble maxdt
 pass_t *get_current_pass   (sat_t *sat, qth_t *qth, gdouble start);
 pass_t *get_pass_no_min_el (sat_t *sat, qth_t *qth, gdouble start, gdouble maxdt);
 
+/* AOS/LOS countdown formatting */
+gchar  *predict_format_aoslos_countdown(const sat_t *sat, gdouble t,
+                                        gboolean include_label,
+                                        gboolean markup);
+
 /* copying */
 pass_t        *copy_pass         (pass_t *pass);
 GSList        *copy_pass_details (GSList *details);

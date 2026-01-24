@@ -71,6 +71,11 @@ static void rot_pref_store_set(GtkListStore *store,
                        ROT_LIST_COL_EL_OFFSET, conf->el_offset,
                        ROT_LIST_COL_AZ_INVERT, conf->invert_az,
                        ROT_LIST_COL_EL_INVERT, conf->invert_el,
+                       ROT_LIST_COL_POLL_PERIOD_MS, conf->rotor_poll_period_ms,
+                       ROT_LIST_COL_POS_STALE_MS, conf->rotor_position_stale_ms,
+                       ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf->rotor_stale_debounce_count,
+                       ROT_LIST_COL_ANGLE_EPSILON, conf->rotor_angle_epsilon_deg,
+                       ROT_LIST_COL_ELEV_FLOOR, conf->rotor_elev_floor_deg,
                        -1);
 }
 
@@ -144,6 +149,11 @@ static void add_cb(GtkWidget * button, gpointer data)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .rotor_poll_period_ms = 1000,
+        .rotor_position_stale_ms = 6000,
+        .rotor_stale_debounce_count = 2,
+        .rotor_angle_epsilon_deg = 1.5,
+        .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
         .last_good_device = NULL,
@@ -230,6 +240,11 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .rotor_poll_period_ms = 1000,
+        .rotor_position_stale_ms = 6000,
+        .rotor_stale_debounce_count = 2,
+        .rotor_angle_epsilon_deg = 1.5,
+        .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
         .last_good_device = NULL,
@@ -260,6 +275,11 @@ static void edit_cb(GtkWidget * button, gpointer data)
                        ROT_LIST_COL_EL_OFFSET, &conf->el_offset,
                        ROT_LIST_COL_AZ_INVERT, &conf->invert_az,
                        ROT_LIST_COL_EL_INVERT, &conf->invert_el,
+                       ROT_LIST_COL_POLL_PERIOD_MS, &conf->rotor_poll_period_ms,
+                       ROT_LIST_COL_POS_STALE_MS, &conf->rotor_position_stale_ms,
+                       ROT_LIST_COL_STALE_DEBOUNCE, &conf->rotor_stale_debounce_count,
+                       ROT_LIST_COL_ANGLE_EPSILON, &conf->rotor_angle_epsilon_deg,
+                       ROT_LIST_COL_ELEV_FLOOR, &conf->rotor_elev_floor_deg,
                        -1);
 
     ctx = g_new0(RotPrefEditorContext, 1);
@@ -358,7 +378,12 @@ static GtkTreeModel *create_and_fill_model(void)
                                    G_TYPE_DOUBLE,       // Az offset
                                    G_TYPE_DOUBLE,       // El offset
                                    G_TYPE_BOOLEAN,      // Az invert
-                                   G_TYPE_BOOLEAN       // El invert
+                                   G_TYPE_BOOLEAN,      // El invert
+                                   G_TYPE_INT,          // Poll period ms
+                                   G_TYPE_INT,          // Position stale ms
+                                   G_TYPE_INT,          // Stale debounce
+                                   G_TYPE_DOUBLE,       // Angle epsilon
+                                   G_TYPE_DOUBLE        // Elevation floor
         );
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
                                          ROT_LIST_COL_NAME,
@@ -403,6 +428,11 @@ static GtkTreeModel *create_and_fill_model(void)
                                        ROT_LIST_COL_EL_OFFSET, conf.el_offset,
                                        ROT_LIST_COL_AZ_INVERT, conf.invert_az,
                                        ROT_LIST_COL_EL_INVERT, conf.invert_el,
+                                       ROT_LIST_COL_POLL_PERIOD_MS, conf.rotor_poll_period_ms,
+                                       ROT_LIST_COL_POS_STALE_MS, conf.rotor_position_stale_ms,
+                                       ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf.rotor_stale_debounce_count,
+                                       ROT_LIST_COL_ANGLE_EPSILON, conf.rotor_angle_epsilon_deg,
+                                       ROT_LIST_COL_ELEV_FLOOR, conf.rotor_elev_floor_deg,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -710,6 +740,11 @@ void sat_pref_rot_ok(void)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .rotor_poll_period_ms = 1000,
+        .rotor_position_stale_ms = 6000,
+        .rotor_stale_debounce_count = 2,
+        .rotor_angle_epsilon_deg = 1.5,
+        .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
         .last_good_device = NULL,

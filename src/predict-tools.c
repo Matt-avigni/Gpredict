@@ -111,6 +111,75 @@ void predict_calc(sat_t * sat, qth_t * qth, gdouble t)
 }
 
 /**
+ * \brief Format AOS/LOS countdown text.
+ *
+ * If markup is TRUE, the returned string contains Pango markup.
+ * Caller owns the returned string.
+ */
+gchar *predict_format_aoslos_countdown(const sat_t *sat, gdouble t,
+                                       gboolean include_label,
+                                       gboolean markup)
+{
+    gdouble         targettime;
+    gdouble         delta;
+    guint           h, m, s;
+    const gchar    *aoslos;
+    gchar          *text;
+
+    if (sat == NULL)
+        return NULL;
+
+    if (sat->el < 0.0)
+    {
+        targettime = sat->aos;
+        aoslos = _("AOS in");
+    }
+    else
+    {
+        targettime = sat->los;
+        aoslos = _("LOS in");
+    }
+
+    if (targettime <= 0.0)
+        return NULL;
+
+    delta = targettime - t;
+    if (delta < 0.0)
+        delta = 0.0;
+
+    s = (guint) (delta * 86400.0);
+    h = s / 3600;
+    s -= 3600 * h;
+    m = s / 60;
+    s -= 60 * m;
+
+    if (include_label)
+    {
+        if (h > 0)
+            text = g_strdup_printf("%s %02u:%02u:%02u", aoslos, h, m, s);
+        else
+            text = g_strdup_printf("%s %02u:%02u", aoslos, m, s);
+    }
+    else
+    {
+        if (h > 0)
+            text = g_strdup_printf("%02u:%02u:%02u", h, m, s);
+        else
+            text = g_strdup_printf("%02u:%02u", m, s);
+    }
+
+    if (markup)
+    {
+        gchar *buff = g_strdup_printf("<span size='xx-large'><b>%s</b></span>",
+                                       text);
+        g_free(text);
+        return buff;
+    }
+
+    return text;
+}
+
+/**
  * \brief Find the AOS time of the next pass.
  * \author Alexandru Csete, OZ9AEC
  * \author John A. Magliacane, KD2BD

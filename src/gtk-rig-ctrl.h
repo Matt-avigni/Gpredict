@@ -216,7 +216,6 @@ struct _gtk_rig_ctrl {
     GpTermView     *term_view;          /*!< Embedded radio debug terminal */
     GtkWidget      *log_toggle;         /*!< Logs toggle button */
     GtkWidget      *log_verbose_toggle; /*!< Verbose rig logging toggle */
-    GtkWidget      *log_trace_toggle;   /*!< Trace rig logging toggle */
     rig_log_level_t log_level;          /*!< Rig log verbosity */
     guint           resize_idle_id;     /*!< Pending resize idle source id */
     gchar          *primary_rig_id;     /*!< Selected primary rig ID */

@@ -85,6 +85,20 @@ rotctld_pos_result_t  rotctld_client_get_pos_ex_timeout(RotctldClient *client,
                                                         gsize reply_len,
                                                         gint timeout_ms,
                                                         gint retries);
+rotctld_pos_result_t  rotctld_client_get_position_timed(RotctldClient *client,
+                                                        gint timeout_ms,
+                                                        gint retries,
+                                                        gint retry_delay_ms,
+                                                        gdouble *az_out,
+                                                        gdouble *el_out,
+                                                        gint *rprt_out);
+gboolean              rotctld_client_set_position_checked(RotctldClient *client,
+                                                          gdouble az,
+                                                          gdouble el,
+                                                          gint *rprt_code_out,
+                                                          HamlibResponseInfo *info_out,
+                                                          gchar *reply_out,
+                                                          gsize reply_len);
 gboolean              rotctld_client_set_pos_ex(RotctldClient *client,
                                                 gdouble az,
                                                 gdouble el,
@@ -104,5 +118,6 @@ gboolean              rotctld_client_request_raw(RotctldClient *client,
                                                  HamlibResponseInfo *info);
 
 gint64                rotctld_client_last_rtt_us(const RotctldClient *client);
+gboolean              rotctld_client_recovery_triggered(const RotctldClient *client);
 
 #endif

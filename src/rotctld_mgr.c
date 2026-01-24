@@ -1018,6 +1018,8 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
         g_ptr_array_add(argv, g_strdup("-s"));
         g_ptr_array_add(argv, g_strdup_printf("%d", baud));
     }
+    g_ptr_array_add(argv, g_strdup("-C"));
+    g_ptr_array_add(argv, g_strdup("timeout=1200,retries=1"));
     {
         const gchar *bind_host = rotctld_mgr_bind_host(host);
         if (host && *host && g_strcmp0(host, bind_host) != 0)

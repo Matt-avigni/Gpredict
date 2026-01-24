@@ -59,11 +59,6 @@ static GtkWidget *minel_label;
 static GtkWidget *maxel_label;
 static GtkWidget *azstoppos;
 static GtkWidget *axismode;
-static GtkWidget *invert_az;
-static GtkWidget *invert_el;
-static GtkWidget *use_offset;
-static GtkWidget *az_offset;
-static GtkWidget *el_offset;
 static gboolean device_scan_in_progress = FALSE;
 static GSList *device_cache = NULL;
 static const gchar *ROT_DEVICE_OTHER_ID = "other";
@@ -645,11 +640,6 @@ static void update_widgets(rotor_conf_t * conf)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), conf->azstoppos);
     gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), conf->axis_mode);
     update_el_limits_sensitivity();
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_az), conf->invert_az);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_el), conf->invert_el);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(use_offset), conf->use_offset);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), conf->az_offset);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), conf->el_offset);
 }
 
 /* called when the user clicks on the CLEAR button */
@@ -675,11 +665,6 @@ static void clear_widgets(void)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0);
     gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
     update_el_limits_sensitivity();
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_az), FALSE);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(invert_el), FALSE);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(use_offset), FALSE);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), 0.0);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), 0.0);
 }
 
 /*
@@ -1085,49 +1070,6 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
                                   "\342\206\222 +180\302\260 rotor is -180\302\260."));
     gtk_grid_attach(GTK_GRID(table), azstoppos, 3, 16, 1, 1);
 
-    /* Axis inversion */
-    label = gtk_label_new(_("Invert"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 17, 1, 1);
-
-    invert_az = gtk_check_button_new_with_label(_("Az"));
-    gtk_grid_attach(GTK_GRID(table), invert_az, 1, 17, 1, 1);
-    invert_el = gtk_check_button_new_with_label(_("El"));
-    gtk_grid_attach(GTK_GRID(table), invert_el, 2, 17, 1, 1);
-
-    /* Offsets */
-    label = gtk_label_new(_("Offsets"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 18, 1, 1);
-
-    use_offset = gtk_check_button_new_with_label(_("Enable"));
-    gtk_widget_set_tooltip_text(use_offset,
-                                _("Apply fixed software offsets to azimuth/elevation.\n"
-                                  "Near-zenith tracking (>=85°) automatically holds azimuth."));
-    gtk_grid_attach(GTK_GRID(table), use_offset, 1, 18, 1, 1);
-
-    label = gtk_label_new(_(" Az offset"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 19, 1, 1);
-    az_offset = gtk_spin_button_new_with_range(-360, 360, 0.1);
-    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(az_offset), 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_offset), 0.0);
-    gtk_grid_attach(GTK_GRID(table), az_offset, 1, 19, 1, 1);
-    label = gtk_label_new(_("deg"));
-    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 19, 1, 1);
-
-    label = gtk_label_new(_(" El offset"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 20, 1, 1);
-    el_offset = gtk_spin_button_new_with_range(-90, 90, 0.1);
-    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_offset), 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_offset), 0.0);
-    gtk_grid_attach(GTK_GRID(table), el_offset, 1, 20, 1, 1);
-    label = gtk_label_new(_("deg"));
-    g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 20, 1, 1);
-
     if (conf->name != NULL)
         update_widgets(conf);
     else
@@ -1224,13 +1166,8 @@ static gboolean apply_changes(rotor_conf_t * conf)
     conf->axis_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(axismode));
 
     /* axis inversion */
-    conf->invert_az = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(invert_az));
-    conf->invert_el = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(invert_el));
 
     /* offsets */
-    conf->use_offset = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(use_offset));
-    conf->az_offset = gtk_spin_button_get_value(GTK_SPIN_BUTTON(az_offset));
-    conf->el_offset = gtk_spin_button_get_value(GTK_SPIN_BUTTON(el_offset));
 
     return TRUE;
 }

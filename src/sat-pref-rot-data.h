@@ -52,6 +52,11 @@ typedef enum {
     ROT_LIST_COL_EL_OFFSET,     /*!< El offset. */
     ROT_LIST_COL_AZ_INVERT,     /*!< Invert azimuth. */
     ROT_LIST_COL_EL_INVERT,     /*!< Invert elevation. */
+    ROT_LIST_COL_POLL_PERIOD_MS, /*!< Poll period in milliseconds. */
+    ROT_LIST_COL_POS_STALE_MS, /*!< Position stale threshold in milliseconds. */
+    ROT_LIST_COL_STALE_DEBOUNCE, /*!< Stale debounce count. */
+    ROT_LIST_COL_ANGLE_EPSILON, /*!< Angle epsilon in degrees. */
+    ROT_LIST_COL_ELEV_FLOOR,   /*!< Elevation floor in degrees. */
     ROT_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rotor_list_col_t;
 

@@ -71,6 +71,11 @@ typedef struct {
     gdouble         maxel;      /*!< Upper elevation limit */
     gdouble         azstoppos;  /*!< absolute position of rotation stops; normally = minaz */
     gdouble         threshold;  /*!< Angle difference that triggers new motion command */
+    gint            rotor_poll_period_ms; /*!< Poll interval for rotctld get_position */
+    gint            rotor_position_stale_ms; /*!< Stale threshold for position age */
+    guint           rotor_stale_debounce_count; /*!< Consecutive stale checks before degrade */
+    gdouble         rotor_angle_epsilon_deg; /*!< Angle comparison tolerance */
+    gdouble         rotor_elev_floor_deg; /*!< Elevation treated as ground */
     gboolean        use_offset; /*!< Apply configured az/el offsets (zenith guard is handled at runtime) */
     gdouble         az_offset;  /*!< Azimuth offset (degrees) */
     gdouble         el_offset;  /*!< Elevation offset (degrees) */
