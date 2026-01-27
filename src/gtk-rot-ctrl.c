@@ -116,10 +116,19 @@
 #define ROT_PRETRACK_REACQUIRE_SEC 2.0
 #define ROT_PRETRACK_WINDOW_SEC 300.0
 #define ROT_PRETRACK_AOS_OFFSET_SEC 0.5
-#define ROT_PRETRACK_RECALC_US (3 * G_USEC_PER_SEC)
+#define ROT_PRETRACK_RECALC_US (2 * G_USEC_PER_SEC)
 #define ROT_PRETRACK_SEARCH_STEP_SEC 2.0
 #define ROT_PRETRACK_REFINE_SEC 0.5
 #define ROT_PRETRACK_HYSTERESIS_DEG 0.5
+#define ROT_CMD_DEADBAND_AZ_DEG 1.0
+#define ROT_CMD_DEADBAND_EL_DEG 0.7
+#define ROT_CMD_DEADBAND_PRETRACK_AZ_DEG 2.0
+#define ROT_CMD_DEADBAND_PRETRACK_EL_DEG 1.0
+#define ROT_CMD_COOLDOWN_MS 1500
+#define ROT_CMD_MAX_HZ 1.0
+#define ROT_CMD_KEEPALIVE_MS 5000
+#define ROT_CMD_POS_FRESH_MS 2500
+#define ROT_CMD_AZ_EPS_MIN_DEG 1.5
 #define ROT_TRACK_LEAD_SEC 0.3
 #define ROT_AZ_OOB_PENALTY 10000.0
 #define ROT_AZ_ENDSTOP_PENALTY 1000.0
@@ -163,11 +172,21 @@
 #define ROTCTLD_AUTODETECT_MAX_CANDIDATES 5
 #define ROTCTLD_KEEPALIVE_US 2000000
 #define ROT_SEND_MIN_INTERVAL_US 400000
+#define ROT_TRACK_RESEND_US 2000000
 #define ROT_LANE_ENDSTOP_MARGIN_DEG 5.0
 #define ROT_LANE_SWITCH_PENALTY_DEG 30.0
 #define ROTCTRL_MAX_BACKEND_IOERR 5
 #define ROTCTRL_BACKEND_IO_WINDOW_US (10 * G_USEC_PER_SEC)
 #define ROTCTRL_AOSLOS_PLACEHOLDER "<span size='xx-large'><b>--</b></span>"
+
+static void gp_safe_label_set_markup(GtkWidget *w, const gchar *markup)
+{
+    if (w == NULL)
+        return;
+
+    if (GTK_IS_LABEL(w))
+        gtk_label_set_markup(GTK_LABEL(w), markup ? markup : "");
+}
 
 typedef struct {
     GThread        *thread;
@@ -395,6 +414,7 @@ struct _GtkRotCtrl {
     gint64          target_state_since_us;
     gint64          target_valid_since_us;
     gint64          target_invalid_since_us;
+    gint64          last_target_update_us;
     gint64          park_pending_since_us;
     gboolean        pretrack_enabled;
     gdouble         pretrack_lookahead_sec;
@@ -418,9 +438,23 @@ struct _GtkRotCtrl {
     gdouble         last_cmd_az360;
     gdouble         last_cmd_el;
     gboolean        last_cmd_valid;
+    gdouble         last_cmd_backend_az;
+    gdouble         last_cmd_backend_el;
+    gboolean        last_cmd_backend_valid;
+    gdouble         committed_user_az;
+    gdouble         committed_user_el;
+    gdouble         committed_raw_az360;
+    gdouble         committed_raw_el;
+    gdouble         committed_backend_az;
+    gdouble         committed_backend_el;
+    gboolean        committed_valid;
+    gint64          committed_since_us;
+    gint64          last_keepalive_time_us;
+    gint64          last_desired_update_us;
     gint64          last_send_us;
     gint            above_eps_count;
     gint64          last_hold_log_us;
+    gint64          last_stale_check_log_us;
     double          az_abs_cur;
     double          az_abs_last_cmd;
     double          last_meas_span_az;
@@ -585,6 +619,11 @@ static gint     rotctrl_stale_ms(const GtkRotCtrl *ctrl);
 static guint    rotctrl_stale_debounce(const GtkRotCtrl *ctrl);
 static gdouble  rotctrl_angle_epsilon(const GtkRotCtrl *ctrl);
 static gdouble  rotctrl_elev_floor(const GtkRotCtrl *ctrl);
+static gdouble  rotctrl_clamp_el_for_backend(GtkRotCtrl *ctrl,
+                                             gdouble target_el,
+                                             gdouble backend_min_el,
+                                             gdouble backend_max_el,
+                                             gboolean *clamped_out);
 static gboolean rot_should_send(GtkRotCtrl *ctrl,
                                 gdouble meas_az360,
                                 gdouble meas_el,
@@ -592,6 +631,8 @@ static gboolean rot_should_send(GtkRotCtrl *ctrl,
                                 gdouble tgt_el,
                                 gdouble eps_az,
                                 gdouble eps_el,
+                                gboolean periodic_due,
+                                gboolean not_at_target,
                                 gint64 now_us,
                                 gint64 min_interval_us,
                                 const gchar **reason_out);
@@ -3230,22 +3271,12 @@ static void rot_format_deg_2(char *out, gsize outsz, gdouble val)
 
 static gdouble norm360(gdouble a)
 {
-    while (a < 0.0)
-        a += 360.0;
-    while (a >= 360.0)
-        a -= 360.0;
-    return a;
+    return rot_norm360(a);
 }
 
 static gdouble ang_delta_deg(gdouble a, gdouble b)
 {
-    gdouble delta = norm360(a) - norm360(b);
-
-    if (delta >= 180.0)
-        delta -= 360.0;
-    if (delta < -180.0)
-        delta += 360.0;
-    return delta;
+    return rot_ang_diff_deg(a, b);
 }
 
 static AzSpan rotctrl_span_from_az_type(rot_az_type_t aztype)
@@ -4800,6 +4831,7 @@ static void rotctrl_pipeline_build(GtkRotCtrl *ctrl,
                                    gint locked_k,
                                    gdouble endstop_margin_deg,
                                    gdouble lane_switch_penalty_deg,
+                                   gboolean apply_elev_floor,
                                    RotCmdPipeline *out)
 {
     gdouble ui_az = target_az360;
@@ -4845,11 +4877,21 @@ static void rotctrl_pipeline_build(GtkRotCtrl *ctrl,
     cmd_az = rotctrl_normalize_backend_az(cmd_az, backend_min_az, backend_max_az);
 
     cmd_el = rotctrl_clamp_el_for_backend(ctrl,
-                                          pre.el_raw,
+                                          cmd_el,
                                           backend_min_el,
                                           backend_max_el,
                                           &el_clamped);
-    cmd_el = rotor_apply_elev_floor(cmd_el, rotctrl_elev_floor(ctrl));
+    if (apply_elev_floor)
+    {
+        gdouble before_floor = cmd_el;
+        cmd_el = rotor_apply_elev_floor(cmd_el, rotctrl_elev_floor(ctrl));
+        if (ctrl != NULL && fabs(cmd_el - before_floor) > 1e-6)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "rot elev floor: before=%.2f floor=%.2f -> %.2f",
+                        before_floor, rotctrl_elev_floor(ctrl), cmd_el);
+        }
+    }
 
     out->az360 = rot_norm360(target_az360);
     out->el = target_el;
@@ -4899,11 +4941,13 @@ static gboolean rot_should_send(GtkRotCtrl *ctrl,
                                 gdouble tgt_el,
                                 gdouble eps_az,
                                 gdouble eps_el,
+                                gboolean periodic_due,
+                                gboolean not_at_target,
                                 gint64 now_us,
                                 gint64 min_interval_us,
                                 const gchar **reason_out)
 {
-    gdouble d_az = fabs(gp_shortest_delta360(meas_az360, tgt_az360));
+    gdouble d_az = rot_ang_dist_deg(meas_az360, tgt_az360);
     gdouble d_el = fabs(meas_el - tgt_el);
 
     if (ctrl == NULL)
@@ -4915,6 +4959,20 @@ static gboolean rot_should_send(GtkRotCtrl *ctrl,
         if (reason_out)
             *reason_out = "HOLD_RATE";
         return FALSE;
+    }
+
+    if (periodic_due)
+    {
+        if (reason_out)
+            *reason_out = "PERIODIC";
+        return TRUE;
+    }
+
+    if (not_at_target)
+    {
+        if (reason_out)
+            *reason_out = "NOT_AT_TARGET";
+        return TRUE;
     }
 
     if (d_az < eps_az && d_el < eps_el)
@@ -7929,7 +7987,7 @@ static void update_aoslos_banner(GtkRotCtrl *ctrl, gdouble t)
     if (buff == NULL)
         buff = g_strdup(ROTCTRL_AOSLOS_PLACEHOLDER);
 
-    gtk_label_set_markup(GTK_LABEL(ctrl->aoslos_banner), buff);
+    gp_safe_label_set_markup(ctrl->aoslos_banner, buff);
     g_free(buff);
 }
 
@@ -7945,6 +8003,8 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
     gchar          *buff;
 
     ctrl->t = t;
+    if (ctrl->target)
+        ctrl->last_target_update_us = g_get_monotonic_time();
 
     if (ctrl->target)
     {
@@ -8105,7 +8165,7 @@ static GtkWidget *create_az_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), ctrl->AzSet, 0, 0, 3, 1);
 
     label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(label), _("Read:"));
+    gp_safe_label_set_markup(label, _("Read:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 1, 1, 1);
 
@@ -8146,7 +8206,7 @@ static GtkWidget *create_el_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), ctrl->ElSet, 0, 0, 3, 1);
 
     label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(label), _("Read: "));
+    gp_safe_label_set_markup(label, _("Read: "));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 1, 1, 1);
 
@@ -8188,6 +8248,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->target_state_since_us = 0;
         ctrl->target_valid_since_us = 0;
         ctrl->target_invalid_since_us = 0;
+        ctrl->last_target_update_us = 0;
         ctrl->last_send_us = 0;
         ctrl->above_eps_count = 0;
         ctrl->pretrack_target_valid = FALSE;
@@ -8199,7 +8260,34 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->pending_lane_since_us = 0;
         ctrl->locked_lane_valid = FALSE;
         ctrl->last_target_valid = FALSE;
+        ctrl->last_cmd_backend_az = 0.0;
+        ctrl->last_cmd_backend_el = 0.0;
+        ctrl->last_cmd_backend_valid = FALSE;
+        ctrl->committed_user_az = 0.0;
+        ctrl->committed_user_el = 0.0;
+        ctrl->committed_raw_az360 = 0.0;
+        ctrl->committed_raw_el = 0.0;
+        ctrl->committed_backend_az = 0.0;
+        ctrl->committed_backend_el = 0.0;
+        ctrl->committed_valid = FALSE;
+        ctrl->committed_since_us = 0;
+        ctrl->last_keepalive_time_us = 0;
+        ctrl->last_desired_update_us = 0;
         ctrl->pos_stale_active = FALSE;
+        ctrl->last_stale_check_log_us = 0;
+        ctrl->last_cmd_backend_az = 0.0;
+        ctrl->last_cmd_backend_el = 0.0;
+        ctrl->last_cmd_backend_valid = FALSE;
+        ctrl->committed_user_az = 0.0;
+        ctrl->committed_user_el = 0.0;
+        ctrl->committed_raw_az360 = 0.0;
+        ctrl->committed_raw_el = 0.0;
+        ctrl->committed_backend_az = 0.0;
+        ctrl->committed_backend_el = 0.0;
+        ctrl->committed_valid = FALSE;
+        ctrl->committed_since_us = 0;
+        ctrl->last_keepalive_time_us = 0;
+        ctrl->last_desired_update_us = 0;
         rotctrl_tracking_policy_reset_reason(ctrl, "track_off");
         return;
     }
@@ -8225,6 +8313,19 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->pending_lane_since_us = 0;
         ctrl->locked_lane_valid = FALSE;
         ctrl->last_target_valid = FALSE;
+        ctrl->last_cmd_backend_az = 0.0;
+        ctrl->last_cmd_backend_el = 0.0;
+        ctrl->last_cmd_backend_valid = FALSE;
+        ctrl->committed_user_az = 0.0;
+        ctrl->committed_user_el = 0.0;
+        ctrl->committed_raw_az360 = 0.0;
+        ctrl->committed_raw_el = 0.0;
+        ctrl->committed_backend_az = 0.0;
+        ctrl->committed_backend_el = 0.0;
+        ctrl->committed_valid = FALSE;
+        ctrl->committed_since_us = 0;
+        ctrl->last_keepalive_time_us = 0;
+        ctrl->last_desired_update_us = 0;
 
         pos_recent = rotctrl_pos_recent(ctrl,
                                         (gint64)rotctrl_stale_ms(ctrl) * 1000,
@@ -8307,6 +8408,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gdouble meas_az360 = 0.0;
     gdouble meas_el = 0.0;
     gdouble last_cmd_backend = 0.0;
+    gdouble last_cmd_ok_az = 0.0;
     gdouble last_cmd_az360 = 0.0;
     gdouble last_cmd_el = 0.0;
     gboolean have_last_cmd_backend = FALSE;
@@ -8464,6 +8566,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     ctrl->pretrack_aos_time = aos_time;
                     ctrl->pretrack_target_valid = TRUE;
                     ctrl->pretrack_last_update_us = now_us;
+                    ctrl->last_desired_update_us = now_us;
                     if (ctrl->verbose_logging)
                     {
                         gchar aos_buf[64] = { 0 };
@@ -8485,6 +8588,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     ctrl->pretrack_target_valid = FALSE;
                     ctrl->pretrack_aos_time = 0.0;
                     ctrl->pretrack_last_update_us = now_us;
+                    ctrl->last_desired_update_us = now_us;
                     ctrl->pretrack_wait_log_us = 0;
                 }
             }
@@ -8595,10 +8699,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         display_el = target_el;
         if (pred_valid)
         {
+            gdouble xform_floor = hold_below ? elev_floor : -1.0;
             if (gp_rot_transform_target(ctrl,
                                         target_az360,
                                         target_el,
-                                        elev_floor,
+                                        xform_floor,
                                         &xform))
             {
                 display_az360 = xform.az_after_southzero;
@@ -8642,7 +8747,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (gp_rot_transform_target(ctrl,
                                     target_az360,
                                     target_el,
-                                    elev_floor,
+                                    -1.0,
                                     &xform))
         {
             target_cmd_az360 = xform.az360_final;
@@ -8672,7 +8777,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         pred_valid = gp_rot_transform_target(ctrl,
                                              target_az360,
                                              target_el,
-                                             elev_floor,
+                                             -1.0,
                                              &xform);
         if (pred_valid)
         {
@@ -8873,6 +8978,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gdouble raw_cmd_az = target_cmd_az360;
         gdouble raw_cmd_el = target_cmd_el;
         RotCmdPipeline pipeline = { 0 };
+        RotCmdPipeline desired_pipeline = { 0 };
         gdouble log_az_pred = az_pred;
         gdouble log_el_pred = el_pred;
         gdouble log_az_user = 0.0;
@@ -8889,15 +8995,45 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gdouble delta_el_phys = 0.0;
         gdouble eps_az = 0.0;
         gdouble eps_el = 0.0;
+        gdouble desired_user_az = 0.0;
+        gdouble desired_user_el = 0.0;
+        gdouble desired_raw_az = 0.0;
+        gdouble desired_raw_el = 0.0;
+        gdouble effective_raw_az = 0.0;
+        gdouble effective_raw_el = 0.0;
+        gdouble effective_user_az = 0.0;
+        gdouble effective_user_el = 0.0;
+        gdouble desired_backend_az = 0.0;
+        gdouble desired_backend_el = 0.0;
+        gdouble last_cmd_backend_az_log = 0.0;
+        gdouble last_cmd_backend_el_log = 0.0;
+        gdouble az_delta_deg = 0.0;
+        gdouble el_delta_deg = 0.0;
+        gdouble deadband_az = ROT_CMD_DEADBAND_AZ_DEG;
+        gdouble deadband_el = ROT_CMD_DEADBAND_EL_DEG;
         gboolean send_ok = FALSE;
         gboolean force_send = FALSE;
         gboolean have_target = FALSE;
+        gboolean not_at_target = FALSE;
         gboolean manual_override = FALSE;
         gboolean pos_stale_now = FALSE;
+        gboolean pos_fresh = FALSE;
+        gboolean pending_target = FALSE;
+        gboolean keepalive_due = FALSE;
+        gboolean cooldown_active = FALSE;
+        gboolean bypass_cooldown = FALSE;
+        gboolean allow_not_at_target = FALSE;
+        gboolean committed_was_valid = FALSE;
         gint64 pos_age_ms = -1;
-        const gchar *sched_reason = "HOLD_EPS";
+        gint64 target_age_ms = -1;
+        gboolean target_recent = FALSE;
+        gint64 cooldown_ms_left = 0;
+        rot_target_state_t desired_state = ROT_TARGET_STATE_IDLE;
+        const gchar *state_reason = "idle";
         const gchar *gate = "skip";
         const gchar *reason = "deadband";
+        const gchar *gate_reason = "deadband";
+        const gchar *sched_reason = "HOLD_EPS";
 
         caps_valid = FALSE;
         g_mutex_lock(&ctrl->client.mutex);
@@ -8914,6 +9050,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         last_cmd_ok_us = ctrl->client.last_cmd_ok_us;
         last_out_az = ctrl->client.azi_out;
         last_out_el = ctrl->client.ele_out;
+        last_cmd_ok_az = ctrl->client.last_cmd_ok_az;
         last_cmd_backend = ctrl->client.last_cmd_ok_az;
         last_cmd_el = ctrl->client.last_cmd_ok_el;
         have_last_cmd_backend = ctrl->client.last_cmd_backend_valid;
@@ -8926,7 +9063,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
         else if (last_cmd_ok_us > 0)
         {
-            last_cmd_backend = last_cmd_ok_az;
+            last_cmd_backend = last_cmd_ok_az; // typo fix: last_cmd_ok_az -> last_cmd_backend_az
             last_cmd_az360 = rot_backend_pos_to_az360(last_cmd_backend);
             have_last_cmd_backend = TRUE;
             have_last_cmd_phys = TRUE;
@@ -9041,7 +9178,29 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (last_pos_us > 0 && now_us > last_pos_us)
             pos_age_ms = (now_us - last_pos_us) / 1000;
+        if (ctrl->last_target_update_us > 0 && now_us > ctrl->last_target_update_us)
+            target_age_ms = (now_us - ctrl->last_target_update_us) / 1000;
+        if (target_age_ms >= 0)
+            target_recent = (target_age_ms <= rotctrl_stale_ms(ctrl));
+
         pos_stale_now = ctrl->tracking && ctrl->engaged && !pos_recent;
+
+        if (ctrl->verbose_logging &&
+            (ctrl->last_stale_check_log_us == 0 ||
+             (now_us - ctrl->last_stale_check_log_us) >= G_USEC_PER_SEC))
+        {
+            const gchar *stale_reason =
+                pos_stale_now ? "pos_stale" : (pos_recent ? "pos_recent" : "target_recent");
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "stale_check: now_us=%lld last_target_us=%lld delta_ms=%lld stale_ms=%d => stale=%d reason=%s",
+                        (long long)now_us,
+                        (long long)ctrl->last_target_update_us,
+                        (long long)target_age_ms,
+                        rotctrl_stale_ms(ctrl),
+                        pos_stale_now ? 1 : 0,
+                        stale_reason);
+            ctrl->last_stale_check_log_us = now_us;
+        }
 
         if (pos_stale_now && !ctrl->pos_stale_active)
         {
@@ -9084,6 +9243,62 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
+        if (ctrl->tracking && !ctrl->engaged)
+        {
+            desired_state = ROT_TARGET_STATE_IDLE;
+            state_reason = "disengaged";
+        }
+        else if (ctrl->tracking && ctrl->conf && ctrl->target)
+        {
+            if (pos_stale_now)
+            {
+                desired_state = ROT_TARGET_STATE_HOLD;
+                state_reason = "stale";
+            }
+            else if (hold_below)
+            {
+                desired_state = ROT_TARGET_STATE_HOLD;
+                state_reason = "hold";
+            }
+            else if (pretrack_active)
+            {
+                desired_state = ROT_TARGET_STATE_PRETRACK;
+                state_reason = "pretrack";
+            }
+            else if (!pred_valid)
+            {
+                desired_state = ROT_TARGET_STATE_HOLD;
+                state_reason = "pred_invalid";
+            }
+            else if (rotpos_valid)
+            {
+                desired_state = ROT_TARGET_STATE_TRACKING_NORMAL;
+                state_reason = "tracking";
+            }
+            else
+            {
+                desired_state = ROT_TARGET_STATE_TRACKING_DEGRADED;
+                state_reason = "tracking_degraded";
+            }
+        }
+        else if (ctrl->tracking)
+        {
+            desired_state = ROT_TARGET_STATE_HOLD;
+            state_reason = "no_target";
+        }
+        else
+        {
+            desired_state = ROT_TARGET_STATE_IDLE;
+            state_reason = "idle";
+        }
+
+        state_changed = (desired_state != ctrl->target_state);
+
+        have_target = pred_valid || autocal_active ||
+                      (hold_below && !hold_no_target);
+        force_send = cal_force_send;
+        committed_was_valid = ctrl->committed_valid;
+
         gdouble ref_backend = fresh_feedback ? meas_backend_az : last_cmd_backend;
         gboolean have_ref_backend = fresh_feedback || have_last_cmd_backend;
 
@@ -9107,9 +9322,79 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         ref_backend = have_last_cmd_backend ? last_cmd_backend : meas_backend_az;
         have_ref_backend = have_last_cmd_backend || rotpos_valid;
 
+        desired_raw_az = target_cmd_az360;
+        desired_raw_el = target_cmd_el;
+        desired_user_az = rot_az360_to_ui(display_az360, ui_mode);
+        desired_user_el = display_el;
+        effective_raw_az = desired_raw_az;
+        effective_raw_el = desired_raw_el;
+        effective_user_az = desired_user_az;
+        effective_user_el = desired_user_el;
+
+        if (desired_state == ROT_TARGET_STATE_PRETRACK)
+        {
+            deadband_az = ROT_CMD_DEADBAND_PRETRACK_AZ_DEG;
+            deadband_el = ROT_CMD_DEADBAND_PRETRACK_EL_DEG;
+        }
+
+        if (have_target && ctrl->committed_valid)
+        {
+            az_delta_deg = rot_ang_dist_deg(desired_user_az, ctrl->committed_user_az);
+            el_delta_deg = fabs(desired_user_el - ctrl->committed_user_el);
+        }
+
+        if (have_target && ctrl->tracking)
+        {
+            gboolean commit_allowed =
+                (desired_state == ROT_TARGET_STATE_PRETRACK ||
+                 desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+                 desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+            committed_was_valid = ctrl->committed_valid;
+            gboolean commit_force = force_send || state_changed || !committed_was_valid;
+            gboolean commit_due = FALSE;
+
+            if (commit_allowed)
+            {
+                commit_due = commit_force ||
+                             (ctrl->committed_valid &&
+                              (az_delta_deg >= deadband_az ||
+                               el_delta_deg >= deadband_el));
+            }
+
+            if (commit_due)
+            {
+                ctrl->committed_user_az = desired_user_az;
+                ctrl->committed_user_el = desired_user_el;
+                ctrl->committed_raw_az360 = desired_raw_az;
+                ctrl->committed_raw_el = desired_raw_el;
+                ctrl->committed_valid = TRUE;
+                ctrl->committed_since_us = now_us;
+                if (commit_force)
+                {
+                    if (state_changed || !committed_was_valid)
+                        gate_reason = "transition";
+                    else
+                        gate_reason = "force";
+                }
+                else
+                    gate_reason = "deadband";
+            }
+        }
+
+        if (ctrl->tracking && ctrl->committed_valid &&
+            (desired_state == ROT_TARGET_STATE_PRETRACK ||
+             desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED))
+        {
+            effective_raw_az = ctrl->committed_raw_az360;
+            effective_raw_el = ctrl->committed_raw_el;
+            effective_user_az = ctrl->committed_user_az;
+            effective_user_el = ctrl->committed_user_el;
+        }
+
         rotctrl_pipeline_build(ctrl,
-                               raw_cmd_az,
-                               raw_cmd_el,
+                               desired_raw_az,
+                               desired_raw_el,
                                backend_az_min,
                                backend_az_max,
                                backend_el_min,
@@ -9120,9 +9405,53 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                ctrl->locked_lane_k,
                                ROT_LANE_ENDSTOP_MARGIN_DEG,
                                ROT_LANE_SWITCH_PENALTY_DEG,
-                               &pipeline);
+                               hold_below,
+                               &desired_pipeline);
 
-        log_az_user = rot_az360_to_ui(display_az360, ui_mode);
+        pipeline = desired_pipeline;
+        if (ctrl->tracking && ctrl->committed_valid &&
+            (desired_state == ROT_TARGET_STATE_PRETRACK ||
+             desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED))
+        {
+            if (rot_ang_dist_deg(desired_raw_az, effective_raw_az) > 1e-6 ||
+                fabs(desired_raw_el - effective_raw_el) > 1e-6)
+            {
+                rotctrl_pipeline_build(ctrl,
+                                       effective_raw_az,
+                                       effective_raw_el,
+                                       backend_az_min,
+                                       backend_az_max,
+                                       backend_el_min,
+                                       backend_el_max,
+                                       ref_backend,
+                                       have_ref_backend,
+                                       ctrl->locked_lane_valid,
+                                       ctrl->locked_lane_k,
+                                       ROT_LANE_ENDSTOP_MARGIN_DEG,
+                                       ROT_LANE_SWITCH_PENALTY_DEG,
+                                       hold_below,
+                                       &pipeline);
+            }
+        }
+
+        desired_backend_az = desired_pipeline.cmd_az;
+        desired_backend_el = desired_pipeline.cmd_el;
+        raw_cmd_az = effective_raw_az;
+        raw_cmd_el = effective_raw_el;
+
+        log_az_user = effective_user_az;
+        gdouble log_cur_user_az = rot_az360_to_ui(meas_az360, ui_mode);
+        gdouble log_cur_user_el = meas_el;
+        gdouble log_offset_az = pred_valid
+                                ? rot_ang_diff_deg(xform.az_after_offsets,
+                                                   xform.az_after_southzero)
+                                : 0.0;
+        gdouble log_offset_el = pred_valid
+                                ? (xform.el_after_offsets - xform.el_after_southzero)
+                                : 0.0;
+        const gchar *wrap_name =
+            (ui_mode == ROT_UI_NORTH_CENTERED) ? "pm180" : "360";
         az_clamped = pipeline.az_clamped;
         el_clamped = pipeline.el_clamped;
         cmdaz = pipeline.cmd_az;
@@ -9146,52 +9475,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         {
             rot_target_state_t prev_state = ctrl->target_state;
-            rot_target_state_t desired_state = ROT_TARGET_STATE_IDLE;
-            const gchar *state_reason = "idle";
-
-            if (ctrl->tracking && !ctrl->engaged)
-            {
-                desired_state = ROT_TARGET_STATE_IDLE;
-                state_reason = "disengaged";
-            }
-            else if (ctrl->tracking && ctrl->conf && ctrl->target)
-            {
-                if (pos_stale_now)
-                {
-                    desired_state = ROT_TARGET_STATE_HOLD;
-                    state_reason = "stale";
-                }
-                else if (hold_below)
-                {
-                    desired_state = ROT_TARGET_STATE_HOLD;
-                    state_reason = "hold";
-                }
-                else if (pretrack_active)
-                {
-                    desired_state = ROT_TARGET_STATE_PRETRACK;
-                    state_reason = "pretrack";
-                }
-                else if (!pred_valid)
-                {
-                    desired_state = ROT_TARGET_STATE_HOLD;
-                    state_reason = "pred_invalid";
-                }
-                else if (rotpos_valid)
-                {
-                    desired_state = ROT_TARGET_STATE_TRACKING_NORMAL;
-                    state_reason = "tracking";
-                }
-                else
-                {
-                    desired_state = ROT_TARGET_STATE_TRACKING_DEGRADED;
-                    state_reason = "tracking_degraded";
-                }
-            }
-            else if (ctrl->tracking)
-            {
-                desired_state = ROT_TARGET_STATE_HOLD;
-                state_reason = "no_target";
-            }
 
             state_changed = (desired_state != prev_state);
             if (state_changed)
@@ -9345,6 +9628,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
+        ctrl->committed_backend_az = cmdaz;
+        ctrl->committed_backend_el = cmdel;
+
         cmdaz_plot = azel_normalize_az_0_360(az_abs_cmd);
         cmdel_plot = cmdel;
 
@@ -9371,11 +9657,58 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
-        have_target = pred_valid || autocal_active ||
-                      (hold_below && !hold_no_target);
         manual_override = rotctrl_manual_override_active(ctrl);
+
+        eps_az = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.5;
+        eps_el = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.0;
+        eps_az = MAX(eps_az, ROT_CMD_AZ_EPS_MIN_DEG);
+
+        if (pos_age_ms >= 0)
+            pos_fresh = (pos_age_ms <= ROT_CMD_POS_FRESH_MS);
+
+        if (ctrl->last_cmd_backend_valid)
+        {
+            last_cmd_backend_az_log = ctrl->last_cmd_backend_az;
+            last_cmd_backend_el_log = ctrl->last_cmd_backend_el;
+        }
+        else
+        {
+            last_cmd_backend_az_log = last_cmd_backend;
+            last_cmd_backend_el_log = last_cmd_el;
+        }
+
+        if (ctrl->tracking && ctrl->committed_valid && pos_fresh)
+        {
+            gdouble cur_user_az = rot_az360_to_ui(meas_az360, ui_mode);
+            gboolean az_ok =
+                (rot_ang_dist_deg(cur_user_az, ctrl->committed_user_az) <= eps_az);
+            gboolean el_ok =
+                (fabs(meas_el - ctrl->committed_user_el) <= eps_el);
+            not_at_target = !(az_ok && el_ok);
+        }
+
+        if (ctrl->tracking && ctrl->committed_valid)
+        {
+            if (!ctrl->last_cmd_valid ||
+                rot_ang_dist_deg(ctrl->committed_raw_az360, ctrl->last_cmd_az360) > 1e-6 ||
+                fabs(ctrl->committed_raw_el - ctrl->last_cmd_el) > 1e-6)
+                pending_target = TRUE;
+        }
+
+        if (!pos_fresh && ctrl->tracking && ctrl->committed_valid)
+        {
+            if (ctrl->last_keepalive_time_us == 0 ||
+                (now_us - ctrl->last_keepalive_time_us) >=
+                    (ROT_CMD_KEEPALIVE_MS * 1000))
+                keepalive_due = TRUE;
+        }
+
+        allow_not_at_target =
+            (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+
         if (ctrl->tracking)
-            allow_send = ctrl->engaged && !ctrl->monitor && !pos_stale_now;
+            allow_send = ctrl->engaged && !ctrl->monitor;
         else
             allow_send = ctrl->engaged && !ctrl->monitor &&
                          (session_ready ? pos_send_ok : manual_override);
@@ -9390,17 +9723,115 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (cal_force_send)
             allow_send = ctrl->engaged && !ctrl->monitor;
 
+        delta_az_phys = rot_ang_dist_deg(meas_az360, raw_cmd_az);
+        delta_el_phys = fabs(raw_cmd_el - meas_el);
+
+        force_send = force_send || (!ctrl->tracking && manual_override);
+        if (!ctrl->tracking && last_cmd_us == 0)
+            force_send = TRUE;
+
+        if (ctrl->tracking)
         {
-            eps_az = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.5;
-            eps_el = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.0;
+            gint64 cooldown_us = (gint64)ROT_CMD_COOLDOWN_MS * 1000;
+            gint64 max_hz_us = (ROT_CMD_MAX_HZ > 0.0)
+                               ? (gint64)(1000000.0 / ROT_CMD_MAX_HZ)
+                               : 0;
+            gint64 rate_limit_us = MAX(cooldown_us, max_hz_us);
 
-            delta_az_phys = fabs(gp_shortest_delta360(meas_az360, raw_cmd_az));
-            delta_el_phys = fabs(raw_cmd_el - meas_el);
+            rate_limit_us = MAX(rate_limit_us, (gint64)ROT_SEND_MIN_INTERVAL_US);
+            if (ctrl->last_cmd_time_us > 0 && now_us > ctrl->last_cmd_time_us)
+            {
+                gint64 elapsed = now_us - ctrl->last_cmd_time_us;
+                if (elapsed < rate_limit_us)
+                {
+                    cooldown_active = TRUE;
+                    cooldown_ms_left = (rate_limit_us - elapsed) / 1000;
+                }
+            }
 
-            force_send = cal_force_send ||
-                         (!ctrl->tracking && manual_override);
-            if (!ctrl->tracking && last_cmd_us == 0)
-                force_send = TRUE;
+            bypass_cooldown = force_send ||
+                              state_changed ||
+                              !committed_was_valid ||
+                              (az_delta_deg >= (2.0 * deadband_az) ||
+                               el_delta_deg >= (2.0 * deadband_el));
+
+            if (!have_target || !allow_send)
+            {
+                gate = "skip";
+                reason = "deadband";
+            }
+            else if (force_send)
+            {
+                gate_reason = "force";
+                if (cooldown_active && !bypass_cooldown)
+                {
+                    gate = "skip";
+                    reason = "cooldown";
+                }
+                else
+                {
+                    gate = "send";
+                    reason = "force";
+                    send_ok = TRUE;
+                }
+            }
+            else if (pending_target)
+            {
+                const gchar *pending_reason = gate_reason;
+                if (cooldown_active && !bypass_cooldown)
+                {
+                    gate = "skip";
+                    reason = "cooldown";
+                }
+                else
+                {
+                    gate = "send";
+                    reason = pending_reason;
+                    send_ok = TRUE;
+                }
+            }
+            else if (keepalive_due)
+            {
+                if (cooldown_active && !bypass_cooldown)
+                {
+                    gate = "skip";
+                    reason = "cooldown";
+                }
+                else
+                {
+                    gate = "send";
+                    reason = "keepalive";
+                    send_ok = TRUE;
+                }
+            }
+            else if (allow_not_at_target && pos_fresh && not_at_target)
+            {
+                if (cooldown_active && !bypass_cooldown)
+                {
+                    gate = "skip";
+                    reason = "cooldown";
+                }
+                else
+                {
+                    gate = "send";
+                    reason = "not_at_target_fresh";
+                    send_ok = TRUE;
+                }
+            }
+            else
+            {
+                gate = "skip";
+                reason = "deadband";
+            }
+        }
+        else
+        {
+            if (ctrl->last_cmd_valid)
+            {
+                gdouble d_az_last = rot_ang_dist_deg(meas_az360, ctrl->last_cmd_az360);
+                gdouble d_el_last = fabs(meas_el - ctrl->last_cmd_el);
+                not_at_target = (d_az_last > eps_az || d_el_last > eps_el);
+            }
 
             send_ok = force_send ||
                       rot_should_send(ctrl,
@@ -9410,33 +9841,32 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                       raw_cmd_el,
                                       eps_az,
                                       eps_el,
+                                      FALSE,
+                                      not_at_target,
                                       now_us,
                                       ROT_SEND_MIN_INTERVAL_US,
                                       &sched_reason);
-        }
 
-        if (!have_target)
-        {
-            gate = "skip";
-            reason = "no_target";
-        }
-        else if (!allow_send)
-        {
-            gate = "skip";
-            reason = pos_stale_now ? "stale" : "blocked";
-        }
-        else if (send_ok)
-        {
-            gate = "send";
-            if (force_send)
-                reason = "FORCE";
+            if (!have_target)
+            {
+                gate = "skip";
+                reason = "no_target";
+            }
+            else if (!allow_send)
+            {
+                gate = "skip";
+                reason = "blocked";
+            }
+            else if (send_ok)
+            {
+                gate = "send";
+                reason = force_send ? "FORCE" : sched_reason;
+            }
             else
+            {
+                gate = "skip";
                 reason = sched_reason;
-        }
-        else
-        {
-            gate = "skip";
-            reason = sched_reason;
+            }
         }
 
         if (allow_send && !send_ok && ctrl->verbose_logging)
@@ -9454,13 +9884,55 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
+        if (ctrl->tracking)
+        {
+            const gchar *mode_name =
+                (desired_state == ROT_TARGET_STATE_PRETRACK) ? "PRETRACK" : "TRACKING";
+            gdouble committed_user_az_log =
+                ctrl->committed_valid ? ctrl->committed_user_az : desired_user_az;
+            gdouble committed_user_el_log =
+                ctrl->committed_valid ? ctrl->committed_user_el : desired_user_el;
+
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "rot_cmd_gate: mode=%s desired_user=(%.2f,%.2f) committed_user=(%.2f,%.2f) "
+                        "desired_backend=(%.2f,%.2f) last_cmd_backend=(%.2f,%.2f) "
+                        "pos_fresh=%d last_good_age_ms=%lld az_delta_deg=%.2f el_delta_deg=%.2f "
+                        "cooldown_ms_left=%lld send=%d reason=%s",
+                        mode_name,
+                        desired_user_az, desired_user_el,
+                        committed_user_az_log, committed_user_el_log,
+                        desired_backend_az, desired_backend_el,
+                        last_cmd_backend_az_log, last_cmd_backend_el_log,
+                        pos_fresh ? 1 : 0,
+                        (long long)pos_age_ms,
+                        az_delta_deg, el_delta_deg,
+                        (long long)cooldown_ms_left,
+                        (allow_send && send_ok) ? 1 : 0,
+                        reason);
+        }
+
         if (have_target)
         {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        "tracking_decision: pred=(%.2f,%.2f) user=(%.2f,%.2f) "
+                        "backend=(%.2f,%.2f) cur_backend=(%.2f,%.2f) "
+                        "cur_user=(%.2f,%.2f) eps=(%.2f,%.2f) send=%d reason=%s "
+                        "wrap=%s offsets=(%.2f,%.2f)",
+                        az_pred, el_pred,
+                        log_az_user, effective_user_el,
+                        cmdaz, cmdel,
+                        meas_backend_az, meas_backend_el,
+                        log_cur_user_az, log_cur_user_el,
+                        eps_az, eps_el,
+                        (allow_send && send_ok) ? 1 : 0,
+                        reason,
+                        wrap_name,
+                        log_offset_az, log_offset_el);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "trk: state=%s pred=%.2f/%.2f user=%.2f/%.2f cmd=%.2f/%.2f meas=%.2f/%.2f fresh=%d gate=%s reason=%s",
                         rot_target_state_name(ctrl->target_state),
                         az_pred, el_pred,
-                        log_az_user, display_el,
+                        log_az_user, effective_user_el,
                         cmdaz, cmdel,
                         meas_backend_az, meas_backend_el,
                         fresh_feedback ? 1 : 0,
@@ -9507,6 +9979,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->last_cmd_az360 = raw_cmd_az;
             ctrl->last_cmd_el = raw_cmd_el;
             ctrl->last_cmd_valid = TRUE;
+            ctrl->last_cmd_backend_az = cmdaz;
+            ctrl->last_cmd_backend_el = cmdel;
+            ctrl->last_cmd_backend_valid = TRUE;
+            if (!pos_fresh || g_strcmp0(reason, "keepalive") == 0)
+                ctrl->last_keepalive_time_us = now_us;
 
             rot_log_rate_limited(ctrl, &ctrl->send_log_rate, 1000000,
                                  SAT_LOG_LEVEL_INFO, "gpredict:tx",
@@ -9939,6 +10416,32 @@ static void wrap_mode_changed_cb(GtkComboBox *box, gpointer data)
     ctrl->pending_lane_valid = FALSE;
     ctrl->pending_lane_since_us = 0;
     ctrl->last_target_valid = FALSE;
+    ctrl->last_cmd_backend_az = 0.0;
+    ctrl->last_cmd_backend_el = 0.0;
+    ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->committed_user_az = 0.0;
+    ctrl->committed_user_el = 0.0;
+    ctrl->committed_raw_az360 = 0.0;
+    ctrl->committed_raw_el = 0.0;
+    ctrl->committed_backend_az = 0.0;
+    ctrl->committed_backend_el = 0.0;
+    ctrl->committed_valid = FALSE;
+    ctrl->committed_since_us = 0;
+    ctrl->last_keepalive_time_us = 0;
+    ctrl->last_desired_update_us = 0;
+    ctrl->last_cmd_backend_az = 0.0;
+    ctrl->last_cmd_backend_el = 0.0;
+    ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->committed_user_az = 0.0;
+    ctrl->committed_user_el = 0.0;
+    ctrl->committed_raw_az360 = 0.0;
+    ctrl->committed_raw_el = 0.0;
+    ctrl->committed_backend_az = 0.0;
+    ctrl->committed_backend_el = 0.0;
+    ctrl->committed_valid = FALSE;
+    ctrl->committed_since_us = 0;
+    ctrl->last_keepalive_time_us = 0;
+    ctrl->last_desired_update_us = 0;
 }
 
 static void rot_limits_changed_cb(GtkSpinButton *spin, gpointer data)
@@ -11958,6 +12461,32 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->last_cmd_az360 = 0.0;
     ctrl->last_cmd_el = 0.0;
     ctrl->last_cmd_valid = FALSE;
+    ctrl->last_cmd_backend_az = 0.0;
+    ctrl->last_cmd_backend_el = 0.0;
+    ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->committed_user_az = 0.0;
+    ctrl->committed_user_el = 0.0;
+    ctrl->committed_raw_az360 = 0.0;
+    ctrl->committed_raw_el = 0.0;
+    ctrl->committed_backend_az = 0.0;
+    ctrl->committed_backend_el = 0.0;
+    ctrl->committed_valid = FALSE;
+    ctrl->committed_since_us = 0;
+    ctrl->last_keepalive_time_us = 0;
+    ctrl->last_desired_update_us = 0;
+    ctrl->last_cmd_backend_az = 0.0;
+    ctrl->last_cmd_backend_el = 0.0;
+    ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->committed_user_az = 0.0;
+    ctrl->committed_user_el = 0.0;
+    ctrl->committed_raw_az360 = 0.0;
+    ctrl->committed_raw_el = 0.0;
+    ctrl->committed_backend_az = 0.0;
+    ctrl->committed_backend_el = 0.0;
+    ctrl->committed_valid = FALSE;
+    ctrl->committed_since_us = 0;
+    ctrl->last_keepalive_time_us = 0;
+    ctrl->last_desired_update_us = 0;
     ctrl->last_send_us = 0;
     ctrl->above_eps_count = 0;
     ctrl->last_hold_log_us = 0;
@@ -14301,8 +14830,8 @@ static GtkWidget *create_aoslos_banner_widgets(GtkRotCtrl *ctrl)
     GtkWidget      *frame;
 
     ctrl->aoslos_banner = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(ctrl->aoslos_banner),
-                         ROTCTRL_AOSLOS_PLACEHOLDER);
+    gp_safe_label_set_markup(ctrl->aoslos_banner,
+                             ROTCTRL_AOSLOS_PLACEHOLDER);
     gtk_widget_set_tooltip_text(ctrl->aoslos_banner,
                                 _("The time remaining until the next AOS or "
                                   "LOS event"));
@@ -14813,6 +15342,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->target_state_since_us = 0;
     ctrl->target_valid_since_us = 0;
     ctrl->target_invalid_since_us = 0;
+    ctrl->last_target_update_us = 0;
     ctrl->park_pending_since_us = 0;
     ctrl->pretrack_enabled = TRUE;
     ctrl->pretrack_lookahead_sec = ROT_PRETRACK_LOOKAHEAD_SEC;
@@ -14869,6 +15399,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->last_stop_us = 0;
     ctrl->rotctld_probe_state = NULL;
     ctrl->rotctld_probe_id = 0;
+    ctrl->last_hold_log_us = 0;
+    ctrl->last_stale_check_log_us = 0;
 
     /* Offset defaults */
     ctrl->use_offset   = FALSE;
