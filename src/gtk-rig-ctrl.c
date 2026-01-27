@@ -86,6 +86,7 @@
 #include "sat-cfg.h"
 #include "sat-pref-rig-editor.h"
 #include "trsp-conf.h"
+#include "ui-popup-quarantine.h"
 
 #ifndef G_SUBPROCESS_FLAGS_STDIN_DEV_NULL
 #ifdef G_SUBPROCESS_FLAGS_STDIN_INHERIT
@@ -118,6 +119,8 @@
 #define RIGCTLD_HEALTH_TIMEOUT_MS 200
 #define RIGCTLD_HEALTH_RETRIES 3
 #define RIGCTLD_HEALTH_RETRY_DELAY_MS 50
+#define RIGCTRL_FREQ_PLACEHOLDER "--- Hz"
+#define RIGCTRL_FREQ_PLACEHOLDER_DIGIT "<span size='xx-large'>-</span>"
 #define RIGCTLD_AUTOSTART_MAX_RESTARTS 2
 #define RIGCTLD_AUTOSTART_RETRY_DELAY_MS 150
 #define RIGCTLD_MODEL_IC9700 3081
@@ -673,6 +676,12 @@ static void     rig_term_log_err_rprt(GtkRigCtrl *ctrl, const gchar *cmd,
                                       const gchar *reply, gint code);
 static gboolean rigctrl_log_at_least(const GtkRigCtrl *ctrl,
                                      rig_log_level_t level);
+static void     rigctrl_ui_begin_update(GtkRigCtrl *ctrl, const gchar *reason);
+static void     rigctrl_ui_end_update(GtkRigCtrl *ctrl, const gchar *reason);
+static void     rigctrl_schedule_trsp_refresh(GtkRigCtrl *ctrl);
+static void     rigctrl_set_freq_knob_value(GtkRigCtrl *ctrl,
+                                            gboolean uplink,
+                                            gdouble value);
 static void     rigctrl_set_log_level(GtkRigCtrl *ctrl,
                                       rig_log_level_t level);
 static void     rigctrl_sync_log_toggles(GtkRigCtrl *ctrl);
@@ -771,21 +780,15 @@ static void     rigctrl_close_socket_internal(GtkRigCtrl *ctrl,
 static gboolean rigctrl_close_socket_idle(gpointer data);
 static gboolean rigctrl_configure_trsp_popup_idle(gpointer data);
 static void     rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data);
-static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
-                                                GdkEventButton *event,
-                                                gpointer data);
-static gboolean rigctrl_trsp_combo_button_release(GtkWidget *widget,
-                                                  GdkEventButton *event,
-                                                  gpointer data);
 static void     rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data);
 static void     rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data);
+static void     sat_selected_cb(GtkComboBox *satsel, gpointer data);
 static gint     rigctrl_trsp_popup_get_max_height(GtkWidget *anchor);
 static gint     rigctrl_trsp_tree_row_count(GtkWidget *tree);
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
                                           GType child_type);
 static void     rigctrl_trsp_fix_expansion(GtkWidget *widget,
                                            GtkWidget *list);
-static gint64   rigctrl_trsp_popup_get_ts(GtkWidget *widget, const gchar *key);
 static void     rigctrl_trsp_popup_set_ts(GtkWidget *widget, const gchar *key);
 static guint    rigctrl_trsp_popup_bump_seq(GtkWidget *widget);
 static guint    rigctrl_trsp_popup_get_seq(GtkWidget *widget);
@@ -894,6 +897,8 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
     GtkWidget *dialog;
 
     if (ctrl == NULL)
+        return;
+    if (ctrl->destroying)
         return;
 
     if (ctrl->destroying)
@@ -1350,6 +1355,94 @@ static gboolean rigctrl_log_at_least(const GtkRigCtrl *ctrl,
     return ctrl->log_level >= level;
 }
 
+static void rigctrl_ui_begin_update(GtkRigCtrl *ctrl, const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->ui_updating = TRUE;
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctrl ui_begin_update %s",
+                    reason ? reason : "(none)");
+}
+
+static void rigctrl_ui_end_update(GtkRigCtrl *ctrl, const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->ui_updating = FALSE;
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctrl ui_end_update %s",
+                    reason ? reason : "(none)");
+}
+
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gboolean    uplink;
+    gdouble     value;
+} RigctrlKnobUpdate;
+
+static gboolean rigctrl_knob_update_idle(gpointer data)
+{
+    RigctrlKnobUpdate *update = data;
+    GtkRigCtrl *ctrl;
+    GtkWidget *knob;
+
+    if (update == NULL)
+        return G_SOURCE_REMOVE;
+
+    ctrl = update->ctrl;
+    knob = NULL;
+    if (ctrl != NULL && !ctrl->destroying)
+        knob = update->uplink ? ctrl->RigFreqUp : ctrl->RigFreqDown;
+
+    if (knob != NULL)
+        gtk_freq_knob_set_value(GTK_FREQ_KNOB(knob), update->value);
+
+    if (ctrl != NULL)
+        g_object_unref(ctrl);
+    g_free(update);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_set_freq_knob_value(GtkRigCtrl *ctrl,
+                                        gboolean uplink,
+                                        gdouble value)
+{
+    GtkWidget *knob = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    knob = uplink ? ctrl->RigFreqUp : ctrl->RigFreqDown;
+    if (knob == NULL)
+        return;
+
+    if (rigctrl_on_main_thread(ctrl))
+    {
+        gtk_freq_knob_set_value(GTK_FREQ_KNOB(knob), value);
+        return;
+    }
+
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctrl marshal freq knob %s value=%.0f",
+                    uplink ? "uplink" : "downlink",
+                    value);
+
+    {
+        RigctrlKnobUpdate *update = g_new0(RigctrlKnobUpdate, 1);
+
+        update->ctrl = g_object_ref(ctrl);
+        update->uplink = uplink;
+        update->value = value;
+        g_main_context_invoke(NULL, rigctrl_knob_update_idle, update);
+    }
+}
+
 static void rig_term_log_raw(GtkRigCtrl *ctrl, const gchar *prefix,
                              const gchar *line, gboolean force)
 {
@@ -1598,6 +1691,9 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
     gboolean visible;
 
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
     if (ctrl == NULL || ctrl->term_view == NULL)
         return;
 
@@ -1654,7 +1750,7 @@ static void rig_verbose_toggle_cb(GtkToggleButton *button, gpointer data)
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
     gboolean verbose;
 
-    if (ctrl == NULL)
+    if (ctrl == NULL || ctrl->ui_updating)
         return;
 
     verbose = gtk_toggle_button_get_active(button);
@@ -1759,11 +1855,97 @@ static gchar *rigctrl_combo_get_active_id(GtkComboBox *box,
     return gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(box));
 }
 
+static gboolean rigctrl_combo_popup_shown(GtkComboBox *box)
+{
+    gboolean shown = FALSE;
+
+    if (box == NULL)
+        return FALSE;
+
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(box), "popup-shown"))
+        g_object_get(box, "popup-shown", &shown, NULL);
+
+    return shown;
+}
+
+
+typedef struct
+{
+    GtkComboBox *box;
+    gint index;
+    GCallback cb;
+    gpointer data;
+    GtkRigCtrl *ctrl;
+} RigCtrlComboUpdate;
+
+static gboolean rigctrl_combo_set_active_idle(gpointer data)
+{
+    RigCtrlComboUpdate *update = data;
+    gboolean was_updating = FALSE;
+
+    if (update == NULL || update->box == NULL)
+    {
+        g_free(update);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (rigctrl_combo_popup_shown(update->box))
+        return G_SOURCE_CONTINUE;
+
+    if (update->ctrl != NULL)
+    {
+        if (update->ctrl->destroying)
+        {
+            g_object_unref(update->box);
+            g_object_unref(update->ctrl);
+            g_free(update);
+            return G_SOURCE_REMOVE;
+        }
+
+        was_updating = update->ctrl->ui_updating;
+        rigctrl_ui_begin_update(update->ctrl, "combo_deferred");
+    }
+
+    g_signal_handlers_block_by_func(update->box, (gpointer)update->cb, update->data);
+    gtk_combo_box_set_active(update->box, update->index);
+    g_signal_handlers_unblock_by_func(update->box, (gpointer)update->cb, update->data);
+
+    if (update->ctrl != NULL && !was_updating)
+        rigctrl_ui_end_update(update->ctrl, "combo_deferred");
+
+    g_object_unref(update->box);
+    if (update->ctrl != NULL)
+        g_object_unref(update->ctrl);
+    g_free(update);
+    return G_SOURCE_REMOVE;
+}
+
 static void rigctrl_combo_set_active_blocked(GtkComboBox *box, gint index,
                                              GCallback cb, gpointer data)
 {
+    GtkRigCtrl *ctrl = IS_GTK_RIG_CTRL(data) ? GTK_RIG_CTRL(data) : NULL;
+
     if (box == NULL)
         return;
+
+    if (ctrl == NULL || !ctrl->ui_updating)
+    {
+        if (rigctrl_combo_popup_shown(box))
+        {
+            RigCtrlComboUpdate *update = g_new0(RigCtrlComboUpdate, 1);
+            update->box = g_object_ref(box);
+            update->index = index;
+            update->cb = cb;
+            update->data = data;
+            if (ctrl != NULL)
+                update->ctrl = g_object_ref(ctrl);
+            g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+                            rigctrl_combo_set_active_idle,
+                            update,
+                            NULL);
+            return;
+        }
+    }
 
     g_signal_handlers_block_by_func(box, (gpointer)cb, data);
     gtk_combo_box_set_active(box, index);
@@ -1853,6 +2035,64 @@ static gboolean rigctrl_on_main_thread(const GtkRigCtrl *ctrl)
     return (g_thread_self() == ctrl->main_thread);
 }
 
+static gboolean rigctrl_freq_display_connected(const GtkRigCtrl *ctrl,
+                                               gboolean uplink)
+{
+    if (ctrl == NULL || !ctrl->engaged)
+        return FALSE;
+
+    if (uplink)
+    {
+        if (ctrl->conf2 != NULL)
+            return (ctrl->conn_state2 == RIGCTRL_CONN_CONNECTED);
+        return (ctrl->conn_state == RIGCTRL_CONN_CONNECTED);
+    }
+
+    return (ctrl->conn_state == RIGCTRL_CONN_CONNECTED);
+}
+
+static void rigctrl_set_knob_placeholder(GtkFreqKnob *knob, gboolean placeholder)
+{
+    guint i;
+
+    if (knob == NULL)
+        return;
+
+    if (!placeholder)
+    {
+        gtk_freq_knob_set_value(knob, gtk_freq_knob_get_value(knob));
+        return;
+    }
+
+    for (i = 0; i < G_N_ELEMENTS(knob->digits); i++)
+        gtk_label_set_markup(GTK_LABEL(knob->digits[i]),
+                             RIGCTRL_FREQ_PLACEHOLDER_DIGIT);
+}
+
+static void rigctrl_update_freq_display(GtkRigCtrl *ctrl)
+{
+    gboolean down_ok;
+    gboolean up_ok;
+
+    if (ctrl == NULL)
+        return;
+
+    down_ok = rigctrl_freq_display_connected(ctrl, FALSE);
+    up_ok = rigctrl_freq_display_connected(ctrl, TRUE);
+
+    /* Doppler is computed from preset frequency + satellite; independent of rig connectivity. */
+    if (ctrl->RigFreqDown)
+        rigctrl_set_knob_placeholder(GTK_FREQ_KNOB(ctrl->RigFreqDown), !down_ok);
+    if (ctrl->RigFreqUp)
+        rigctrl_set_knob_placeholder(GTK_FREQ_KNOB(ctrl->RigFreqUp), !up_ok);
+}
+
+static gboolean rigctrl_update_freq_display_idle(gpointer data)
+{
+    rigctrl_update_freq_display(GTK_RIG_CTRL(data));
+    return G_SOURCE_REMOVE;
+}
+
 static const gchar *rigctrl_conn_state_name(rigctrl_conn_state_t state)
 {
     switch (state)
@@ -1902,6 +2142,11 @@ static void rigctrl_set_conn_state(GtkRigCtrl *ctrl,
                  rigctrl_conn_state_name(prev_state),
                  rigctrl_conn_state_name(state),
                  reason ? reason : "no reason");
+
+    if (rigctrl_on_main_thread(ctrl))
+        rigctrl_update_freq_display(ctrl);
+    else
+        g_idle_add(rigctrl_update_freq_display_idle, ctrl);
 }
 
 static void G_GNUC_UNUSED rig_show_conn_error(GtkRigCtrl *ctrl,
@@ -2126,6 +2371,11 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->close_pending_id = 0;
     }
     remove_timer(ctrl);
+    if (ctrl->pending_ui_refresh_id != 0)
+    {
+        g_source_remove(ctrl->pending_ui_refresh_id);
+        ctrl->pending_ui_refresh_id = 0;
+    }
 
     if (ctrl->rigctl_thread != NULL)
     {
@@ -2292,6 +2542,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->log_verbose_toggle = NULL;
     ctrl->log_level = RIG_LOG_QUIET;
     rigctld_client_set_log_level(ctrl->log_level);
+    ctrl->ui_updating = FALSE;
+    ctrl->pending_ui_refresh_id = 0;
     ctrl->resize_idle_id = 0;
     ctrl->primary_rig_id = NULL;
     ctrl->secondary_rig_id = NULL;
@@ -3654,17 +3906,6 @@ static void rigctrl_show_log(GtkRigCtrl *ctrl)
     rigctrl_schedule_resize(ctrl);
 }
 
-static gint64 rigctrl_trsp_popup_get_ts(GtkWidget *widget, const gchar *key)
-{
-    gint64 *ts = NULL;
-
-    if (widget == NULL || key == NULL)
-        return 0;
-
-    ts = g_object_get_data(G_OBJECT(widget), key);
-    return ts != NULL ? *ts : 0;
-}
-
 static void rigctrl_trsp_popup_set_ts(GtkWidget *widget, const gchar *key)
 {
     gint64 *ts = NULL;
@@ -3872,57 +4113,6 @@ static void rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data)
         return;
 
     g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(widget));
-}
-
-static gboolean rigctrl_trsp_combo_button_press(GtkWidget *widget,
-                                                GdkEventButton *event,
-                                                gpointer data)
-{
-    gint64 last_hide = 0;
-    gint64 now = 0;
-
-    (void)data;
-    (void)event;
-
-    if (widget == NULL)
-        return FALSE;
-
-    last_hide = rigctrl_trsp_popup_get_ts(widget, "rigctrl-popup-last-hide");
-    if (last_hide > 0)
-    {
-        now = g_get_monotonic_time();
-        if ((now - last_hide) < RIGCTRL_TRSP_POPUP_DEBOUNCE_US)
-            return TRUE;
-    }
-
-    return FALSE;
-}
-
-static gboolean rigctrl_trsp_combo_button_release(GtkWidget *widget,
-                                                  GdkEventButton *event,
-                                                  gpointer data)
-{
-    gint64 last_show = 0;
-    gint64 now = 0;
-
-    (void)data;
-    (void)event;
-
-    if (widget == NULL)
-        return FALSE;
-
-    if (g_object_get_data(G_OBJECT(widget), "rigctrl-popup-opened") != NULL)
-    {
-        last_show = rigctrl_trsp_popup_get_ts(widget, "rigctrl-popup-last-show");
-        if (last_show > 0)
-        {
-            now = g_get_monotonic_time();
-            if ((now - last_show) < RIGCTRL_TRSP_POPUP_DEBOUNCE_US)
-                return TRUE;
-        }
-    }
-
-    return FALSE;
 }
 
 static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
@@ -4301,6 +4491,8 @@ void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
         }
     }
 
+    rigctrl_update_freq_display(ctrl);
+
     g_mutex_unlock(&ctrl->rig_ctrl_updatelock);
 }
 
@@ -4321,7 +4513,9 @@ void gtk_rig_ctrl_select_sat(GtkRigCtrl * ctrl, gint catnum)
             if (sat->tle.catnr == catnum)
             {
                 /* assume the index is the same in sat selector */
-                gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->SatSel), i);
+                rigctrl_combo_set_active_blocked(GTK_COMBO_BOX(ctrl->SatSel), i,
+                                                 G_CALLBACK(sat_selected_cb),
+                                                 ctrl);
                 break;
             }
         }
@@ -4334,6 +4528,9 @@ static void downlink_changed_cb(GtkFreqKnob * knob, gpointer data)
     gint64          hz = 0;
 
     (void)knob;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
 
     if (ctrl->suppress_user_base)
         return;
@@ -4351,6 +4548,9 @@ static void uplink_changed_cb(GtkFreqKnob * knob, gpointer data)
     gint64          hz = 0;
 
     (void)knob;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
 
     if (ctrl->suppress_user_base)
         return;
@@ -4496,22 +4696,34 @@ static GtkWidget *create_uplink_widgets(GtkRigCtrl * ctrl)
 
     return frame;
 }
-
+static void trsp_selected_cb(GtkComboBox * box, gpointer data);
 
 static void load_trsp_list(GtkRigCtrl * ctrl)
 {
     trsp_t         *trsp = NULL;
+    GtkListStore   *store = NULL;
+    GtkTreeIter     iter;
     guint           i, n;
+    guint           rows = 0;
+    gboolean        was_updating = FALSE;
+
+    if (ctrl == NULL || ctrl->TrspSel == NULL)
+        return;
+
+    if (rigctrl_combo_popup_shown(GTK_COMBO_BOX(ctrl->TrspSel)))
+    {
+        rigctrl_schedule_trsp_refresh(ctrl);
+        return;
+    }
 
     if (ctrl->trsplist != NULL)
     {
-        n = g_slist_length(ctrl->trsplist);
-        for (i = 0; i < n; i++)
-            gtk_combo_box_text_remove(GTK_COMBO_BOX_TEXT(ctrl->TrspSel), 0);
-
         free_transponders(ctrl->trsplist);
+        ctrl->trsplist = NULL;
         ctrl->trsp = NULL;
     }
+
+    store = gtk_list_store_new(1, G_TYPE_STRING);
 
     /* check if there is a target satellite */
     if (ctrl->target == NULL)
@@ -4519,7 +4731,7 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s:%s: GtkSatModule has no target satellite."),
                     __FILE__, __func__);
-        return;
+        goto apply_model;
     }
 
     /* read transponders for new target */
@@ -4529,28 +4741,86 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
                 _("%s:%s: Satellite %d has %d transponder modes."),
                 __FILE__, __func__, ctrl->target->tle.catnr, n);
 
-    if (n == 0)
-        return;
-
     for (i = 0; i < n; i++)
     {
         trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, i);
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->TrspSel),
-                                       trsp->name);
+        if (trsp == NULL)
+            continue;
+
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter, 0, trsp->name, -1);
+        rows++;
 
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     _("%s:%s: Read transponder '%s' for satellite %d"),
                     __FILE__, __func__, trsp->name, ctrl->target->tle.catnr);
     }
 
-    ctrl->trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, 0);
-    rigctrl_apply_trsp_preset(ctrl, FALSE);
-    if (gtk_combo_box_get_active(GTK_COMBO_BOX(ctrl->TrspSel)) != 0)
+    if (rows > 0)
+    {
+        ctrl->trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, 0);
+        rigctrl_apply_trsp_preset(ctrl, FALSE);
+    }
+
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctrl trsp combo rows=%u active=%s",
+                    rows,
+                    rows > 0 ? "0" : "(none)");
+
+apply_model:
+    was_updating = ctrl->ui_updating;
+    rigctrl_ui_begin_update(ctrl, "trsp_list");
+    g_signal_handlers_block_by_func(ctrl->TrspSel,
+                                    (gpointer)G_CALLBACK(trsp_selected_cb),
+                                    ctrl);
+    gtk_combo_box_set_model(GTK_COMBO_BOX(ctrl->TrspSel), GTK_TREE_MODEL(store));
+    if (rows > 0)
         gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->TrspSel), 0);
+    g_signal_handlers_unblock_by_func(ctrl->TrspSel,
+                                      (gpointer)G_CALLBACK(trsp_selected_cb),
+                                      ctrl);
+    if (!was_updating)
+        rigctrl_ui_end_update(ctrl, "trsp_list");
+    g_object_unref(store);
 
     if (ctrl->TrspSel != NULL)
         g_idle_add(rigctrl_configure_trsp_popup_idle,
                    g_object_ref(ctrl->TrspSel));
+}
+
+static gboolean rigctrl_trsp_refresh_idle(gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    if (ctrl == NULL)
+        return G_SOURCE_REMOVE;
+
+    ctrl->pending_ui_refresh_id = 0;
+    if (!ctrl->destroying)
+        load_trsp_list(ctrl);
+
+    g_object_unref(ctrl);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_schedule_trsp_refresh(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+    if (ctrl->destroying)
+        return;
+
+    if (ctrl->pending_ui_refresh_id != 0)
+        return;
+
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        sat_log_log(SAT_LOG_LEVEL_DEBUG, "rigctrl schedule transponder refresh");
+
+    ctrl->pending_ui_refresh_id =
+        g_idle_add(rigctrl_trsp_refresh_idle, g_object_ref(ctrl));
+    if (ctrl->pending_ui_refresh_id == 0)
+        g_object_unref(ctrl);
 }
 
 static gboolean have_conf(void)
@@ -4594,6 +4864,9 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gint            i;
 
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
     i = gtk_combo_box_get_active(satsel);
     if (i >= 0)
     {
@@ -4607,7 +4880,7 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
         ctrl->pass = get_next_pass(ctrl->target, ctrl->qth, 3.0);
 
         /* read transponders for new target */
-        load_trsp_list(ctrl);
+        rigctrl_schedule_trsp_refresh(ctrl);
         ctrl->user_edit_down = FALSE;
         ctrl->user_edit_up = FALSE;
     }
@@ -4698,6 +4971,9 @@ static void trsp_selected_cb(GtkComboBox * box, gpointer data)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gint            i, n;
 
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
     i = gtk_combo_box_get_active(box);
     n = g_slist_length(ctrl->trsplist);
 
@@ -4745,6 +5021,9 @@ static void rx_track_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
 
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
     ctrl->rx_track_enabled = gtk_toggle_button_get_active(button);
     rigctrl_sync_tracking_state(ctrl);
 
@@ -4769,6 +5048,9 @@ static void rx_track_toggle_cb(GtkToggleButton *button, gpointer data)
 static void tx_track_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
 
     ctrl->tx_track_enabled = gtk_toggle_button_get_active(button);
     rigctrl_sync_tracking_state(ctrl);
@@ -4796,6 +5078,9 @@ static void delay_changed_cb(GtkSpinButton * spin, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
 
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
     ctrl->delay = (guint) gtk_spin_button_get_value(spin);
     if (ctrl->conf)
         ctrl->conf->cycle = ctrl->delay;
@@ -4809,6 +5094,9 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gchar          *buff;
     gchar          *selected_id;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: Primary device selected: %d"),
@@ -4842,9 +5130,11 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
 
         rigctrl_reset_reconnect(ctrl, FALSE);
 
+        rigctrl_ui_begin_update(ctrl, "primary_rig_selected");
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->cycle_spin),
                                   ctrl->conf->cycle);
         rigctrl_apply_log_level_from_conf(ctrl, ctrl->conf);
+        rigctrl_ui_end_update(ctrl, "primary_rig_selected");
 
         /* update LO widgets */
         buff = g_strdup_printf(_("%.0f MHz"), ctrl->conf->lo / 1.0e6);
@@ -4874,6 +5164,9 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gchar          *buff;
     gchar          *selected_id;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
 
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -4987,6 +5280,9 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
 
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
     if (!gtk_toggle_button_get_active(button))
     {
         /* Disengage: close socket / stop worker thread */
@@ -5064,6 +5360,8 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
      * state; this mirrors the previous behaviour.
      */
     ctrl->conf2 = NULL;
+
+    rigctrl_update_freq_display(ctrl);
 }
 
 static void rigctrl_combo_set_ellipsize(GtkComboBox *combo)
@@ -5129,6 +5427,8 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_tooltip_text(ctrl->SatSel, _("Select target object"));
     g_signal_connect(ctrl->SatSel, "changed", G_CALLBACK(sat_selected_cb),
                      ctrl);
+    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
+                                    GTK_COMBO_BOX(ctrl->SatSel));
     gtk_grid_attach(GTK_GRID(table), ctrl->SatSel, 1, 0, 3, 1);
     gtk_size_group_add_widget(combo_group, ctrl->SatSel);
 
@@ -5147,12 +5447,10 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     load_trsp_list(ctrl);
     g_signal_connect(ctrl->TrspSel, "realize",
                      G_CALLBACK(rigctrl_trsp_combo_realize), NULL);
-    g_signal_connect(ctrl->TrspSel, "button-press-event",
-                     G_CALLBACK(rigctrl_trsp_combo_button_press), NULL);
-    g_signal_connect(ctrl->TrspSel, "button-release-event",
-                     G_CALLBACK(rigctrl_trsp_combo_button_release), NULL);
     g_signal_connect(ctrl->TrspSel, "changed", G_CALLBACK(trsp_selected_cb),
                      ctrl);
+    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
+                                    GTK_COMBO_BOX(ctrl->TrspSel));
     gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 1, 3, 1);
     gtk_size_group_add_widget(combo_group, ctrl->TrspSel);
 
@@ -5383,11 +5681,95 @@ static void rigctrl_combo_restore_selection(GtkComboBox *box,
         count = gtk_tree_model_iter_n_children(model, NULL);
 
     if (count <= 0)
-        index = -1;
-    else if (index < 0)
+        return;
+
+    if (index < 0)
         index = 0;
 
     rigctrl_combo_set_active_blocked(box, index, cb, data);
+}
+
+typedef struct
+{
+    GtkRigCtrl *ctrl;
+    gboolean rebuilt;
+} RigCtrlDeviceRefresh;
+
+static guint rigctrl_device_refresh_id(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return 0;
+
+    return GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(ctrl), "rigctrl-device-refresh-id"));
+}
+
+static void rigctrl_set_device_refresh_id(GtkRigCtrl *ctrl, guint id)
+{
+    if (ctrl == NULL)
+        return;
+
+    g_object_set_data(G_OBJECT(ctrl), "rigctrl-device-refresh-id",
+                      GUINT_TO_POINTER(id));
+}
+
+static gboolean rigctrl_device_selectors_refresh_idle(gpointer data)
+{
+    RigCtrlDeviceRefresh *job = data;
+    GtkRigCtrl *ctrl = job ? job->ctrl : NULL;
+
+    if (ctrl == NULL)
+    {
+        g_free(job);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (ctrl->destroying)
+    {
+        rigctrl_set_device_refresh_id(ctrl, 0);
+        g_object_unref(ctrl);
+        g_free(job);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (rigctrl_combo_popup_shown(GTK_COMBO_BOX(ctrl->DevSel)) ||
+        rigctrl_combo_popup_shown(GTK_COMBO_BOX(ctrl->DevSel2)))
+        return G_SOURCE_CONTINUE;
+
+    rigctrl_set_device_refresh_id(ctrl, 0);
+    rigctrl_rebuild_device_selectors(ctrl, job->rebuilt);
+    g_object_unref(ctrl);
+    g_free(job);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_schedule_device_selectors_refresh(GtkRigCtrl *ctrl,
+                                                      gboolean rebuilt)
+{
+    RigCtrlDeviceRefresh *job;
+    guint id;
+
+    if (ctrl == NULL || ctrl->destroying)
+        return;
+
+    if (rigctrl_device_refresh_id(ctrl) != 0)
+        return;
+
+    job = g_new0(RigCtrlDeviceRefresh, 1);
+    job->ctrl = g_object_ref(ctrl);
+    job->rebuilt = rebuilt;
+    id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+                         rigctrl_device_selectors_refresh_idle,
+                         job,
+                         NULL);
+    if (id == 0)
+    {
+        g_object_unref(ctrl);
+        g_free(job);
+        return;
+    }
+
+    rigctrl_set_device_refresh_id(ctrl, id);
 }
 
 static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
@@ -5396,30 +5778,63 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
     GSList *rigs;
     GSList *tx_rigs;
     GSList *iter;
+    GtkListStore *primary_model = NULL;
+    GtkListStore *secondary_model = NULL;
+    GtkTreeIter tree_iter;
+    guint primary_rows = 0;
+    guint secondary_rows = 0;
+    gboolean was_updating = FALSE;
 
     if (ctrl == NULL || ctrl->DevSel == NULL || ctrl->DevSel2 == NULL)
         return;
 
+    if (rigctrl_combo_popup_shown(GTK_COMBO_BOX(ctrl->DevSel)) ||
+        rigctrl_combo_popup_shown(GTK_COMBO_BOX(ctrl->DevSel2)))
+    {
+        rigctrl_schedule_device_selectors_refresh(ctrl, rebuilt);
+        return;
+    }
+
     rigs = rigctrl_collect_rig_names(FALSE, TRUE);
     tx_rigs = rigctrl_collect_rig_names(TRUE, FALSE);
 
+    primary_model = gtk_list_store_new(1, G_TYPE_STRING);
+    for (iter = rigs; iter != NULL; iter = iter->next)
+    {
+        gtk_list_store_append(primary_model, &tree_iter);
+        gtk_list_store_set(primary_model, &tree_iter, 0, iter->data, -1);
+        primary_rows++;
+    }
+
+    secondary_model = gtk_list_store_new(1, G_TYPE_STRING);
+    gtk_list_store_append(secondary_model, &tree_iter);
+    gtk_list_store_set(secondary_model, &tree_iter, 0, _("None"), -1);
+    secondary_rows++;
+    for (iter = tx_rigs; iter != NULL; iter = iter->next)
+    {
+        gtk_list_store_append(secondary_model, &tree_iter);
+        gtk_list_store_set(secondary_model, &tree_iter, 0, iter->data, -1);
+        secondary_rows++;
+    }
+
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctrl rebuild device combos primary=%u secondary=%u requested_primary=%s requested_secondary=%s",
+                    primary_rows, secondary_rows,
+                    rigctrl_id_for_log(ctrl->primary_rig_id),
+                    rigctrl_id_for_log(ctrl->secondary_rig_id));
+
+    was_updating = ctrl->ui_updating;
+    rigctrl_ui_begin_update(ctrl, "device_selectors");
     g_signal_handlers_block_by_func(ctrl->DevSel,
                                     (gpointer)G_CALLBACK(primary_rig_selected_cb), ctrl);
     g_signal_handlers_block_by_func(ctrl->DevSel2,
                                     (gpointer)G_CALLBACK(secondary_rig_selected_cb), ctrl);
 
-    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(ctrl->DevSel));
-    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(ctrl->DevSel2));
-
-    for (iter = rigs; iter != NULL; iter = iter->next)
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel),
-                                       iter->data);
-
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2),
-                                   _("None"));
-    for (iter = tx_rigs; iter != NULL; iter = iter->next)
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->DevSel2),
-                                       iter->data);
+    gtk_combo_box_set_model(GTK_COMBO_BOX(ctrl->DevSel),
+                            GTK_TREE_MODEL(primary_model));
+    gtk_combo_box_set_model(GTK_COMBO_BOX(ctrl->DevSel2),
+                            GTK_TREE_MODEL(secondary_model));
 
     rigctrl_combo_restore_selection(GTK_COMBO_BOX(ctrl->DevSel),
                                     ctrl->primary_rig_id, FALSE,
@@ -5432,6 +5847,26 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
                                       (gpointer)G_CALLBACK(primary_rig_selected_cb), ctrl);
     g_signal_handlers_unblock_by_func(ctrl->DevSel2,
                                       (gpointer)G_CALLBACK(secondary_rig_selected_cb), ctrl);
+    if (!was_updating)
+        rigctrl_ui_end_update(ctrl, "device_selectors");
+
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+    {
+        gchar *active_primary =
+            rigctrl_combo_get_active_id(GTK_COMBO_BOX(ctrl->DevSel), FALSE);
+        gchar *active_secondary =
+            rigctrl_combo_get_active_id(GTK_COMBO_BOX(ctrl->DevSel2), TRUE);
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rigctrl device combo active primary=%s secondary=%s",
+                    rigctrl_id_for_log(active_primary),
+                    rigctrl_id_for_log(active_secondary));
+        g_free(active_primary);
+        g_free(active_secondary);
+    }
+
+    g_object_unref(primary_model);
+    g_object_unref(secondary_model);
 
     rigctrl_set_selection_id(ctrl, "primary", &ctrl->primary_rig_id,
                              rigctrl_combo_get_active_id(GTK_COMBO_BOX(ctrl->DevSel),
@@ -5481,9 +5916,13 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 
     g_signal_connect(ctrl->DevSel, "changed",
                      G_CALLBACK(primary_rig_selected_cb), ctrl);
+    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
+                                    GTK_COMBO_BOX(ctrl->DevSel));
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel, 1, 0, 1, 1);
     g_signal_connect(ctrl->DevSel2, "changed",
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
+    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
+                                    GTK_COMBO_BOX(ctrl->DevSel2));
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel2, 1, 1, 1, 1);
 
     /* Logs toggle */
@@ -7254,7 +7693,7 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
         else if (llabs(readfreq - ctrl->lastrxf) >= 1)
         {
             /* user might have altered radio frequency => update rig readback */
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+            rigctrl_set_freq_knob_value(ctrl, FALSE,
                                     (gdouble)readfreq);
             ctrl->lastrxf = readfreq;
             ctrl->rig_actual_down_hz = readfreq;
@@ -7274,8 +7713,8 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
     rigctrl_update_last_target(ctrl, TRUE, tmpfreq);
     rigctrl_update_last_target(ctrl, FALSE, target_up);
 
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), (gdouble)tmpfreq);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)target_up);
+    rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)tmpfreq);
+    rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)target_up);
 
     sent_freq = tmpfreq;
 
@@ -7328,7 +7767,7 @@ static void exec_rx_cycle(GtkRigCtrl * ctrl)
                     ctrl->lastrxf = readback;
                     ctrl->rig_actual_down_hz = readback;
                     rigctrl_update_last_sent(ctrl, TRUE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                    rigctrl_set_freq_knob_value(ctrl, FALSE,
                                             (gdouble)readback);
 
                     /* This is only effective in RIG_TYPE_TRX mode.
@@ -7405,7 +7844,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
         else if (llabs(readfreq - ctrl->lasttxf) >= 1)
         {
             /* user might have altered radio frequency => update rig readback */
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)readfreq);
+            rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)readfreq);
             ctrl->lasttxf = readfreq;
             ctrl->rig_actual_up_hz = readfreq;
 
@@ -7424,8 +7863,8 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
     rigctrl_update_last_target(ctrl, FALSE, tmpfreq);
     rigctrl_update_last_target(ctrl, TRUE, target_down);
 
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)tmpfreq);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), (gdouble)target_down);
+    rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)tmpfreq);
+    rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)target_down);
 
     sent_freq = tmpfreq;
 
@@ -7478,7 +7917,7 @@ static void exec_tx_cycle(GtkRigCtrl * ctrl)
                     ctrl->lasttxf = readback;
                     ctrl->rig_actual_up_hz = readback;
                     rigctrl_update_last_sent(ctrl, FALSE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                    rigctrl_set_freq_knob_value(ctrl, TRUE,
                                             (gdouble)readback);
 
                     /* This is only effective in RIG_TYPE_TRX mode.
@@ -7592,7 +8031,7 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
                                      use_rit_xit, &base_sat,
                                      &doppler_hz, &target_ok);
     rigctrl_update_last_target(ctrl, FALSE, tmpfreq);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)tmpfreq);
+    rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)tmpfreq);
 
     /* if device is engaged, send freq command to radio */
     if ((ctrl->engaged) && target_ok &&
@@ -7657,8 +8096,8 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
     rigctrl_update_last_target(ctrl, TRUE, rigfreqd);
     rigctrl_update_last_target(ctrl, FALSE, rigfrequ);
 
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), (gdouble)rigfreqd);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)rigfrequ);
+    rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)rigfreqd);
+    rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)rigfrequ);
 
     if (!ctrl->engaged)
         return;
@@ -7713,7 +8152,7 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                     ctrl->lastrxf = readback;
                     ctrl->rig_actual_down_hz = readback;
                     rigctrl_update_last_sent(ctrl, TRUE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                    rigctrl_set_freq_knob_value(ctrl, FALSE,
                                             (gdouble)readback);
                 }
                 else
@@ -7780,7 +8219,7 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                     ctrl->lasttxf = readback;
                     ctrl->rig_actual_up_hz = readback;
                     rigctrl_update_last_sent(ctrl, FALSE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                    rigctrl_set_freq_knob_value(ctrl, TRUE,
                                             (gdouble)readback);
                 }
                 else
@@ -7837,7 +8276,7 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
             dialchanged = TRUE;
 
             /* user might have altered radio frequency => update rig readback */
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)readfreq);
+            rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)readfreq);
             ctrl->lasttxf = readfreq;
             ctrl->rig_actual_up_hz = readfreq;
 
@@ -7859,8 +8298,8 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
     rigctrl_update_last_target(ctrl, FALSE, tmpfreq);
     rigctrl_update_last_target(ctrl, TRUE, target_down);
 
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)tmpfreq);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), (gdouble)target_down);
+    rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)tmpfreq);
+    rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)target_down);
 
     sent_freq = tmpfreq;
 
@@ -7913,7 +8352,7 @@ static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
                     ctrl->lasttxf = readback;
                     ctrl->rig_actual_up_hz = readback;
                     rigctrl_update_last_sent(ctrl, FALSE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                    rigctrl_set_freq_knob_value(ctrl, TRUE,
                                             (gdouble)readback);
                 }
                 else
@@ -7965,7 +8404,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
         if (llabs(readfreq - ctrl->lastrxf) >= 1)
         {
             down_dialchanged = TRUE;
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+            rigctrl_set_freq_knob_value(ctrl, FALSE,
                                     (gdouble)readfreq);
             ctrl->lastrxf = readfreq;
             ctrl->rig_actual_down_hz = readfreq;
@@ -7981,7 +8420,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                                          tx_use_rit_xit, &base_sat_up,
                                          &doppler_up, &up_ok);
         rigctrl_update_last_target(ctrl, FALSE, tmpfreq);
-        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)tmpfreq);
+        rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)tmpfreq);
 
         if ((ctrl->engaged) && up_ok &&
             rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
@@ -8009,7 +8448,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                         ctrl->lasttxf = readback;
                         ctrl->rig_actual_up_hz = readback;
                         rigctrl_update_last_sent(ctrl, FALSE, readback);
-                        gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                        rigctrl_set_freq_knob_value(ctrl, TRUE,
                                                 (gdouble)readback);
                     }
                     else
@@ -8041,7 +8480,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                                      rx_use_rit_xit, &base_sat_down,
                                      &doppler_down, &down_ok);
     rigctrl_update_last_target(ctrl, TRUE, tmpfreq);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown), (gdouble)tmpfreq);
+    rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)tmpfreq);
 
     if ((ctrl->engaged) && down_ok &&
         rigctrl_should_send_freq(ctrl, TRUE, tmpfreq))
@@ -8069,7 +8508,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                     ctrl->lastrxf = readback;
                     ctrl->rig_actual_down_hz = readback;
                     rigctrl_update_last_sent(ctrl, TRUE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqDown),
+                    rigctrl_set_freq_knob_value(ctrl, FALSE,
                                             (gdouble)readback);
                 }
                 else
@@ -8104,7 +8543,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
         if (llabs(readfreq - ctrl->lasttxf) >= 1)
         {
             up_dialchanged = TRUE;
-            gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)readfreq);
+            rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)readfreq);
             ctrl->lasttxf = readfreq;
             ctrl->rig_actual_up_hz = readfreq;
         }
@@ -8117,7 +8556,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                                      tx_use_rit_xit, &base_sat_up,
                                      &doppler_up, &up_ok);
     rigctrl_update_last_target(ctrl, FALSE, tmpfreq);
-    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp), (gdouble)tmpfreq);
+    rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)tmpfreq);
 
     if ((ctrl->engaged) && up_ok &&
         rigctrl_should_send_freq(ctrl, FALSE, tmpfreq))
@@ -8145,7 +8584,7 @@ static void exec_dual_rig_cycle(GtkRigCtrl * ctrl)
                     ctrl->lasttxf = readback;
                     ctrl->rig_actual_up_hz = readback;
                     rigctrl_update_last_sent(ctrl, FALSE, readback);
-                    gtk_freq_knob_set_value(GTK_FREQ_KNOB(ctrl->RigFreqUp),
+                    rigctrl_set_freq_knob_value(ctrl, TRUE,
                                             (gdouble)readback);
                 }
                 else
@@ -12166,7 +12605,6 @@ gpointer rigctl_run(gpointer data)
     {
         t_ctrl = GTK_RIG_CTRL(g_async_queue_pop(ctrl->rigctlq));
         ctrl = t_ctrl;
-        while (g_main_context_iteration(NULL, FALSE));
 
         if (t_ctrl == NULL)
         {
@@ -12320,6 +12758,8 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
 
     widget = g_object_new(GTK_TYPE_RIG_CTRL, NULL);
     rigctrl = GTK_RIG_CTRL(widget);
+
+    gp_ui_quarantine_install(gtk_widget_get_toplevel(widget));
 
     g_signal_connect(widget, "key-press-event", G_CALLBACK(key_press_cb),
                      NULL);

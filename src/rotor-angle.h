@@ -5,7 +5,7 @@
 #include <math.h>
 
 /* Keep azimuth math consistent across wrap boundaries. */
-static inline double rotor_wrap360_inline(double deg)
+static inline double wrap360(double deg)
 {
     double val = fmod(deg, 360.0);
     if (val < 0.0)
@@ -16,7 +16,7 @@ static inline double rotor_wrap360_inline(double deg)
 /* Signed delta in [-180, 180] between azimuths. */
 static inline double shortest_az_delta(double a, double b)
 {
-    double delta = rotor_wrap360_inline(a) - rotor_wrap360_inline(b);
+    double delta = wrap360(a) - wrap360(b);
     if (delta > 180.0)
         delta -= 360.0;
     else if (delta < -180.0)

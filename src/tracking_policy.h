@@ -5,6 +5,7 @@
 
 #include "azel_mapping.h"
 #include "payload-profile.h"
+#include "rotor-target.h"
 
 typedef struct RigCaps RigCaps;
 typedef struct RotCaps RotCaps;
@@ -77,5 +78,56 @@ TrackDecision tracking_policy_decide(const TrackPolicy *p,
                                      double el_target,
                                      double az_abs_last_cmd,
                                      double el_last_cmd);
+
+typedef enum {
+    TRACKING_WRAP_CONTINUOUS = 0,
+    TRACKING_WRAP_NORTH_CENTERED = 1
+} tracking_wrap_mode_t;
+
+typedef enum {
+    TRACKING_GEOM_NORMAL = 0,
+    TRACKING_GEOM_FLIPPED = 1
+} tracking_geom_mode_t;
+
+typedef struct {
+    tracking_wrap_mode_t wrap_mode;
+    tracking_geom_mode_t geom_mode;
+    gdouble az_min;
+    gdouble az_max;
+    gdouble el_min;
+    gdouble el_max;
+    gdouble seam;
+    gint    preferred_k;
+    gdouble last_cmd_az;
+    gboolean last_cmd_valid;
+    gboolean chosen;
+    gboolean degraded;
+    gboolean logged_no_branch;
+    gboolean logged_empty_set;
+    gdouble window_start;
+    gdouble window_end;
+} RotTrackingPolicy;
+
+void rot_tracking_policy_reset(RotTrackingPolicy *p);
+gboolean rot_tracking_policy_choose(RotTrackingPolicy *p,
+                                    tracking_wrap_mode_t wrap_mode,
+                                    gdouble az_min,
+                                    gdouble az_max,
+                                    gdouble el_min,
+                                    gdouble el_max,
+                                    gboolean allow_flip,
+                                    const rot_target_sample_t *samples,
+                                    gsize sample_count,
+                                    gboolean *used_flip_out,
+                                    gboolean *degraded_out);
+gboolean rot_tracking_policy_select_cmd(const RotTrackingPolicy *p,
+                                        gdouble az_pred,
+                                        gdouble el_pred,
+                                        gboolean have_measured,
+                                        gdouble measured_az,
+                                        gdouble last_cmd_az,
+                                        gdouble *az_cmd_out,
+                                        gdouble *el_cmd_out,
+                                        gboolean *empty_set_out);
 
 #endif

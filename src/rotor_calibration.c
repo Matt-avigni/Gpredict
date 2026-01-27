@@ -6,6 +6,7 @@
 #include <math.h>
 
 #include "gpredict-utils.h"
+#include "rotor-angle.h"
 
 static gchar *calib_sanitize_id(const char *rotor_id)
 {
@@ -54,18 +55,6 @@ static gchar *calib_build_path(const char *rotor_id, gchar **dir_out)
 
     g_free(safe_id);
     return path;
-}
-
-double wrap360(double az_deg)
-{
-    double wrapped = fmod(az_deg, 360.0);
-
-    if (wrapped < 0.0)
-        wrapped += 360.0;
-    if (wrapped >= 360.0)
-        wrapped -= 360.0;
-
-    return wrapped;
 }
 
 double wrap180(double az_deg)

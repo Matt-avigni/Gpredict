@@ -34,33 +34,38 @@
 #include "sat-log.h"
 #include "sat-pref-rot-editor.h"
 #include "serial-ports.h"
+#include "ui-popup-quarantine.h"
 
 
 extern GtkWidget *window;       /* dialog window defined in sat-pref.c */
-static GtkWidget *dialog;       /* dialog window */
-static GtkWidget *name;         /* Configuration name */
-static GtkWidget *host;         /* host name or IP */
-static GtkWidget *port;         /* port number */
-static GtkWidget *autostart;
-static GtkWidget *protocol;
-static GtkWidget *baud;
-static GtkWidget *device_combo;
-static GtkWidget *device_refresh;
-static GtkWidget *device_manual;
-static GtkWidget *device_manual_revealer;
-static GtkWidget *device_autopick;
-static GtkWidget *device_status;
-static GtkWidget *aztype;
-static GtkWidget *minaz;
-static GtkWidget *maxaz;
-static GtkWidget *minel;
-static GtkWidget *maxel;
-static GtkWidget *minel_label;
-static GtkWidget *maxel_label;
-static GtkWidget *azstoppos;
-static GtkWidget *axismode;
-static gboolean device_scan_in_progress = FALSE;
-static GSList *device_cache = NULL;
+
+typedef struct {
+    GtkWidget *dialog;       /* dialog window */
+    GtkWidget *name;         /* Configuration name */
+    GtkWidget *host;         /* host name or IP */
+    GtkWidget *port;         /* port number */
+    GtkWidget *autostart;
+    GtkWidget *protocol;
+    GtkWidget *baud;
+    GtkWidget *device_combo;
+    GtkWidget *device_refresh;
+    GtkWidget *device_manual;
+    GtkWidget *device_manual_revealer;
+    GtkWidget *device_autopick;
+    GtkWidget *device_status;
+    GtkWidget *aztype;
+    GtkWidget *minaz;
+    GtkWidget *maxaz;
+    GtkWidget *minel;
+    GtkWidget *maxel;
+    GtkWidget *minel_label;
+    GtkWidget *maxel_label;
+    GtkWidget *axismode;
+    gboolean device_scan_in_progress;
+    gboolean ui_updating;
+    guint pending_ui_refresh_id;
+    GSList *device_cache;
+} RotPrefUi;
 static const gchar *ROT_DEVICE_OTHER_ID = "other";
 
 typedef struct {
@@ -68,10 +73,117 @@ typedef struct {
     RotPrefEditorDoneFunc  done;
     gpointer               user_data;
     gboolean               finished;
+    RotPrefUi             *ui;
 } RotPrefDialogState;
 
-static void update_el_limits_sensitivity(void);
+static void update_el_limits_sensitivity(RotPrefUi *ui);
 static void axismode_changed_cb(GtkComboBox *box, gpointer data);
+static void name_changed(GtkWidget *widget, gpointer data);
+static gboolean rot_pref_form_is_valid(RotPrefUi *ui);
+static void rot_pref_update_ok_button(RotPrefUi *ui);
+static void rot_pref_on_field_changed(GtkWidget *widget, gpointer data);
+static void protocol_changed_cb(GtkComboBox *box, gpointer data);
+static void device_combo_changed_cb(GtkComboBox *box, gpointer data);
+static void device_refresh_cb(GtkButton *button, gpointer data);
+static void device_autopick_toggled_cb(GtkToggleButton *toggle, gpointer data);
+static void aztype_changed_cb(GtkComboBox *box, gpointer data);
+static void rot_pref_schedule_device_combo_refresh(RotPrefUi *ui);
+
+static void rot_pref_ui_begin_update(RotPrefUi *ui, const gchar *reason)
+{
+    if (ui == NULL)
+        return;
+
+    ui->ui_updating = TRUE;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rot-pref ui_begin_update %s",
+                reason ? reason : "(none)");
+}
+
+static void rot_pref_ui_end_update(RotPrefUi *ui, const gchar *reason)
+{
+    if (ui == NULL)
+        return;
+
+    ui->ui_updating = FALSE;
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rot-pref ui_end_update %s",
+                reason ? reason : "(none)");
+}
+
+static gboolean rot_pref_combo_popup_shown(GtkComboBox *combo)
+{
+    gboolean shown = FALSE;
+
+    if (combo == NULL)
+        return FALSE;
+
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(combo), "popup-shown"))
+        g_object_get(combo, "popup-shown", &shown, NULL);
+
+    return shown;
+}
+
+
+static gboolean rot_pref_form_is_valid(RotPrefUi *ui)
+{
+    gchar *trimmed;
+    gboolean valid;
+
+    if (ui == NULL || ui->name == NULL)
+        return FALSE;
+
+    trimmed = g_strdup(gtk_entry_get_text(GTK_ENTRY(ui->name)));
+    g_strstrip(trimmed);
+    valid = trimmed[0] != '\0';
+    g_free(trimmed);
+
+    return valid;
+}
+
+static void rot_pref_update_ok_button(RotPrefUi *ui)
+{
+    if (ui == NULL || ui->dialog == NULL)
+        return;
+
+    gtk_dialog_set_response_sensitive(GTK_DIALOG(ui->dialog),
+                                      GTK_RESPONSE_OK,
+                                      rot_pref_form_is_valid(ui));
+}
+
+static void rot_pref_on_field_changed(GtkWidget *widget, gpointer data)
+{
+    RotPrefUi *ui = data;
+
+    (void)widget;
+
+    if (ui != NULL && ui->ui_updating)
+        return;
+
+    rot_pref_update_ok_button(ui);
+}
+
+static void rot_pref_combo_set_active(GtkComboBox *combo, gint index,
+                                      GCallback cb)
+{
+    if (combo == NULL)
+        return;
+
+    g_signal_handlers_block_by_func(combo, (gpointer)cb, NULL);
+    gtk_combo_box_set_active(combo, index);
+    g_signal_handlers_unblock_by_func(combo, (gpointer)cb, NULL);
+}
+
+static void rot_pref_combo_set_active_id(GtkComboBox *combo, const gchar *id,
+                                         GCallback cb)
+{
+    if (combo == NULL)
+        return;
+
+    g_signal_handlers_block_by_func(combo, (gpointer)cb, NULL);
+    gtk_combo_box_set_active_id(combo, id);
+    g_signal_handlers_unblock_by_func(combo, (gpointer)cb, NULL);
+}
 
 static void rot_pref_message_response(GtkDialog *dialog,
                                       gint response,
@@ -92,11 +204,12 @@ static void rot_pref_message_destroy(GtkWidget *widget, gpointer user_data)
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref message dialog destroyed");
 }
 
-static void rot_pref_show_dialog(GtkMessageType type,
+static void rot_pref_show_dialog(RotPrefUi *ui,
+                                 GtkMessageType type,
                                  const gchar *primary,
                                  const gchar *secondary)
 {
-    GtkWindow *parent = dialog ? GTK_WINDOW(dialog) : NULL;
+    GtkWindow *parent = ui && ui->dialog ? GTK_WINDOW(ui->dialog) : NULL;
     GtkWidget *msg = gtk_message_dialog_new(parent,
                                             GTK_DIALOG_DESTROY_WITH_PARENT,
                                             type,
@@ -198,35 +311,38 @@ static gboolean rot_pref_is_other_id(const gchar *id)
     return g_strcmp0(id, ROT_DEVICE_OTHER_ID) == 0;
 }
 
-static void rot_pref_update_device_ui_state(void)
+static void rot_pref_update_device_ui_state(RotPrefUi *ui)
 {
     gboolean autopick = FALSE;
     const gchar *active_id = NULL;
     gboolean show_manual = FALSE;
 
-    if (device_autopick)
-        autopick = gtk_toggle_button_get_active(
-            GTK_TOGGLE_BUTTON(device_autopick));
+    if (ui == NULL)
+        return;
 
-    if (device_combo)
-        active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(device_combo));
+    if (ui->device_autopick)
+        autopick = gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(ui->device_autopick));
+
+    if (ui->device_combo)
+        active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->device_combo));
 
     if (!autopick)
     {
         show_manual = rot_pref_is_other_id(active_id);
-        if (!show_manual && active_id == NULL && device_manual)
-            show_manual = gtk_entry_get_text_length(GTK_ENTRY(device_manual)) > 0;
+        if (!show_manual && active_id == NULL && ui->device_manual)
+            show_manual = gtk_entry_get_text_length(GTK_ENTRY(ui->device_manual)) > 0;
     }
 
-    if (device_combo)
-        gtk_widget_set_sensitive(device_combo, !autopick);
+    if (ui->device_combo)
+        gtk_widget_set_sensitive(ui->device_combo, !autopick);
 
-    if (device_manual)
-        gtk_widget_set_sensitive(device_manual, show_manual);
+    if (ui->device_manual)
+        gtk_widget_set_sensitive(ui->device_manual, show_manual);
 
-    if (device_manual_revealer)
+    if (ui->device_manual_revealer)
         gtk_revealer_set_reveal_child(
-            GTK_REVEALER(device_manual_revealer), show_manual);
+            GTK_REVEALER(ui->device_manual_revealer), show_manual);
 }
 
 static const gchar *rot_protocol_id(rot_protocol_t protocol)
@@ -262,44 +378,65 @@ static rot_protocol_t rot_protocol_from_combo(GtkComboBox *combo)
     return rot_protocol_from_id(id);
 }
 
-static void rot_pref_update_device_status(GSList *list, gboolean autopick)
+static void rot_pref_update_device_status(RotPrefUi *ui,
+                                          GSList *list,
+                                          gboolean autopick)
 {
-    if (device_status == NULL)
+    if (ui == NULL || ui->device_status == NULL)
         return;
 
     if (list == NULL)
     {
-        gtk_label_set_text(GTK_LABEL(device_status),
+        gtk_label_set_text(GTK_LABEL(ui->device_status),
                            autopick
                            ? _("No USB serial devices found")
                            : _("No serial devices found."));
     }
     else
-        gtk_label_set_text(GTK_LABEL(device_status), "");
+        gtk_label_set_text(GTK_LABEL(ui->device_status), "");
 }
 
-static void rot_pref_update_device_combo(GSList *list,
+static void rot_pref_update_device_combo(RotPrefUi *ui,
+                                         GSList *list,
                                          const gchar *current_id,
                                          gboolean autopick,
                                          const gchar *manual)
 {
     gchar *selected = NULL;
     const gchar *current = current_id;
+    GtkListStore *store = NULL;
+    GtkTreeIter iter;
+    guint rows = 0;
 
-    if (device_combo == NULL)
+    if (ui == NULL || ui->device_combo == NULL)
         return;
 
-    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(device_combo));
-
-    for (GSList *iter = list; iter != NULL; iter = iter->next)
+    if (rot_pref_combo_popup_shown(GTK_COMBO_BOX(ui->device_combo)))
     {
-        const gchar *path = iter->data;
-        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(device_combo),
-                                  path, path);
+        rot_pref_schedule_device_combo_refresh(ui);
+        return;
     }
 
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(device_combo),
-                              ROT_DEVICE_OTHER_ID, _("Other..."));
+    store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+    for (GSList *iter_list = list; iter_list != NULL; iter_list = iter_list->next)
+    {
+        const gchar *path = iter_list->data;
+        if (path == NULL)
+            continue;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+                           0, path,
+                           1, path,
+                           -1);
+        rows++;
+    }
+
+    gtk_list_store_append(store, &iter);
+    gtk_list_store_set(store, &iter,
+                       0, _("Other..."),
+                       1, ROT_DEVICE_OTHER_ID,
+                       -1);
+    rows++;
 
     if (rot_pref_is_other_id(current))
         current = NULL;
@@ -311,17 +448,78 @@ static void rot_pref_update_device_combo(GSList *list,
     else if (current && rot_pref_list_contains(list, current))
         selected = g_strdup(current);
 
-    if (selected)
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(device_combo), selected);
-    else
-        gtk_combo_box_set_active(GTK_COMBO_BOX(device_combo), -1);
+    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                "rot-pref device combo rebuild rows=%u selected=%s autopick=%d",
+                rows,
+                selected ? selected : "(none)",
+                autopick ? 1 : 0);
 
-    rot_pref_update_device_status(list, autopick);
-    rot_pref_update_device_ui_state();
+    rot_pref_ui_begin_update(ui, "device_combo");
+    g_signal_handlers_block_by_func(ui->device_combo,
+                                    (gpointer)G_CALLBACK(device_combo_changed_cb),
+                                    NULL);
+    gtk_combo_box_set_model(GTK_COMBO_BOX(ui->device_combo), GTK_TREE_MODEL(store));
+    gtk_combo_box_set_id_column(GTK_COMBO_BOX(ui->device_combo), 1);
+    if (rows > 0)
+    {
+        if (selected)
+            gtk_combo_box_set_active_id(GTK_COMBO_BOX(ui->device_combo), selected);
+        else
+            gtk_combo_box_set_active(GTK_COMBO_BOX(ui->device_combo), -1);
+    }
+    g_signal_handlers_unblock_by_func(ui->device_combo,
+                                      (gpointer)G_CALLBACK(device_combo_changed_cb),
+                                      NULL);
+    rot_pref_ui_end_update(ui, "device_combo");
+    g_object_unref(store);
+
+    rot_pref_update_device_status(ui, list, autopick);
+    rot_pref_update_device_ui_state(ui);
     g_free(selected);
 }
 
+static gboolean rot_pref_device_combo_refresh_idle(gpointer data)
+{
+    RotPrefUi *ui = data;
+    const gchar *current_id = NULL;
+    const gchar *manual_text = NULL;
+    gboolean autopick = TRUE;
+
+    if (ui == NULL)
+        return G_SOURCE_REMOVE;
+
+    if (ui->device_combo &&
+        rot_pref_combo_popup_shown(GTK_COMBO_BOX(ui->device_combo)))
+        return G_SOURCE_CONTINUE;
+
+    ui->pending_ui_refresh_id = 0;
+
+    if (ui->device_combo)
+        current_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->device_combo));
+    if (ui->device_autopick)
+        autopick = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->device_autopick));
+    if (ui->device_manual)
+        manual_text = gtk_entry_get_text(GTK_ENTRY(ui->device_manual));
+
+    rot_pref_update_device_combo(ui, ui->device_cache, current_id, autopick, manual_text);
+    return G_SOURCE_REMOVE;
+}
+
+static void rot_pref_schedule_device_combo_refresh(RotPrefUi *ui)
+{
+    if (ui == NULL)
+        return;
+
+    if (ui->pending_ui_refresh_id != 0)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref schedule device combo refresh");
+    ui->pending_ui_refresh_id =
+        g_idle_add(rot_pref_device_combo_refresh_idle, ui);
+}
+
 typedef struct {
+    GWeakRef dialog_ref;
     GSList  *list;
     gchar   *current_id;
     gchar   *manual;
@@ -345,49 +543,78 @@ static gpointer rot_pref_scan_devices_thread(gpointer data)
 static gboolean rot_pref_scan_devices_done(gpointer data)
 {
     RotDeviceScanResult *result = data;
+    GtkWidget *dialog;
+    RotPrefUi *ui;
 
-    device_scan_in_progress = FALSE;
-    if (device_refresh)
-        gtk_widget_set_sensitive(device_refresh, TRUE);
+    dialog = result ? g_weak_ref_get(&result->dialog_ref) : NULL;
+    ui = dialog ? g_object_get_data(G_OBJECT(dialog), "rot_pref_ui") : NULL;
 
-    if (device_cache)
-        gp_serial_free_candidates(device_cache);
+    if (ui == NULL)
+    {
+        if (result && result->list)
+            gp_serial_free_candidates(result->list);
+        if (dialog)
+            g_object_unref(dialog);
+        if (result)
+            g_weak_ref_clear(&result->dialog_ref);
+        g_free(result ? result->current_id : NULL);
+        g_free(result ? result->manual : NULL);
+        g_free(result);
+        return G_SOURCE_REMOVE;
+    }
 
-    device_cache = result ? result->list : NULL;
+    ui->device_scan_in_progress = FALSE;
+    if (ui->device_refresh)
+        gtk_widget_set_sensitive(ui->device_refresh, TRUE);
 
-    rot_pref_update_device_combo(device_cache,
+    if (ui->device_cache)
+        gp_serial_free_candidates(ui->device_cache);
+
+    ui->device_cache = result ? result->list : NULL;
+
+    rot_pref_update_device_combo(ui,
+                                 ui->device_cache,
                                  result ? result->current_id : NULL,
                                  result ? result->autopick : TRUE,
                                  result ? result->manual : NULL);
 
     g_free(result ? result->current_id : NULL);
     g_free(result ? result->manual : NULL);
+    if (result)
+        g_weak_ref_clear(&result->dialog_ref);
     g_free(result);
+    if (dialog)
+        g_object_unref(dialog);
     return G_SOURCE_REMOVE;
 }
 
-static void rot_pref_scan_devices_async(const gchar *current_id,
+static void rot_pref_scan_devices_async(RotPrefUi *ui,
+                                        const gchar *current_id,
                                         gboolean force_autopick)
 {
     RotDeviceScanResult *result = NULL;
     const gchar *manual_text = NULL;
 
-    if (device_scan_in_progress)
+    if (ui == NULL)
         return;
 
-    device_scan_in_progress = TRUE;
-    if (device_refresh)
-        gtk_widget_set_sensitive(device_refresh, FALSE);
+    if (ui->device_scan_in_progress)
+        return;
+
+    ui->device_scan_in_progress = TRUE;
+    if (ui->device_refresh)
+        gtk_widget_set_sensitive(ui->device_refresh, FALSE);
 
     result = g_new0(RotDeviceScanResult, 1);
+    g_weak_ref_init(&result->dialog_ref, ui->dialog);
     result->current_id = current_id ? g_strdup(current_id) : NULL;
     if (force_autopick)
         result->autopick = TRUE;
     else
-        result->autopick = device_autopick ?
-            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(device_autopick)) : TRUE;
-    if (device_manual)
-        manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
+        result->autopick = ui->device_autopick ?
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->device_autopick)) : TRUE;
+    if (ui->device_manual)
+        manual_text = gtk_entry_get_text(GTK_ENTRY(ui->device_manual));
     result->manual = (manual_text && *manual_text) ? g_strdup(manual_text) : NULL;
 
     GThread *thread = g_thread_new("rot-device-scan",
@@ -396,7 +623,8 @@ static void rot_pref_scan_devices_async(const gchar *current_id,
     g_thread_unref(thread);
 }
 
-static gchar *rot_pref_resolve_device(const gchar *current,
+static gchar *rot_pref_resolve_device(RotPrefUi *ui,
+                                      const gchar *current,
                                       gboolean autopick,
                                       gchar **detail)
 {
@@ -410,7 +638,7 @@ static gchar *rot_pref_resolve_device(const gchar *current,
     if (rot_pref_is_other_id(use_current))
         use_current = NULL;
 
-    list = device_cache;
+    list = ui ? ui->device_cache : NULL;
     if (list == NULL)
         list = gp_serial_list_candidates();
 
@@ -426,13 +654,15 @@ static gchar *rot_pref_resolve_device(const gchar *current,
                            : "No serial device selected");
     }
 
-    if (list != device_cache)
+    if (ui == NULL || list != ui->device_cache)
         gp_serial_free_candidates(list);
 
     return picked;
 }
 
-static gchar *rot_pref_resolve_device_from_ui(gboolean autopick, gchar **detail)
+static gchar *rot_pref_resolve_device_from_ui(RotPrefUi *ui,
+                                              gboolean autopick,
+                                              gchar **detail)
 {
     const gchar *active_id = NULL;
     const gchar *manual_text = NULL;
@@ -441,14 +671,17 @@ static gchar *rot_pref_resolve_device_from_ui(gboolean autopick, gchar **detail)
     if (detail)
         *detail = NULL;
 
-    if (device_combo)
-        active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(device_combo));
-    if (device_manual)
-        manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
+    if (ui == NULL)
+        return NULL;
+
+    if (ui->device_combo)
+        active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->device_combo));
+    if (ui->device_manual)
+        manual_text = gtk_entry_get_text(GTK_ENTRY(ui->device_manual));
 
     current = active_id;
     if (autopick)
-        return rot_pref_resolve_device(current, TRUE, detail);
+        return rot_pref_resolve_device(ui, current, TRUE, detail);
 
     if (rot_pref_is_other_id(active_id) || active_id == NULL || *active_id == '\0')
     {
@@ -463,9 +696,10 @@ static gchar *rot_pref_resolve_device_from_ui(gboolean autopick, gchar **detail)
 }
 static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
 {
-    const gchar *host_text = gtk_entry_get_text(GTK_ENTRY(host));
-    const gchar *spawn_host = host_text;
-    gint port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
+    RotPrefUi *ui = data;
+    const gchar *host_text;
+    const gchar *spawn_host;
+    gint port_val;
     gchar *device = NULL;
     gchar *device_note = NULL;
     gchar *stderr_tail = NULL;
@@ -474,11 +708,17 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
     RotctldMgr *mgr = NULL;
 
     (void)button;
-    (void)data;
+
+    if (ui == NULL || ui->host == NULL || ui->port == NULL)
+        return;
+
+    host_text = gtk_entry_get_text(GTK_ENTRY(ui->host));
+    spawn_host = host_text;
+    port_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->port));
 
     if (host_text == NULL || *host_text == '\0')
     {
-        rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+        rot_pref_show_dialog(ui, GTK_MESSAGE_ERROR,
                              _("rotctld connection failed"),
                              _("Missing host."));
         return;
@@ -486,7 +726,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
 
     if (port_val <= 0 || port_val > 65535)
     {
-        rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+        rot_pref_show_dialog(ui, GTK_MESSAGE_ERROR,
                              _("rotctld connection failed"),
                              _("Invalid port."));
         return;
@@ -496,17 +736,17 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
         spawn_host = "127.0.0.1";
 
     if (rotctld_mgr_host_is_local(host_text) &&
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart)))
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->autostart)))
     {
-        gboolean autopick = device_autopick &&
-            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(device_autopick));
+        gboolean autopick = ui->device_autopick &&
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->device_autopick));
 
-        device = rot_pref_resolve_device_from_ui(autopick, &device_note);
+        device = rot_pref_resolve_device_from_ui(ui, autopick, &device_note);
         if (device == NULL || *device == '\0')
         {
             const gchar *msg = device_note ? device_note
                                            : _("No serial device selected.");
-            rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+            rot_pref_show_dialog(ui, GTK_MESSAGE_ERROR,
                                  _("rotctld connection failed"),
                                  msg);
             g_free(device);
@@ -515,13 +755,13 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
         }
 
         rot_protocol_t proto =
-            rot_protocol_from_combo(GTK_COMBO_BOX(protocol));
+            rot_protocol_from_combo(GTK_COMBO_BOX(ui->protocol));
         if (!rot_protocol_is_valid(proto))
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         "rotctld test: invalid rotator protocol %d",
                         proto);
-            rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+            rot_pref_show_dialog(ui, GTK_MESSAGE_ERROR,
                                  _("rotctld connection failed"),
                                  _("Invalid rotator protocol."));
             g_free(device);
@@ -530,7 +770,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
         }
 
         gint model = rot_protocol_to_hamlib_model(proto);
-        gint baud_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(baud));
+        gint baud_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->baud));
         gchar *error = NULL;
 
         if (baud_val <= 0)
@@ -544,7 +784,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
                                 TRUE, &error);
         if (mgr == NULL)
         {
-            rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+            rot_pref_show_dialog(ui, GTK_MESSAGE_ERROR,
                                  _("rotctld connection failed"),
                                  _("See log for details."));
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -567,7 +807,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
 
     if (ok)
     {
-        rot_pref_show_dialog(GTK_MESSAGE_INFO,
+        rot_pref_show_dialog(ui, GTK_MESSAGE_INFO,
                              _("rotctld connection OK"),
                              _("See log for details."));
         sat_log_log(SAT_LOG_LEVEL_INFO,
@@ -575,7 +815,7 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
     }
     else
     {
-        rot_pref_show_dialog(GTK_MESSAGE_ERROR,
+        rot_pref_show_dialog(ui, GTK_MESSAGE_ERROR,
                              _("rotctld connection failed"),
                              _("See log for details."));
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -595,76 +835,96 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
 }
 
 /* Update widgets from the currently selected row in the treeview */
-static void update_widgets(rotor_conf_t * conf)
+static void update_widgets(RotPrefUi *ui, rotor_conf_t * conf)
 {
+    if (ui == NULL || conf == NULL)
+        return;
+
+    rot_pref_ui_begin_update(ui, "update_widgets");
+
     /* configuration name */
-    gtk_entry_set_text(GTK_ENTRY(name), conf->name);
+    gtk_entry_set_text(GTK_ENTRY(ui->name), conf->name);
 
     /* host */
     if (conf->host)
-        gtk_entry_set_text(GTK_ENTRY(host), conf->host);
+        gtk_entry_set_text(GTK_ENTRY(ui->host), conf->host);
 
     /* port */
     if (conf->port > 0 && conf->port <= 65535)
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), conf->port);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->port), conf->port);
     else
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4533); /* hamlib default? */
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->port), 4533); /* hamlib default? */
 
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart),
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->autostart),
                                  conf->autostart);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(protocol),
-                                rot_protocol_id(conf->protocol));
+    rot_pref_combo_set_active_id(GTK_COMBO_BOX(ui->protocol),
+                                 rot_protocol_id(conf->protocol),
+                                 G_CALLBACK(protocol_changed_cb));
     if (conf->baud > 0)
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud), conf->baud);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud), conf->baud);
     else
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud),
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                                   rot_protocol_default_baud(conf->protocol));
 
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(device_autopick),
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->device_autopick),
                                  conf->device_autopick);
-    gtk_entry_set_text(GTK_ENTRY(device_manual),
+    gtk_entry_set_text(GTK_ENTRY(ui->device_manual),
                        conf->device_manual ? conf->device_manual : "");
-    rot_pref_scan_devices_async(conf->device, FALSE);
-    rot_pref_update_device_ui_state();
+    rot_pref_scan_devices_async(ui, conf->device, FALSE);
+    rot_pref_update_device_ui_state(ui);
 
-    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype),
-                             (conf->aztype == ROT_AZ_TYPE_180)
-                             ? ROT_AZ_TYPE_180
-                             : ROT_AZ_TYPE_360);
+    rot_pref_combo_set_active(GTK_COMBO_BOX(ui->aztype),
+                              (conf->aztype == ROT_AZ_TYPE_180)
+                              ? ROT_AZ_TYPE_180
+                              : ROT_AZ_TYPE_360,
+                              G_CALLBACK(aztype_changed_cb));
 
     /* az and el limits */
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), conf->minaz);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), conf->maxaz);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minel), conf->minel);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), conf->maxel);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), conf->azstoppos);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), conf->axis_mode);
-    update_el_limits_sensitivity();
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), conf->minaz);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), conf->maxaz);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), conf->minel);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), conf->maxel);
+    rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), conf->axis_mode,
+                              G_CALLBACK(axismode_changed_cb));
+    update_el_limits_sensitivity(ui);
+
+    rot_pref_ui_end_update(ui, "update_widgets");
+    rot_pref_update_ok_button(ui);
 }
 
 /* called when the user clicks on the CLEAR button */
-static void clear_widgets(void)
+static void clear_widgets(RotPrefUi *ui)
 {
-    gtk_entry_set_text(GTK_ENTRY(name), "");
-    gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4533);     /* hamlib default? */
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), TRUE);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(protocol),
-                                rot_protocol_id(ROT_PROTOCOL_GS232B));
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud),
+    if (ui == NULL)
+        return;
+
+    rot_pref_ui_begin_update(ui, "clear_widgets");
+
+    gtk_entry_set_text(GTK_ENTRY(ui->name), "");
+    gtk_entry_set_text(GTK_ENTRY(ui->host), "127.0.0.1");
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->port), 4533);     /* hamlib default? */
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->autostart), TRUE);
+    rot_pref_combo_set_active_id(GTK_COMBO_BOX(ui->protocol),
+                                 rot_protocol_id(ROT_PROTOCOL_GS232B),
+                                 G_CALLBACK(protocol_changed_cb));
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                               rot_protocol_default_baud(ROT_PROTOCOL_GS232B));
-    gtk_entry_set_text(GTK_ENTRY(device_manual), "");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(device_autopick), TRUE);
-    rot_pref_scan_devices_async(NULL, FALSE);
-    rot_pref_update_device_ui_state();
-    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), ROT_AZ_TYPE_360);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 360);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minel), 0);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), 90);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
-    update_el_limits_sensitivity();
+    gtk_entry_set_text(GTK_ENTRY(ui->device_manual), "");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->device_autopick), TRUE);
+    rot_pref_scan_devices_async(ui, NULL, FALSE);
+    rot_pref_update_device_ui_state(ui);
+    rot_pref_combo_set_active(GTK_COMBO_BOX(ui->aztype), ROT_AZ_TYPE_360,
+                              G_CALLBACK(aztype_changed_cb));
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), 0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), 0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 90);
+    rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), ROT_AXIS_MODE_AZ_EL,
+                              G_CALLBACK(axismode_changed_cb));
+    update_el_limits_sensitivity(ui);
+
+    rot_pref_ui_end_update(ui, "clear_widgets");
+    rot_pref_update_ok_button(ui);
 }
 
 /*
@@ -674,11 +934,13 @@ static void clear_widgets(void)
  */
 static void name_changed(GtkWidget * widget, gpointer data)
 {
+    RotPrefUi     *ui = data;
     const gchar    *text;
     gchar          *entry, *end, *j;
     gint            len, pos;
 
-    (void)data;
+    if (ui != NULL && ui->ui_updating)
+        return;
 
     /* step 1: ensure that only valid characters are entered
        (stolen from xlog, tnx pg4i)
@@ -700,116 +962,113 @@ static void name_changed(GtkWidget * widget, gpointer data)
 
     /* step 2: if name seems all right, enable OK button */
     text = gtk_entry_get_text(GTK_ENTRY(widget));
-
-    if (g_utf8_strlen(text, -1) > 0)
-    {
-        gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog),
-                                          GTK_RESPONSE_OK, TRUE);
-    }
-    else
-    {
-        gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog),
-                                          GTK_RESPONSE_OK, FALSE);
-    }
+    (void)text;
+    rot_pref_update_ok_button(ui);
 }
 
 static void protocol_changed_cb(GtkComboBox * box, gpointer data)
 {
+    RotPrefUi *ui = data;
     rot_protocol_t proto = rot_protocol_from_combo(box);
 
-    (void)data;
+    if (ui != NULL && ui->ui_updating)
+        return;
 
-    if (baud)
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud),
+    if (ui != NULL && ui->baud)
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                                   rot_protocol_default_baud(proto));
 }
 
 static void device_refresh_cb(GtkButton *button, gpointer data)
 {
+    RotPrefUi *ui = data;
     const gchar *current_id = NULL;
 
     (void)button;
-    (void)data;
 
-    if (device_combo)
+    if (ui != NULL && ui->ui_updating)
+        return;
+
+    if (ui != NULL && ui->device_combo)
         current_id = gtk_combo_box_get_active_id(
-            GTK_COMBO_BOX(device_combo));
+            GTK_COMBO_BOX(ui->device_combo));
 
-    rot_pref_scan_devices_async(current_id, TRUE);
+    rot_pref_scan_devices_async(ui, current_id, TRUE);
 }
 
 static void device_autopick_toggled_cb(GtkToggleButton *button, gpointer data)
 {
-    const gchar *current_id = NULL;
-    const gchar *manual_text = NULL;
-    gboolean autopick = FALSE;
+    RotPrefUi *ui = data;
 
-    (void)data;
+    if (ui != NULL && ui->ui_updating)
+        return;
 
-    autopick = gtk_toggle_button_get_active(button);
-    if (device_combo)
-        current_id = gtk_combo_box_get_active_id(
-            GTK_COMBO_BOX(device_combo));
-    if (device_manual)
-        manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
-
-    rot_pref_update_device_combo(device_cache,
-                                 current_id,
-                                 autopick,
-                                 manual_text);
+    (void)button;
+    rot_pref_schedule_device_combo_refresh(ui);
 }
 
 static void device_combo_changed_cb(GtkComboBox *box, gpointer data)
 {
+    RotPrefUi *ui = data;
     (void)box;
-    (void)data;
 
-    rot_pref_update_device_ui_state();
+    if (ui != NULL && ui->ui_updating)
+        return;
+
+    rot_pref_update_device_ui_state(ui);
 }
 
-static void update_el_limits_sensitivity(void)
+static void update_el_limits_sensitivity(RotPrefUi *ui)
 {
     gboolean az_el = TRUE;
 
-    if (axismode)
-        az_el = (gtk_combo_box_get_active(GTK_COMBO_BOX(axismode)) == ROT_AXIS_MODE_AZ_EL);
+    if (ui == NULL)
+        return;
 
-    if (minel)
-        gtk_widget_set_sensitive(minel, az_el);
-    if (maxel)
-        gtk_widget_set_sensitive(maxel, az_el);
-    if (minel_label)
-        gtk_widget_set_sensitive(minel_label, az_el);
-    if (maxel_label)
-        gtk_widget_set_sensitive(maxel_label, az_el);
+    if (ui->axismode)
+        az_el = (gtk_combo_box_get_active(GTK_COMBO_BOX(ui->axismode)) ==
+                 ROT_AXIS_MODE_AZ_EL);
+
+    if (ui->minel)
+        gtk_widget_set_sensitive(ui->minel, az_el);
+    if (ui->maxel)
+        gtk_widget_set_sensitive(ui->maxel, az_el);
+    if (ui->minel_label)
+        gtk_widget_set_sensitive(ui->minel_label, az_el);
+    if (ui->maxel_label)
+        gtk_widget_set_sensitive(ui->maxel_label, az_el);
 }
 
 static void axismode_changed_cb(GtkComboBox *box, gpointer data)
 {
+    RotPrefUi *ui = data;
     (void)box;
-    (void)data;
 
-    update_el_limits_sensitivity();
+    if (ui != NULL && ui->ui_updating)
+        return;
+
+    update_el_limits_sensitivity(ui);
 }
 
 static void aztype_changed_cb(GtkComboBox * box, gpointer data)
 {
+    RotPrefUi *ui = data;
     gint            type = gtk_combo_box_get_active(box);
 
-    (void)data;
+    if (ui != NULL && ui->ui_updating)
+        return;
 
+    rot_pref_ui_begin_update(ui, "aztype_changed");
     switch (type)
     {
     case ROT_AZ_TYPE_360:
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 360.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0.0);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), 0.0);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360.0);
         break;
 
     case ROT_AZ_TYPE_180:
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), -180.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), +180.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), -180.0);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), -180.0);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), +180.0);
         break;
 
     default:
@@ -817,9 +1076,10 @@ static void aztype_changed_cb(GtkComboBox * box, gpointer data)
                     _("%s:%s: Invalid AZ rotator type."), __FILE__, __func__);
         break;
     }
+    rot_pref_ui_end_update(ui, "aztype_changed");
 }
 
-static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
+static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
 {
     GtkWidget      *table;
     GtkWidget      *label;
@@ -836,110 +1096,123 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 0, 1, 1);
 
-    name = gtk_entry_new();
-    gtk_entry_set_max_length(GTK_ENTRY(name), 25);
-    gtk_widget_set_tooltip_text(name,
+    ui->name = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(ui->name), 25);
+    gtk_widget_set_tooltip_text(ui->name,
                                 _("Enter a short name for this configuration, "
                                   " e.g. ROTOR-1.\n"
                                   "Allowed characters: 0..9, a..z, A..Z, - and _"));
-    gtk_grid_attach(GTK_GRID(table), name, 1, 0, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->name, 1, 0, 3, 1);
 
     /* attach changed signal so that we can enable OK button when
        a proper name has been entered
      */
-    g_signal_connect(name, "changed", G_CALLBACK(name_changed), NULL);
+    g_signal_connect(ui->name, "changed", G_CALLBACK(name_changed), ui);
+    g_signal_connect(ui->name, "changed", G_CALLBACK(rot_pref_on_field_changed), ui);
 
     /* Host */
     label = gtk_label_new(_("Host"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 1, 1, 1);
 
-    host = gtk_entry_new();
-    gtk_entry_set_max_length(GTK_ENTRY(host), 50);
-    gtk_entry_set_text(GTK_ENTRY(host), "127.0.0.1");
-    gtk_widget_set_tooltip_text(host,
+    ui->host = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(ui->host), 50);
+    gtk_entry_set_text(GTK_ENTRY(ui->host), "127.0.0.1");
+    g_signal_connect(ui->host, "changed", G_CALLBACK(rot_pref_on_field_changed), ui);
+    gtk_widget_set_tooltip_text(ui->host,
                                 _("Enter the host where rotctld is running. "
                                   "You can use both host name and IP address, "
                                   "e.g. 192.168.1.100\n\n"
                                   "If gpredict and rotctld are running on the "
                                   "same computer, use 127.0.0.1"));
-    gtk_grid_attach(GTK_GRID(table), host, 1, 1, 3, 1); 
+    gtk_grid_attach(GTK_GRID(table), ui->host, 1, 1, 3, 1); 
 
     /* port */
     label = gtk_label_new(_("Port"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 2, 1, 1);
 
-    port = gtk_spin_button_new_with_range(1024, 65535, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(port), 4533);
-    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(port), 0);
-    gtk_widget_set_tooltip_text(port,
+    ui->port = gtk_spin_button_new_with_range(1024, 65535, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->port), 4533);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ui->port), 0);
+    g_signal_connect(ui->port, "value-changed", G_CALLBACK(rot_pref_on_field_changed), ui);
+    gtk_widget_set_tooltip_text(ui->port,
                                 _("Enter the port number where rotctld is "
                                   "listening. Default is 4533."));
-    gtk_grid_attach(GTK_GRID(table), port, 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->port, 1, 2, 1, 1);
 
     test_button = gtk_button_new_with_label(_("Test connection"));
     gtk_widget_set_tooltip_text(test_button,
                                 _("Start rotctld if needed and query its status."));
     gtk_grid_attach(GTK_GRID(table), test_button, 2, 2, 2, 1);
     g_signal_connect(test_button, "clicked",
-                     G_CALLBACK(rotctld_test_connection_cb), NULL);
+                     G_CALLBACK(rotctld_test_connection_cb), ui);
 
-    autostart = gtk_check_button_new_with_label(_("Auto-start local rotctld"));
-    gtk_widget_set_tooltip_text(autostart,
+    ui->autostart = gtk_check_button_new_with_label(_("Auto-start local rotctld"));
+    gtk_widget_set_tooltip_text(ui->autostart,
                                 _("Start rotctld automatically when connecting to a local host."));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), TRUE);
-    gtk_grid_attach(GTK_GRID(table), autostart, 1, 3, 3, 1);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->autostart), TRUE);
+    gtk_grid_attach(GTK_GRID(table), ui->autostart, 1, 3, 3, 1);
+    g_signal_connect(ui->autostart, "toggled",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
     /* Protocol */
     label = gtk_label_new(_("Protocol"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
 
-    protocol = gtk_combo_box_text_new();
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(protocol),
+    ui->protocol = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->protocol),
                               "gs232b", _("Yaesu GS-232B"));
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(protocol),
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->protocol),
                               "rot1prog", _("SPID Rot1Prog"));
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(protocol),
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->protocol),
                               "rot2prog", _("SPID Rot2Prog"));
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(protocol),
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(ui->protocol),
                                 rot_protocol_id(ROT_PROTOCOL_GS232B));
-    gtk_grid_attach(GTK_GRID(table), protocol, 1, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->protocol, 1, 4, 2, 1);
     g_message("rot-editor: protocol selector added");
-    g_signal_connect(G_OBJECT(protocol), "changed",
-                     G_CALLBACK(protocol_changed_cb), NULL);
+    g_signal_connect(G_OBJECT(ui->protocol), "changed",
+                     G_CALLBACK(protocol_changed_cb), ui);
+    g_signal_connect(G_OBJECT(ui->protocol), "changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+    gp_ui_quarantine_register_combo(ui->dialog, GTK_COMBO_BOX(ui->protocol));
 
     /* Baud */
     label = gtk_label_new(_("Baud"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 5, 1, 1);
 
-    baud = gtk_spin_button_new_with_range(300, 921600, 100);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(baud),
+    ui->baud = gtk_spin_button_new_with_range(300, 921600, 100);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                               rot_protocol_default_baud(ROT_PROTOCOL_GS232B));
-    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(baud), 0);
-    gtk_widget_set_tooltip_text(baud, _("Serial baud rate for rotctld."));
-    gtk_grid_attach(GTK_GRID(table), baud, 1, 5, 1, 1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ui->baud), 0);
+    gtk_widget_set_tooltip_text(ui->baud, _("Serial baud rate for rotctld."));
+    gtk_grid_attach(GTK_GRID(table), ui->baud, 1, 5, 1, 1);
+    g_signal_connect(ui->baud, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
     /* Device */
     label = gtk_label_new(_("Device"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
 
-    device_combo = gtk_combo_box_text_new();
-    gtk_widget_set_tooltip_text(device_combo,
+    ui->device_combo = gtk_combo_box_text_new();
+    gtk_widget_set_tooltip_text(ui->device_combo,
                                 _("Select the serial device for your rotor."));
-    gtk_grid_attach(GTK_GRID(table), device_combo, 1, 6, 2, 1);
-    g_signal_connect(device_combo, "changed",
-                     G_CALLBACK(device_combo_changed_cb), NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->device_combo, 1, 6, 2, 1);
+    g_signal_connect(ui->device_combo, "changed",
+                     G_CALLBACK(device_combo_changed_cb), ui);
+    g_signal_connect(ui->device_combo, "changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+    gp_ui_quarantine_register_combo(ui->dialog, GTK_COMBO_BOX(ui->device_combo));
 
-    device_refresh = gtk_button_new_with_label(_("Find port"));
-    gtk_widget_set_tooltip_text(device_refresh,
+    ui->device_refresh = gtk_button_new_with_label(_("Find port"));
+    gtk_widget_set_tooltip_text(ui->device_refresh,
                                 _("Scan for serial devices and pick the best match."));
-    gtk_grid_attach(GTK_GRID(table), device_refresh, 3, 6, 1, 1);
-    g_signal_connect(device_refresh, "clicked",
-                     G_CALLBACK(device_refresh_cb), NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->device_refresh, 3, 6, 1, 1);
+    g_signal_connect(ui->device_refresh, "clicked",
+                     G_CALLBACK(device_refresh_cb), ui);
 
     /* Custom device path */
     device_manual_row = gtk_grid_new();
@@ -949,136 +1222,138 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(device_manual_row), label, 0, 0, 1, 1);
 
-    device_manual = gtk_entry_new();
-    gtk_widget_set_tooltip_text(device_manual,
+    ui->device_manual = gtk_entry_new();
+    gtk_widget_set_tooltip_text(ui->device_manual,
                                 _("Used only when Device=Other..."));
-    gtk_grid_attach(GTK_GRID(device_manual_row), device_manual, 1, 0, 3, 1);
+    gtk_grid_attach(GTK_GRID(device_manual_row), ui->device_manual, 1, 0, 3, 1);
+    g_signal_connect(ui->device_manual, "changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
-    device_manual_revealer = gtk_revealer_new();
-    gtk_revealer_set_transition_type(GTK_REVEALER(device_manual_revealer),
+    ui->device_manual_revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(ui->device_manual_revealer),
                                      GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
-    gtk_container_add(GTK_CONTAINER(device_manual_revealer), device_manual_row);
-    gtk_grid_attach(GTK_GRID(table), device_manual_revealer, 0, 7, 4, 1);
+    gtk_container_add(GTK_CONTAINER(ui->device_manual_revealer), device_manual_row);
+    gtk_grid_attach(GTK_GRID(table), ui->device_manual_revealer, 0, 7, 4, 1);
 
-    device_autopick = gtk_check_button_new_with_label(_("Auto-detect port when empty"));
-    gtk_widget_set_tooltip_text(device_autopick,
+    ui->device_autopick = gtk_check_button_new_with_label(_("Auto-detect port when empty"));
+    gtk_widget_set_tooltip_text(ui->device_autopick,
                                 _("Leave the device field empty and detect a serial port when connecting."));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(device_autopick), TRUE);
-    gtk_grid_attach(GTK_GRID(table), device_autopick, 1, 8, 2, 1);
-    g_signal_connect(device_autopick, "toggled",
-                     G_CALLBACK(device_autopick_toggled_cb), NULL);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->device_autopick), TRUE);
+    gtk_grid_attach(GTK_GRID(table), ui->device_autopick, 1, 8, 2, 1);
+    g_signal_connect(ui->device_autopick, "toggled",
+                     G_CALLBACK(device_autopick_toggled_cb), ui);
+    g_signal_connect(ui->device_autopick, "toggled",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
-    device_status = gtk_label_new("");
-    g_object_set(device_status, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), device_status, 1, 9, 3, 1);
+    ui->device_status = gtk_label_new("");
+    g_object_set(ui->device_status, "xalign", 0.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->device_status, 1, 9, 3, 1);
 
     gtk_grid_attach(GTK_GRID(table),
                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
                     0, 10, 4, 1);
 
-    /* Axis mode */
-    label = gtk_label_new(_("Axis mode"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 1, 1);
-
-    axismode = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
-                                   _("Azimuth + Elevation"));
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(axismode),
-                                   _("Azimuth only"));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(axismode), ROT_AXIS_MODE_AZ_EL);
-    gtk_widget_set_tooltip_text(axismode,
-                                _("Select whether this rotor supports both azimuth and elevation."));
-    gtk_grid_attach(GTK_GRID(table), axismode, 1, 11, 2, 1);
-    g_signal_connect(G_OBJECT(axismode), "changed",
-                     G_CALLBACK(axismode_changed_cb), NULL);
-
     /* Tracking geometry */
     label = gtk_label_new(_("Tracking geometry"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 4, 1);
 
-    label = gtk_label_new(_("Az wrap type"));
+    /* Axis mode */
+    label = gtk_label_new(_("Axis mode"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+
+    ui->axismode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->axismode),
+                                   _("Azimuth + Elevation"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->axismode),
+                                   _("Azimuth only"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ui->axismode), ROT_AXIS_MODE_AZ_EL);
+    gtk_widget_set_tooltip_text(ui->axismode,
+                                _("Select whether this rotor supports both azimuth and elevation."));
+    gtk_grid_attach(GTK_GRID(table), ui->axismode, 1, 12, 2, 1);
+    g_signal_connect(G_OBJECT(ui->axismode), "changed",
+                     G_CALLBACK(axismode_changed_cb), ui);
+    g_signal_connect(G_OBJECT(ui->axismode), "changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+    gp_ui_quarantine_register_combo(ui->dialog, GTK_COMBO_BOX(ui->axismode));
+
+    label = gtk_label_new(_("Wrap type"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
 
-    aztype = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
-                                   _("0\302\260 \342\206\222 360\302\260"));
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(aztype),
-                                   _("North-centered (-180\302\260..+180\302\260)"));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(aztype), ROT_AZ_TYPE_360);
-    gtk_widget_set_tooltip_text(aztype,
+    ui->aztype = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->aztype),
+                                   _("Continuous"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->aztype),
+                                   _("North centered"));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ui->aztype), ROT_AZ_TYPE_360);
+    gtk_widget_set_tooltip_text(ui->aztype,
                                 _("Select the azimuth wrap convention. "
                                   "0\302\260 is at North, clockwise is positive."));
-    gtk_grid_attach(GTK_GRID(table), aztype, 1, 13, 2, 1);
-    g_signal_connect(G_OBJECT(aztype), "changed",
-                     G_CALLBACK(aztype_changed_cb), NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->aztype, 1, 13, 2, 1);
+    g_signal_connect(G_OBJECT(ui->aztype), "changed",
+                     G_CALLBACK(aztype_changed_cb), ui);
+    g_signal_connect(G_OBJECT(ui->aztype), "changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+    gp_ui_quarantine_register_combo(ui->dialog, GTK_COMBO_BOX(ui->aztype));
 
     /* Az and El limits */
     label = gtk_label_new(_(" Min Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
-    minaz = gtk_spin_button_new_with_range(-200, 100, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minaz), 0);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(minaz), TRUE);
-    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(minaz), FALSE);
-    gtk_grid_attach(GTK_GRID(table), minaz, 1, 14, 1, 1);
+    ui->minaz = gtk_spin_button_new_with_range(-200, 100, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), 0);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->minaz), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->minaz), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->minaz, 1, 14, 1, 1);
+    g_signal_connect(ui->minaz, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
     label = gtk_label_new(_(" Max Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 2, 14, 1, 1);
-    maxaz = gtk_spin_button_new_with_range(0, 480, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxaz), 360);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(maxaz), TRUE);
-    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(maxaz), FALSE);
-    gtk_grid_attach(GTK_GRID(table), maxaz, 3, 14, 1, 1);
+    ui->maxaz = gtk_spin_button_new_with_range(0, 480, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->maxaz), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->maxaz), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->maxaz, 3, 14, 1, 1);
+    g_signal_connect(ui->maxaz, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
-    minel_label = gtk_label_new(_(" Min El"));
-    g_object_set(minel_label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), minel_label, 0, 15, 1, 1);
-    minel = gtk_spin_button_new_with_range(-10, 180, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minel), 0);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(minel), TRUE);
-    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(minel), FALSE);
-    gtk_grid_attach(GTK_GRID(table), minel, 1, 15, 1, 1);
+    ui->minel_label = gtk_label_new(_(" Min El"));
+    g_object_set(ui->minel_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->minel_label, 0, 15, 1, 1);
+    ui->minel = gtk_spin_button_new_with_range(-10, 180, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), 0);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->minel), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->minel), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->minel, 1, 15, 1, 1);
+    g_signal_connect(ui->minel, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
-    maxel_label = gtk_label_new(_(" Max El"));
-    g_object_set(maxel_label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), maxel_label, 2, 15, 1, 1);
-    maxel = gtk_spin_button_new_with_range(-10, 180, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(maxel), 90);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(maxel), TRUE);
-    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(maxel), FALSE);
-    gtk_grid_attach(GTK_GRID(table), maxel, 3, 15, 1, 1);
+    ui->maxel_label = gtk_label_new(_(" Max El"));
+    g_object_set(ui->maxel_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->maxel_label, 2, 15, 1, 1);
+    ui->maxel = gtk_spin_button_new_with_range(-10, 180, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 90);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->maxel), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->maxel), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->maxel, 3, 15, 1, 1);
+    g_signal_connect(ui->maxel, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
 
-    label = gtk_label_new(_(" Azimuth end stop position"));
-    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 1, 16, 2, 1);
-    azstoppos = gtk_spin_button_new_with_range(-180, 360, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(azstoppos), 0);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(azstoppos), TRUE);
-    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(azstoppos), FALSE);
-    gtk_widget_set_tooltip_text(azstoppos,
-                                _("Set the position of the azimuth end stop "
-                                  "here, where 0\302\260 is at North, "
-                                  "-180\302\260 is south, etc. "
-                                  "The default for a 0\302\260 \342\206\222 "
-                                  "180\302\260 \342\206\222 360\302\260 rotor "
-                                  "is 0\302\260, and the default for a "
-                                  "-180\302\260 \342\206\222 0\302\260 "
-                                  "\342\206\222 +180\302\260 rotor is -180\302\260."));
-    gtk_grid_attach(GTK_GRID(table), azstoppos, 3, 16, 1, 1);
 
     if (conf->name != NULL)
-        update_widgets(conf);
+        update_widgets(ui, conf);
     else
     {
-        rot_pref_scan_devices_async(NULL, FALSE);
-        rot_pref_update_device_ui_state();
+        rot_pref_scan_devices_async(ui, NULL, FALSE);
+        rot_pref_update_device_ui_state(ui);
     }
 
-    update_el_limits_sensitivity();
+    update_el_limits_sensitivity(ui);
+    rot_pref_update_ok_button(ui);
 
     gtk_widget_show_all(table);
 
@@ -1086,39 +1361,43 @@ static GtkWidget *create_editor_widgets(rotor_conf_t * conf)
 }
 
 /* Called when the user clicks the OK button */
-static gboolean apply_changes(rotor_conf_t * conf)
+static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
 {
+    if (ui == NULL || conf == NULL)
+        return FALSE;
+
     /* name */
     if (conf->name)
         g_free(conf->name);
 
-    conf->name = g_strdup(gtk_entry_get_text(GTK_ENTRY(name)));
+    conf->name = g_strdup(gtk_entry_get_text(GTK_ENTRY(ui->name)));
 
     /* host */
     if (conf->host)
         g_free(conf->host);
 
-    conf->host = g_strdup(gtk_entry_get_text(GTK_ENTRY(host)));
+    conf->host = g_strdup(gtk_entry_get_text(GTK_ENTRY(ui->host)));
 
     /* port */
-    conf->port = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(port));
+    conf->port = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->port));
 
-    conf->autostart = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
-    conf->protocol = rot_protocol_from_combo(GTK_COMBO_BOX(protocol));
-    conf->baud = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(baud));
+    conf->autostart =
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->autostart));
+    conf->protocol = rot_protocol_from_combo(GTK_COMBO_BOX(ui->protocol));
+    conf->baud = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->baud));
     if (conf->baud <= 0)
         conf->baud = rot_protocol_default_baud(conf->protocol);
 
     {
         gboolean autopick = gtk_toggle_button_get_active(
-            GTK_TOGGLE_BUTTON(device_autopick));
+            GTK_TOGGLE_BUTTON(ui->device_autopick));
         const gchar *active_id = NULL;
         const gchar *manual_text = NULL;
 
-        if (device_combo)
-            active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(device_combo));
-        if (device_manual)
-            manual_text = gtk_entry_get_text(GTK_ENTRY(device_manual));
+        if (ui->device_combo)
+            active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->device_combo));
+        if (ui->device_manual)
+            manual_text = gtk_entry_get_text(GTK_ENTRY(ui->device_manual));
 
         if (conf->device)
             g_free(conf->device);
@@ -1151,19 +1430,18 @@ static gboolean apply_changes(rotor_conf_t * conf)
     }
 
     /* az type */
-    conf->aztype = gtk_combo_box_get_active(GTK_COMBO_BOX(aztype));
+    conf->aztype = gtk_combo_box_get_active(GTK_COMBO_BOX(ui->aztype));
 
     /* az and el ranges */
-    conf->minaz = gtk_spin_button_get_value(GTK_SPIN_BUTTON(minaz));
-    conf->maxaz = gtk_spin_button_get_value(GTK_SPIN_BUTTON(maxaz));
-    conf->minel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(minel));
-    conf->maxel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(maxel));
+    conf->minaz = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->minaz));
+    conf->maxaz = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->maxaz));
+    conf->minel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->minel));
+    conf->maxel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->maxel));
 
     /* az stop position */
-    conf->azstoppos = gtk_spin_button_get_value(GTK_SPIN_BUTTON(azstoppos));
 
     /* axis mode */
-    conf->axis_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(axismode));
+    conf->axis_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(ui->axismode));
 
     /* axis inversion */
 
@@ -1186,7 +1464,7 @@ static void rot_pref_dialog_response(GtkDialog *dialog,
     switch (response)
     {
     case GTK_RESPONSE_OK:
-        if (apply_changes(state->conf))
+        if (apply_changes(state->ui, state->conf))
         {
             if (state->done)
                 state->done(state->conf, TRUE, state->user_data);
@@ -1197,7 +1475,7 @@ static void rot_pref_dialog_response(GtkDialog *dialog,
         break;
 
     case GTK_RESPONSE_REJECT:
-        clear_widgets();
+        clear_widgets(state->ui);
         break;
 
     default:
@@ -1213,24 +1491,35 @@ static void rot_pref_dialog_response(GtkDialog *dialog,
 static void rot_pref_dialog_destroy(GtkWidget *widget, gpointer user_data)
 {
     RotPrefDialogState *state = user_data;
+    RotPrefUi *ui;
 
     (void)widget;
 
     if (state == NULL)
         return;
 
+    ui = state->ui;
     if (!state->finished && state->done)
         state->done(state->conf, FALSE, state->user_data);
-    dialog = NULL;
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref editor destroyed");
-    g_free(state);
+    if (ui != NULL)
+        ui->ui_updating = FALSE;
 
-    if (device_cache)
+    if (ui != NULL && ui->pending_ui_refresh_id != 0)
     {
-        gp_serial_free_candidates(device_cache);
-        device_cache = NULL;
+        g_source_remove(ui->pending_ui_refresh_id);
+        ui->pending_ui_refresh_id = 0;
     }
-    device_scan_in_progress = FALSE;
+
+    if (ui != NULL && ui->device_cache)
+    {
+        gp_serial_free_candidates(ui->device_cache);
+        ui->device_cache = NULL;
+    }
+    if (ui != NULL)
+        ui->device_scan_in_progress = FALSE;
+
+    g_free(state);
 }
 
 /**
@@ -1245,6 +1534,8 @@ void sat_pref_rot_editor_run(rotor_conf_t *conf,
                              gpointer user_data)
 {
     RotPrefDialogState *state;
+    RotPrefUi *ui;
+    GtkWidget *dialog;
 
     /* create dialog and add contents */
     dialog = gtk_dialog_new_with_buttons(_("Edit rotator configuration"),
@@ -1259,14 +1550,19 @@ void sat_pref_rot_editor_run(rotor_conf_t *conf,
     gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog),
                                       GTK_RESPONSE_OK, FALSE);
 
+    ui = g_new0(RotPrefUi, 1);
+    ui->dialog = dialog;
+    g_object_set_data_full(G_OBJECT(dialog), "rot_pref_ui", ui, g_free);
+    gp_ui_quarantine_install(dialog);
     gtk_container_add(GTK_CONTAINER
                       (gtk_dialog_get_content_area(GTK_DIALOG(dialog))),
-                      create_editor_widgets(conf));
+                      create_editor_widgets(ui, conf));
 
     state = g_new0(RotPrefDialogState, 1);
     state->conf = conf;
     state->done = done;
     state->user_data = user_data;
+    state->ui = ui;
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "rot-pref editor created");
     g_signal_connect(dialog, "response",

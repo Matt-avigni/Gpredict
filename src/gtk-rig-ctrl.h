@@ -218,6 +218,8 @@ struct _gtk_rig_ctrl {
     GtkWidget      *log_verbose_toggle; /*!< Verbose rig logging toggle */
     rig_log_level_t log_level;          /*!< Rig log verbosity */
     guint           resize_idle_id;     /*!< Pending resize idle source id */
+    gboolean        ui_updating;        /*!< Guard against re-entrant UI updates */
+    guint           pending_ui_refresh_id; /*!< Coalesced UI refresh id */
     gchar          *primary_rig_id;     /*!< Selected primary rig ID */
     gchar          *secondary_rig_id;   /*!< Selected secondary rig ID */
     GtkWidget      *status_label;       /*!< Command/status indicator */

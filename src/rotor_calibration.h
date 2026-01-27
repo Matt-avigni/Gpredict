@@ -14,7 +14,6 @@ typedef struct RotorCalib {
 typedef bool (*fn_setpos)(double az_deg, double el_deg);
 typedef bool (*fn_getpos)(double *az_deg, double *el_deg);
 
-double wrap360(double az_deg);
 double wrap180(double az_deg);
 
 bool calib_load(const char *rotor_id, RotorCalib *out);
