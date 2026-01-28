@@ -48,6 +48,8 @@ const char *rot_cmd_reason_name(rot_cmd_reason_t reason)
         return "stale_hold";
     case ROT_CMD_REASON_NO_POS:
         return "no_pos";
+    case ROT_CMD_REASON_STALE_RELAXED:
+        return "stale_relaxed";
     case ROT_CMD_REASON_FORCE:
         return "force";
     case ROT_CMD_REASON_IN_FLIGHT:
@@ -165,6 +167,21 @@ void rot_cmd_decision_eval(const rot_cmd_decision_input_t *in,
 
     if (!in->pos_fresh && in->setpoint_valid)
     {
+        gdouble stale_relaxed_az = (in->deadband_az > 0.0)
+                                       ? (0.5 * in->deadband_az)
+                                       : 0.0;
+        gdouble stale_relaxed_el = (in->deadband_el > 0.0)
+                                       ? (0.5 * in->deadband_el)
+                                       : 0.0;
+
+        if (delta_az >= stale_relaxed_az || delta_el >= stale_relaxed_el)
+        {
+            out->send = TRUE;
+            out->action = ROT_CMD_ACTION_SEND;
+            out->reason = ROT_CMD_REASON_STALE_RELAXED;
+            return;
+        }
+
         if (in->resend_due)
         {
             out->send = TRUE;
