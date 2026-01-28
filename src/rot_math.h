@@ -26,6 +26,10 @@ gdouble rot_norm180(gdouble x);
 
 gdouble rot_delta_shortest_360(gdouble from360, gdouble to360);
 
+gdouble rot_ang_diff_deg(gdouble a, gdouble b);
+
+gdouble rot_ang_dist_deg(gdouble a, gdouble b);
+
 gdouble rot_ui_to_az360(gdouble ui_az, rot_ui_mode_t mode);
 
 gdouble rot_az360_to_ui(gdouble az360, rot_ui_mode_t mode);

@@ -8,6 +8,8 @@
 #include "gpredict-utils.h"
 #include "rotor-angle.h"
 
+#define DEFAULT_CALIB_UNCERTAINTY_DEG 0.5
+
 static gchar *calib_sanitize_id(const char *rotor_id)
 {
     gchar *safe = NULL;
@@ -83,12 +85,20 @@ bool calib_load(const char *rotor_id, RotorCalib *out)
                                   G_KEY_FILE_KEEP_COMMENTS,
                                   NULL))
     {
+        out->az_uncertainty_deg = DEFAULT_CALIB_UNCERTAINTY_DEG;
+        out->el_uncertainty_deg = DEFAULT_CALIB_UNCERTAINTY_DEG;
         out->enabled =
             g_key_file_get_boolean(keyfile, "calib", "enabled", NULL);
         out->az_offset_deg =
             g_key_file_get_double(keyfile, "calib", "az_offset_deg", NULL);
         out->el_offset_deg =
             g_key_file_get_double(keyfile, "calib", "el_offset_deg", NULL);
+        if (g_key_file_has_key(keyfile, "calib", "az_uncertainty_deg", NULL))
+            out->az_uncertainty_deg =
+                g_key_file_get_double(keyfile, "calib", "az_uncertainty_deg", NULL);
+        if (g_key_file_has_key(keyfile, "calib", "el_uncertainty_deg", NULL))
+            out->el_uncertainty_deg =
+                g_key_file_get_double(keyfile, "calib", "el_uncertainty_deg", NULL);
         ok = TRUE;
     }
 
@@ -121,6 +131,10 @@ bool calib_save(const char *rotor_id, const RotorCalib *c)
                           c->az_offset_deg);
     g_key_file_set_double(keyfile, "calib", "el_offset_deg",
                           c->el_offset_deg);
+    g_key_file_set_double(keyfile, "calib", "az_uncertainty_deg",
+                          c->az_uncertainty_deg);
+    g_key_file_set_double(keyfile, "calib", "el_uncertainty_deg",
+                          c->el_uncertainty_deg);
 
     ok = (gpredict_save_key_file(keyfile, path) == 0);
 
@@ -128,6 +142,26 @@ bool calib_save(const char *rotor_id, const RotorCalib *c)
     g_free(dir);
     g_free(path);
     return ok;
+}
+
+void calib_apply_mech_zero(RotorCalib *c,
+                           double mech_az,
+                           double mech_el,
+                           double uncertainty_deg)
+{
+    double tol = uncertainty_deg;
+
+    if (c == NULL)
+        return;
+
+    if (tol <= 0.0)
+        tol = DEFAULT_CALIB_UNCERTAINTY_DEG;
+
+    c->az_offset_deg = wrap360(-mech_az);
+    c->el_offset_deg = -mech_el;
+    c->az_uncertainty_deg = tol;
+    c->el_uncertainty_deg = tol;
+    c->enabled = true;
 }
 
 void world_to_mech(double *az_deg_canon, double *el_deg, const RotorCalib *c)
@@ -185,9 +219,8 @@ bool calib_run_wizard(GtkWindow *parent,
         return false;
 
     updated = *io_calib;
-    updated.az_offset_deg = wrap360(-mech_az);
-    updated.el_offset_deg = -mech_el;
-    updated.enabled = true;
+    calib_apply_mech_zero(&updated, mech_az, mech_el,
+                          DEFAULT_CALIB_UNCERTAINTY_DEG);
 
     (void)calib_save(rotor_id, &updated);
     *io_calib = updated;

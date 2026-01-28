@@ -663,6 +663,11 @@ static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
                                                   const radio_conf_t *conf);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
+static gboolean radio_apply_ui_settings(GtkRigCtrl *ctrl, gboolean strict);
+static gboolean rigctrl_cycle_focus_out_cb(GtkWidget *widget,
+                                           GdkEventFocus *event,
+                                           gpointer data);
+static void     rigctrl_cycle_activate_cb(GtkEntry *entry, gpointer data);
 static void     rig_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_verbose_toggle_cb(GtkToggleButton *button, gpointer data);
 static void     rig_term_log_tx(GtkRigCtrl *ctrl, const gchar *cmd);
@@ -5020,11 +5025,21 @@ static void rigctrl_sync_tracking_state(GtkRigCtrl *ctrl)
 static void rx_track_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+    gboolean        requested;
 
     if (ctrl == NULL || ctrl->ui_updating)
         return;
 
-    ctrl->rx_track_enabled = gtk_toggle_button_get_active(button);
+    requested = gtk_toggle_button_get_active(button);
+    if (requested && !radio_apply_ui_settings(ctrl, TRUE))
+    {
+        rigctrl_ui_begin_update(ctrl, "rx_track_invalid_settings");
+        gtk_toggle_button_set_active(button, FALSE);
+        rigctrl_ui_end_update(ctrl, "rx_track_invalid_settings");
+        return;
+    }
+
+    ctrl->rx_track_enabled = requested;
     rigctrl_sync_tracking_state(ctrl);
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE: rx tracking %s",
@@ -5048,11 +5063,21 @@ static void rx_track_toggle_cb(GtkToggleButton *button, gpointer data)
 static void tx_track_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
+    gboolean        requested;
 
     if (ctrl == NULL || ctrl->ui_updating)
         return;
 
-    ctrl->tx_track_enabled = gtk_toggle_button_get_active(button);
+    requested = gtk_toggle_button_get_active(button);
+    if (requested && !radio_apply_ui_settings(ctrl, TRUE))
+    {
+        rigctrl_ui_begin_update(ctrl, "tx_track_invalid_settings");
+        gtk_toggle_button_set_active(button, FALSE);
+        rigctrl_ui_end_update(ctrl, "tx_track_invalid_settings");
+        return;
+    }
+
+    ctrl->tx_track_enabled = requested;
     rigctrl_sync_tracking_state(ctrl);
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "SATMODE: tx tracking %s",
@@ -5087,6 +5112,126 @@ static void delay_changed_cb(GtkSpinButton * spin, gpointer data)
 
     if (ctrl->engaged && ctrl->conn_state == RIGCTRL_CONN_CONNECTED)
         start_timer(ctrl);
+}
+
+static gboolean rigctrl_parse_spin_value(GtkSpinButton *spin, gdouble *value)
+{
+    const gchar *text;
+    gchar *end = NULL;
+    gdouble val;
+
+    if (spin == NULL || value == NULL)
+        return FALSE;
+
+    text = gtk_entry_get_text(GTK_ENTRY(spin));
+    if (text == NULL)
+        return FALSE;
+
+    errno = 0;
+    val = g_ascii_strtod(text, &end);
+    if (text == end || errno == ERANGE)
+        return FALSE;
+
+    while (g_ascii_isspace(*end))
+        end++;
+
+    if (*end != '\0')
+        return FALSE;
+
+    *value = val;
+    return TRUE;
+}
+
+/* Authoritative UI apply path used before engage/track starts. */
+static gboolean radio_apply_ui_settings(GtkRigCtrl *ctrl, gboolean strict)
+{
+    GtkSpinButton *spin;
+    GtkAdjustment *adj;
+    gdouble raw = 0.0;
+    gdouble lower;
+    gdouble upper;
+    gdouble value;
+    guint delay_ms;
+
+    if (ctrl == NULL || ctrl->cycle_spin == NULL)
+        return TRUE;
+
+    spin = GTK_SPIN_BUTTON(ctrl->cycle_spin);
+    adj = gtk_spin_button_get_adjustment(spin);
+    lower = gtk_adjustment_get_lower(adj);
+    upper = gtk_adjustment_get_upper(adj);
+
+    if (strict)
+    {
+        if (!rigctrl_parse_spin_value(spin, &raw))
+        {
+            rig_show_error_dialog(
+                ctrl,
+                _("Invalid cycle delay"),
+                _("Cycle delay must be a valid number."));
+            return FALSE;
+        }
+        if (raw < lower || raw > upper)
+        {
+            gchar *msg = g_strdup_printf(_("Cycle delay must be between %.0f and %.0f ms."),
+                                         lower, upper);
+            rig_show_error_dialog(ctrl, _("Invalid cycle delay"), msg);
+            g_free(msg);
+            return FALSE;
+        }
+        gtk_spin_button_set_value(spin, raw);
+    }
+
+    gtk_spin_button_update(spin);
+    value = gtk_spin_button_get_value(spin);
+    delay_ms = (guint)llround(value);
+
+    ctrl->delay = delay_ms;
+    if (ctrl->conf)
+        ctrl->conf->cycle = ctrl->delay;
+
+    if (ctrl->engaged && ctrl->conn_state == RIGCTRL_CONN_CONNECTED)
+        start_timer(ctrl);
+
+    if (strict)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "Applied radio settings: cycle_ms=%u",
+                    delay_ms);
+        rig_term_log(ctrl, "gpredict:rx",
+                     "applied radio settings: cycle_ms=%u",
+                     delay_ms);
+    }
+
+    return TRUE;
+}
+
+static gboolean rigctrl_cycle_focus_out_cb(GtkWidget *widget,
+                                           GdkEventFocus *event,
+                                           gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    (void)widget;
+    (void)event;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return FALSE;
+
+    radio_apply_ui_settings(ctrl, FALSE);
+    return FALSE;
+}
+
+static void rigctrl_cycle_activate_cb(GtkEntry *entry, gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    (void)entry;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
+    radio_apply_ui_settings(ctrl, FALSE);
 }
 
 static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
@@ -5304,6 +5449,15 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     }
     else
     {
+        /* Apply UI settings before starting any worker activity. */
+        if (!radio_apply_ui_settings(ctrl, TRUE))
+        {
+            rigctrl_ui_begin_update(ctrl, "engage_invalid_settings");
+            gtk_toggle_button_set_active(button, FALSE);
+            rigctrl_ui_end_update(ctrl, "engage_invalid_settings");
+            return;
+        }
+
         /* User-initiated engage: clear error gating for a fresh attempt. */
         rigctrl_reset_error_gates(ctrl);
         ctrl->engage_pending = TRUE;
@@ -5970,6 +6124,10 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                   "commands sent to the rig."));
     g_signal_connect(ctrl->cycle_spin, "value-changed",
                      G_CALLBACK(delay_changed_cb), ctrl);
+    g_signal_connect(ctrl->cycle_spin, "focus-out-event",
+                     G_CALLBACK(rigctrl_cycle_focus_out_cb), ctrl);
+    g_signal_connect(ctrl->cycle_spin, "activate",
+                     G_CALLBACK(rigctrl_cycle_activate_cb), ctrl);
     gtk_grid_attach(GTK_GRID(table), ctrl->cycle_spin, 1, 3, 1, 1);
 
     label = gtk_label_new(_("msec"));

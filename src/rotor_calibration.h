@@ -8,6 +8,8 @@
 typedef struct RotorCalib {
     double az_offset_deg;
     double el_offset_deg;
+    double az_uncertainty_deg;
+    double el_uncertainty_deg;
     bool enabled;
 } RotorCalib;
 
@@ -18,6 +20,11 @@ double wrap180(double az_deg);
 
 bool calib_load(const char *rotor_id, RotorCalib *out);
 bool calib_save(const char *rotor_id, const RotorCalib *c);
+
+void calib_apply_mech_zero(RotorCalib *c,
+                           double mech_az,
+                           double mech_el,
+                           double uncertainty_deg);
 
 void world_to_mech(double *az_deg_canon, double *el_deg, const RotorCalib *c);
 void mech_to_world(double *az_deg_canon, double *el_deg, const RotorCalib *c);

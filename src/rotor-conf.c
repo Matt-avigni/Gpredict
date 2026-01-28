@@ -66,6 +66,13 @@
 #define KEY_EL_INVERT   "ElInvert"
 #define KEY_PRETRACK_SECONDS "PretrackSeconds"
 #define KEY_PRETRACK_SLEW "SlewToAOSWhileBelowHorizon"
+#define KEY_PRETRACK_IMMEDIATE "PretrackImmediate"
+#define KEY_PRETRACK_MIN_EL "PretrackMinEl"
+#define KEY_STALE_WARN_MS "StaleWarnMs"
+#define KEY_STALE_DEGRADED_MS "StaleDegradedMs"
+#define KEY_STALE_HOLD_MS "StaleHoldMs"
+#define KEY_STALE_PARK_MS "StaleParkMs"
+#define KEY_STALE_RESUME_MS "StaleResumeMs"
 #define KEY_LAST_GOOD_DEVICE "LastGoodDevice"
 #define KEY_LAST_GOOD_BAUD "LastGoodBaud"
 
@@ -76,9 +83,16 @@
 #define DEFAULT_DEVICE_AUTOPICK TRUE
 #define DEFAULT_PRETRACK_SECONDS 300.0
 #define DEFAULT_PRETRACK_SLEW TRUE
+#define DEFAULT_PRETRACK_IMMEDIATE TRUE
+#define DEFAULT_PRETRACK_MIN_EL 1.0
 #define DEFAULT_POLL_PERIOD_MS 1000
 #define DEFAULT_POS_STALE_MS 6000
 #define DEFAULT_STALE_DEBOUNCE 2
+#define DEFAULT_STALE_WARN_MS 2500
+#define DEFAULT_STALE_DEGRADED_MS 5000
+#define DEFAULT_STALE_HOLD_MS 7000
+#define DEFAULT_STALE_PARK_MS 10000
+#define DEFAULT_STALE_RESUME_MS 1000
 #define DEFAULT_ANGLE_EPSILON_DEG 1.5
 #define DEFAULT_ELEV_FLOOR_DEG 1.0
 
@@ -375,6 +389,92 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     if (conf->rotor_position_stale_ms < 1000)
         conf->rotor_position_stale_ms = 1000;
 
+    conf->rotor_stale_warn_ms = DEFAULT_STALE_WARN_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_STALE_WARN_MS, NULL))
+    {
+        conf->rotor_stale_warn_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_STALE_WARN_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: StaleWarnMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_STALE_WARN_MS);
+            g_clear_error(&error);
+            conf->rotor_stale_warn_ms = DEFAULT_STALE_WARN_MS;
+        }
+    }
+    if (conf->rotor_stale_warn_ms < 500)
+        conf->rotor_stale_warn_ms = 500;
+
+    conf->rotor_stale_degraded_ms = DEFAULT_STALE_DEGRADED_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_STALE_DEGRADED_MS, NULL))
+    {
+        conf->rotor_stale_degraded_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_STALE_DEGRADED_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: StaleDegradedMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_STALE_DEGRADED_MS);
+            g_clear_error(&error);
+            conf->rotor_stale_degraded_ms = DEFAULT_STALE_DEGRADED_MS;
+        }
+    }
+    if (conf->rotor_stale_degraded_ms < conf->rotor_stale_warn_ms)
+        conf->rotor_stale_degraded_ms = conf->rotor_stale_warn_ms;
+
+    conf->rotor_stale_hold_ms = DEFAULT_STALE_HOLD_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_STALE_HOLD_MS, NULL))
+    {
+        conf->rotor_stale_hold_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_STALE_HOLD_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: StaleHoldMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_STALE_HOLD_MS);
+            g_clear_error(&error);
+            conf->rotor_stale_hold_ms = DEFAULT_STALE_HOLD_MS;
+        }
+    }
+    if (conf->rotor_stale_hold_ms < conf->rotor_stale_degraded_ms)
+        conf->rotor_stale_hold_ms = conf->rotor_stale_degraded_ms;
+
+    conf->rotor_stale_park_ms = DEFAULT_STALE_PARK_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_STALE_PARK_MS, NULL))
+    {
+        conf->rotor_stale_park_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_STALE_PARK_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: StaleParkMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_STALE_PARK_MS);
+            g_clear_error(&error);
+            conf->rotor_stale_park_ms = DEFAULT_STALE_PARK_MS;
+        }
+    }
+    if (conf->rotor_stale_park_ms > 0 &&
+        conf->rotor_stale_park_ms < conf->rotor_stale_hold_ms)
+        conf->rotor_stale_park_ms = conf->rotor_stale_hold_ms;
+
+    conf->rotor_stale_resume_ms = DEFAULT_STALE_RESUME_MS;
+    if (g_key_file_has_key(cfg, GROUP, KEY_STALE_RESUME_MS, NULL))
+    {
+        conf->rotor_stale_resume_ms =
+            g_key_file_get_integer(cfg, GROUP, KEY_STALE_RESUME_MS, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: StaleResumeMs not defined for %s. Assuming %d."),
+                        __func__, conf->name, DEFAULT_STALE_RESUME_MS);
+            g_clear_error(&error);
+            conf->rotor_stale_resume_ms = DEFAULT_STALE_RESUME_MS;
+        }
+    }
+    if (conf->rotor_stale_resume_ms < 0)
+        conf->rotor_stale_resume_ms = 0;
+
     conf->rotor_stale_debounce_count = DEFAULT_STALE_DEBOUNCE;
     if (g_key_file_has_key(cfg, GROUP, KEY_STALE_DEBOUNCE, NULL))
     {
@@ -612,6 +712,38 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
         }
     }
 
+    conf->pretrack_immediate = DEFAULT_PRETRACK_IMMEDIATE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_PRETRACK_IMMEDIATE, NULL))
+    {
+        conf->pretrack_immediate =
+            g_key_file_get_boolean(cfg, GROUP, KEY_PRETRACK_IMMEDIATE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: PretrackImmediate not defined for %s. Assuming true."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->pretrack_immediate = DEFAULT_PRETRACK_IMMEDIATE;
+        }
+    }
+
+    conf->pretrack_min_el = DEFAULT_PRETRACK_MIN_EL;
+    if (g_key_file_has_key(cfg, GROUP, KEY_PRETRACK_MIN_EL, NULL))
+    {
+        conf->pretrack_min_el =
+            g_key_file_get_double(cfg, GROUP, KEY_PRETRACK_MIN_EL, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: PretrackMinEl not defined for %s. Assuming %.1f."),
+                        __func__, conf->name, DEFAULT_PRETRACK_MIN_EL);
+            g_clear_error(&error);
+            conf->pretrack_min_el = DEFAULT_PRETRACK_MIN_EL;
+        }
+    }
+    if (conf->pretrack_min_el < 0.0)
+        conf->pretrack_min_el = 0.0;
+
     conf->last_good_device = NULL;
     if (g_key_file_has_key(cfg, GROUP, KEY_LAST_GOOD_DEVICE, NULL))
     {
@@ -690,6 +822,10 @@ void rotor_conf_save(rotor_conf_t * conf)
                           conf->pretrack_seconds);
     g_key_file_set_boolean(cfg, GROUP, KEY_PRETRACK_SLEW,
                            conf->slew_to_aos_while_below_horizon);
+    g_key_file_set_boolean(cfg, GROUP, KEY_PRETRACK_IMMEDIATE,
+                           conf->pretrack_immediate);
+    g_key_file_set_double(cfg, GROUP, KEY_PRETRACK_MIN_EL,
+                          conf->pretrack_min_el);
 
     if (conf->device && *conf->device)
         g_key_file_set_string(cfg, GROUP, KEY_DEVICE, conf->device);
@@ -740,6 +876,36 @@ void rotor_conf_save(rotor_conf_t * conf)
     else
         g_key_file_set_integer(cfg, GROUP, KEY_STALE_DEBOUNCE,
                                (gint)conf->rotor_stale_debounce_count);
+
+    if (conf->rotor_stale_warn_ms == DEFAULT_STALE_WARN_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_STALE_WARN_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_STALE_WARN_MS,
+                               conf->rotor_stale_warn_ms);
+
+    if (conf->rotor_stale_degraded_ms == DEFAULT_STALE_DEGRADED_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_STALE_DEGRADED_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_STALE_DEGRADED_MS,
+                               conf->rotor_stale_degraded_ms);
+
+    if (conf->rotor_stale_hold_ms == DEFAULT_STALE_HOLD_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_STALE_HOLD_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_STALE_HOLD_MS,
+                               conf->rotor_stale_hold_ms);
+
+    if (conf->rotor_stale_park_ms == DEFAULT_STALE_PARK_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_STALE_PARK_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_STALE_PARK_MS,
+                               conf->rotor_stale_park_ms);
+
+    if (conf->rotor_stale_resume_ms == DEFAULT_STALE_RESUME_MS)
+        g_key_file_remove_key(cfg, GROUP, KEY_STALE_RESUME_MS, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_STALE_RESUME_MS,
+                               conf->rotor_stale_resume_ms);
 
     if (fabs(conf->rotor_angle_epsilon_deg - DEFAULT_ANGLE_EPSILON_DEG) < 1e-6)
         g_key_file_remove_key(cfg, GROUP, KEY_ANGLE_EPSILON, NULL);

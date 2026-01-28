@@ -57,6 +57,16 @@ gdouble rot_delta_shortest_360(gdouble from360, gdouble to360)
     return d;
 }
 
+gdouble rot_ang_diff_deg(gdouble a, gdouble b)
+{
+    return rot_norm180(a - b);
+}
+
+gdouble rot_ang_dist_deg(gdouble a, gdouble b)
+{
+    return fabs(rot_ang_diff_deg(a, b));
+}
+
 gdouble rot_ui_to_az360(gdouble ui_az, rot_ui_mode_t mode)
 {
     (void)mode;

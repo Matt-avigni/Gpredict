@@ -84,6 +84,7 @@
 #include "rotor-cmd-map.h"
 #include "rotor-trajectory-planner.h"
 #include "rotor-target.h"
+#include "rotor-decision.h"
 #include "rotor-angle.h"
 #include "rot-angle.h"
 #include "rot_math.h"
@@ -192,6 +193,8 @@ static void gp_safe_label_set_markup(GtkWidget *w, const gchar *markup)
 
     if (GTK_IS_LABEL(w))
         gtk_label_set_markup(GTK_LABEL(w), markup ? markup : "");
+    else
+        g_warning("Expected GtkLabel, got %s", G_OBJECT_TYPE_NAME(w));
 }
 
 typedef struct {
@@ -205,6 +208,7 @@ typedef struct {
     gboolean        use_setpos;
     gboolean        apply_calib;
     gboolean        allow_send_no_pos;
+    gboolean        stop_pending;
     gint            stop_requested;
     gboolean        send_quit;
     gboolean        thread_done;
@@ -416,6 +420,7 @@ struct _GtkRotCtrl {
     guint64         engage_generation;
     rot_session_state_t session_state;
     gboolean        tracking_active;
+    gboolean        force_next_send;
     rot_target_state_t target_state;
     gint64          target_state_since_us;
     gint64          target_valid_since_us;
@@ -425,6 +430,8 @@ struct _GtkRotCtrl {
     gboolean        pretrack_enabled;
     gdouble         pretrack_lookahead_sec;
     gdouble         reacquire_hysteresis_sec;
+    gboolean        pretrack_immediate;
+    gdouble         pretrack_min_el;
     gdouble         pretrack_target_az;
     gdouble         pretrack_target_el;
     gdouble         pretrack_aos_time;
@@ -447,6 +454,11 @@ struct _GtkRotCtrl {
     gdouble         last_cmd_backend_az;
     gdouble         last_cmd_backend_el;
     gboolean        last_cmd_backend_valid;
+    gdouble         setpoint_user_az;
+    gdouble         setpoint_user_el;
+    gdouble         setpoint_backend_az;
+    gdouble         setpoint_backend_el;
+    gboolean        setpoint_valid;
     gdouble         committed_user_az;
     gdouble         committed_user_el;
     gdouble         committed_raw_az360;
@@ -532,10 +544,15 @@ struct _GtkRotCtrl {
     RotLogRate      send_log_rate;
     RotLogRate      cmd_skip_rate;
     RotLogRate      pos_stale_rate;
+    RotLogRate      pos_warn_rate;
     guint           pos_stale_hits;
     gboolean        pos_stale_active;
     gboolean        pos_stale_hyst_active;
     guint           pos_stale_ready_hits;
+    gboolean        stale_hold_active;
+    gint64          stale_hold_since_us;
+    gint64          stale_resume_since_us;
+    gboolean        stale_recovered_pulse;
 
     /* Reserved flag; currently always kept FALSE (no special SEND-ONLY mode). */
     gboolean        send_only_mode;
@@ -552,6 +569,11 @@ struct _GtkRotCtrl {
     gboolean        cal_active;
     rot_autocal_state_t cal_state;
     gboolean        cal_did_setpos;
+    GtkWidget      *calib_dialog;
+    RotorCalib      calib_backup;
+    gboolean        calib_backup_valid;
+    gboolean        cal_hold_active;
+    gint64          cal_hold_since_us;
     gint64          cal_start_us;
     gint64          cal_timeout_us;
     gdouble         cal_last_az;
@@ -559,6 +581,9 @@ struct _GtkRotCtrl {
     gboolean        cal_have_last;
     guint           cal_stable_count;
     gint64          cal_last_log_us;
+    gdouble         motion_err_mag;
+    gboolean        motion_err_valid;
+    guint           motion_stall_count;
 };
 
 struct _GtkRotCtrlClass {
@@ -574,8 +599,20 @@ static guint64 rotctld_conn_seq = 0;
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
 static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason);
+static void rot_show_message(GtkRotCtrl *ctrl,
+                             GtkMessageType type,
+                             const gchar *title,
+                             const gchar *message);
 static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data);
 static void rot_verbose_cb(GtkToggleButton *button, gpointer data);
+static void rotctrl_set_cal_hold(GtkRotCtrl *ctrl,
+                                 gboolean active,
+                                 const gchar *reason);
+static gboolean rotor_apply_ui_settings(GtkRotCtrl *ctrl, gboolean strict);
+static gboolean rotctrl_settings_focus_out_cb(GtkWidget *widget,
+                                              GdkEventFocus *event,
+                                              gpointer data);
+static void     rotctrl_settings_activate_cb(GtkEntry *entry, gpointer data);
 static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
@@ -623,6 +660,11 @@ static gdouble  rotctrl_normalize_backend_az(gdouble az,
                                              gdouble backend_min_az,
                                              gdouble backend_max_az);
 static gint     rotctrl_poll_period_ms(const GtkRotCtrl *ctrl);
+static gint     rotctrl_stale_warn_ms(const GtkRotCtrl *ctrl);
+static gint     rotctrl_stale_degraded_ms(const GtkRotCtrl *ctrl);
+static gint     rotctrl_stale_hold_ms(const GtkRotCtrl *ctrl);
+static gint     rotctrl_stale_park_ms(const GtkRotCtrl *ctrl);
+static gint     rotctrl_stale_resume_ms(const GtkRotCtrl *ctrl);
 static gint     rotctrl_stale_ms(const GtkRotCtrl *ctrl);
 static guint    rotctrl_stale_debounce(const GtkRotCtrl *ctrl);
 static gdouble  rotctrl_angle_epsilon(const GtkRotCtrl *ctrl);
@@ -785,6 +827,12 @@ static gboolean rotctrl_find_entry_time(const rot_plan_t *plan,
                                         gdouble now_t,
                                         gdouble min_el,
                                         gdouble *entry_t_out);
+static gboolean rotctrl_find_pretrack_cmd(const GtkRotCtrl *ctrl,
+                                          gdouble t_start,
+                                          gdouble min_el,
+                                          gdouble *az_out,
+                                          gdouble *el_out,
+                                          gdouble *t_out);
 static gboolean rotctrl_use_rotctld_caps(GtkRotCtrl *ctrl,
                                          gboolean caps_valid,
                                          gdouble caps_az_min,
@@ -871,6 +919,9 @@ static void calib_enabled_toggled_cb(GtkToggleButton *button, gpointer data);
 static void calib_az_offset_changed_cb(GtkSpinButton *spin, gpointer data);
 static void calib_el_offset_changed_cb(GtkSpinButton *spin, gpointer data);
 static void calib_autocal_clicked_cb(GtkButton *button, gpointer data);
+static void calib_autocal_response_cb(GtkDialog *dialog,
+                                      gint response_id,
+                                      gpointer data);
 static bool rotctrl_calib_ensure_id(GtkRotCtrl *ctrl);
 static void rotctrl_calib_reload(GtkRotCtrl *ctrl);
 static void rotctrl_calib_update_widgets(GtkRotCtrl *ctrl);
@@ -890,7 +941,13 @@ static void rotctrl_calib_apply_read(GtkRotCtrl *ctrl,
                                      gdouble *world_el,
                                      gdouble *mech_az_out,
                                      gdouble *mech_el_out);
+static gdouble rotctrl_calib_uncertainty_deg(GtkRotCtrl *ctrl);
 static void rotctrl_autocal_start(GtkRotCtrl *ctrl);
+static void rotctrl_autocal_close_dialog(GtkRotCtrl *ctrl);
+static gboolean rotctrl_autocal_apply_mech(GtkRotCtrl *ctrl,
+                                           gdouble mech_az,
+                                           gdouble mech_el,
+                                           const gchar **reason_out);
 static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
                                  gboolean rotpos_valid,
                                  gdouble rotaz,
@@ -1583,6 +1640,8 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     gboolean stale_exit = FALSE;
     gboolean stale_active = FALSE;
     gint stale_ms = 0;
+    gint warn_ms = 0;
+    gint degraded_ms = 0;
 
     if (ctrl == NULL)
         return;
@@ -1610,10 +1669,12 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     now_us = g_get_monotonic_time();
     if (last_pos_us > 0 && now_us > last_pos_us)
         pos_age_ms = (now_us - last_pos_us) / 1000;
-    stale_ms = rotctrl_stale_ms(ctrl);
+    warn_ms = rotctrl_stale_warn_ms(ctrl);
+    degraded_ms = rotctrl_stale_degraded_ms(ctrl);
+    stale_ms = degraded_ms;
     stale_suppressed = rotctrl_stale_suppressed(ctrl);
-    stale_enter = (last_pos_us <= 0) || (pos_age_ms >= ROT_STALE_ENTER_MS);
-    stale_exit = (pos_age_ms >= 0) && (pos_age_ms <= ROT_STALE_EXIT_MS);
+    stale_enter = (last_pos_us <= 0) || (pos_age_ms >= degraded_ms);
+    stale_exit = (pos_age_ms >= 0) && (pos_age_ms <= warn_ms);
     if (stale_suppressed)
     {
         ctrl->pos_stale_hyst_active = FALSE;
@@ -1761,8 +1822,8 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
                                  stale_reason,
                                  (long long)pos_age_ms,
                                  pos_failures,
-                                 ROT_STALE_ENTER_MS,
-                                 ROT_STALE_EXIT_MS);
+                                 degraded_ms,
+                                 warn_ms);
         }
         rot_session_set_state(ctrl, ROT_SESSION_DEGRADED,
                               stale_reason, FALSE);
@@ -3596,6 +3657,45 @@ static gboolean rotctrl_find_entry_time(const rot_plan_t *plan,
     return FALSE;
 }
 
+static gboolean rotctrl_find_pretrack_cmd(const GtkRotCtrl *ctrl,
+                                          gdouble t_start,
+                                          gdouble min_el,
+                                          gdouble *az_out,
+                                          gdouble *el_out,
+                                          gdouble *t_out)
+{
+    if (ctrl == NULL)
+        return FALSE;
+
+    if (!ctrl->trajectory_plan.valid ||
+        ctrl->trajectory_plan.cmd_samples == NULL ||
+        ctrl->trajectory_plan.cmd_samples->len == 0)
+        return FALSE;
+
+    for (guint i = 0; i < ctrl->trajectory_plan.cmd_samples->len; i++)
+    {
+        rot_plan_cmd_t cmd =
+            g_array_index(ctrl->trajectory_plan.cmd_samples, rot_plan_cmd_t, i);
+
+        if (cmd.t < t_start)
+            continue;
+        if (!cmd.trackable)
+            continue;
+        if (cmd.cmd_el < min_el)
+            continue;
+
+        if (az_out)
+            *az_out = cmd.cmd_az;
+        if (el_out)
+            *el_out = cmd.cmd_el;
+        if (t_out)
+            *t_out = cmd.t;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 static void rotctrl_update_user_limits(GtkRotCtrl *ctrl)
 {
     RotLimitSet limits;
@@ -4502,9 +4602,8 @@ static gdouble rotctrl_normalize_backend_az(gdouble az,
     const gdouble eps = 1e-6;
 
     if (backend_min_az >= -eps &&
-        backend_max_az <= (360.0 + eps) &&
-        fabs(az - 360.0) <= eps)
-        return 0.0;
+        backend_max_az <= (360.0 + eps))
+        return gp_norm360(az);
 
     return az;
 }
@@ -4954,13 +5053,72 @@ static gint rotctrl_poll_period_ms(const GtkRotCtrl *ctrl)
 
 static gint rotctrl_stale_ms(const GtkRotCtrl *ctrl)
 {
+    return rotctrl_stale_degraded_ms(ctrl);
+}
+
+static gint rotctrl_stale_warn_ms(const GtkRotCtrl *ctrl)
+{
+    gint val = ROT_CMD_POS_FRESH_MS;
+
+    if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_warn_ms > 0)
+        val = ctrl->conf->rotor_stale_warn_ms;
+
+    if (val < 500)
+        val = 500;
+
+    return val;
+}
+
+static gint rotctrl_stale_degraded_ms(const GtkRotCtrl *ctrl)
+{
     gint val = ROTCTLD_DEFAULT_STALE_MS;
 
-    if (ctrl && ctrl->conf && ctrl->conf->rotor_position_stale_ms > 0)
+    if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_degraded_ms > 0)
+        val = ctrl->conf->rotor_stale_degraded_ms;
+    else if (ctrl && ctrl->conf && ctrl->conf->rotor_position_stale_ms > 0)
         val = ctrl->conf->rotor_position_stale_ms;
 
-    if (val < 1000)
-        val = 1000;
+    if (val < rotctrl_stale_warn_ms(ctrl))
+        val = rotctrl_stale_warn_ms(ctrl);
+
+    return val;
+}
+
+static gint rotctrl_stale_hold_ms(const GtkRotCtrl *ctrl)
+{
+    gint val = ROT_STALE_ENTER_MS;
+
+    if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_hold_ms > 0)
+        val = ctrl->conf->rotor_stale_hold_ms;
+
+    if (val < rotctrl_stale_degraded_ms(ctrl))
+        val = rotctrl_stale_degraded_ms(ctrl);
+
+    return val;
+}
+
+static gint rotctrl_stale_park_ms(const GtkRotCtrl *ctrl)
+{
+    gint val = ROT_STALE_ENTER_MS;
+
+    if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_park_ms >= 0)
+        val = ctrl->conf->rotor_stale_park_ms;
+
+    if (val > 0 && val < rotctrl_stale_hold_ms(ctrl))
+        val = rotctrl_stale_hold_ms(ctrl);
+
+    return val;
+}
+
+static gint rotctrl_stale_resume_ms(const GtkRotCtrl *ctrl)
+{
+    gint val = ROT_STALE_EXIT_MS;
+
+    if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_resume_ms >= 0)
+        val = ctrl->conf->rotor_stale_resume_ms;
+
+    if (val < 0)
+        val = 0;
 
     return val;
 }
@@ -5077,6 +5235,9 @@ static gdouble rotctrl_elev_floor(const GtkRotCtrl *ctrl)
 static gboolean rotctrl_stale_suppressed(const GtkRotCtrl *ctrl)
 {
     if (ctrl == NULL)
+        return TRUE;
+
+    if (ctrl->cal_active || ctrl->cal_hold_active)
         return TRUE;
 
     if (!ctrl->tracking)
@@ -5426,6 +5587,11 @@ static void rot_target_state_set(GtkRotCtrl *ctrl,
                          from, to, reason ? reason : "none",
                          cur_az, cur_el, rotctrl_wrap_mode_name(wrap_mode));
 
+    if (state == ROT_TARGET_STATE_PRETRACK ||
+        state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+        state == ROT_TARGET_STATE_TRACKING_DEGRADED)
+        ctrl->force_next_send = TRUE;
+
     ctrl->target_state = state;
     ctrl->target_state_since_us = now_us;
 }
@@ -5738,6 +5904,9 @@ static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
 
     if (ctrl == NULL)
         return FALSE;
+
+    if (ctrl->cal_hold_active)
+        rotctrl_set_cal_hold(ctrl, FALSE, "manual_input");
 
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
@@ -6498,6 +6667,7 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.use_setpos = FALSE;
     ctrl->client.apply_calib = FALSE;
     ctrl->client.allow_send_no_pos = FALSE;
+    ctrl->client.stop_pending = FALSE;
     ctrl->client.running = TRUE;
     g_atomic_int_set(&ctrl->client.stop_requested, 0);
     g_mutex_lock(&ctrl->client.mutex);
@@ -7230,6 +7400,7 @@ static gpointer rotctld_client_thread(gpointer data)
         gboolean allow_no_pos = FALSE;
         gboolean use_setpos = FALSE;
         gboolean apply_calib = FALSE;
+        gboolean stop_pending = FALSE;
         const gchar *cmd_name = "move";
         gint64 now_us = g_get_monotonic_time();
         gint64 backoff_until = 0;
@@ -7259,7 +7430,31 @@ static gpointer rotctld_client_thread(gpointer data)
             use_setpos = ctrl->client.use_setpos;
             apply_calib = ctrl->client.apply_calib;
         }
+        stop_pending = ctrl->client.stop_pending;
+        if (stop_pending)
+            ctrl->client.new_trg = FALSE;
+        ctrl->client.stop_pending = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
+
+        if (stop_pending)
+        {
+            have_trg = FALSE;
+            send_cmd = FALSE;
+            if (!rotctld_client_stop(ctrl->client.client))
+            {
+                rot_log_rate_limited(ctrl, &pos_skip_rate,
+                                     ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                     SAT_LOG_LEVEL_WARN, "gpredict:warn",
+                                     "rotctld stop failed");
+            }
+            else
+            {
+                rot_log_rate_limited(ctrl, &pos_skip_rate,
+                                     ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                     SAT_LOG_LEVEL_INFO, "gpredict:tx",
+                                     "rotctld stop sent");
+            }
+        }
 
         if (have_trg)
             send_cmd = TRUE;
@@ -8260,18 +8455,42 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     gboolean        locked;
     gboolean        pos_recent = FALSE;
     gboolean        session_ready = FALSE;
+    gboolean        requested;
 
     if (ctrl == NULL || ctrl->ui_updating)
         return;
 
+    if (ctrl->cal_hold_active)
+        rotctrl_set_cal_hold(ctrl, FALSE, "track_toggle");
+
     locked = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut));
-    ctrl->tracking = gtk_toggle_button_get_active(button);
+    requested = gtk_toggle_button_get_active(button);
+    if (requested && !rotor_apply_ui_settings(ctrl, TRUE))
+    {
+        rotctrl_ui_begin_update(ctrl, "track_invalid_settings");
+        gtk_toggle_button_set_active(button, FALSE);
+        rotctrl_ui_end_update(ctrl, "track_invalid_settings");
+        return;
+    }
+
+    ctrl->tracking = requested;
     gtk_widget_set_sensitive(ctrl->MonitorCheckBox,
                              !(ctrl->tracking || locked));
     gtk_widget_set_sensitive(ctrl->AzSet, !ctrl->tracking);
     gtk_widget_set_sensitive(ctrl->ElSet, !ctrl->tracking);
 
-    if (!ctrl->tracking) {
+    if (ctrl->tracking)
+    {
+        ctrl->force_next_send = TRUE;
+        ctrl->setpoint_valid = FALSE;
+        ctrl->setpoint_user_az = 0.0;
+        ctrl->setpoint_user_el = 0.0;
+        ctrl->setpoint_backend_az = 0.0;
+        ctrl->setpoint_backend_el = 0.0;
+    }
+
+    if (!ctrl->tracking)
+    {
         rot_plan_reset(&ctrl->trajectory_plan);
         set_flipped_pass(ctrl);
         ctrl->tracking_active = FALSE;
@@ -8294,6 +8513,12 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->last_cmd_backend_az = 0.0;
         ctrl->last_cmd_backend_el = 0.0;
         ctrl->last_cmd_backend_valid = FALSE;
+        ctrl->setpoint_user_az = 0.0;
+        ctrl->setpoint_user_el = 0.0;
+        ctrl->setpoint_backend_az = 0.0;
+        ctrl->setpoint_backend_el = 0.0;
+        ctrl->setpoint_valid = FALSE;
+        ctrl->force_next_send = FALSE;
         ctrl->committed_user_az = 0.0;
         ctrl->committed_user_el = 0.0;
         ctrl->committed_raw_az360 = 0.0;
@@ -8304,25 +8529,16 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->committed_since_us = 0;
         ctrl->last_keepalive_time_us = 0;
         ctrl->last_desired_update_us = 0;
-        ctrl->pos_stale_hyst_active = FALSE;
-        ctrl->pos_stale_ready_hits = 0;
         ctrl->pos_stale_active = FALSE;
         ctrl->last_stale_check_log_us = 0;
         ctrl->pos_stale_hyst_active = FALSE;
         ctrl->pos_stale_ready_hits = 0;
-        ctrl->last_cmd_backend_az = 0.0;
-        ctrl->last_cmd_backend_el = 0.0;
-        ctrl->last_cmd_backend_valid = FALSE;
-        ctrl->committed_user_az = 0.0;
-        ctrl->committed_user_el = 0.0;
-        ctrl->committed_raw_az360 = 0.0;
-        ctrl->committed_raw_el = 0.0;
-        ctrl->committed_backend_az = 0.0;
-        ctrl->committed_backend_el = 0.0;
-        ctrl->committed_valid = FALSE;
-        ctrl->committed_since_us = 0;
-        ctrl->last_keepalive_time_us = 0;
-        ctrl->last_desired_update_us = 0;
+        ctrl->stale_hold_active = FALSE;
+        ctrl->stale_hold_since_us = 0;
+        ctrl->stale_resume_since_us = 0;
+        ctrl->stale_recovered_pulse = FALSE;
+        ctrl->motion_err_valid = FALSE;
+        ctrl->motion_stall_count = 0;
         rotctrl_tracking_policy_reset_reason(ctrl, "track_off");
         return;
     }
@@ -8464,6 +8680,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gdouble elev_floor = 0.0;
     SpanConfig user_span_cfg = { 0 };
     SpanConfig backend_span_cfg = { 0 };
+    rot_target_caps_t decision_caps = { 0 };
     gboolean user_span_extended = FALSE;
     gboolean backend_span_extended = FALSE;
     AzSpan backend_span_mode = AZSPAN_360;
@@ -8484,6 +8701,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean session_ready = FALSE;
     gchar last_pos_error[64] = { 0 };
     gboolean autocal_active = FALSE;
+    gboolean cal_hold_active = FALSE;
     gboolean cal_force_send = FALSE;
 
     pos_recent = rotctrl_pos_recent(ctrl,
@@ -8553,6 +8771,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             (ctrl->pretrack_lookahead_sec > 0.0)
                 ? ctrl->pretrack_lookahead_sec
                 : ROT_PRETRACK_LOOKAHEAD_SEC;
+        if (ctrl->pretrack_immediate)
+            pretrack_window = MAX(pretrack_window, ROT_PRETRACK_LOOKAHEAD_SEC);
         gdouble aos_time = 0.0;
         gdouble aos_az360 = 0.0;
         gdouble aos_el = 0.0;
@@ -8590,8 +8810,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (below_horizon && ctrl->pretrack_enabled)
         {
-            if (!ctrl->pretrack_target_valid ||
-                (now_us - ctrl->pretrack_last_update_us) >= ROT_PRETRACK_RECALC_US)
+            if (!ctrl->pretrack_target_valid)
             {
                 aos_found = rotctrl_find_next_aos(ctrl,
                                                   ctrl->t,
@@ -8604,12 +8823,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
                 if (aos_found)
                 {
+                    gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
+                    if (ctrl->conf != NULL)
+                        pretrack_el = CLAMP(pretrack_el,
+                                            ctrl->conf->minel,
+                                            ctrl->conf->maxel);
                     ctrl->pretrack_target_az = aos_az360;
-                    ctrl->pretrack_target_el = (aos_el < elev_floor) ? elev_floor : aos_el;
+                    ctrl->pretrack_target_el = pretrack_el;
                     ctrl->pretrack_aos_time = aos_time;
                     ctrl->pretrack_target_valid = TRUE;
                     ctrl->pretrack_last_update_us = now_us;
                     ctrl->last_desired_update_us = now_us;
+                    ctrl->force_next_send = TRUE;
                     if (ctrl->verbose_logging)
                     {
                         gchar aos_buf[64] = { 0 };
@@ -8628,11 +8853,63 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 }
                 else
                 {
-                    ctrl->pretrack_target_valid = FALSE;
-                    ctrl->pretrack_aos_time = 0.0;
-                    ctrl->pretrack_last_update_us = now_us;
-                    ctrl->last_desired_update_us = now_us;
-                    ctrl->pretrack_wait_log_us = 0;
+                    gdouble plan_az = 0.0;
+                    gdouble plan_el = 0.0;
+                    gdouble plan_t = 0.0;
+                    gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
+
+                    if (ctrl->conf != NULL)
+                        pretrack_el = CLAMP(pretrack_el,
+                                            ctrl->conf->minel,
+                                            ctrl->conf->maxel);
+
+                    if (rotctrl_find_pretrack_cmd(ctrl,
+                                                  ctrl->t,
+                                                  elev_floor,
+                                                  &plan_az,
+                                                  &plan_el,
+                                                  &plan_t))
+                    {
+                        ctrl->pretrack_target_az = plan_az;
+                        ctrl->pretrack_target_el = plan_el;
+                        ctrl->pretrack_aos_time = plan_t;
+                        ctrl->pretrack_target_valid = TRUE;
+                        ctrl->pretrack_last_update_us = now_us;
+                        ctrl->last_desired_update_us = now_us;
+                        ctrl->force_next_send = TRUE;
+                        if (ctrl->verbose_logging)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack plan_entry az=%.2f el=%.2f",
+                                        plan_az,
+                                        plan_el);
+                        }
+                    }
+                    else if (live_valid)
+                    {
+                        ctrl->pretrack_target_az = live_az360;
+                        ctrl->pretrack_target_el = pretrack_el;
+                        ctrl->pretrack_aos_time = 0.0;
+                        ctrl->pretrack_target_valid = TRUE;
+                        ctrl->pretrack_last_update_us = now_us;
+                        ctrl->last_desired_update_us = now_us;
+                        ctrl->force_next_send = TRUE;
+                        if (ctrl->verbose_logging)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack fallback live az=%.2f el=%.2f",
+                                        live_az360,
+                                        pretrack_el);
+                        }
+                    }
+                    else
+                    {
+                        ctrl->pretrack_target_valid = FALSE;
+                        ctrl->pretrack_aos_time = 0.0;
+                        ctrl->pretrack_last_update_us = now_us;
+                        ctrl->last_desired_update_us = now_us;
+                        ctrl->pretrack_wait_log_us = 0;
+                    }
                 }
             }
 
@@ -8851,6 +9128,41 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
     }
 
+    cal_hold_active = ctrl->cal_hold_active;
+    if (cal_hold_active && !autocal_active)
+    {
+        setaz = 0.0;
+        setel = 0.0;
+        target_az360 = 0.0;
+        target_el = 0.0;
+        pred_valid = gp_rot_transform_target(ctrl,
+                                             target_az360,
+                                             target_el,
+                                             -1.0,
+                                             &xform);
+        if (pred_valid)
+        {
+            display_az360 = xform.az_after_southzero;
+            display_el = xform.el_after_southzero;
+            target_cmd_az360 = xform.az360_final;
+            target_cmd_el = xform.el_final;
+            az_pred = xform.az_after_southzero;
+            el_pred = xform.el_after_southzero;
+        }
+        else
+        {
+            display_az360 = target_az360;
+            display_el = target_el;
+            target_cmd_az360 = 0.0;
+            target_cmd_el = 0.0;
+            az_pred = 0.0;
+            el_pred = 0.0;
+        }
+        below_horizon = FALSE;
+        pretrack_active = FALSE;
+        hold_below = FALSE;
+    }
+
     /* Handle I/O with rotctld client if running */
     if (ctrl->client.running)
     {
@@ -9044,14 +9356,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gdouble desired_user_el = 0.0;
         gdouble desired_raw_az = 0.0;
         gdouble desired_raw_el = 0.0;
-        gdouble effective_raw_az = 0.0;
-        gdouble effective_raw_el = 0.0;
-        gdouble effective_user_az = 0.0;
-        gdouble effective_user_el = 0.0;
         gdouble desired_backend_az = 0.0;
         gdouble desired_backend_el = 0.0;
-        gdouble last_cmd_backend_az_log = 0.0;
-        gdouble last_cmd_backend_el_log = 0.0;
+        gdouble setpoint_backend_az = 0.0;
+        gdouble setpoint_backend_el = 0.0;
+        rot_cmd_decision_t decision_out = { 0 };
         gdouble last_cmd_user_az_log = 0.0;
         gdouble last_cmd_user_el_log = 0.0;
         gdouble az_delta_deg = 0.0;
@@ -9060,31 +9369,26 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gdouble deadband_el = ROT_CMD_DEADBAND_EL_DEG;
         gboolean send_ok = FALSE;
         gboolean force_send = FALSE;
+        gboolean force_transition = FALSE;
         gboolean have_target = FALSE;
         gboolean not_at_target = FALSE;
         gboolean manual_override = FALSE;
         gboolean pos_stale_now = FALSE;
         gboolean pos_fresh = FALSE;
-        gboolean pending_target = FALSE;
+        gboolean moving_toward = FALSE;
+        gboolean stopped_unexpected = FALSE;
+        gdouble motion_err = 0.0;
         gboolean resend_due = FALSE;
-        gboolean cooldown_active = FALSE;
-        gboolean bypass_cooldown = FALSE;
-        gboolean allow_not_at_target = FALSE;
-        gboolean committed_was_valid = FALSE;
         gdouble delta_backend_az = 0.0;
         gdouble delta_backend_el = 0.0;
         gdouble delta_user_az = 0.0;
         gdouble delta_user_el = 0.0;
-        gboolean min_step_ok = FALSE;
         gint64 pos_age_ms = -1;
         gint64 target_age_ms = -1;
-        gboolean target_recent = FALSE;
-        gint64 cooldown_ms_left = 0;
         rot_target_state_t desired_state = ROT_TARGET_STATE_IDLE;
         const gchar *state_reason = "idle";
-        const gchar *gate = "skip";
-        const gchar *reason = "deadband";
-        const gchar *gate_reason = "deadband";
+        rot_cmd_action_t gate = ROT_CMD_ACTION_SUPPRESS;
+        rot_cmd_reason_t reason = ROT_CMD_REASON_DEADBAND;
         const gchar *sched_reason = "HOLD_EPS";
 
         caps_valid = FALSE;
@@ -9115,7 +9419,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
         else if (last_cmd_ok_us > 0)
         {
-            last_cmd_backend = last_cmd_ok_az; // typo fix: last_cmd_ok_az -> last_cmd_backend_az
+            last_cmd_backend = last_cmd_ok_az;
             last_cmd_az360 = rot_backend_pos_to_az360(last_cmd_backend);
             have_last_cmd_backend = TRUE;
             have_last_cmd_phys = TRUE;
@@ -9232,11 +9536,89 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             pos_age_ms = (now_us - last_pos_us) / 1000;
         if (ctrl->last_target_update_us > 0 && now_us > ctrl->last_target_update_us)
             target_age_ms = (now_us - ctrl->last_target_update_us) / 1000;
-        if (target_age_ms >= 0)
-            target_recent = (target_age_ms <= rotctrl_stale_ms(ctrl));
 
+        ctrl->stale_recovered_pulse = FALSE;
+        if (ctrl->cal_active)
+        {
+            ctrl->stale_hold_active = FALSE;
+            ctrl->stale_hold_since_us = 0;
+            ctrl->stale_resume_since_us = 0;
+        }
+        else if (pos_age_ms >= 0)
+        {
+            gint warn_ms = rotctrl_stale_warn_ms(ctrl);
+            gint degraded_ms = rotctrl_stale_degraded_ms(ctrl);
+            gint hold_ms = rotctrl_stale_hold_ms(ctrl);
+            gint park_ms = rotctrl_stale_park_ms(ctrl);
+            gint resume_ms = rotctrl_stale_resume_ms(ctrl);
+
+            pos_fresh = (pos_age_ms <= warn_ms);
+
+            if (pos_age_ms >= warn_ms && pos_age_ms < degraded_ms)
+            {
+                rot_log_rate_limited(ctrl, &ctrl->pos_warn_rate,
+                                     ROTCTLD_FAILURE_LOG_INTERVAL_US,
+                                     SAT_LOG_LEVEL_WARN, "gpredict:warn",
+                                     "position warning: age=%lldms warn_ms=%d",
+                                     (long long)pos_age_ms,
+                                     warn_ms);
+            }
+
+            if (pos_age_ms >= hold_ms)
+            {
+                if (!ctrl->stale_hold_active)
+                {
+                    ctrl->stale_hold_active = TRUE;
+                    ctrl->stale_hold_since_us = now_us;
+                    ctrl->stale_resume_since_us = 0;
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                "rot hold: position stale age=%lldms hold_ms=%d",
+                                (long long)pos_age_ms,
+                                hold_ms);
+                }
+            }
+
+            if (ctrl->stale_hold_active)
+            {
+                if (pos_fresh)
+                {
+                    if (ctrl->stale_resume_since_us == 0)
+                        ctrl->stale_resume_since_us = now_us;
+                    if (resume_ms == 0 ||
+                        (now_us - ctrl->stale_resume_since_us) >=
+                            ((gint64)resume_ms * 1000))
+                    {
+                        ctrl->stale_hold_active = FALSE;
+                        ctrl->stale_resume_since_us = 0;
+                        ctrl->stale_recovered_pulse = TRUE;
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    "rot hold: recovered after %dms fresh",
+                                    resume_ms);
+                    }
+                }
+                else
+                {
+                    ctrl->stale_resume_since_us = 0;
+                }
+            }
+
+            if (park_ms > 0 && pos_age_ms >= park_ms)
+            {
+                if (ctrl->park_pending_since_us == 0)
+                {
+                    ctrl->park_pending_since_us = now_us;
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                "rot stale: disconnect requested age=%lldms park_ms=%d",
+                                (long long)pos_age_ms,
+                                park_ms);
+                    rotctld_request_thread_stop(ctrl, TRUE);
+                }
+            }
+        }
 
         pos_stale_now = ctrl->tracking && ctrl->engaged && !pos_recent;
+        if (ctrl->cal_active)
+            pos_stale_now = FALSE;
 
         if (ctrl->verbose_logging &&
             (ctrl->last_stale_check_log_us == 0 ||
@@ -9296,7 +9678,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
-        if (ctrl->tracking && !ctrl->engaged)
+        if (cal_hold_active)
+        {
+            desired_state = ROT_TARGET_STATE_HOLD;
+            state_reason = "cal_hold";
+        }
+        else if (ctrl->tracking && !ctrl->engaged)
         {
             desired_state = ROT_TARGET_STATE_IDLE;
             state_reason = "disengaged";
@@ -9336,11 +9723,15 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
 
         state_changed = (desired_state != ctrl->target_state);
+        force_transition =
+            state_changed &&
+            ctrl->target_state == ROT_TARGET_STATE_PRETRACK &&
+            (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
 
-        have_target = pred_valid || autocal_active ||
+        have_target = pred_valid || autocal_active || cal_hold_active ||
                       (hold_below && !hold_no_target);
-        force_send = cal_force_send;
-        committed_was_valid = ctrl->committed_valid;
+        force_send = cal_force_send || ctrl->force_next_send || force_transition;
 
         gdouble ref_backend = fresh_feedback ? meas_backend_az : last_cmd_backend;
         gboolean have_ref_backend = fresh_feedback || have_last_cmd_backend;
@@ -9369,11 +9760,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         desired_raw_el = target_cmd_el;
         desired_user_az = rot_az360_to_ui(display_az360, ui_mode);
         desired_user_el = display_el;
-        effective_raw_az = desired_raw_az;
-        effective_raw_el = desired_raw_el;
-        effective_user_az = desired_user_az;
-        effective_user_el = desired_user_el;
-
         if (desired_state == ROT_TARGET_STATE_PRETRACK)
         {
             deadband_az = ROT_CMD_DEADBAND_PRETRACK_AZ_DEG;
@@ -9392,7 +9778,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 (desired_state == ROT_TARGET_STATE_PRETRACK ||
                  desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
                  desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
-            committed_was_valid = ctrl->committed_valid;
+            gboolean committed_was_valid = ctrl->committed_valid;
             gboolean commit_force = force_send || state_changed || !committed_was_valid;
             gboolean commit_due = FALSE;
 
@@ -9419,27 +9805,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 ctrl->committed_raw_el = desired_raw_el;
                 ctrl->committed_valid = TRUE;
                 ctrl->committed_since_us = now_us;
-                if (commit_force)
-                {
-                    if (state_changed || !committed_was_valid)
-                        gate_reason = "transition";
-                    else
-                        gate_reason = "force";
-                }
-                else
-                    gate_reason = "deadband";
             }
-        }
-
-        if (ctrl->tracking && ctrl->committed_valid &&
-            (desired_state == ROT_TARGET_STATE_PRETRACK ||
-             desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED))
-        {
-            effective_raw_az = ctrl->committed_raw_az360;
-            effective_raw_el = ctrl->committed_raw_el;
-            effective_user_az = ctrl->committed_user_az;
-            effective_user_el = ctrl->committed_user_el;
         }
 
         rotctrl_pipeline_build(ctrl,
@@ -9459,38 +9825,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                &desired_pipeline);
 
         pipeline = desired_pipeline;
-        if (ctrl->tracking && ctrl->committed_valid &&
-            (desired_state == ROT_TARGET_STATE_PRETRACK ||
-             desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED))
-        {
-            if (rot_ang_dist_deg(desired_raw_az, effective_raw_az) > 1e-6 ||
-                fabs(desired_raw_el - effective_raw_el) > 1e-6)
-            {
-                rotctrl_pipeline_build(ctrl,
-                                       effective_raw_az,
-                                       effective_raw_el,
-                                       backend_az_min,
-                                       backend_az_max,
-                                       backend_el_min,
-                                       backend_el_max,
-                                       ref_backend,
-                                       have_ref_backend,
-                                       ctrl->locked_lane_valid,
-                                       ctrl->locked_lane_k,
-                                       ROT_LANE_ENDSTOP_MARGIN_DEG,
-                                       ROT_LANE_SWITCH_PENALTY_DEG,
-                                       hold_below,
-                                       &pipeline);
-            }
-        }
-
         desired_backend_az = desired_pipeline.cmd_az;
         desired_backend_el = desired_pipeline.cmd_el;
-        raw_cmd_az = effective_raw_az;
-        raw_cmd_el = effective_raw_el;
+        raw_cmd_az = desired_raw_az;
+        raw_cmd_el = desired_raw_el;
 
-        log_az_user = effective_user_az;
+        log_az_user = desired_user_az;
         gdouble log_cur_user_az = rot_az360_to_ui(meas_az360, ui_mode);
         gdouble log_cur_user_el = meas_el;
         gdouble log_offset_az = pred_valid
@@ -9529,6 +9869,23 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             state_changed = (desired_state != prev_state);
             if (state_changed)
             {
+                if (prev_state == ROT_TARGET_STATE_PRETRACK &&
+                    (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+                     desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED))
+                {
+                    gchar tbuf[64] = { 0 };
+                    const gchar *tstr = "unknown";
+
+                    rotctrl_format_utc_jd(ctrl->t, tbuf, sizeof(tbuf));
+                    if (tbuf[0] != '\0')
+                        tstr = tbuf;
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "MODE_SWITCH PRETRACK->TRACKING at t=%s",
+                                tstr);
+                    rot_term_log(ctrl, "gpredict:state",
+                                 "MODE_SWITCH PRETRACK->TRACKING at t=%s",
+                                 tstr);
+                }
                 rot_target_state_set(ctrl, desired_state, state_reason);
                 ctrl->target_valid_since_us = 0;
                 ctrl->target_invalid_since_us = 0;
@@ -9619,6 +9976,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                 (ctrl->target_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
                                  ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED ||
                                  ctrl->target_state == ROT_TARGET_STATE_PRETRACK);
+        if (cal_hold_active)
+            ctrl->tracking_active = FALSE;
 
         if (rotpos_valid && !hold_below)
         {
@@ -9678,6 +10037,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
+        desired_backend_az = cmdaz;
+        desired_backend_el = cmdel;
+
         ctrl->committed_backend_az = cmdaz;
         ctrl->committed_backend_el = cmdel;
 
@@ -9713,75 +10075,60 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         eps_el = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.0;
         eps_az = MAX(eps_az, ROT_CMD_AZ_EPS_MIN_DEG);
 
-        if (pos_age_ms >= 0)
-            pos_fresh = (pos_age_ms <= ROT_CMD_POS_FRESH_MS);
-
-        if (ctrl->last_cmd_backend_valid)
-        {
-            last_cmd_backend_az_log = ctrl->last_cmd_backend_az;
-            last_cmd_backend_el_log = ctrl->last_cmd_backend_el;
-        }
-        else
-        {
-            last_cmd_backend_az_log = last_cmd_backend;
-            last_cmd_backend_el_log = last_cmd_el;
-        }
-
-        setpoint_user_az = effective_user_az;
-        setpoint_user_el = effective_user_el;
         if (ctrl->last_cmd_valid)
         {
             last_cmd_user_az_log =
                 rot_az360_to_ui(ctrl->last_cmd_az360, ui_mode);
             last_cmd_user_el_log = ctrl->last_cmd_el;
-
-            delta_user_az = rot_ang_dist_deg(setpoint_user_az, last_cmd_user_az_log);
-            delta_user_el = fabs(setpoint_user_el - last_cmd_user_el_log);
         }
 
-        delta_backend_az = fabs(cmdaz - last_cmd_backend_az_log);
-        delta_backend_el = fabs(cmdel - last_cmd_backend_el_log);
-        min_step_ok =
-            (delta_backend_az >= ROT_CMD_MIN_AZ_DEG ||
-             delta_backend_el >= ROT_CMD_MIN_EL_DEG);
-        if (!ctrl->last_cmd_valid)
-            min_step_ok = TRUE;
+        if (ctrl->setpoint_valid)
+        {
+            setpoint_user_az = ctrl->setpoint_user_az;
+            setpoint_user_el = ctrl->setpoint_user_el;
+            setpoint_backend_az = ctrl->setpoint_backend_az;
+            setpoint_backend_el = ctrl->setpoint_backend_el;
+        }
+        else
+        {
+            setpoint_user_az = desired_user_az;
+            setpoint_user_el = desired_user_el;
+            setpoint_backend_az = cmdaz;
+            setpoint_backend_el = cmdel;
+        }
 
-        if (ctrl->tracking && ctrl->committed_valid && pos_fresh)
+        if (ctrl->setpoint_valid)
+        {
+            delta_user_az = rot_ang_dist_deg(desired_user_az, setpoint_user_az);
+            delta_user_el = fabs(desired_user_el - setpoint_user_el);
+            delta_backend_az = fabs(shortest_az_delta(cmdaz, setpoint_backend_az));
+            delta_backend_el = fabs(cmdel - setpoint_backend_el);
+        }
+        else
+        {
+            delta_user_az = 0.0;
+            delta_user_el = 0.0;
+            delta_backend_az = 0.0;
+            delta_backend_el = 0.0;
+        }
+
+        if (ctrl->tracking && ctrl->setpoint_valid && pos_fresh)
         {
             gdouble cur_user_az = rot_az360_to_ui(meas_az360, ui_mode);
             gboolean az_ok =
-                (rot_ang_dist_deg(cur_user_az, ctrl->committed_user_az) <= eps_az);
+                (rot_ang_dist_deg(cur_user_az, setpoint_user_az) <= eps_az);
             gboolean el_ok =
-                (fabs(meas_el - ctrl->committed_user_el) <= eps_el);
+                (fabs(meas_el - setpoint_user_el) <= eps_el);
             not_at_target = !(az_ok && el_ok);
         }
-
-        if (ctrl->tracking && ctrl->committed_valid)
-        {
-            if (!ctrl->last_cmd_valid ||
-                rot_ang_dist_deg(ctrl->committed_raw_az360, ctrl->last_cmd_az360) > 1e-6 ||
-                fabs(ctrl->committed_raw_el - ctrl->last_cmd_el) > 1e-6)
-                pending_target = TRUE;
-        }
-
-        if (!pos_fresh && ctrl->tracking_active && ctrl->committed_valid)
-        {
-            if (ctrl->last_keepalive_time_us == 0 ||
-                (now_us - ctrl->last_keepalive_time_us) >=
-                    (ROT_CMD_RESEND_MS * 1000))
-                resend_due = TRUE;
-        }
-
-        allow_not_at_target =
-            (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
 
         if (ctrl->tracking)
             allow_send = ctrl->engaged && !ctrl->monitor;
         else
             allow_send = ctrl->engaged && !ctrl->monitor &&
                          (session_ready ? pos_send_ok : manual_override);
+        if (cal_hold_active)
+            allow_send = ctrl->engaged && !ctrl->monitor;
         {
             RotTransformSnapshotState snap_state;
             rot_transform_snapshot_state_init(&snap_state);
@@ -9802,111 +10149,96 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (ctrl->tracking)
         {
-            gint64 cooldown_us = (gint64)ROT_CMD_COOLDOWN_MS * 1000;
-            gint64 max_hz_us = (ROT_CMD_MAX_HZ > 0.0)
-                               ? (gint64)(1000000.0 / ROT_CMD_MAX_HZ)
-                               : 0;
-            gint64 rate_limit_us = MAX(cooldown_us, max_hz_us);
+            if (ctrl->setpoint_valid && pos_fresh)
+            {
+                gdouble cur_user_az = rot_az360_to_ui(meas_az360, ui_mode);
+                gdouble err_az = rot_ang_dist_deg(cur_user_az, setpoint_user_az);
+                gdouble err_el = fabs(meas_el - setpoint_user_el);
+                motion_err = err_az + err_el;
 
-            rate_limit_us = MAX(rate_limit_us, (gint64)ROT_SEND_MIN_INTERVAL_US);
-            if (ctrl->last_cmd_time_us > 0 && now_us > ctrl->last_cmd_time_us)
-            {
-                gint64 elapsed = now_us - ctrl->last_cmd_time_us;
-                if (elapsed < rate_limit_us)
+                if (ctrl->motion_err_valid)
                 {
-                    cooldown_active = TRUE;
-                    cooldown_ms_left = (rate_limit_us - elapsed) / 1000;
+                    if (motion_err <= (ctrl->motion_err_mag - 0.05))
+                    {
+                        moving_toward = TRUE;
+                        ctrl->motion_stall_count = 0;
+                    }
+                    else
+                    {
+                        if (ctrl->motion_stall_count < G_MAXUINT)
+                            ctrl->motion_stall_count++;
+                        if (ctrl->motion_stall_count >= 2)
+                            stopped_unexpected = TRUE;
+                    }
                 }
-            }
+                else
+                {
+                    ctrl->motion_err_valid = TRUE;
+                    ctrl->motion_stall_count = 0;
+                }
 
-            bypass_cooldown = force_send ||
-                              state_changed ||
-                              !committed_was_valid ||
-                              (az_delta_deg >= (2.0 * deadband_az) ||
-                               el_delta_deg >= (2.0 * deadband_el));
-
-            if (!have_target)
-            {
-                gate = "skip";
-                reason = "no_target";
-            }
-            else if (!allow_send)
-            {
-                gate = "skip";
-                reason = "blocked";
-            }
-            else if (force_send)
-            {
-                gate_reason = "force";
-                if (cooldown_active && !bypass_cooldown)
-                {
-                    gate = "skip";
-                    reason = "cooldown";
-                }
-                else
-                {
-                    gate = "send";
-                    reason = "force";
-                    send_ok = TRUE;
-                }
-            }
-            else if (pending_target)
-            {
-                const gchar *pending_reason = gate_reason;
-                if (!min_step_ok && !resend_due)
-                {
-                    gate = "skip";
-                    reason = "min_step";
-                }
-                else if (cooldown_active && !bypass_cooldown)
-                {
-                    gate = "skip";
-                    reason = "cooldown";
-                }
-                else
-                {
-                    gate = "send";
-                    reason = pending_reason;
-                    send_ok = TRUE;
-                }
-            }
-            else if (resend_due)
-            {
-                if (cooldown_active && !bypass_cooldown)
-                {
-                    gate = "skip";
-                    reason = "cooldown";
-                }
-                else
-                {
-                    gate = "send";
-                    reason = "resend";
-                    send_ok = TRUE;
-                }
-            }
-            else if (allow_not_at_target && pos_fresh && not_at_target)
-            {
-                if (!min_step_ok && !resend_due)
-                {
-                    gate = "skip";
-                    reason = "min_step";
-                }
-                else if (cooldown_active && !bypass_cooldown)
-                {
-                    gate = "skip";
-                    reason = "cooldown";
-                }
-                else
-                {
-                    gate = "send";
-                    reason = "not_at_target_fresh";
-                    send_ok = TRUE;
-                }
+                ctrl->motion_err_mag = motion_err;
             }
             else
             {
-                gate = "skip";
-                reason = "deadband";
+                ctrl->motion_err_valid = FALSE;
+                ctrl->motion_stall_count = 0;
+            }
+
+            resend_due =
+                ctrl->setpoint_valid &&
+                ctrl->last_send_us > 0 &&
+                (now_us - ctrl->last_send_us) >=
+                    ((gint64)ROT_CMD_RESEND_MS * 1000);
+
+            rotctrl_build_target_caps(ctrl, &decision_caps);
+
+            {
+                rot_cmd_decision_input_t decision_in = { 0 };
+
+                decision_in.mode =
+                    (desired_state == ROT_TARGET_STATE_PRETRACK)
+                        ? ROT_CMD_MODE_PRETRACK
+                        : ROT_CMD_MODE_TRACKING;
+                decision_in.allow_send = allow_send;
+                decision_in.have_target = have_target;
+                decision_in.force_send = force_send;
+                decision_in.stale_hold = ctrl->stale_hold_active;
+                decision_in.setpoint_valid = ctrl->setpoint_valid;
+                decision_in.pos_fresh = pos_fresh;
+                decision_in.last_good_age_ms = pos_age_ms;
+                decision_in.not_at_target = not_at_target;
+                decision_in.moving_toward = moving_toward;
+                decision_in.stopped_unexpected = stopped_unexpected;
+                decision_in.pos_recovered = ctrl->stale_recovered_pulse;
+                decision_in.resend_due = resend_due;
+                decision_in.now_us = now_us;
+                decision_in.last_send_us = ctrl->last_send_us;
+                decision_in.min_interval_us = ROT_SEND_MIN_INTERVAL_US;
+                decision_in.desired_user_az = desired_user_az;
+                decision_in.desired_user_el = desired_user_el;
+                decision_in.desired_backend_az = desired_backend_az;
+                decision_in.desired_backend_el = desired_backend_el;
+                decision_in.setpoint_user_az = setpoint_user_az;
+                decision_in.setpoint_user_el = setpoint_user_el;
+                decision_in.last_cmd_user_az = last_cmd_user_az_log;
+                decision_in.last_cmd_user_el = last_cmd_user_el_log;
+                decision_in.delta_backend_az = delta_backend_az;
+                decision_in.delta_backend_el = delta_backend_el;
+                decision_in.deadband_az = deadband_az;
+                decision_in.deadband_el = deadband_el;
+                decision_in.min_step_az = ROT_CMD_MIN_AZ_DEG;
+                decision_in.min_step_el = ROT_CMD_MIN_EL_DEG;
+                decision_in.target_change_az = deadband_az * 2.0;
+                decision_in.target_change_el = deadband_el * 2.0;
+                decision_in.caps = decision_caps;
+
+                rot_cmd_decision_eval(&decision_in, &decision_out);
+                send_ok = decision_out.send;
+                reason = decision_out.reason;
+                gate = decision_out.action;
+                delta_user_az = decision_out.delta_user_az;
+                delta_user_el = decision_out.delta_user_el;
             }
         }
         else
@@ -9934,23 +10266,23 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
             if (!have_target)
             {
-                gate = "skip";
-                reason = "no_target";
+                gate = ROT_CMD_ACTION_SUPPRESS;
+                reason = ROT_CMD_REASON_NO_TARGET;
             }
             else if (!allow_send)
             {
-                gate = "skip";
-                reason = "blocked";
+                gate = ROT_CMD_ACTION_SUPPRESS;
+                reason = ROT_CMD_REASON_BLOCKED;
             }
             else if (send_ok)
             {
-                gate = "send";
-                reason = force_send ? "FORCE" : sched_reason;
+                gate = ROT_CMD_ACTION_SEND;
+                reason = force_send ? ROT_CMD_REASON_FORCE : ROT_CMD_REASON_TARGET;
             }
             else
             {
-                gate = "skip";
-                reason = sched_reason;
+                gate = ROT_CMD_ACTION_SUPPRESS;
+                reason = ROT_CMD_REASON_DEADBAND;
             }
         }
 
@@ -9960,7 +10292,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             {
                 sat_log_log(SAT_LOG_LEVEL_DEBUG,
                             "rot hold: reason=%s d_az=%.2f d_el=%.2f eps=(%.2f, %.2f)",
-                            reason,
+                            rot_cmd_reason_name(reason),
                             delta_az_phys,
                             delta_el_phys,
                             eps_az,
@@ -9973,35 +10305,34 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         {
             const gchar *mode_name =
                 (desired_state == ROT_TARGET_STATE_PRETRACK) ? "PRETRACK" : "TRACKING";
-            gdouble committed_user_az_log =
-                ctrl->committed_valid ? ctrl->committed_user_az : desired_user_az;
-            gdouble committed_user_el_log =
-                ctrl->committed_valid ? ctrl->committed_user_el : desired_user_el;
-            gdouble desired_user_az_log = live_valid ? live_user_az : setpoint_user_az;
-            gdouble desired_user_el_log = live_valid ? live_user_el : setpoint_user_el;
-            gboolean cooldown_ok = (!cooldown_active || bypass_cooldown);
-            const gchar *action = (allow_send && send_ok) ? "SEND" : "SUPPRESS";
+            gdouble desired_user_az_log = live_valid ? live_user_az : desired_user_az;
+            gdouble desired_user_el_log = live_valid ? live_user_el : desired_user_el;
+            const gchar *action = rot_cmd_action_name(gate);
+            const gchar *range_reason =
+                (reason == ROT_CMD_REASON_RANGE)
+                    ? rot_target_invalid_reason_name(decision_out.range_reason)
+                    : "none";
 
             rot_term_log(ctrl, "gpredict:tx",
                          "rot_cmd_gate: mode=%s desired_user=(%.2f,%.2f) setpoint_user=(%.2f,%.2f) "
-                         "last_cmd_user=(%.2f,%.2f) desired_backend=(%.2f,%.2f) last_cmd_backend=(%.2f,%.2f) "
-                         "pos_fresh=%d last_good_age_ms=%lld delta_user=(%.2f,%.2f) delta_backend=(%.2f,%.2f) "
-                         "min_step_ok=%d cooldown_ok=%d resend_due=%d action=%s reason=%s",
+                         "last_cmd_user=(%.2f,%.2f) desired_backend=(%.2f,%.2f) setpoint_backend=(%.2f,%.2f) "
+                         "in_flight=%d stale_hold=%d pos_fresh=%d last_good_age_ms=%lld "
+                         "delta_user=(%.2f,%.2f) delta_backend=(%.2f,%.2f) action=%s reason=%s range=%s",
                          mode_name,
                          desired_user_az_log, desired_user_el_log,
                          setpoint_user_az, setpoint_user_el,
                          last_cmd_user_az_log, last_cmd_user_el_log,
                          desired_backend_az, desired_backend_el,
-                         last_cmd_backend_az_log, last_cmd_backend_el_log,
+                         setpoint_backend_az, setpoint_backend_el,
+                         ctrl->setpoint_valid ? 1 : 0,
+                         ctrl->stale_hold_active ? 1 : 0,
                          pos_fresh ? 1 : 0,
                          (long long)pos_age_ms,
                          delta_user_az, delta_user_el,
                          delta_backend_az, delta_backend_el,
-                         min_step_ok ? 1 : 0,
-                         cooldown_ok ? 1 : 0,
-                         resend_due ? 1 : 0,
                          action,
-                         reason);
+                         rot_cmd_reason_name(reason),
+                         range_reason);
         }
 
         if (have_target)
@@ -10012,24 +10343,25 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         "cur_user=(%.2f,%.2f) eps=(%.2f,%.2f) send=%d reason=%s "
                         "wrap=%s offsets=(%.2f,%.2f)",
                         az_pred, el_pred,
-                        log_az_user, effective_user_el,
+                        log_az_user, desired_user_el,
                         cmdaz, cmdel,
                         meas_backend_az, meas_backend_el,
                         log_cur_user_az, log_cur_user_el,
                         eps_az, eps_el,
                         (allow_send && send_ok) ? 1 : 0,
-                        reason,
+                        rot_cmd_reason_name(reason),
                         wrap_name,
                         log_offset_az, log_offset_el);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "trk: state=%s pred=%.2f/%.2f user=%.2f/%.2f cmd=%.2f/%.2f meas=%.2f/%.2f fresh=%d gate=%s reason=%s",
                         rot_target_state_name(ctrl->target_state),
                         az_pred, el_pred,
-                        log_az_user, effective_user_el,
+                        log_az_user, desired_user_el,
                         cmdaz, cmdel,
                         meas_backend_az, meas_backend_el,
                         fresh_feedback ? 1 : 0,
-                        gate, reason);
+                        rot_cmd_action_name(gate),
+                        rot_cmd_reason_name(reason));
         }
 
         if (now_us - ctrl->last_tick_log_us >= 1000000)
@@ -10042,7 +10374,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         cmdaz - last_out_az,
                         cmdel - last_out_el,
                         ctrl->engaged ? 1 : 0,
-                        reason);
+                        rot_cmd_reason_name(reason));
             ctrl->last_tick_log_us = now_us;
         }
 
@@ -10075,7 +10407,15 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->last_cmd_backend_az = cmdaz;
             ctrl->last_cmd_backend_el = cmdel;
             ctrl->last_cmd_backend_valid = TRUE;
-            if (!pos_fresh || g_strcmp0(reason, "resend") == 0)
+            ctrl->setpoint_backend_az = desired_backend_az;
+            ctrl->setpoint_backend_el = desired_backend_el;
+            ctrl->setpoint_user_az = desired_user_az;
+            ctrl->setpoint_user_el = desired_user_el;
+            ctrl->setpoint_valid = TRUE;
+            ctrl->force_next_send = FALSE;
+            ctrl->motion_err_valid = FALSE;
+            ctrl->motion_stall_count = 0;
+            if (!pos_fresh || reason == ROT_CMD_REASON_RESEND)
                 ctrl->last_keepalive_time_us = now_us;
 
             rot_log_rate_limited(ctrl, &ctrl->send_log_rate, 1000000,
@@ -10085,7 +10425,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                  log_az_pred, log_az_user, cmdaz,
                                  log_el_pred, cmdel,
                                  rot_target_state_name(ctrl->target_state),
-                                 reason);
+                                 rot_cmd_reason_name(reason));
         }
 
         if (ctrl->verbose_logging)
@@ -10129,7 +10469,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                             pipeline.cmd_az, pipeline.cmd_el,
                             az_clamped ? 1 : 0,
                             el_clamped ? 1 : 0,
-                            reason,
+                            rot_cmd_reason_name(reason),
                             cmdaz, cmdel,
                             meas_backend_az, meas_backend_el,
                             pos360_log,
@@ -10352,6 +10692,169 @@ static void threshold_changed_cb(GtkSpinButton * spin, gpointer data)
         ctrl->conf->threshold = ctrl->threshold;
 }
 
+static gboolean rotctrl_parse_spin_value(GtkSpinButton *spin, gdouble *value)
+{
+    const gchar *text;
+    gchar *end = NULL;
+    gdouble val;
+
+    if (spin == NULL || value == NULL)
+        return FALSE;
+
+    text = gtk_entry_get_text(GTK_ENTRY(spin));
+    if (text == NULL)
+        return FALSE;
+
+    errno = 0;
+    val = g_ascii_strtod(text, &end);
+    if (text == end || errno == ERANGE)
+        return FALSE;
+
+    while (g_ascii_isspace(*end))
+        end++;
+
+    if (*end != '\0')
+        return FALSE;
+
+    *value = val;
+    return TRUE;
+}
+
+/* Authoritative UI apply path used before engage/track starts. */
+static gboolean rotor_apply_ui_settings(GtkRotCtrl *ctrl, gboolean strict)
+{
+    GtkSpinButton *cycle_spin;
+    GtkSpinButton *thld_spin;
+    GtkAdjustment *adj;
+    gdouble raw = 0.0;
+    gdouble lower;
+    gdouble upper;
+    gdouble value;
+    guint delay_ms;
+    gdouble threshold_deg;
+
+    if (ctrl == NULL)
+        return TRUE;
+
+    cycle_spin = ctrl->cycle_spin ? GTK_SPIN_BUTTON(ctrl->cycle_spin) : NULL;
+    thld_spin = ctrl->thld_spin ? GTK_SPIN_BUTTON(ctrl->thld_spin) : NULL;
+
+    if (cycle_spin)
+    {
+        adj = gtk_spin_button_get_adjustment(cycle_spin);
+        lower = gtk_adjustment_get_lower(adj);
+        upper = gtk_adjustment_get_upper(adj);
+
+        if (strict)
+        {
+            if (!rotctrl_parse_spin_value(cycle_spin, &raw))
+            {
+                rot_show_message(ctrl, GTK_MESSAGE_ERROR,
+                                 _("Invalid cycle delay"),
+                                 _("Cycle delay must be a valid number."));
+                return FALSE;
+            }
+            if (raw < lower || raw > upper)
+            {
+                gchar *msg = g_strdup_printf(_("Cycle delay must be between %.0f and %.0f ms."),
+                                             lower, upper);
+                rot_show_message(ctrl, GTK_MESSAGE_ERROR,
+                                 _("Invalid cycle delay"), msg);
+                g_free(msg);
+                return FALSE;
+            }
+            gtk_spin_button_set_value(cycle_spin, raw);
+        }
+
+        gtk_spin_button_update(cycle_spin);
+        value = gtk_spin_button_get_value(cycle_spin);
+        delay_ms = (guint)llround(value);
+
+        ctrl->delay = delay_ms;
+        if (ctrl->conf)
+            ctrl->conf->cycle = ctrl->delay;
+
+        if (ctrl->timerid > 0)
+            g_source_remove(ctrl->timerid);
+
+        ctrl->timerid = g_timeout_add(ctrl->delay, rot_ctrl_timeout_cb, ctrl);
+    }
+
+    if (thld_spin)
+    {
+        adj = gtk_spin_button_get_adjustment(thld_spin);
+        lower = gtk_adjustment_get_lower(adj);
+        upper = gtk_adjustment_get_upper(adj);
+
+        gtk_spin_button_update(thld_spin);
+        threshold_deg = gtk_spin_button_get_value(thld_spin);
+
+        if (strict)
+        {
+            if (!isfinite(threshold_deg))
+            {
+                rot_show_message(ctrl, GTK_MESSAGE_ERROR,
+                                 _("Invalid threshold"),
+                                 _("Tracking threshold must be a valid number."));
+                return FALSE;
+            }
+            if (threshold_deg <= 0.0 || threshold_deg > 180.0)
+            {
+                gchar *msg = g_strdup_printf(_("Tracking threshold must be between %.2f and %.2f degrees."),
+                                             MAX(0.01, lower), MIN(180.0, upper));
+                rot_show_message(ctrl, GTK_MESSAGE_ERROR,
+                                 _("Invalid threshold"), msg);
+                g_free(msg);
+                return FALSE;
+            }
+        }
+
+        ctrl->threshold = threshold_deg;
+        if (ctrl->conf)
+            ctrl->conf->threshold = ctrl->threshold;
+    }
+
+    if (strict && cycle_spin && thld_spin)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "Applied rotor settings: cycle_ms=%u threshold_deg=%.2f",
+                    ctrl->delay, ctrl->threshold);
+        rot_term_log(ctrl, "gpredict:rx",
+                     "applied rotor settings: cycle_ms=%u threshold_deg=%.2f",
+                     ctrl->delay, ctrl->threshold);
+    }
+
+    return TRUE;
+}
+
+static gboolean rotctrl_settings_focus_out_cb(GtkWidget *widget,
+                                              GdkEventFocus *event,
+                                              gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)widget;
+    (void)event;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return FALSE;
+
+    rotor_apply_ui_settings(ctrl, FALSE);
+    return FALSE;
+}
+
+static void rotctrl_settings_activate_cb(GtkEntry *entry, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)entry;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
+    rotor_apply_ui_settings(ctrl, FALSE);
+}
+
 static void rotctrl_update_geometry_sensitivity(GtkRotCtrl *ctrl)
 {
     gboolean az_el = FALSE;
@@ -10512,6 +11015,12 @@ static void wrap_mode_changed_cb(GtkComboBox *box, gpointer data)
     ctrl->last_cmd_backend_az = 0.0;
     ctrl->last_cmd_backend_el = 0.0;
     ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->setpoint_user_az = 0.0;
+    ctrl->setpoint_user_el = 0.0;
+    ctrl->setpoint_backend_az = 0.0;
+    ctrl->setpoint_backend_el = 0.0;
+    ctrl->setpoint_valid = FALSE;
+    ctrl->force_next_send = FALSE;
     ctrl->committed_user_az = 0.0;
     ctrl->committed_user_el = 0.0;
     ctrl->committed_raw_az360 = 0.0;
@@ -10525,6 +11034,12 @@ static void wrap_mode_changed_cb(GtkComboBox *box, gpointer data)
     ctrl->last_cmd_backend_az = 0.0;
     ctrl->last_cmd_backend_el = 0.0;
     ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->setpoint_user_az = 0.0;
+    ctrl->setpoint_user_el = 0.0;
+    ctrl->setpoint_backend_az = 0.0;
+    ctrl->setpoint_backend_el = 0.0;
+    ctrl->setpoint_valid = FALSE;
+    ctrl->force_next_send = FALSE;
     ctrl->committed_user_az = 0.0;
     ctrl->committed_user_el = 0.0;
     ctrl->committed_raw_az360 = 0.0;
@@ -10696,6 +11211,8 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
             (ctrl->conf->pretrack_seconds > 0.0)
                 ? ctrl->conf->pretrack_seconds
                 : ROT_PRETRACK_LOOKAHEAD_SEC;
+        ctrl->pretrack_immediate = ctrl->conf->pretrack_immediate;
+        ctrl->pretrack_min_el = ctrl->conf->pretrack_min_el;
 
         if (ctrl->offset_check) {
             g_signal_handlers_block_by_func(ctrl->offset_check,
@@ -14644,6 +15161,9 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         gboolean will_send_quit = FALSE;
         const gchar *reason = NULL;
 
+        if (ctrl->cal_hold_active)
+            rotctrl_set_cal_hold(ctrl, FALSE, "disengage");
+
         ctrl->engaged = FALSE;
         ctrl->engage_pending = FALSE;
         ctrl->tracking_active = FALSE;
@@ -14695,6 +15215,15 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
     {
         if (ctrl->engaged || ctrl->engage_pending)
             return;
+
+        /* Apply UI settings before starting any worker activity. */
+        if (!rotor_apply_ui_settings(ctrl, TRUE))
+        {
+            rotctrl_ui_begin_update(ctrl, "engage_invalid_settings");
+            gtk_toggle_button_set_active(button, FALSE);
+            rotctrl_ui_end_update(ctrl, "engage_invalid_settings");
+            return;
+        }
 
         {
             gchar *conf_err = NULL;
@@ -14757,6 +15286,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             ctrl->client.send_quit = FALSE;
             ctrl->client.allow_send_no_pos = FALSE;
             ctrl->client.apply_calib = FALSE;
+            ctrl->client.stop_pending = FALSE;
             g_atomic_int_set(&ctrl->client.stop_requested, 0);
             g_mutex_unlock(&ctrl->client.mutex);
             rotctld_ensure_result_t ensure = rotctld_ensure_running(ctrl);
@@ -15056,6 +15586,10 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "commands sent to the rotator."));
     g_signal_connect(ctrl->cycle_spin, "value-changed",
                      G_CALLBACK(delay_changed_cb), ctrl);
+    g_signal_connect(ctrl->cycle_spin, "focus-out-event",
+                     G_CALLBACK(rotctrl_settings_focus_out_cb), ctrl);
+    g_signal_connect(ctrl->cycle_spin, "activate",
+                     G_CALLBACK(rotctrl_settings_activate_cb), ctrl);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->cycle_spin, 1, 2, 1, 1);
 
     label = gtk_label_new(_("msec"));
@@ -15077,6 +15611,10 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "threshold, no new commands are sent"));
     g_signal_connect(ctrl->thld_spin, "value-changed",
                      G_CALLBACK(threshold_changed_cb), ctrl);
+    g_signal_connect(ctrl->thld_spin, "focus-out-event",
+                     G_CALLBACK(rotctrl_settings_focus_out_cb), ctrl);
+    g_signal_connect(ctrl->thld_spin, "activate",
+                     G_CALLBACK(rotctrl_settings_activate_cb), ctrl);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->thld_spin, 1, 3, 1, 1);
 
     label = gtk_label_new(_("deg"));
@@ -15132,7 +15670,7 @@ static GtkWidget *create_calibration_widgets(GtkRotCtrl *ctrl)
 
     autocal_button = gtk_button_new_with_label(_("Auto-calibration"));
     gtk_widget_set_tooltip_text(autocal_button,
-                                _("Commands 0/0 and shifts the reference when stable."));
+                                _("Moves to 0/0 and prompts for alignment to TRUE NORTH."));
     g_signal_connect(autocal_button, "clicked",
                      G_CALLBACK(calib_autocal_clicked_cb), ctrl);
     gtk_grid_attach(GTK_GRID(grid), autocal_button, 0, 0, 2, 1);
@@ -15199,6 +15737,9 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
                          _("Engage the rotator before parking it."));
         return;
     }
+
+    if (ctrl->cal_hold_active)
+        rotctrl_set_cal_hold(ctrl, FALSE, "park");
 
     /* Route through the unified control loop: update knobs and allow manual send. */
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), 0.0);
@@ -15442,6 +15983,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->pretrack_enabled = TRUE;
     ctrl->pretrack_lookahead_sec = ROT_PRETRACK_LOOKAHEAD_SEC;
     ctrl->reacquire_hysteresis_sec = ROT_PRETRACK_REACQUIRE_SEC;
+    ctrl->pretrack_immediate = TRUE;
+    ctrl->pretrack_min_el = 1.0;
     ctrl->pretrack_target_az = 0.0;
     ctrl->pretrack_target_el = 0.0;
     ctrl->pretrack_aos_time = 0.0;
@@ -15461,6 +16004,12 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->last_cmd_az360 = 0.0;
     ctrl->last_cmd_el = 0.0;
     ctrl->last_cmd_valid = FALSE;
+    ctrl->setpoint_user_az = 0.0;
+    ctrl->setpoint_user_el = 0.0;
+    ctrl->setpoint_backend_az = 0.0;
+    ctrl->setpoint_backend_el = 0.0;
+    ctrl->setpoint_valid = FALSE;
+    ctrl->force_next_send = FALSE;
     ctrl->plan_log_pending = FALSE;
     ctrl->plan_log_window_start = 0.0;
     ctrl->plan_log_window_end = 0.0;
@@ -15496,6 +16045,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->rotctld_probe_id = 0;
     ctrl->last_hold_log_us = 0;
     ctrl->last_stale_check_log_us = 0;
+    memset(&ctrl->pos_warn_rate, 0, sizeof(ctrl->pos_warn_rate));
 
     /* Offset defaults */
     ctrl->use_offset   = FALSE;
@@ -15541,10 +16091,15 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     memset(&ctrl->send_log_rate, 0, sizeof(ctrl->send_log_rate));
     memset(&ctrl->cmd_skip_rate, 0, sizeof(ctrl->cmd_skip_rate));
     memset(&ctrl->pos_stale_rate, 0, sizeof(ctrl->pos_stale_rate));
+    memset(&ctrl->pos_warn_rate, 0, sizeof(ctrl->pos_warn_rate));
     ctrl->pos_stale_hits = 0;
     ctrl->pos_stale_active = FALSE;
     ctrl->pos_stale_hyst_active = FALSE;
     ctrl->pos_stale_ready_hits = 0;
+    ctrl->stale_hold_active = FALSE;
+    ctrl->stale_hold_since_us = 0;
+    ctrl->stale_resume_since_us = 0;
+    ctrl->stale_recovered_pulse = FALSE;
     ctrl->out_of_range = FALSE;
     ctrl->last_oob_log_us = 0;
     ctrl->last_oob_raw_az = 0.0;
@@ -15559,6 +16114,11 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->cal_active = FALSE;
     ctrl->cal_state = ROT_AUTOCAL_IDLE;
     ctrl->cal_did_setpos = FALSE;
+    ctrl->cal_hold_active = FALSE;
+    ctrl->cal_hold_since_us = 0;
+    ctrl->calib_dialog = NULL;
+    ctrl->calib_backup = (RotorCalib){ 0 };
+    ctrl->calib_backup_valid = FALSE;
     ctrl->cal_start_us = 0;
     ctrl->cal_timeout_us = 0;
     ctrl->cal_last_az = 0.0;
@@ -15566,6 +16126,9 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->cal_have_last = FALSE;
     ctrl->cal_stable_count = 0;
     ctrl->cal_last_log_us = 0;
+    ctrl->motion_err_mag = 0.0;
+    ctrl->motion_err_valid = FALSE;
+    ctrl->motion_stall_count = 0;
     memset(&ctrl->trajectory_plan, 0, sizeof(ctrl->trajectory_plan));
     rot_plan_reset(&ctrl->trajectory_plan);
     /* Reserved flag; keep FALSE (no special SEND-ONLY mode). */
@@ -15627,6 +16190,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->client.backend_ioerr_first_us = 0;
     ctrl->client.backend_ioerr_last_log_us = 0;
     ctrl->client.backend_ioerr_disengage_pending = FALSE;
+    ctrl->client.stop_pending = FALSE;
     ctrl->client.rxbuf = NULL;
 
     rot_transform_update(ctrl);
@@ -16044,6 +16608,90 @@ static void rotctrl_calib_apply_read(GtkRotCtrl *ctrl,
         *mech_el_out = el;
 }
 
+static gdouble rotctrl_calib_uncertainty_deg(GtkRotCtrl *ctrl)
+{
+    gdouble eps = 0.0;
+
+    if (ctrl != NULL)
+        eps = rotctrl_angle_epsilon(ctrl);
+
+    if (eps <= 0.0)
+        eps = 0.5;
+
+    return eps;
+}
+
+static void rotctrl_set_cal_hold(GtkRotCtrl *ctrl,
+                                 gboolean active,
+                                 const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->cal_hold_active == active)
+        return;
+
+    ctrl->cal_hold_active = active;
+    ctrl->cal_hold_since_us = active ? g_get_monotonic_time() : 0;
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "CAL_HOLD %s reason=%s",
+                active ? "ON" : "OFF",
+                reason ? reason : "none");
+    rot_term_log(ctrl, "gpredict:state",
+                 "CAL_HOLD %s reason=%s",
+                 active ? "ON" : "OFF",
+                 reason ? reason : "none");
+}
+
+static void rotctrl_autocal_close_dialog(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->calib_dialog == NULL)
+        return;
+
+    GtkWidget *dialog = ctrl->calib_dialog;
+    ctrl->calib_dialog = NULL;
+    gtk_widget_destroy(dialog);
+}
+
+static gboolean rotctrl_autocal_apply_mech(GtkRotCtrl *ctrl,
+                                           gdouble mech_az,
+                                           gdouble mech_el,
+                                           const gchar **reason_out)
+{
+    RotorCalib updated = { 0 };
+    gdouble uncertainty = 0.0;
+
+    if (ctrl == NULL)
+    {
+        if (reason_out)
+            *reason_out = "no_ctrl";
+        return FALSE;
+    }
+
+    if (!rotctrl_calib_ensure_id(ctrl))
+    {
+        if (reason_out)
+            *reason_out = "no_rotor_id";
+        return FALSE;
+    }
+
+    uncertainty = rotctrl_calib_uncertainty_deg(ctrl);
+    updated = ctrl->calib;
+    calib_apply_mech_zero(&updated, mech_az, mech_el, uncertainty);
+
+    if (!calib_save(ctrl->rotor_id, &updated))
+    {
+        if (reason_out)
+            *reason_out = "save_failed";
+        return FALSE;
+    }
+
+    ctrl->calib = updated;
+    rotctrl_calib_update_widgets(ctrl);
+    return TRUE;
+}
+
 static void rotctrl_autocal_finish(GtkRotCtrl *ctrl,
                                    gboolean ok,
                                    const gchar *reason)
@@ -16054,6 +16702,8 @@ static void rotctrl_autocal_finish(GtkRotCtrl *ctrl,
     ctrl->cal_active = FALSE;
     ctrl->cal_state = ok ? ROT_AUTOCAL_DONE : ROT_AUTOCAL_FAIL;
     ctrl->cal_did_setpos = FALSE;
+    ctrl->cal_timeout_us = 0;
+    rotctrl_autocal_close_dialog(ctrl);
     if (ctrl->calib_autocal_button)
         gtk_widget_set_sensitive(ctrl->calib_autocal_button, TRUE);
 
@@ -16063,6 +16713,13 @@ static void rotctrl_autocal_finish(GtkRotCtrl *ctrl,
         rot_term_log(ctrl, "gpredict:warn",
                      "autocal failed reason=%s", reason);
     }
+
+    if (!ok && ctrl->calib_backup_valid)
+    {
+        ctrl->calib = ctrl->calib_backup;
+        rotctrl_calib_update_widgets(ctrl);
+    }
+    ctrl->calib_backup_valid = FALSE;
 }
 
 static void rotctrl_autocal_start(GtkRotCtrl *ctrl)
@@ -16076,19 +16733,29 @@ static void rotctrl_autocal_start(GtkRotCtrl *ctrl)
         return;
 
     if (ctrl->cal_active)
+    {
+        if (ctrl->calib_dialog)
+            gtk_window_present(GTK_WINDOW(ctrl->calib_dialog));
         return;
+    }
+
+    if (ctrl->cal_hold_active)
+        rotctrl_set_cal_hold(ctrl, FALSE, "autocal_start");
 
     now_us = g_get_monotonic_time();
     ctrl->cal_active = TRUE;
     ctrl->cal_state = ROT_AUTOCAL_SENDING;
     ctrl->cal_did_setpos = FALSE;
     ctrl->cal_start_us = now_us;
-    ctrl->cal_timeout_us = ROT_AUTOCAL_TIMEOUT_US;
+    ctrl->cal_timeout_us = 0;
     ctrl->cal_last_az = 0.0;
     ctrl->cal_last_el = 0.0;
     ctrl->cal_have_last = FALSE;
     ctrl->cal_stable_count = 0;
     ctrl->cal_last_log_us = 0;
+    ctrl->calib_backup = ctrl->calib;
+    ctrl->calib_backup_valid = TRUE;
+    rotctrl_autocal_close_dialog(ctrl);
 
     if (ctrl->calib_autocal_button)
         gtk_widget_set_sensitive(ctrl->calib_autocal_button, FALSE);
@@ -16105,9 +16772,29 @@ static void rotctrl_autocal_start(GtkRotCtrl *ctrl)
     rot_term_log(ctrl, "gpredict:rx",
                  "autocal start pos_valid=%d pos=(%.2f, %.2f) cmd=(0.00, 0.00)",
                  pos_valid ? 1 : 0, cur_az, cur_el);
+    sat_log_log(SAT_LOG_LEVEL_INFO, "CAL_START");
+    rot_term_log(ctrl, "gpredict:rx", "CAL_START");
 
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), 0.0);
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), 0.0);
+
+    {
+        GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+        GtkWindow *parent = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
+        GtkWidget *dialog = gtk_message_dialog_new(parent,
+                                                   GTK_DIALOG_MODAL |
+                                                   GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                   GTK_MESSAGE_INFO,
+                                                   GTK_BUTTONS_OK_CANCEL,
+                                                   _("Calibration in progress. Rotor moving to (0\302\260,0\302\260).\n"
+                                                     "When it stops, align antennas to TRUE NORTH, then press OK."));
+        gtk_window_set_title(GTK_WINDOW(dialog), _("Calibration"));
+        gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+        g_signal_connect(dialog, "response",
+                         G_CALLBACK(calib_autocal_response_cb), ctrl);
+        ctrl->calib_dialog = dialog;
+        gtk_widget_show(dialog);
+    }
 }
 
 static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
@@ -16135,93 +16822,111 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
         return;
     }
 
-    if (!rotpos_valid)
-    {
-        if (now_us - ctrl->cal_last_log_us >= ROT_AUTOCAL_LOG_INTERVAL_US)
-        {
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "autocal waiting pos=unknown stable=%u",
-                        ctrl->cal_stable_count);
-            rot_term_log_verbose(ctrl, "gpredict:rx",
-                                 "autocal waiting pos=unknown stable=%u",
-                                 ctrl->cal_stable_count);
-            ctrl->cal_last_log_us = now_us;
-        }
-        return;
-    }
-
-    if (!ctrl->cal_have_last)
-    {
-        ctrl->cal_last_az = rotaz;
-        ctrl->cal_last_el = rotel;
-        ctrl->cal_have_last = TRUE;
-        ctrl->cal_stable_count = 0;
-    }
-    else
-    {
-        rot_az_type_t az_type =
-            (ctrl->conf != NULL) ? ctrl->conf->aztype : ROT_AZ_TYPE_360;
-        gdouble eps = rotctrl_angle_epsilon(ctrl);
-        gdouble daz = fabs(az_wrap_diff(rotaz, ctrl->cal_last_az, az_type));
-        gdouble del = fabs(rotel - ctrl->cal_last_el);
-
-        if (daz <= eps && del <= eps)
-            ctrl->cal_stable_count++;
-        else
-            ctrl->cal_stable_count = 0;
-
-        ctrl->cal_last_az = rotaz;
-        ctrl->cal_last_el = rotel;
-    }
-
-    if (ctrl->cal_stable_count >= ROT_AUTOCAL_STABLE_COUNT)
-    {
-        if (!rotctrl_calib_ensure_id(ctrl))
-        {
-            rotctrl_autocal_finish(ctrl, FALSE, "no_rotor_id");
-            return;
-        }
-
-        ctrl->cal_state = ROT_AUTOCAL_APPLYING;
-        gdouble az_shift = -rotaz;
-        gdouble el_shift = -rotel;
-        gdouble new_az = wrap360(ctrl->calib.az_offset_deg + az_shift);
-        gdouble new_el = ctrl->calib.el_offset_deg + el_shift;
-
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "autocal apply meas=(%.2f, %.2f) shift=(%.2f, %.2f) "
-                    "offsets=(%.2f, %.2f) enabled=%d",
-                    rotaz, rotel,
-                    az_shift, el_shift,
-                    new_az, new_el,
-                    ctrl->calib.enabled ? 1 : 0);
-        rot_term_log(ctrl, "gpredict:rx",
-                     "autocal apply meas=(%.2f, %.2f) shift=(%.2f, %.2f) "
-                     "offsets=(%.2f, %.2f) enabled=%d",
-                     rotaz, rotel,
-                     az_shift, el_shift,
-                     new_az, new_el,
-                     ctrl->calib.enabled ? 1 : 0);
-
-        ctrl->calib.az_offset_deg = new_az;
-        ctrl->calib.el_offset_deg = new_el;
-        (void)calib_save(ctrl->rotor_id, &ctrl->calib);
-        rotctrl_calib_update_widgets(ctrl);
-
-        rotctrl_autocal_finish(ctrl, TRUE, "stable");
-        return;
-    }
-
     if (now_us - ctrl->cal_last_log_us >= ROT_AUTOCAL_LOG_INTERVAL_US)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "autocal waiting pos=(%.2f, %.2f) stable=%u",
-                    rotaz, rotel, ctrl->cal_stable_count);
+                    "autocal waiting user pos_valid=%d pos=(%.2f, %.2f)",
+                    rotpos_valid ? 1 : 0,
+                    rotaz, rotel);
         rot_term_log_verbose(ctrl, "gpredict:rx",
-                             "autocal waiting pos=(%.2f, %.2f) stable=%u",
-                             rotaz, rotel, ctrl->cal_stable_count);
+                             "autocal waiting user pos_valid=%d pos=(%.2f, %.2f)",
+                             rotpos_valid ? 1 : 0,
+                             rotaz, rotel);
         ctrl->cal_last_log_us = now_us;
     }
+}
+
+static void calib_autocal_response_cb(GtkDialog *dialog,
+                                      gint response_id,
+                                      gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gdouble mech_az = 0.0;
+    gdouble mech_el = 0.0;
+    const gchar *reason = NULL;
+
+    if (ctrl == NULL)
+    {
+        gtk_widget_destroy(GTK_WIDGET(dialog));
+        return;
+    }
+
+    ctrl->calib_dialog = NULL;
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+
+    if (!ctrl->cal_active)
+        return;
+
+    if (response_id == GTK_RESPONSE_OK)
+    {
+        if (!rotctrl_calib_read_mech_pos(ctrl, &mech_az, &mech_el))
+        {
+            rot_show_message(ctrl,
+                             GTK_MESSAGE_ERROR,
+                             _("Calibration"),
+                             _("Unable to read current rotor position."));
+            rotctrl_autocal_finish(ctrl, FALSE, "no_position");
+            return;
+        }
+
+        if (!rotctrl_autocal_apply_mech(ctrl, mech_az, mech_el, &reason))
+        {
+            rot_show_message(ctrl,
+                             GTK_MESSAGE_ERROR,
+                             _("Calibration"),
+                             _("Unable to save calibration."));
+            rotctrl_autocal_finish(ctrl, FALSE,
+                                   reason ? reason : "save_failed");
+            return;
+        }
+
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "autocal apply mech=(%.2f, %.2f) offsets=(%.2f, %.2f) "
+                    "unc=(%.2f, %.2f) enabled=%d",
+                    mech_az, mech_el,
+                    ctrl->calib.az_offset_deg,
+                    ctrl->calib.el_offset_deg,
+                    ctrl->calib.az_uncertainty_deg,
+                    ctrl->calib.el_uncertainty_deg,
+                    ctrl->calib.enabled ? 1 : 0);
+        rot_term_log(ctrl, "gpredict:rx",
+                     "autocal apply mech=(%.2f, %.2f) offsets=(%.2f, %.2f) "
+                     "unc=(%.2f, %.2f) enabled=%d",
+                     mech_az, mech_el,
+                     ctrl->calib.az_offset_deg,
+                     ctrl->calib.el_offset_deg,
+                     ctrl->calib.az_uncertainty_deg,
+                     ctrl->calib.el_uncertainty_deg,
+                     ctrl->calib.enabled ? 1 : 0);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "CAL_OK pos=(%.2f, %.2f) stored_as_zero tol=(%.2f, %.2f)",
+                    mech_az, mech_el,
+                    ctrl->calib.az_uncertainty_deg,
+                    ctrl->calib.el_uncertainty_deg);
+        rot_term_log(ctrl, "gpredict:rx",
+                     "CAL_OK pos=(%.2f, %.2f) stored_as_zero tol=(%.2f, %.2f)",
+                     mech_az, mech_el,
+                     ctrl->calib.az_uncertainty_deg,
+                     ctrl->calib.el_uncertainty_deg);
+
+        ctrl->force_next_send = TRUE;
+        ctrl->setpoint_valid = FALSE;
+        ctrl->last_target_valid = FALSE;
+        ctrl->pretrack_target_valid = FALSE;
+        ctrl->last_target_update_us = 0;
+        rotctrl_set_cal_hold(ctrl, TRUE, "cal_ok");
+
+        rotctrl_autocal_finish(ctrl, TRUE, "user_ok");
+        return;
+    }
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.stop_pending = TRUE;
+    ctrl->client.new_trg = FALSE;
+    g_mutex_unlock(&ctrl->client.mutex);
+    sat_log_log(SAT_LOG_LEVEL_INFO, "CAL_CANCEL");
+    rot_term_log(ctrl, "gpredict:rx", "CAL_CANCEL");
+    rotctrl_autocal_finish(ctrl, FALSE, "cancel");
 }
 
 static void calib_enabled_toggled_cb(GtkToggleButton *button, gpointer data)
