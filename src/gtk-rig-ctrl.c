@@ -51,20 +51,7 @@
 #include <fcntl.h>
 #endif
 
-/* NETWORK */
-#ifndef WIN32
-#ifdef _WIN32
-  #include <winsock2.h>   /* htons(), etc. */
-  #include <ws2tcpip.h>
-#else
-  #include <arpa/inet.h>  /* htons(), etc. */
-#endif
-#include <netdb.h>              /* gethostbyname() */
-#include <netinet/in.h>         /* struct sockaddr_in */
-#include <sys/socket.h>         /* socket(), connect(), send() */
-#else
-#include <winsock2.h>
-#endif
+#include "net_compat.h"
 #ifdef G_OS_WIN32
 #include <windows.h>
 #endif
@@ -10044,6 +10031,13 @@ static gboolean rigctld_connect_addrinfo_timeout(const gchar *host, gint port,
     if (host == NULL || sock == NULL)
         return FALSE;
 
+    if (net_init() != 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: network init failed"), __func__);
+        return FALSE;
+    }
+
     if (err_out)
         *err_out = 0;
     if (so_err_out)
@@ -10176,6 +10170,13 @@ static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
 
     if (host == NULL || sock == NULL)
         return FALSE;
+
+    if (net_init() != 0)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: network init failed"), __func__);
+        return FALSE;
+    }
 
     *sock = -1;
     memset(&hints, 0, sizeof(hints));

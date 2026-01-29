@@ -3,11 +3,8 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/types.h>
-#ifndef WIN32
-#include <sys/socket.h>
-#else
-#include <winsock2.h>
-#endif
+
+#include "net_compat.h"
 
 #define RIGCTLD_RXBUF_CHUNK 512
 #define RIGCTLD_DUMP_STATE_MIN_LINES 2

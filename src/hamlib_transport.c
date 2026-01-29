@@ -6,11 +6,7 @@
 
 #include <gio/gio.h>
 
-#ifndef WIN32
-#include <sys/socket.h>
-#else
-#include <winsock2.h>
-#endif
+#include "net_compat.h"
 
 #define HAMLIB_RXBUF_CHUNK 512
 #define HAMLIB_LINE_BUF 512
@@ -643,6 +639,13 @@ gboolean hamlib_transport_connect(HamlibTransport *transport,
     {
         if (error_out)
             *error_out = g_strdup("invalid host/port");
+        return FALSE;
+    }
+
+    if (net_init() != 0)
+    {
+        if (error_out)
+            *error_out = g_strdup("network init failed");
         return FALSE;
     }
 

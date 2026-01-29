@@ -440,6 +440,7 @@ struct _GtkRotCtrl {
     gint64          target_invalid_since_us;
     gint64          last_target_update_us;
     gint64          park_pending_since_us;
+    gboolean        park_requested;
     gboolean        pretrack_enabled;
     gdouble         pretrack_lookahead_sec;
     gdouble         reacquire_hysteresis_sec;
@@ -8781,6 +8782,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->last_target_update_us = 0;
         ctrl->last_send_us = 0;
         ctrl->above_eps_count = 0;
+        ctrl->park_requested = FALSE;
         ctrl->pretrack_target_valid = FALSE;
         ctrl->pretrack_last_update_us = 0;
         ctrl->pretrack_aos_time = 0.0;
@@ -9029,6 +9031,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean autocal_active = FALSE;
     gboolean cal_hold_active = FALSE;
     gboolean cal_force_send = FALSE;
+    gboolean park_active = FALSE;
 
     pos_recent = rotctrl_pos_recent(ctrl,
                                     (gint64)rotctrl_stale_ms(ctrl) * 1000,
@@ -10853,7 +10856,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (!ctrl->tracking && last_cmd_us == 0)
             force_send = TRUE;
 
-        if (ctrl->tracking)
+        park_active = ctrl->park_requested;
+
+        if (ctrl->tracking || park_active)
         {
             if (ctrl->setpoint_valid && pos_fresh)
             {
@@ -10891,98 +10896,101 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 ctrl->motion_stall_count = 0;
             }
 
-            resend_due =
-                ctrl->setpoint_valid &&
-                ctrl->last_send_us > 0 &&
-                (now_us - ctrl->last_send_us) >=
-                    ((gint64)ROT_CMD_RESEND_MS * 1000);
-
-            rot_target_caps_t wrap_caps = decision_caps;
-            if (wrap_caps.az_wrap_mode == ROT_TARGET_WRAP_180 &&
-                (wrap_caps.az_min_deg < -180.0 || wrap_caps.az_max_deg > 180.0))
+            if (ctrl->tracking)
             {
-                wrap_caps.az_wrap_mode = ROT_TARGET_WRAP_360;
-            }
-            wrap_reason = ROT_TARGET_INVALID_NONE;
-            wrap_mismatch =
-                (!rot_target_is_valid(&wrap_caps,
-                                      desired_user_az,
-                                      desired_user_el,
-                                      NULL,
-                                      &wrap_reason) &&
-                 wrap_reason == ROT_TARGET_INVALID_WRAP_MISMATCH);
-            wrap_bypass =
-                wrap_mismatch &&
-                (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-                 desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+                resend_due =
+                    ctrl->setpoint_valid &&
+                    ctrl->last_send_us > 0 &&
+                    (now_us - ctrl->last_send_us) >=
+                        ((gint64)ROT_CMD_RESEND_MS * 1000);
 
-            if ((desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-                 desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED) &&
-                wrap_mismatch)
-            {
-                if (!ctrl->wrap_acquire_active)
+                rot_target_caps_t wrap_caps = decision_caps;
+                if (wrap_caps.az_wrap_mode == ROT_TARGET_WRAP_180 &&
+                    (wrap_caps.az_min_deg < -180.0 || wrap_caps.az_max_deg > 180.0))
                 {
-                    if (rotctrl_pick_wrap_candidate(desired_raw_az,
-                                                    ref_backend,
-                                                    backend_az_min,
-                                                    backend_az_max,
-                                                    &wrap_candidate_a,
-                                                    &wrap_candidate_b,
-                                                    &wrap_candidate,
-                                                    &wrap_candidate_k))
-                    {
-                        gdouble wrap_eps =
-                            MAX((ctrl->threshold > 0.0) ? ctrl->threshold : 1.5,
-                                ROT_CMD_AZ_EPS_MIN_DEG);
-                        gdouble wrap_tol = MAX(k_meas_tol_deg, k_meas_quantum_deg);
-                        gdouble diff_backend =
-                            fabs(shortest_az_delta(meas_backend_az,
-                                                   wrap_candidate));
+                    wrap_caps.az_wrap_mode = ROT_TARGET_WRAP_360;
+                }
+                wrap_reason = ROT_TARGET_INVALID_NONE;
+                wrap_mismatch =
+                    (!rot_target_is_valid(&wrap_caps,
+                                          desired_user_az,
+                                          desired_user_el,
+                                          NULL,
+                                          &wrap_reason) &&
+                     wrap_reason == ROT_TARGET_INVALID_WRAP_MISMATCH);
+                wrap_bypass =
+                    wrap_mismatch &&
+                    (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+                     desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
 
-                        if (rotpos_valid && diff_backend <= (wrap_eps + wrap_tol))
+                if ((desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+                     desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED) &&
+                    wrap_mismatch)
+                {
+                    if (!ctrl->wrap_acquire_active)
+                    {
+                        if (rotctrl_pick_wrap_candidate(desired_raw_az,
+                                                        ref_backend,
+                                                        backend_az_min,
+                                                        backend_az_max,
+                                                        &wrap_candidate_a,
+                                                        &wrap_candidate_b,
+                                                        &wrap_candidate,
+                                                        &wrap_candidate_k))
                         {
-                            wrap_bypass = TRUE;
+                            gdouble wrap_eps =
+                                MAX((ctrl->threshold > 0.0) ? ctrl->threshold : 1.5,
+                                    ROT_CMD_AZ_EPS_MIN_DEG);
+                            gdouble wrap_tol = MAX(k_meas_tol_deg, k_meas_quantum_deg);
+                            gdouble diff_backend =
+                                fabs(shortest_az_delta(meas_backend_az,
+                                                       wrap_candidate));
+
+                            if (rotpos_valid && diff_backend <= (wrap_eps + wrap_tol))
+                            {
+                                wrap_bypass = TRUE;
+                            }
+                            else
+                            {
+                                ctrl->wrap_acquire_active = TRUE;
+                                ctrl->wrap_acquire_sent = FALSE;
+                                ctrl->wrap_acquire_target_backend = wrap_candidate;
+                                ctrl->wrap_acquire_target_az360 = desired_raw_az;
+                                ctrl->wrap_acquire_target_k = wrap_candidate_k;
+                                ctrl->wrap_acquire_since_us = now_us;
+                                ctrl->wrap_acquire_last_log_us = 0;
+                                ctrl->force_next_send = TRUE;
+                                sat_log_log(SAT_LOG_LEVEL_INFO,
+                                            "TRACK wrap mismatch -> starting wrap acquisition "
+                                            "meas=%.2f desired_user=%.2f cand=(%.2f, %.2f) chosen=%.2f",
+                                            meas_backend_az,
+                                            desired_user_az,
+                                            wrap_candidate_a,
+                                            wrap_candidate_b,
+                                            wrap_candidate);
+                                rot_term_log(ctrl, "gpredict:state",
+                                             "TRACK wrap mismatch -> starting wrap acquisition "
+                                             "meas=%.2f desired_user=%.2f cand=(%.2f, %.2f) chosen=%.2f",
+                                             meas_backend_az,
+                                             desired_user_az,
+                                             wrap_candidate_a,
+                                             wrap_candidate_b,
+                                             wrap_candidate);
+                            }
                         }
                         else
                         {
-                            ctrl->wrap_acquire_active = TRUE;
-                            ctrl->wrap_acquire_sent = FALSE;
-                            ctrl->wrap_acquire_target_backend = wrap_candidate;
-                            ctrl->wrap_acquire_target_az360 = desired_raw_az;
-                            ctrl->wrap_acquire_target_k = wrap_candidate_k;
-                            ctrl->wrap_acquire_since_us = now_us;
-                            ctrl->wrap_acquire_last_log_us = 0;
-                            ctrl->force_next_send = TRUE;
-                            sat_log_log(SAT_LOG_LEVEL_INFO,
-                                        "TRACK wrap mismatch -> starting wrap acquisition "
-                                        "meas=%.2f desired_user=%.2f cand=(%.2f, %.2f) chosen=%.2f",
-                                        meas_backend_az,
-                                        desired_user_az,
-                                        wrap_candidate_a,
-                                        wrap_candidate_b,
-                                        wrap_candidate);
-                            rot_term_log(ctrl, "gpredict:state",
-                                         "TRACK wrap mismatch -> starting wrap acquisition "
-                                         "meas=%.2f desired_user=%.2f cand=(%.2f, %.2f) chosen=%.2f",
-                                         meas_backend_az,
-                                         desired_user_az,
-                                         wrap_candidate_a,
-                                         wrap_candidate_b,
-                                         wrap_candidate);
+                            sat_log_log(SAT_LOG_LEVEL_WARN,
+                                        "TRACK wrap mismatch: no backend candidate for az=%.2f range=(%.2f..%.2f)",
+                                        desired_raw_az,
+                                        backend_az_min,
+                                        backend_az_max);
+                            rot_term_log(ctrl, "gpredict:warn",
+                                         "TRACK wrap mismatch: no backend candidate for az=%.2f range=(%.2f..%.2f)",
+                                         desired_raw_az,
+                                         backend_az_min,
+                                         backend_az_max);
                         }
-                    }
-                    else
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_WARN,
-                                    "TRACK wrap mismatch: no backend candidate for az=%.2f range=(%.2f..%.2f)",
-                                    desired_raw_az,
-                                    backend_az_min,
-                                    backend_az_max);
-                        rot_term_log(ctrl, "gpredict:warn",
-                                     "TRACK wrap mismatch: no backend candidate for az=%.2f range=(%.2f..%.2f)",
-                                     desired_raw_az,
-                                     backend_az_min,
-                                     backend_az_max);
                     }
                 }
             }
@@ -11011,9 +11019,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 }
 
                 decision_in.mode =
-                    (desired_state == ROT_TARGET_STATE_PRETRACK)
-                        ? ROT_CMD_MODE_PRETRACK
-                        : ROT_CMD_MODE_TRACKING;
+                    park_active
+                        ? ROT_CMD_MODE_PARK
+                        : ((desired_state == ROT_TARGET_STATE_PRETRACK)
+                               ? ROT_CMD_MODE_PRETRACK
+                               : ROT_CMD_MODE_TRACKING);
                 decision_in.allow_send = allow_send;
                 decision_in.have_target = have_target;
                 decision_in.force_send = force_send;
@@ -11231,6 +11241,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->force_next_send = FALSE;
             ctrl->motion_err_valid = FALSE;
             ctrl->motion_stall_count = 0;
+            if (reason == ROT_CMD_REASON_PARK)
+            {
+                rot_term_log(ctrl, "gpredict:tx",
+                             "send target park user=(%.2f,%.2f) backend=(%.2f,%.2f) reason=park",
+                             desired_user_az, desired_user_el,
+                             cmdaz, cmdel);
+                ctrl->park_requested = FALSE;
+            }
             if (!pos_fresh || reason == ROT_CMD_REASON_RESEND)
                 ctrl->last_keepalive_time_us = now_us;
 
@@ -16640,6 +16658,9 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
     if (ctrl->cal_hold_active)
         rotctrl_set_cal_hold(ctrl, FALSE, "park");
 
+    if (ctrl->tracking && ctrl->track)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+
     ui_mode = (ctrl->conf && ctrl->conf->aztype == ROT_AZ_TYPE_180)
               ? ROT_UI_NORTH_CENTERED
               : ROT_UI_360;
@@ -16667,6 +16688,8 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), park_user_el);
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
+    ctrl->park_requested = TRUE;
+    ctrl->force_next_send = TRUE;
 
     /* Inform the user what was commanded. */
     {
@@ -16903,6 +16926,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->target_invalid_since_us = 0;
     ctrl->last_target_update_us = 0;
     ctrl->park_pending_since_us = 0;
+    ctrl->park_requested = FALSE;
     ctrl->pretrack_enabled = TRUE;
     ctrl->pretrack_lookahead_sec = ROT_PRETRACK_LOOKAHEAD_SEC;
     ctrl->reacquire_hysteresis_sec = ROT_PRETRACK_REACQUIRE_SEC;
@@ -17926,6 +17950,18 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
     ctrl->cal_timeout_us = ROT_AUTOCAL_TIMEOUT_US;
 
     gint64 now_us = g_get_monotonic_time();
+    gint64 last_pos_us = 0;
+    gint64 pos_age_ms = -1;
+    gboolean sample_fresh = FALSE;
+    gdouble stable_eps = MAX(ROT_AUTOCAL_STABLE_EPS_DEG, k_meas_quantum_deg);
+
+    g_mutex_lock(&ctrl->client.mutex);
+    last_pos_us = ctrl->client.last_pos_us;
+    g_mutex_unlock(&ctrl->client.mutex);
+    if (last_pos_us > 0 && now_us > last_pos_us)
+        pos_age_ms = (now_us - last_pos_us) / 1000;
+    sample_fresh = rotpos_valid && pos_age_ms >= 0 &&
+                   pos_age_ms <= ROT_CMD_POS_FRESH_MS;
     if (!ctrl->engaged || !ctrl->client.running)
     {
         rotctrl_autocal_finish(ctrl, FALSE, "disengaged");
@@ -17941,7 +17977,7 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
 
     if (ctrl->cal_state == ROT_AUTOCAL_DRIVE_ZERO)
     {
-        if (rotpos_valid)
+        if (sample_fresh)
         {
             gdouble az_err = fabs(shortest_az_delta(rotaz, 0.0));
             gdouble el_err = fabs(rotel);
@@ -17981,17 +18017,15 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
     else if (ctrl->cal_state == ROT_AUTOCAL_SETTLE ||
              ctrl->cal_state == ROT_AUTOCAL_READY)
     {
-        if (!rotpos_valid)
+        if (ctrl->cal_state == ROT_AUTOCAL_READY)
+        {
+            /* Hold READY once reached to avoid re-entry. */
+        }
+        else if (!sample_fresh)
         {
             ctrl->cal_window_count = 0;
             ctrl->cal_window_idx = 0;
             ctrl->cal_ready_count = 0;
-            if (ctrl->cal_state == ROT_AUTOCAL_READY)
-            {
-                ctrl->cal_state = ROT_AUTOCAL_SETTLE;
-                ctrl->cal_settle_start_us = now_us;
-                rotctrl_autocal_set_ok_sensitive(ctrl, FALSE);
-            }
         }
         else
         {
@@ -18042,8 +18076,8 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
                 gboolean stable_enough =
                     have_stats &&
                     ctrl->cal_window_count >= ROT_AUTOCAL_STABLE_WINDOW &&
-                    spread_az <= ROT_AUTOCAL_STABLE_EPS_DEG &&
-                    dev_el <= ROT_AUTOCAL_STABLE_EPS_DEG;
+                    spread_az <= stable_eps &&
+                    dev_el <= stable_eps;
 
                 if (stable_enough)
                 {
@@ -18064,13 +18098,7 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
                 gboolean ready_by_stable =
                     stable_enough &&
                     ctrl->cal_ready_count >= ROT_AUTOCAL_READY_COUNT;
-                gboolean ready_by_timeout =
-                    ctrl->cal_state == ROT_AUTOCAL_SETTLE &&
-                    ctrl->cal_settle_start_us > 0 &&
-                    (now_us - ctrl->cal_settle_start_us) >=
-                        ((gint64)ROT_AUTOCAL_SETTLE_MAX_MS * 1000);
-
-                if ((ready_by_stable || ready_by_timeout) &&
+                if (ready_by_stable &&
                     ctrl->cal_state != ROT_AUTOCAL_READY)
                 {
                     gint64 settle_ms =
@@ -18078,44 +18106,34 @@ static void rotctrl_autocal_tick(GtkRotCtrl *ctrl,
                             ? (now_us - ctrl->cal_settle_start_us) / 1000
                             : 0;
                     ctrl->cal_state = ROT_AUTOCAL_READY;
+                    ctrl->cal_settle_start_us = 0;
                     rotctrl_autocal_set_ok_sensitive(ctrl, TRUE);
-                    if (ready_by_timeout)
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_INFO,
-                                    "autocal READY due to timeout settle_ms=%lld "
-                                    "mean=(%.2f, %.2f) spread=%.2f dev_el=%.2f buf=%u poll_ms=%d",
-                                    (long long)settle_ms,
-                                    mean_az, mean_el, spread_az, dev_el,
-                                    ctrl->cal_window_count,
-                                    rotctrl_poll_period_ms(ctrl));
-                        rot_term_log(ctrl, "gpredict:state",
-                                     "autocal READY due to timeout settle_ms=%lld "
-                                     "mean=(%.2f, %.2f) spread=%.2f dev_el=%.2f buf=%u poll_ms=%d",
-                                     (long long)settle_ms,
-                                     mean_az, mean_el, spread_az, dev_el,
-                                     ctrl->cal_window_count,
-                                     rotctrl_poll_period_ms(ctrl));
-                    }
-                    else
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_INFO,
-                                    "autocal phase SETTLE->READY settle_ms=%lld "
-                                    "mean=(%.2f, %.2f) spread=%.2f dev_el=%.2f buf=%u poll_ms=%d",
-                                    (long long)settle_ms,
-                                    mean_az, mean_el, spread_az, dev_el,
-                                    ctrl->cal_window_count,
-                                    rotctrl_poll_period_ms(ctrl));
-                        rot_term_log(ctrl, "gpredict:state",
-                                     "autocal phase SETTLE->READY settle_ms=%lld "
-                                     "mean=(%.2f, %.2f) spread=%.2f dev_el=%.2f buf=%u poll_ms=%d",
-                                     (long long)settle_ms,
-                                     mean_az, mean_el, spread_az, dev_el,
-                                     ctrl->cal_window_count,
-                                     rotctrl_poll_period_ms(ctrl));
-                    }
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "autocal phase SETTLE->READY settle_ms=%lld "
+                                "mean=(%.2f, %.2f) spread=%.2f dev_el=%.2f buf=%u poll_ms=%d",
+                                (long long)settle_ms,
+                                mean_az, mean_el, spread_az, dev_el,
+                                ctrl->cal_window_count,
+                                rotctrl_poll_period_ms(ctrl));
+                    rot_term_log(ctrl, "gpredict:state",
+                                 "autocal phase SETTLE->READY settle_ms=%lld "
+                                 "mean=(%.2f, %.2f) spread=%.2f dev_el=%.2f buf=%u poll_ms=%d",
+                                 (long long)settle_ms,
+                                 mean_az, mean_el, spread_az, dev_el,
+                                 ctrl->cal_window_count,
+                                 rotctrl_poll_period_ms(ctrl));
                 }
             }
         }
+    }
+
+    if (ctrl->cal_state == ROT_AUTOCAL_SETTLE &&
+        ctrl->cal_settle_start_us > 0 &&
+        (now_us - ctrl->cal_settle_start_us) >=
+            ((gint64)ROT_AUTOCAL_SETTLE_MAX_MS * 1000))
+    {
+        rotctrl_autocal_finish(ctrl, FALSE, "timeout");
+        return;
     }
 
     if (now_us - ctrl->cal_last_log_us >= ROT_AUTOCAL_LOG_INTERVAL_US)
@@ -18162,6 +18180,7 @@ static void calib_autocal_response_cb(GtkDialog *dialog,
         gdouble spread_az = 0.0;
         gdouble mean_el = 0.0;
         gdouble dev_el = 0.0;
+        gdouble stable_eps = MAX(ROT_AUTOCAL_STABLE_EPS_DEG, k_meas_quantum_deg);
 
         if (ctrl->cal_state != ROT_AUTOCAL_READY)
         {
@@ -18207,8 +18226,8 @@ static void calib_autocal_response_cb(GtkDialog *dialog,
             }
         }
 
-        if (spread_az > ROT_AUTOCAL_STABLE_EPS_DEG ||
-            dev_el > ROT_AUTOCAL_STABLE_EPS_DEG)
+        if (spread_az > stable_eps ||
+            dev_el > stable_eps)
         {
             sat_log_log(SAT_LOG_LEVEL_WARN,
                         "CAL_OK using unstable estimate spread=(%.2f, %.2f)",

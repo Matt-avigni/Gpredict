@@ -48,6 +48,8 @@ const char *rot_cmd_reason_name(rot_cmd_reason_t reason)
         return "stale_hold";
     case ROT_CMD_REASON_NO_POS:
         return "no_pos";
+    case ROT_CMD_REASON_PARK:
+        return "park";
     case ROT_CMD_REASON_STALE_RELAXED:
         return "stale_relaxed";
     case ROT_CMD_REASON_FORCE:
@@ -131,6 +133,14 @@ void rot_cmd_decision_eval(const rot_cmd_decision_input_t *in,
             out->range_reason = reason;
             return;
         }
+    }
+
+    if (in->mode == ROT_CMD_MODE_PARK)
+    {
+        out->send = TRUE;
+        out->action = ROT_CMD_ACTION_SEND;
+        out->reason = ROT_CMD_REASON_PARK;
+        return;
     }
 
     if (in->setpoint_valid)
