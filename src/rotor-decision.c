@@ -153,18 +153,55 @@ void rot_cmd_decision_eval(const rot_cmd_decision_input_t *in,
         out->delta_user_el = delta_el;
     }
 
-    if (!in->force_send && in->setpoint_valid &&
-        delta_az < in->deadband_az &&
-        delta_el < in->deadband_el)
     {
-        out->reason = ROT_CMD_REASON_DEADBAND;
-        return;
+        gdouble db_az = (in->deadband_az > 0.0) ? in->deadband_az : 0.0;
+        gdouble db_el = (in->deadband_el > 0.0) ? in->deadband_el : 0.0;
+
+        if (!in->force_send && in->setpoint_valid &&
+            delta_az < db_az &&
+            delta_el < db_el &&
+            in->delta_backend_az < db_az)
+        {
+            out->reason = ROT_CMD_REASON_DEADBAND;
+            return;
+        }
     }
 
     if (in->stale_hold)
     {
+        if (in->setpoint_valid)
+        {
+            gdouble change_az = (in->target_change_az > 0.0)
+                                    ? in->target_change_az
+                                    : in->deadband_az;
+            gdouble change_el = (in->target_change_el > 0.0)
+                                    ? in->target_change_el
+                                    : in->deadband_el;
+
+            if (in->delta_backend_az >= change_az ||
+                delta_az >= change_az ||
+                delta_el >= change_el)
+            {
+                out->send = TRUE;
+                out->action = ROT_CMD_ACTION_SEND;
+                out->reason = ROT_CMD_REASON_TARGET_CHANGE;
+                return;
+            }
+        }
         out->reason = ROT_CMD_REASON_STALE_HOLD;
         return;
+    }
+
+    if (in->force_send && in->setpoint_valid)
+    {
+        gdouble db_az = (in->deadband_az > 0.0) ? in->deadband_az : 0.0;
+        gdouble db_el = (in->deadband_el > 0.0) ? in->deadband_el : 0.0;
+
+        if (delta_az <= db_az && delta_el <= db_el)
+        {
+            out->reason = ROT_CMD_REASON_DEADBAND;
+            return;
+        }
     }
 
     if (in->force_send)

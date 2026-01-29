@@ -38,6 +38,7 @@
 
 #include <gtk/gtk.h>
 #include <glib/gi18n.h>
+#include <gio/gio.h>
 #include <sys/time.h>
 
 #include "compat.h"
@@ -54,6 +55,7 @@
 #include "gtk-sat-module-tmg.h"
 #include "gtk-single-sat.h"
 #include "gtk-sky-glance.h"
+#include "tle-autoupdate.h"
 #include "mod-cfg.h"
 #include "mod-cfg-get-param.h"
 #include "mod-mgr.h"
@@ -66,6 +68,7 @@
 
 
 static GtkVBoxClass *parent_class = NULL;
+static gboolean sat_module_silent_reload = FALSE;
 
 static void gtk_sat_module_free_sat(gpointer sat)
 {
@@ -137,6 +140,7 @@ static void gtk_sat_module_destroy(GtkWidget * widget)
     GtkSatModule   *module = GTK_SAT_MODULE(widget);
     GtkWidget      *view;
     guint           i;
+    GCancellable   *cancellable;
 
     /*save the configuration */
     mod_cfg_save(module->name, module->cfgdata);
@@ -147,6 +151,12 @@ static void gtk_sat_module_destroy(GtkWidget * widget)
         g_source_remove(module->timerid);
         module->timerid = 0;
     }
+
+    /* cancel any pending TLE autoupdate */
+    cancellable = g_object_get_data(G_OBJECT(module),
+                                    "tle-autoupdate-cancellable");
+    if (cancellable)
+        g_cancellable_cancel(cancellable);
 
     /* destroy time controller */
     if (module->tmgActive)
@@ -474,8 +484,9 @@ static void gtk_sat_module_load_sats(GtkSatModule * module)
                 gtk_sat_data_init_sat(sat, module->qth);
                 g_hash_table_insert(module->satellites, key, sat);
                 succ++;
-                sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                            _("%s: Read data for #%d"), __func__, sats[i]);
+                if (!sat_module_silent_reload)
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                _("%s: Read data for #%d"), __func__, sats[i]);
             }
             else
             {
@@ -490,8 +501,9 @@ static void gtk_sat_module_load_sats(GtkSatModule * module)
         }
     }
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: Read %d out of %d satellites"), __func__, succ, length);
+    if (!sat_module_silent_reload)
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: Read %d out of %d satellites"), __func__, succ, length);
 
     g_free(sats);
 }
@@ -1054,6 +1066,7 @@ GtkWidget *gtk_sat_module_new(const gchar * cfgfile)
     module->tmgCdnum = get_current_daynum();
 
     gtk_sat_module_load_sats(module);
+    tle_autoupdate_start(module);
 
     /* menu */
     GtkWidget * image = gtk_image_new_from_icon_name("open-menu-symbolic",
@@ -1439,9 +1452,10 @@ void gtk_sat_module_reload_sats(GtkSatModule * module)
     /* lock module */
     g_mutex_lock(&module->busy);
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: Reloading satellites for module %s"),
-                __func__, module->name);
+    if (!sat_module_silent_reload)
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: Reloading satellites for module %s"),
+                    __func__, module->name);
 
     /* remove each element from the hash table, but keep the hash table */
     g_hash_table_remove_all(module->satellites);
@@ -1463,6 +1477,15 @@ void gtk_sat_module_reload_sats(GtkSatModule * module)
 
     /* unlock module */
     g_mutex_unlock(&module->busy);
+}
+
+void gtk_sat_module_reload_sats_silent(GtkSatModule * module)
+{
+    gboolean prev = sat_module_silent_reload;
+
+    sat_module_silent_reload = TRUE;
+    gtk_sat_module_reload_sats(module);
+    sat_module_silent_reload = prev;
 }
 
 /** Select a new satellite */

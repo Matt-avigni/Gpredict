@@ -82,9 +82,35 @@ int main(void)
     in = base_input();
     in.desired_user_az = 10.1;
     in.desired_user_el = 5.05;
+    in.delta_backend_az = 0.1;
+    in.delta_backend_el = 0.1;
     rot_cmd_decision_eval(&in, &out);
     assert(!out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "deadband");
+
+    /* Force send should not rearm when target unchanged */
+    in = base_input();
+    in.force_send = TRUE;
+    in.desired_user_az = in.setpoint_user_az;
+    in.desired_user_el = in.setpoint_user_el;
+    in.delta_backend_az = 0.0;
+    in.delta_backend_el = 0.0;
+    rot_cmd_decision_eval(&in, &out);
+    assert(!out.send);
+    expect_reason(rot_cmd_reason_name(out.reason), "deadband");
+
+    /* Stable target: suppress repeatedly even at high tick rates */
+    in = base_input();
+    in.desired_user_az = in.setpoint_user_az;
+    in.desired_user_el = in.setpoint_user_el;
+    in.delta_backend_az = 0.0;
+    in.delta_backend_el = 0.0;
+    for (int i = 0; i < 100; i++)
+    {
+        rot_cmd_decision_eval(&in, &out);
+        assert(!out.send);
+        expect_reason(rot_cmd_reason_name(out.reason), "deadband");
+    }
 
     /* Track press -> PRETRACK immediate initial send */
     in = base_input();
@@ -111,35 +137,37 @@ int main(void)
     in.desired_user_el = 6.0;
     in.delta_backend_az = 1.2;
     in.delta_backend_el = 0.2;
-    in.moving_toward = FALSE;
+    in.not_at_target = FALSE;
     rot_cmd_decision_eval(&in, &out);
     assert(out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "target");
 
     /* In-flight suppression */
     in = base_input();
-    in.desired_user_az = 12.0;
-    in.desired_user_el = 6.0;
+    in.desired_user_az = 13.0;
+    in.desired_user_el = 6.5;
     in.setpoint_user_az = 11.8;
     in.setpoint_user_el = 5.9;
     rot_cmd_decision_eval(&in, &out);
     assert(!out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "in_flight");
 
-    /* No position feedback: only resend due can trigger send */
+    /* No position feedback inside deadband */
     in = base_input();
     in.pos_fresh = FALSE;
-    in.desired_user_az = 12.0;
+    in.desired_user_az = 10.4;
     in.setpoint_user_az = 10.0;
     in.resend_due = FALSE;
+    in.delta_backend_az = 0.1;
+    in.delta_backend_el = 0.1;
     rot_cmd_decision_eval(&in, &out);
     assert(!out.send);
-    expect_reason(rot_cmd_reason_name(out.reason), "no_pos");
+    expect_reason(rot_cmd_reason_name(out.reason), "deadband");
 
     /* Resend safeguard */
     in = base_input();
-    in.desired_user_az = 12.0;
-    in.desired_user_el = 6.0;
+    in.desired_user_az = 13.0;
+    in.desired_user_el = 6.5;
     in.setpoint_user_az = 11.8;
     in.setpoint_user_el = 5.9;
     in.resend_due = TRUE;
@@ -151,9 +179,21 @@ int main(void)
     in = base_input();
     in.stale_hold = TRUE;
     in.force_send = TRUE;
+    in.desired_user_az = in.setpoint_user_az;
+    in.desired_user_el = in.setpoint_user_el;
+    in.delta_backend_az = 0.0;
+    in.delta_backend_el = 0.0;
     rot_cmd_decision_eval(&in, &out);
     assert(!out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "stale_hold");
+
+    /* Stale hold allows send when target change is large */
+    in = base_input();
+    in.stale_hold = TRUE;
+    in.delta_backend_az = 10.0;
+    rot_cmd_decision_eval(&in, &out);
+    assert(out.send);
+    expect_reason(rot_cmd_reason_name(out.reason), "target_change");
 
     /* Force send overrides cooldown */
     in = base_input();
@@ -190,8 +230,8 @@ int main(void)
 
     /* Stopped unexpectedly */
     in = base_input();
-    in.desired_user_az = 12.0;
-    in.desired_user_el = 6.0;
+    in.desired_user_az = 13.0;
+    in.desired_user_el = 6.5;
     in.setpoint_user_az = 11.8;
     in.setpoint_user_el = 5.9;
     in.moving_toward = FALSE;
@@ -203,9 +243,31 @@ int main(void)
     /* Force send */
     in = base_input();
     in.force_send = TRUE;
+    in.desired_user_az = 12.0;
+    in.desired_user_el = 6.0;
+    in.setpoint_user_az = 10.0;
+    in.setpoint_user_el = 5.0;
     rot_cmd_decision_eval(&in, &out);
     assert(out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "force");
+
+    /* Force should not spam when target already applied */
+    in = base_input();
+    in.force_send = TRUE;
+    in.desired_user_az = 20.0;
+    in.desired_user_el = 10.0;
+    in.setpoint_user_az = 10.0;
+    in.setpoint_user_el = 5.0;
+    rot_cmd_decision_eval(&in, &out);
+    assert(out.send);
+    expect_reason(rot_cmd_reason_name(out.reason), "force");
+
+    in.setpoint_user_az = in.desired_user_az;
+    in.setpoint_user_el = in.desired_user_el;
+    in.force_send = TRUE;
+    rot_cmd_decision_eval(&in, &out);
+    assert(!out.send);
+    expect_reason(rot_cmd_reason_name(out.reason), "deadband");
 
     return 0;
 }

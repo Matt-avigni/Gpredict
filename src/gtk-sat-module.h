@@ -131,6 +131,7 @@ void            gtk_sat_module_close_cb(GtkWidget * button, gpointer data);
 void            gtk_sat_module_config_cb(GtkWidget * button, gpointer data);
 
 void            gtk_sat_module_reload_sats(GtkSatModule * module);
+void            gtk_sat_module_reload_sats_silent(GtkSatModule * module);
 void            gtk_sat_module_reconf(GtkSatModule * module, gboolean local);
 void            gtk_sat_module_select_sat(GtkSatModule * module, gint catnum);
 

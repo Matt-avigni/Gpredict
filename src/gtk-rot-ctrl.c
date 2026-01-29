@@ -138,6 +138,14 @@
 #define ROT_STALE_READY_CONFIRM_POLLS 2
 #define ROT_TRACK_LEAD_SEC 0.3
 #define ROT_AZ_OOB_PENALTY 10000.0
+
+#define ROT_PRESET_MAX 8
+#define ROT_PRESET_ROWS 2
+#define ROT_PRESET_COLS 4
+#define ROT_PRESET_GROUP "rotor_presets"
+#define ROT_PRESET_COUNT_KEY "count"
+#define ROT_PRESET_RESPONSE_DELETE 1001
+#define ROT_PRESET_BUTTON_HEIGHT 44
 #define ROT_AZ_ENDSTOP_PENALTY 1000.0
 #define ROT_BELOW_HORIZON_MARGIN_DEG 0.5
 #define ROT_AUTOCAL_TIMEOUT_US (45 * G_USEC_PER_SEC)
@@ -339,6 +347,12 @@ typedef enum {
 } rot_autocal_state_t;
 
 typedef struct {
+    gchar *name;
+    gdouble az;
+    gdouble el;
+} RotPreset;
+
+typedef struct {
     gboolean        valid;
     rot_plan_mode_t mode;
     gboolean        crosses_endstop;
@@ -418,6 +432,10 @@ struct _GtkRotCtrl {
     GtkWidget      *min_el_spin;
     GtkWidget      *max_el_spin;
     GtkWidget      *az_endstop_spin;
+    GtkWidget      *preset_grid;
+
+    RotPreset       presets[ROT_PRESET_MAX];
+    guint           preset_count;
 
     GSList         *sats;
     sat_t          *target;
@@ -654,6 +672,13 @@ static gboolean rotctrl_settings_focus_out_cb(GtkWidget *widget,
                                               GdkEventFocus *event,
                                               gpointer data);
 static void     rotctrl_settings_activate_cb(GtkEntry *entry, gpointer data);
+static void     rotctrl_presets_clear(GtkRotCtrl *ctrl);
+static gboolean rotctrl_presets_load(GtkRotCtrl *ctrl);
+static gboolean rotctrl_presets_save(GtkRotCtrl *ctrl);
+static void     rotctrl_presets_refresh(GtkRotCtrl *ctrl);
+static void     rotctrl_preset_create_cb(GtkButton *button, gpointer data);
+static void     rotctrl_preset_edit_cb(GtkButton *button, gpointer data);
+static void     rotctrl_preset_activate_cb(GtkButton *button, gpointer data);
 static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
@@ -1095,6 +1120,7 @@ static void rot_term_log_post(GtkRotCtrl *ctrl, gchar *line)
         return;
 
     if (ctrl == NULL || ctrl->term_view == NULL)
+    /* Avoid re-arming force on NORMAL<->DEGRADED oscillations. */
     {
         g_free(line);
         return;
@@ -4552,6 +4578,9 @@ static gboolean rotctrl_resolve_wrap_candidate(const RotLimitSet *user_limits,
                                                gdouble desired_raw_az,
                                                gdouble ref_user_az,
                                                gboolean have_ref,
+                                               rot_ui_mode_t ui_mode,
+                                               gdouble ref_backend_az,
+                                               gboolean have_ref_backend,
                                                gdouble *out_user_az,
                                                gdouble *out_raw_az,
                                                gint *out_k,
@@ -4576,9 +4605,9 @@ static gboolean rotctrl_resolve_wrap_candidate(const RotLimitSet *user_limits,
     for (guint i = 0; i < G_N_ELEMENTS(k_list); i++)
     {
         gint k = k_list[i];
-        gdouble cand_user = desired_user_az + (360.0 * k);
         gdouble cand_raw = desired_raw_az + (360.0 * k);
         gdouble cost = 0.0;
+        gdouble cand_user = rot_az360_to_ui(cand_raw, ui_mode);
 
         if (user_limits && user_limits->valid)
         {
@@ -4591,7 +4620,9 @@ static gboolean rotctrl_resolve_wrap_candidate(const RotLimitSet *user_limits,
                 continue;
         }
 
-        if (have_ref)
+        if (have_ref_backend)
+            cost = fabs(cand_raw - ref_backend_az);
+        else if (have_ref)
             cost = rotctrl_wrap_distance(user_limits, cand_user, ref_user_az);
 
         if (!found || cost < (best_cost - 1e-6))
@@ -5858,10 +5889,19 @@ static void rot_target_state_set(GtkRotCtrl *ctrl,
                          from, to, reason ? reason : "none",
                          cur_az, cur_el, rotctrl_wrap_mode_name(wrap_mode));
 
-    if (state == ROT_TARGET_STATE_PRETRACK ||
-        state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-        state == ROT_TARGET_STATE_TRACKING_DEGRADED)
-        ctrl->force_next_send = TRUE;
+    {
+        gboolean was_tracking =
+            (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
+             ctrl->target_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+        gboolean now_tracking =
+            (state == ROT_TARGET_STATE_PRETRACK ||
+             state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+
+        if (now_tracking && !was_tracking)
+            ctrl->force_next_send = TRUE;
+    }
 
     ctrl->target_state = state;
     ctrl->target_state_since_us = now_us;
@@ -10235,6 +10275,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             if (desired_state == ROT_TARGET_STATE_PRETRACK && ctrl->pretrack_wrap_valid)
             {
                 desired_user_az = ctrl->pretrack_wrap_user_az;
+                desired_raw_az = ctrl->pretrack_wrap_raw_az;
             }
             else
             {
@@ -10245,6 +10286,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                                           desired_raw_az,
                                                           ref_user_az,
                                                           have_ref_user,
+                                                          ui_mode,
+                                                          ref_backend,
+                                                          have_ref_backend,
                                                           &resolved_user_az,
                                                           &resolved_raw_az,
                                                           &resolved_k,
@@ -10287,8 +10331,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                        ctrl->backend_limits.valid ? "set" : "unknown");
                         }
                         sat_log_log(SAT_LOG_LEVEL_INFO,
-                                    "wrap_resolve: raw_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
+                                    "wrap_resolve: raw_az=%.2f user_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
                                     "chosen=%.2f current=%.2f %s reason=%s",
+                                    desired_raw_az,
                                     desired_user_az,
                                     cand0, cand1, cand2, cand3, cand4,
                                     resolved_user_az,
@@ -10296,8 +10341,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                     limits_buf,
                                     wrap_mismatch_now ? "wrap_mismatch" : "rewrap");
                         rot_term_log(ctrl, "gpredict:state",
-                                     "wrap_resolve: raw_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
+                                     "wrap_resolve: raw_az=%.2f user_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
                                      "chosen=%.2f current=%.2f %s reason=%s",
+                                     desired_raw_az,
                                      desired_user_az,
                                      cand0, cand1, cand2, cand3, cand4,
                                      resolved_user_az,
@@ -10306,6 +10352,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                      wrap_mismatch_now ? "wrap_mismatch" : "rewrap");
                     }
                     desired_user_az = resolved_user_az;
+                    desired_raw_az = resolved_raw_az;
                     if (desired_state == ROT_TARGET_STATE_PRETRACK)
                     {
                         ctrl->pretrack_wrap_valid = TRUE;
@@ -10349,15 +10396,17 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                    ctrl->backend_limits.valid ? "set" : "unknown");
                     }
                     sat_log_log(SAT_LOG_LEVEL_WARN,
-                                "wrap_resolve: raw_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
+                                "wrap_resolve: raw_az=%.2f user_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
                                 "chosen=none current=%.2f %s reason=no_candidate",
+                                desired_raw_az,
                                 desired_user_az,
                                 cand0, cand1, cand2, cand3, cand4,
                                 ref_user_az,
                                 limits_buf);
                     rot_term_log(ctrl, "gpredict:warn",
-                                 "wrap_resolve: raw_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
+                                 "wrap_resolve: raw_az=%.2f user_az=%.2f candidates=[%.2f %.2f %.2f %.2f %.2f] "
                                  "chosen=none current=%.2f %s reason=no_candidate",
+                                 desired_raw_az,
                                  desired_user_az,
                                  cand0, cand1, cand2, cand3, cand4,
                                  ref_user_az,
@@ -10807,7 +10856,10 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         {
             delta_user_az = rot_ang_dist_deg(desired_user_az, setpoint_user_az);
             delta_user_el = fabs(desired_user_el - setpoint_user_el);
-            delta_backend_az = fabs(shortest_az_delta(cmdaz, setpoint_backend_az));
+            if (backend_span_extended)
+                delta_backend_az = fabs(cmdaz - setpoint_backend_az);
+            else
+                delta_backend_az = fabs(shortest_az_delta(cmdaz, setpoint_backend_az));
             delta_backend_el = fabs(cmdel - setpoint_backend_el);
         }
         else
@@ -11076,19 +11128,38 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 not_at_target = (d_az_last > eps_az || d_el_last > eps_el);
             }
 
-            send_ok = force_send ||
-                      rot_should_send(ctrl,
-                                      meas_az360,
-                                      meas_el,
-                                      raw_cmd_az,
-                                      raw_cmd_el,
-                                      eps_az,
-                                      eps_el,
-                                      FALSE,
-                                      not_at_target,
-                                      now_us,
-                                      ROT_SEND_MIN_INTERVAL_US,
-                                      &sched_reason);
+            {
+                gboolean manual_target_hold = FALSE;
+
+                if (!ctrl->tracking && !force_send && ctrl->setpoint_valid &&
+                    delta_user_az < deadband_az &&
+                    delta_user_el < deadband_el)
+                {
+                    manual_target_hold = TRUE;
+                }
+
+                if (manual_target_hold && !resend_due && !stopped_unexpected)
+                {
+                    send_ok = FALSE;
+                    sched_reason = "TARGET_HOLD";
+                }
+                else
+                {
+                    send_ok = force_send ||
+                              rot_should_send(ctrl,
+                                              meas_az360,
+                                              meas_el,
+                                              raw_cmd_az,
+                                              raw_cmd_el,
+                                              eps_az,
+                                              eps_el,
+                                              resend_due,
+                                              not_at_target,
+                                              now_us,
+                                              ROT_SEND_MIN_INTERVAL_US,
+                                              &sched_reason);
+                }
+            }
 
             if (!have_target)
             {
@@ -11103,7 +11174,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             else if (send_ok)
             {
                 gate = ROT_CMD_ACTION_SEND;
-                reason = force_send ? ROT_CMD_REASON_FORCE : ROT_CMD_REASON_TARGET;
+                reason = force_send ? ROT_CMD_REASON_FORCE
+                                    : (resend_due ? ROT_CMD_REASON_RESEND
+                                                  : ROT_CMD_REASON_TARGET);
             }
             else
             {
@@ -11125,6 +11198,43 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                             eps_el);
                 ctrl->last_hold_log_us = now_us;
             }
+        }
+
+        if (ctrl->verbose_logging)
+        {
+            const gchar *mode_name =
+                park_active ? "PARK" : (ctrl->tracking ? "TRACK" : "IDLE");
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "rot_decision: mode=%s allow=%d have_target=%d force=%d stale_hold=%d "
+                        "setpoint_valid=%d in_flight=%d pos_fresh=%d last_good_age_ms=%lld "
+                        "desired_user=(%.2f,%.2f) setpoint_user=(%.2f,%.2f) last_cmd_user=(%.2f,%.2f) "
+                        "delta_user=(%.2f,%.2f) deadband=(%.2f,%.2f) min_step=(%.2f,%.2f) action=%s reason=%s",
+                        mode_name,
+                        allow_send ? 1 : 0,
+                        have_target ? 1 : 0,
+                        force_send ? 1 : 0,
+                        ctrl->stale_hold_active ? 1 : 0,
+                        ctrl->setpoint_valid ? 1 : 0,
+                        not_at_target ? 1 : 0,
+                        pos_fresh ? 1 : 0,
+                        (long long)pos_age_ms,
+                        desired_user_az, desired_user_el,
+                        setpoint_user_az, setpoint_user_el,
+                        last_cmd_user_az_log, last_cmd_user_el_log,
+                        delta_user_az, delta_user_el,
+                        deadband_az, deadband_el,
+                        ROT_CMD_MIN_AZ_DEG, ROT_CMD_MIN_EL_DEG,
+                        rot_cmd_action_name(gate),
+                        rot_cmd_reason_name(reason));
+        }
+
+        if (allow_send && send_ok && ctrl->setpoint_valid &&
+            fabs(delta_user_az) < 1e-6 && fabs(delta_user_el) < 1e-6 &&
+            fabs(delta_backend_az) < 1e-6 && fabs(delta_backend_el) < 1e-6)
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "rot_cmd_gate: SEND with zero delta reason=%s",
+                        rot_cmd_reason_name(reason));
         }
 
         if (ctrl->tracking)
@@ -12125,6 +12235,8 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
 
         rotctrl_calib_reload(ctrl);
         rot_transform_update(ctrl);
+        rotctrl_presets_load(ctrl);
+        rotctrl_presets_refresh(ctrl);
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
         ctrl->target_state_since_us = 0;
         ctrl->target_valid_since_us = 0;
@@ -12155,6 +12267,8 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
             g_free(ctrl->conf->last_good_device);
         g_free(ctrl->conf);
         ctrl->conf = NULL;
+        rotctrl_presets_clear(ctrl);
+        rotctrl_presets_refresh(ctrl);
     }
 }
 
@@ -16703,41 +16817,579 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
     }
 }
 
-/* Create preset position widgets */
-static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
+typedef struct {
+    GtkRotCtrl *ctrl;
+    gint index;
+    GtkWidget *dialog;
+    GtkWidget *name_entry;
+    GtkWidget *az_spin;
+    GtkWidget *el_spin;
+    GtkWidget *delete_button;
+} RotPresetDialog;
+
+static gchar *rotctrl_presets_config_path(GtkRotCtrl *ctrl)
 {
-    GtkWidget *frame, *grid, *label, *button;
+    gchar *dirname = NULL;
+    gchar *path = NULL;
 
-    frame = gtk_frame_new(_("Preset positions"));
+    if (ctrl == NULL || ctrl->conf == NULL || ctrl->conf->name == NULL)
+        return NULL;
 
+    dirname = get_hwconf_dir();
+    path = g_strconcat(dirname, G_DIR_SEPARATOR_S,
+                       ctrl->conf->name, ".rot", NULL);
+    g_free(dirname);
+
+    return path;
+}
+
+static void rotctrl_presets_clear(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    for (guint i = 0; i < ctrl->preset_count; i++)
+    {
+        g_free(ctrl->presets[i].name);
+        ctrl->presets[i].name = NULL;
+    }
+    ctrl->preset_count = 0;
+}
+
+static gboolean rotctrl_presets_load(GtkRotCtrl *ctrl)
+{
+    GKeyFile *cfg = NULL;
+    gchar *path = NULL;
+    GError *error = NULL;
+    gint count = 0;
+
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return FALSE;
+
+    path = rotctrl_presets_config_path(ctrl);
+    if (path == NULL)
+        return FALSE;
+
+    cfg = g_key_file_new();
+    if (!g_key_file_load_from_file(cfg, path,
+                                   G_KEY_FILE_KEEP_COMMENTS |
+                                   G_KEY_FILE_KEEP_TRANSLATIONS,
+                                   NULL))
+    {
+        g_key_file_free(cfg);
+        g_free(path);
+        rotctrl_presets_clear(ctrl);
+        return FALSE;
+    }
+
+    rotctrl_presets_clear(ctrl);
+
+    if (!g_key_file_has_group(cfg, ROT_PRESET_GROUP))
+    {
+        g_key_file_free(cfg);
+        g_free(path);
+        return TRUE;
+    }
+
+    count = g_key_file_get_integer(cfg, ROT_PRESET_GROUP,
+                                   ROT_PRESET_COUNT_KEY, &error);
+    if (error != NULL)
+    {
+        g_clear_error(&error);
+        count = 0;
+    }
+
+    for (gint i = 0; i < count && i < ROT_PRESET_MAX; i++)
+    {
+        gchar *key = NULL;
+        gchar *name = NULL;
+        gdouble az = 0.0;
+        gdouble el = 0.0;
+
+        key = g_strdup_printf("preset%d_name", i);
+        name = g_key_file_get_string(cfg, ROT_PRESET_GROUP, key, &error);
+        g_free(key);
+        if (error != NULL)
+        {
+            g_clear_error(&error);
+            continue;
+        }
+
+        key = g_strdup_printf("preset%d_az", i);
+        az = g_key_file_get_double(cfg, ROT_PRESET_GROUP, key, &error);
+        g_free(key);
+        if (error != NULL)
+        {
+            g_clear_error(&error);
+            g_free(name);
+            continue;
+        }
+
+        key = g_strdup_printf("preset%d_el", i);
+        el = g_key_file_get_double(cfg, ROT_PRESET_GROUP, key, &error);
+        g_free(key);
+        if (error != NULL)
+        {
+            g_clear_error(&error);
+            g_free(name);
+            continue;
+        }
+
+        ctrl->presets[ctrl->preset_count].name = name;
+        ctrl->presets[ctrl->preset_count].az = az;
+        ctrl->presets[ctrl->preset_count].el = el;
+        ctrl->preset_count++;
+    }
+
+    g_key_file_free(cfg);
+    g_free(path);
+    return TRUE;
+}
+
+static gboolean rotctrl_presets_save(GtkRotCtrl *ctrl)
+{
+    GKeyFile *cfg = NULL;
+    gchar *path = NULL;
+    gchar *data = NULL;
+    gsize len = 0;
+    GError *error = NULL;
+
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return FALSE;
+
+    path = rotctrl_presets_config_path(ctrl);
+    if (path == NULL)
+        return FALSE;
+
+    cfg = g_key_file_new();
+    g_key_file_load_from_file(cfg, path,
+                              G_KEY_FILE_KEEP_COMMENTS |
+                              G_KEY_FILE_KEEP_TRANSLATIONS,
+                              NULL);
+
+    if (g_key_file_has_group(cfg, ROT_PRESET_GROUP))
+        g_key_file_remove_group(cfg, ROT_PRESET_GROUP, NULL);
+
+    g_key_file_set_integer(cfg, ROT_PRESET_GROUP,
+                           ROT_PRESET_COUNT_KEY,
+                           (gint) ctrl->preset_count);
+
+    for (guint i = 0; i < ctrl->preset_count && i < ROT_PRESET_MAX; i++)
+    {
+        gchar *key = NULL;
+
+        key = g_strdup_printf("preset%u_name", i);
+        g_key_file_set_string(cfg, ROT_PRESET_GROUP, key,
+                              ctrl->presets[i].name ? ctrl->presets[i].name : "");
+        g_free(key);
+
+        key = g_strdup_printf("preset%u_az", i);
+        g_key_file_set_double(cfg, ROT_PRESET_GROUP, key,
+                              ctrl->presets[i].az);
+        g_free(key);
+
+        key = g_strdup_printf("preset%u_el", i);
+        g_key_file_set_double(cfg, ROT_PRESET_GROUP, key,
+                              ctrl->presets[i].el);
+        g_free(key);
+    }
+
+    data = g_key_file_to_data(cfg, &len, NULL);
+    if (!g_file_set_contents(path, data, len, &error))
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s: Failed to save presets: %s"),
+                    __func__,
+                    error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_free(data);
+        g_key_file_free(cfg);
+        g_free(path);
+        return FALSE;
+    }
+
+    g_free(data);
+    g_key_file_free(cfg);
+    g_free(path);
+    return TRUE;
+}
+
+static void rotctrl_presets_apply(GtkRotCtrl *ctrl,
+                                  gint index,
+                                  const gchar *name,
+                                  gdouble az,
+                                  gdouble el)
+{
+    if (ctrl == NULL || name == NULL || *name == '\0')
+        return;
+
+    if (index < 0)
+    {
+        if (ctrl->preset_count >= ROT_PRESET_MAX)
+            return;
+        index = (gint) ctrl->preset_count;
+        ctrl->preset_count++;
+    }
+    else if ((guint) index >= ctrl->preset_count)
+    {
+        return;
+    }
+
+    g_free(ctrl->presets[index].name);
+    ctrl->presets[index].name = g_strdup(name);
+    ctrl->presets[index].az = az;
+    ctrl->presets[index].el = el;
+
+    rotctrl_presets_save(ctrl);
+    rotctrl_presets_refresh(ctrl);
+}
+
+static void rotctrl_presets_delete(GtkRotCtrl *ctrl, gint index)
+{
+    if (ctrl == NULL)
+        return;
+    if (index < 0 || (guint) index >= ctrl->preset_count)
+        return;
+
+    g_free(ctrl->presets[index].name);
+    ctrl->presets[index].name = NULL;
+
+    for (guint i = (guint) index + 1; i < ctrl->preset_count; i++)
+    {
+        ctrl->presets[i - 1] = ctrl->presets[i];
+    }
+
+    if (ctrl->preset_count > 0)
+        ctrl->preset_count--;
+
+    if (ctrl->preset_count < ROT_PRESET_MAX)
+    {
+        ctrl->presets[ctrl->preset_count].name = NULL;
+        ctrl->presets[ctrl->preset_count].az = 0.0;
+        ctrl->presets[ctrl->preset_count].el = 0.0;
+    }
+
+    rotctrl_presets_save(ctrl);
+    rotctrl_presets_refresh(ctrl);
+}
+
+static void rotctrl_preset_dialog_free(gpointer data)
+{
+    RotPresetDialog *ctx = data;
+
+    g_free(ctx);
+}
+
+static void rotctrl_preset_dialog_response(GtkDialog *dialog,
+                                           gint response_id,
+                                           gpointer user_data)
+{
+    RotPresetDialog *ctx = user_data;
+    GtkRotCtrl *ctrl = ctx ? ctx->ctrl : NULL;
+
+    if (ctrl == NULL)
+    {
+        gtk_widget_destroy(GTK_WIDGET(dialog));
+        return;
+    }
+
+    if (response_id == GTK_RESPONSE_OK)
+    {
+        const gchar *raw_name =
+            gtk_entry_get_text(GTK_ENTRY(ctx->name_entry));
+        gchar *name = g_strdup(raw_name ? raw_name : "");
+        GtkWidget *error_dialog = NULL;
+        gdouble az = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ctx->az_spin));
+        gdouble el = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ctx->el_spin));
+
+        g_strstrip(name);
+        if (*name == '\0')
+        {
+            error_dialog = gtk_message_dialog_new(GTK_WINDOW(ctx->dialog),
+                                                  GTK_DIALOG_MODAL |
+                                                  GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                  GTK_MESSAGE_ERROR,
+                                                  GTK_BUTTONS_OK,
+                                                  "%s",
+                                                  _("Preset name cannot be empty."));
+            gtk_dialog_run(GTK_DIALOG(error_dialog));
+            gtk_widget_destroy(error_dialog);
+            gtk_widget_grab_focus(ctx->name_entry);
+            g_free(name);
+            return;
+        }
+
+        rotctrl_presets_apply(ctrl, ctx->index, name, az, el);
+        g_free(name);
+    }
+    else if (response_id == ROT_PRESET_RESPONSE_DELETE)
+    {
+        rotctrl_presets_delete(ctrl, ctx->index);
+    }
+
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static void rotctrl_preset_dialog_open(GtkRotCtrl *ctrl, gint index)
+{
+    RotPresetDialog *ctx = NULL;
+    GtkWidget *dialog = NULL;
+    GtkWidget *content = NULL;
+    GtkWidget *grid = NULL;
+    GtkWidget *label = NULL;
+    GtkWidget *entry = NULL;
+    GtkWidget *az_spin = NULL;
+    GtkWidget *el_spin = NULL;
+    GtkWidget *delete_btn = NULL;
+    gboolean is_edit = FALSE;
+
+    if (ctrl == NULL)
+        return;
+
+    is_edit = (index >= 0 && (guint) index < ctrl->preset_count);
+
+    dialog = gtk_dialog_new_with_buttons(_("Preset position"),
+                                         GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(ctrl))),
+                                         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                         _("_Cancel"), GTK_RESPONSE_CANCEL,
+                                         _("_Delete preset"), ROT_PRESET_RESPONSE_DELETE,
+                                         _("_OK"), GTK_RESPONSE_OK,
+                                         NULL);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     grid = gtk_grid_new();
-    gtk_container_set_border_width(GTK_CONTAINER(grid), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 5);
-    gtk_container_add(GTK_CONTAINER(frame), grid);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 6);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 8);
+    gtk_container_add(GTK_CONTAINER(content), grid);
 
-    /* Service button placeholder */
-    label = gtk_label_new(_("Service position"));
+    label = gtk_label_new(_("Preset name"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(grid), label, 0, 0, 1, 1);
 
-    GtkWidget *btn_service = gtk_button_new_with_label(_("Service"));
-    gtk_widget_set_sensitive(btn_service, FALSE);
-    gtk_widget_set_tooltip_text(btn_service,
-                                _("Service position (coming soon)"));
-    gtk_grid_attach(GTK_GRID(grid), btn_service, 1, 0, 1, 1);
+    entry = gtk_entry_new();
+    gtk_grid_attach(GTK_GRID(grid), entry, 1, 0, 1, 1);
 
-    /* Park button: move rotor to configured rest position */
-    label = gtk_label_new(_("Park"));
+    label = gtk_label_new(_("Preset Az"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
 
-    button = gtk_button_new_with_label(_("Park"));
-    gtk_widget_set_tooltip_text(button,
-                                _("Send the rotor to the configured park position."));
-    g_signal_connect(button, "clicked",
-                     G_CALLBACK(rot_park_zenith_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(grid), button, 1, 1, 1, 1);
+    az_spin = gtk_spin_button_new_with_range(-360.0, 360.0, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(az_spin), 2);
+    gtk_grid_attach(GTK_GRID(grid), az_spin, 1, 1, 1, 1);
+
+    label = gtk_label_new(_("Preset El"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
+
+    el_spin = gtk_spin_button_new_with_range(-90.0, 180.0, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_spin), 2);
+    gtk_grid_attach(GTK_GRID(grid), el_spin, 1, 2, 1, 1);
+
+    if (is_edit)
+    {
+        gtk_entry_set_text(GTK_ENTRY(entry),
+                           ctrl->presets[index].name ? ctrl->presets[index].name : "");
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(az_spin),
+                                  ctrl->presets[index].az);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(el_spin),
+                                  ctrl->presets[index].el);
+    }
+
+    delete_btn = gtk_dialog_get_widget_for_response(GTK_DIALOG(dialog),
+                                                    ROT_PRESET_RESPONSE_DELETE);
+
+    ctx = g_new0(RotPresetDialog, 1);
+    ctx->ctrl = ctrl;
+    ctx->index = is_edit ? index : -1;
+    ctx->dialog = dialog;
+    ctx->name_entry = entry;
+    ctx->az_spin = az_spin;
+    ctx->el_spin = el_spin;
+    ctx->delete_button = delete_btn;
+
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(rotctrl_preset_dialog_response), ctx);
+    g_object_set_data_full(G_OBJECT(dialog), "preset-dialog",
+                           ctx, rotctrl_preset_dialog_free);
+
+    gtk_widget_show_all(dialog);
+
+    if (!is_edit && delete_btn != NULL)
+        gtk_widget_hide(delete_btn);
+}
+
+static void rotctrl_preset_move(GtkRotCtrl *ctrl, gint index)
+{
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+    const gchar *name = NULL;
+
+    if (ctrl == NULL || index < 0 || (guint) index >= ctrl->preset_count)
+        return;
+
+    if (!ctrl->conf || !ctrl->engaged || !ctrl->client.running)
+    {
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_WARNING,
+                         _("Preset position"),
+                         _("Engage the rotator before moving to a preset."));
+        return;
+    }
+
+    az = ctrl->presets[index].az;
+    el = ctrl->presets[index].el;
+    name = ctrl->presets[index].name ? ctrl->presets[index].name : _("Preset");
+
+    if (ctrl->cal_hold_active)
+        rotctrl_set_cal_hold(ctrl, FALSE, "preset");
+
+    if (ctrl->tracking && ctrl->track)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), az);
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), el);
+    ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
+    ctrl->manual_sync_pending = FALSE;
+    ctrl->park_requested = FALSE;
+    ctrl->force_next_send = TRUE;
+
+    {
+        gchar *msg = g_strdup_printf(_("moving to '%s' (AZ=%.2f EL=%.2f)"),
+                                     name, az, el);
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_INFO,
+                         _("Preset position"),
+                         msg);
+        g_free(msg);
+    }
+}
+
+static GtkWidget *rotctrl_preset_slot_widget(GtkRotCtrl *ctrl, guint index)
+{
+    GtkWidget *box = NULL;
+    GtkWidget *main_btn = NULL;
+    GtkWidget *edit_btn = NULL;
+    const gchar *name = NULL;
+
+    if (ctrl == NULL || index >= ctrl->preset_count)
+        return NULL;
+
+    name = ctrl->presets[index].name ? ctrl->presets[index].name : _("Preset");
+
+    box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+
+    main_btn = gtk_button_new_with_label(name);
+    gtk_widget_set_size_request(main_btn, -1, ROT_PRESET_BUTTON_HEIGHT);
+    gtk_widget_set_hexpand(main_btn, TRUE);
+    gtk_widget_set_halign(main_btn, GTK_ALIGN_FILL);
+    g_object_set_data(G_OBJECT(main_btn), "preset-index",
+                      GINT_TO_POINTER((gint) index));
+    g_signal_connect(main_btn, "clicked",
+                     G_CALLBACK(rotctrl_preset_activate_cb), ctrl);
+
+    edit_btn = gtk_button_new_with_label(_("Edit"));
+    gtk_widget_set_hexpand(edit_btn, FALSE);
+    gtk_widget_set_size_request(edit_btn, 48, ROT_PRESET_BUTTON_HEIGHT);
+    g_object_set_data(G_OBJECT(edit_btn), "preset-index",
+                      GINT_TO_POINTER((gint) index));
+    g_signal_connect(edit_btn, "clicked",
+                     G_CALLBACK(rotctrl_preset_edit_cb), ctrl);
+
+    gtk_box_pack_start(GTK_BOX(box), main_btn, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), edit_btn, FALSE, FALSE, 0);
+
+    return box;
+}
+
+static void rotctrl_presets_refresh(GtkRotCtrl *ctrl)
+{
+    GList *children = NULL;
+
+    if (ctrl == NULL || ctrl->preset_grid == NULL)
+        return;
+
+    children = gtk_container_get_children(GTK_CONTAINER(ctrl->preset_grid));
+    for (GList *item = children; item != NULL; item = item->next)
+        gtk_widget_destroy(GTK_WIDGET(item->data));
+    g_list_free(children);
+
+    for (guint slot = 0; slot < ROT_PRESET_MAX; slot++)
+    {
+        guint row = slot / ROT_PRESET_COLS;
+        guint col = slot % ROT_PRESET_COLS;
+        GtkWidget *widget = NULL;
+
+        if (slot < ctrl->preset_count)
+        {
+            widget = rotctrl_preset_slot_widget(ctrl, slot);
+        }
+        else if (slot == ctrl->preset_count &&
+                 ctrl->preset_count < ROT_PRESET_MAX)
+        {
+            widget = gtk_button_new_with_label(_("Create preset"));
+            gtk_widget_set_size_request(widget, -1, ROT_PRESET_BUTTON_HEIGHT);
+            gtk_widget_set_hexpand(widget, TRUE);
+            gtk_widget_set_halign(widget, GTK_ALIGN_FILL);
+            g_signal_connect(widget, "clicked",
+                             G_CALLBACK(rotctrl_preset_create_cb), ctrl);
+        }
+        else
+        {
+            widget = gtk_label_new("");
+        }
+
+        gtk_grid_attach(GTK_GRID(ctrl->preset_grid),
+                        widget,
+                        (gint) col, (gint) row, 1, 1);
+    }
+
+    gtk_widget_show_all(ctrl->preset_grid);
+}
+
+static void rotctrl_preset_create_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)button;
+    rotctrl_preset_dialog_open(ctrl, -1);
+}
+
+static void rotctrl_preset_edit_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gint index = GPOINTER_TO_INT(
+        g_object_get_data(G_OBJECT(button), "preset-index"));
+
+    rotctrl_preset_dialog_open(ctrl, index);
+}
+
+static void rotctrl_preset_activate_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gint index = GPOINTER_TO_INT(
+        g_object_get_data(G_OBJECT(button), "preset-index"));
+
+    rotctrl_preset_move(ctrl, index);
+}
+
+/* Create preset position widgets */
+static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
+{
+    GtkWidget *frame, *preset_grid;
+
+    frame = gtk_frame_new(_("Preset positions"));
+
+    preset_grid = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(preset_grid), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(preset_grid), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(preset_grid), 5);
+    gtk_grid_set_row_homogeneous(GTK_GRID(preset_grid), TRUE);
+    gtk_grid_set_column_homogeneous(GTK_GRID(preset_grid), TRUE);
+    ctrl->preset_grid = preset_grid;
+    gtk_container_add(GTK_CONTAINER(frame), preset_grid);
+    rotctrl_presets_refresh(ctrl);
 
     return frame;
 }
@@ -16917,6 +17569,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->min_el_spin = NULL;
     ctrl->max_el_spin = NULL;
     ctrl->az_endstop_spin = NULL;
+    ctrl->preset_grid = NULL;
+    ctrl->preset_count = 0;
 
     ctrl->tracking = FALSE;
     ctrl->tracking_active = FALSE;
@@ -17205,6 +17859,8 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         g_free(ctrl->conf);
         ctrl->conf = NULL;
     }
+
+    rotctrl_presets_clear(ctrl);
 
     g_free(ctrl->rotor_id);
     ctrl->rotor_id = NULL;

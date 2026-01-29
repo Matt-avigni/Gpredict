@@ -797,7 +797,15 @@ void rotor_conf_save(rotor_conf_t * conf)
         return;
 
     /* create a config structure */
+    confdir = get_hwconf_dir();
+    fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rot", NULL);
+    g_free(confdir);
+
     cfg = g_key_file_new();
+    g_key_file_load_from_file(cfg, fname,
+                              G_KEY_FILE_KEEP_COMMENTS |
+                              G_KEY_FILE_KEEP_TRANSLATIONS,
+                              NULL);
 
     g_key_file_set_string(cfg, GROUP, KEY_HOST, conf->host);
     g_key_file_set_integer(cfg, GROUP, KEY_PORT, conf->port);
@@ -918,11 +926,6 @@ void rotor_conf_save(rotor_conf_t * conf)
     else
         g_key_file_set_double(cfg, GROUP, KEY_ELEV_FLOOR,
                               conf->rotor_elev_floor_deg);
-
-    /* build filename */
-    confdir = get_hwconf_dir();
-    fname = g_strconcat(confdir, G_DIR_SEPARATOR_S, conf->name, ".rot", NULL);
-    g_free(confdir);
 
     /* save information */
     gpredict_save_key_file(cfg, fname);
