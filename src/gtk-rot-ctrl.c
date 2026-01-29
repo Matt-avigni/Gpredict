@@ -16611,17 +16611,20 @@ static GtkWidget *create_calibration_widgets(GtkRotCtrl *ctrl)
 /**
  * Park the rotor at a "rest" position.
  *
- * For Matteo's current station we define the park position as
- * AZ=0°, EL=90° (true North, antenna pointing straight up).
- *
- * This does NOT change the logical calibration (which remains
- * AZ=0°, EL=0° at the North horizon). It is only a convenience
- * command to move the rotor to a preferred rest position.
+ * Park at the configured station rest position (user space).
  */
 static void
 rot_park_zenith_cb(GtkButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gdouble park_user_az = 0.0;
+    gdouble park_user_el = 0.0;
+    gdouble park_az360 = 0.0;
+    gdouble park_backend_az = 0.0;
+    gdouble park_backend_el = 0.0;
+    rot_ui_mode_t ui_mode = ROT_UI_360;
+    RotTargetOut xform = { 0 };
+    gboolean xform_ok = FALSE;
 
     (void)button;
 
@@ -16637,19 +16640,43 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
     if (ctrl->cal_hold_active)
         rotctrl_set_cal_hold(ctrl, FALSE, "park");
 
+    ui_mode = (ctrl->conf && ctrl->conf->aztype == ROT_AZ_TYPE_180)
+              ? ROT_UI_NORTH_CENTERED
+              : ROT_UI_360;
+    rot_get_park_position(ctrl, &park_user_az, &park_user_el);
+    park_az360 = rot_ui_to_az360(park_user_az, ui_mode);
+    xform_ok = gp_rot_transform_target(ctrl,
+                                       park_az360,
+                                       park_user_el,
+                                       -1.0,
+                                       &xform);
+    park_backend_az = xform_ok ? xform.az360_final : park_az360;
+    park_backend_el = xform_ok ? xform.el_final : park_user_el;
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "park pressed: park_user=(%.2f,%.2f) park_backend=(%.2f,%.2f)",
+                park_user_az, park_user_el,
+                park_backend_az, park_backend_el);
+    rot_term_log(ctrl, "gpredict:rx",
+                 "park pressed: park_user=(%.2f,%.2f) park_backend=(%.2f,%.2f)",
+                 park_user_az, park_user_el,
+                 park_backend_az, park_backend_el);
+
     /* Route through the unified control loop: update knobs and allow manual send. */
-    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), 0.0);
-    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), 90.0);
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), park_user_az);
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), park_user_el);
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
 
     /* Inform the user what was commanded. */
     {
+        gchar *msg = g_strdup_printf(_("The rotor has been commanded to AZ=%.2f\302\260, EL=%.2f\302\260."),
+                                     park_user_az, park_user_el);
         rot_show_message(ctrl,
                          GTK_MESSAGE_INFO,
                          _("Park rotor"),
-                         _("The rotor has been commanded to AZ=0°, EL=90° (park position).\n\n"
-                           "Verify that the antenna is pointing straight up over true North."));
+                         msg);
+        g_free(msg);
     }
 }
 
@@ -16677,14 +16704,14 @@ static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
                                 _("Service position (coming soon)"));
     gtk_grid_attach(GTK_GRID(grid), btn_service, 1, 0, 1, 1);
 
-    /* Park button: move rotor to AZ=0°, EL=90° (rest position) */
-    label = gtk_label_new(_("Park (AZ=0°, EL=90°)"));
+    /* Park button: move rotor to configured rest position */
+    label = gtk_label_new(_("Park"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(grid), label, 0, 1, 1, 1);
 
     button = gtk_button_new_with_label(_("Park"));
     gtk_widget_set_tooltip_text(button,
-                                _("Send the rotor to AZ=0°, EL=90° as a rest/park position."));
+                                _("Send the rotor to the configured park position."));
     g_signal_connect(button, "clicked",
                      G_CALLBACK(rot_park_zenith_cb), ctrl);
     gtk_grid_attach(GTK_GRID(grid), button, 1, 1, 1, 1);
@@ -17766,6 +17793,25 @@ static void rotctrl_autocal_finish(GtkRotCtrl *ctrl,
                      "autocal failed reason=%s", reason);
     }
 
+    if (!ok && reason && g_strcmp0(reason, "cancel") != 0 &&
+        g_strcmp0(reason, "save_failed") != 0)
+    {
+        const gchar *detail = _("Calibration failed. Check rotor feedback and try again.");
+        if (g_strcmp0(reason, "timeout") == 0)
+            detail = _("Calibration timed out. Check rotor feedback and try again.");
+        else if (g_strcmp0(reason, "disengaged") == 0)
+            detail = _("Calibration aborted: rotor disengaged.");
+        else if (g_strcmp0(reason, "no_position") == 0)
+            detail = _("Calibration failed: no position feedback.");
+        else if (g_strcmp0(reason, "apply_fail") == 0 ||
+                 g_strcmp0(reason, "save_failed") == 0)
+            detail = _("Calibration failed to save. Check config permissions.");
+        rot_show_message(ctrl,
+                         GTK_MESSAGE_ERROR,
+                         _("Calibration"),
+                         detail);
+    }
+
     if (!ok && ctrl->calib_backup_valid)
     {
         ctrl->calib = ctrl->calib_backup;
@@ -17855,8 +17901,8 @@ static void rotctrl_autocal_start(GtkRotCtrl *ctrl)
                                                    GTK_DIALOG_DESTROY_WITH_PARENT,
                                                    GTK_MESSAGE_INFO,
                                                    GTK_BUTTONS_OK_CANCEL,
-                                                   _("Calibration in progress. Rotor moving to (0\302\260,0\302\260).\n"
-                                                     "When it stops, align antennas to TRUE NORTH, then press OK."));
+                                                   _("Calibrating: moving to (0\302\260,0\302\260). "
+                                                     "Align to TRUE NORTH, press OK."));
         gtk_window_set_title(GTK_WINDOW(dialog), _("Calibration"));
         gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
         gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog),
