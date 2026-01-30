@@ -47,14 +47,28 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef G_OS_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifndef socklen_t
+typedef int socklen_t;
+#endif
+#include <windows.h>
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
 #ifndef WIN32
 #include <fcntl.h>
 #endif
 
 #include "net_compat.h"
-#ifdef G_OS_WIN32
-#include <windows.h>
-#endif
 
 #include "compat.h"
 #include "gp-term-view.h"
@@ -85,6 +99,22 @@
 
 #ifndef AI_ADDRCONFIG
 #define AI_ADDRCONFIG 0
+#endif
+
+#ifdef G_OS_WIN32
+static gboolean winsock_ensure_init(void)
+{
+    static gsize init_state = 0;
+
+    if (g_once_init_enter(&init_state))
+    {
+        WSADATA wsa;
+        int rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+        g_once_init_leave(&init_state, (rc == 0) ? 1 : 2);
+    }
+
+    return init_state == 1;
+}
 #endif
 
 
@@ -10031,6 +10061,14 @@ static gboolean rigctld_connect_addrinfo_timeout(const gchar *host, gint port,
     if (host == NULL || sock == NULL)
         return FALSE;
 
+#ifdef G_OS_WIN32
+    if (!winsock_ensure_init())
+    {
+        g_warning("%s: WSAStartup failed", __func__);
+        return FALSE;
+    }
+#endif
+
     if (net_init() != 0)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -10171,6 +10209,14 @@ static gboolean rigctld_connect_addrinfo(const gchar *host, gint port,
     if (host == NULL || sock == NULL)
         return FALSE;
 
+#ifdef G_OS_WIN32
+    if (!winsock_ensure_init())
+    {
+        g_warning("%s: WSAStartup failed", __func__);
+        return FALSE;
+    }
+#endif
+
     if (net_init() != 0)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -10303,6 +10349,14 @@ static gboolean rigctld_try_connect_once(const gchar *host, gint port,
 
     if (host == NULL)
         return FALSE;
+
+#ifdef G_OS_WIN32
+    if (!winsock_ensure_init())
+    {
+        g_warning("%s: WSAStartup failed", __func__);
+        return FALSE;
+    }
+#endif
 
     if (last_err)
         *last_err = 0;

@@ -162,7 +162,21 @@ int main(void)
     in.delta_backend_el = 0.1;
     rot_cmd_decision_eval(&in, &out);
     assert(!out.send);
-    expect_reason(rot_cmd_reason_name(out.reason), "deadband");
+    expect_reason(rot_cmd_reason_name(out.reason), "no_pos");
+
+    /* No position feedback blocks even large target changes */
+    in = base_input();
+    in.pos_fresh = FALSE;
+    in.desired_user_az = 30.0;
+    in.desired_user_el = 15.0;
+    in.setpoint_user_az = 5.0;
+    in.setpoint_user_el = 2.0;
+    in.delta_backend_az = 20.0;
+    in.delta_backend_el = 10.0;
+    in.resend_due = TRUE;
+    rot_cmd_decision_eval(&in, &out);
+    assert(!out.send);
+    expect_reason(rot_cmd_reason_name(out.reason), "no_pos");
 
     /* Resend safeguard */
     in = base_input();

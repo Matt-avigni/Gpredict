@@ -143,6 +143,12 @@ void rot_cmd_decision_eval(const rot_cmd_decision_input_t *in,
         return;
     }
 
+    if (!in->pos_fresh && in->mode != ROT_CMD_MODE_PARK)
+    {
+        out->reason = ROT_CMD_REASON_NO_POS;
+        return;
+    }
+
     if (in->setpoint_valid)
     {
         delta_az = rot_decision_az_delta(&in->caps,

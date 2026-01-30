@@ -664,6 +664,42 @@ int main(void)
         }
     }
     {
+        gdouble hs_az = 0.0;
+        gdouble hs_el = 0.0;
+        gchar dump_state[1024];
+        gchar pos_reply[128];
+        gboolean pos_ok = FALSE;
+
+        dump_state[0] = '\0';
+        pos_reply[0] = '\0';
+        if (!rotctld_client_handshake(rot_fail,
+                                      500,
+                                      &hs_az,
+                                      &hs_el,
+                                      dump_state,
+                                      sizeof(dump_state),
+                                      pos_reply,
+                                      sizeof(pos_reply),
+                                      &pos_ok))
+        {
+            g_printerr("rotctld handshake failed in failure mode\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+        if (pos_ok)
+        {
+            g_printerr("rotctld handshake unexpected pos_ok in failure mode\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+        if (rotctld_client_get_state(rot_fail) == ROTCTLD_CLIENT_READY)
+        {
+            g_printerr("rotctld handshake failure should not set READY state\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+    }
+    {
         HamlibResponseInfo info = { 0 };
         gchar reply[64] = { 0 };
 
