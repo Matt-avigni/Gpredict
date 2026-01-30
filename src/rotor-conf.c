@@ -73,6 +73,7 @@
 #define KEY_STALE_HOLD_MS "StaleHoldMs"
 #define KEY_STALE_PARK_MS "StaleParkMs"
 #define KEY_STALE_RESUME_MS "StaleResumeMs"
+#define KEY_DISABLE_POS_FEEDBACK "DisablePosFeedbackChecks"
 #define KEY_LAST_GOOD_DEVICE "LastGoodDevice"
 #define KEY_LAST_GOOD_BAUD "LastGoodBaud"
 
@@ -95,6 +96,7 @@
 #define DEFAULT_STALE_RESUME_MS 1000
 #define DEFAULT_ANGLE_EPSILON_DEG 1.5
 #define DEFAULT_ELEV_FLOOR_DEG 1.0
+#define DEFAULT_DISABLE_POS_FEEDBACK FALSE
 
 /* Hamlib rotator model IDs from hamlib/rotlist.h. */
 #define ROT_HAMLIB_MODEL_GS232B    ROT_MODEL_GS232B
@@ -474,6 +476,21 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     }
     if (conf->rotor_stale_resume_ms < 0)
         conf->rotor_stale_resume_ms = 0;
+
+    conf->disable_pos_feedback_checks = DEFAULT_DISABLE_POS_FEEDBACK;
+    if (g_key_file_has_key(cfg, GROUP, KEY_DISABLE_POS_FEEDBACK, NULL))
+    {
+        conf->disable_pos_feedback_checks =
+            g_key_file_get_boolean(cfg, GROUP, KEY_DISABLE_POS_FEEDBACK, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: DisablePosFeedbackChecks not defined for %s. Assuming false."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->disable_pos_feedback_checks = DEFAULT_DISABLE_POS_FEEDBACK;
+        }
+    }
 
     conf->rotor_stale_debounce_count = DEFAULT_STALE_DEBOUNCE;
     if (g_key_file_has_key(cfg, GROUP, KEY_STALE_DEBOUNCE, NULL))
@@ -914,6 +931,12 @@ void rotor_conf_save(rotor_conf_t * conf)
     else
         g_key_file_set_integer(cfg, GROUP, KEY_STALE_RESUME_MS,
                                conf->rotor_stale_resume_ms);
+
+    if (conf->disable_pos_feedback_checks == DEFAULT_DISABLE_POS_FEEDBACK)
+        g_key_file_remove_key(cfg, GROUP, KEY_DISABLE_POS_FEEDBACK, NULL);
+    else
+        g_key_file_set_boolean(cfg, GROUP, KEY_DISABLE_POS_FEEDBACK,
+                               conf->disable_pos_feedback_checks);
 
     if (fabs(conf->rotor_angle_epsilon_deg - DEFAULT_ANGLE_EPSILON_DEG) < 1e-6)
         g_key_file_remove_key(cfg, GROUP, KEY_ANGLE_EPSILON, NULL);

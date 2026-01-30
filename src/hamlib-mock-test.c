@@ -83,7 +83,10 @@ static GSubprocess *spawn_rotctld_mock(const gchar *python,
                                        guint16 port,
                                        gboolean fail_get_pos,
                                        gboolean fail_set_pos,
-                                       gboolean drop_set_pos)
+                                       gboolean drop_set_pos,
+                                       gboolean split_replies,
+                                       gint disconnect_after,
+                                       gboolean once)
 {
     GSubprocess *proc = NULL;
     GError *error = NULL;
@@ -99,13 +102,21 @@ static GSubprocess *spawn_rotctld_mock(const gchar *python,
     g_ptr_array_add(argv, g_strdup("127.0.0.1"));
     g_ptr_array_add(argv, g_strdup("--port"));
     g_ptr_array_add(argv, g_strdup(port_str));
-    g_ptr_array_add(argv, g_strdup("--once"));
+    if (once)
+        g_ptr_array_add(argv, g_strdup("--once"));
     if (fail_get_pos)
         g_ptr_array_add(argv, g_strdup("--fail-get-pos"));
     if (fail_set_pos)
         g_ptr_array_add(argv, g_strdup("--fail-set-pos"));
     if (drop_set_pos)
         g_ptr_array_add(argv, g_strdup("--drop-set-pos"));
+    if (split_replies)
+        g_ptr_array_add(argv, g_strdup("--split-replies"));
+    if (disconnect_after > 0)
+    {
+        g_ptr_array_add(argv, g_strdup("--disconnect-after"));
+        g_ptr_array_add(argv, g_strdup_printf("%d", disconnect_after));
+    }
     g_ptr_array_add(argv, NULL);
 
     proc = g_subprocess_newv((const gchar *const *)argv->pdata,
@@ -159,6 +170,51 @@ static gboolean connect_rotctld_with_retry(RotctldClient *client,
     return FALSE;
 }
 
+typedef struct {
+    RotctldClient *client;
+    gboolean ok;
+} RotThreadCtx;
+
+static gpointer rot_thread_getpos(gpointer data)
+{
+    RotThreadCtx *ctx = data;
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+
+    if (ctx == NULL || ctx->client == NULL)
+        return NULL;
+
+    for (gint i = 0; i < 25; i++)
+    {
+        if (!rotctld_client_get_pos(ctx->client, &az, &el))
+        {
+            ctx->ok = FALSE;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static gpointer rot_thread_setpos(gpointer data)
+{
+    RotThreadCtx *ctx = data;
+
+    if (ctx == NULL || ctx->client == NULL)
+        return NULL;
+
+    for (gint i = 0; i < 25; i++)
+    {
+        gdouble az = (gdouble)(i % 10) * 3.0;
+        gdouble el = (gdouble)(i % 5) * 2.0;
+        if (!rotctld_client_set_pos(ctx->client, az, el))
+        {
+            ctx->ok = FALSE;
+            break;
+        }
+    }
+    return NULL;
+}
+
 int main(void)
 {
     gchar *python = NULL;
@@ -168,14 +224,20 @@ int main(void)
     guint16 rig_port_select = 0;
     guint16 rot_port = 0;
     guint16 rot_fail_port = 0;
+    guint16 rot_split_port = 0;
+    guint16 rot_drop_port = 0;
     GSubprocess *rig_proc = NULL;
     GSubprocess *rig_select_proc = NULL;
     GSubprocess *rot_proc = NULL;
     GSubprocess *rot_fail_proc = NULL;
+    GSubprocess *rot_split_proc = NULL;
+    GSubprocess *rot_drop_proc = NULL;
     RigctldClient *rig = NULL;
     RigctldClient *rig_select = NULL;
     RotctldClient *rot = NULL;
     RotctldClient *rot_fail = NULL;
+    RotctldClient *rot_split = NULL;
+    RotctldClient *rot_drop = NULL;
     radio_conf_t conf;
     const RigCaps *caps = NULL;
     const RotCaps *rcaps = NULL;
@@ -193,7 +255,7 @@ int main(void)
     }
 
     rig_script = g_build_filename("..", "scripts", "mock_rigctld.py", NULL);
-    rot_script = g_build_filename("..", "scripts", "mock_rotctld.py", NULL);
+    rot_script = g_build_filename("..", "tests", "mock_rotctld_server.py", NULL);
 
     if (!g_file_test(rig_script, G_FILE_TEST_EXISTS) ||
         !g_file_test(rot_script, G_FILE_TEST_EXISTS))
@@ -233,7 +295,7 @@ int main(void)
     rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE);
     rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select, TRUE);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
-                                  FALSE, FALSE, FALSE);
+                                  FALSE, FALSE, FALSE, FALSE, 0, TRUE);
     if (rig_proc == NULL || rig_select_proc == NULL || rot_proc == NULL)
     {
         ok = FALSE;
@@ -579,6 +641,24 @@ int main(void)
         }
     }
     {
+        RotThreadCtx ctx_get = { rot, TRUE };
+        RotThreadCtx ctx_set = { rot, TRUE };
+        GThread *t_get = NULL;
+        GThread *t_set = NULL;
+
+        t_get = g_thread_new("rot-getpos", rot_thread_getpos, &ctx_get);
+        t_set = g_thread_new("rot-setpos", rot_thread_setpos, &ctx_set);
+        g_thread_join(t_get);
+        g_thread_join(t_set);
+
+        if (!ctx_get.ok || !ctx_set.ok)
+        {
+            g_printerr("rotctld concurrent request test failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+    }
+    {
         HamlibResponseInfo info = { 0 };
         gchar reply[64] = { 0 };
         gint count = 0;
@@ -620,6 +700,25 @@ int main(void)
           rot_fail_port == rot_port);
          attempt++)
         rot_fail_port = pick_free_port();
+    rot_split_port = pick_free_port();
+    for (gint attempt = 0;
+         attempt < 5 &&
+         (rot_split_port == 0 ||
+          rot_split_port == rig_port ||
+          rot_split_port == rot_port ||
+          rot_split_port == rot_fail_port);
+         attempt++)
+        rot_split_port = pick_free_port();
+    rot_drop_port = pick_free_port();
+    for (gint attempt = 0;
+         attempt < 5 &&
+         (rot_drop_port == 0 ||
+          rot_drop_port == rig_port ||
+          rot_drop_port == rot_port ||
+          rot_drop_port == rot_fail_port ||
+          rot_drop_port == rot_split_port);
+         attempt++)
+        rot_drop_port = pick_free_port();
     if (rot_fail_port == 0 ||
         rot_fail_port == rig_port ||
         rot_fail_port == rot_port)
@@ -628,17 +727,40 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
+    if (rot_split_port == 0 || rot_drop_port == 0)
+    {
+        g_printerr("failed to select mock port for rotctld split/drop test\n");
+        ok = FALSE;
+        goto cleanup;
+    }
 
     rot_fail_proc = spawn_rotctld_mock(python, rot_script, rot_fail_port,
-                                       TRUE, TRUE, FALSE);
+                                       TRUE, TRUE, FALSE, FALSE, 0, TRUE);
     if (rot_fail_proc == NULL)
     {
         ok = FALSE;
         goto cleanup;
     }
 
+    rot_split_proc = spawn_rotctld_mock(python, rot_script, rot_split_port,
+                                        FALSE, FALSE, FALSE, TRUE, 0, TRUE);
+    rot_drop_proc = spawn_rotctld_mock(python, rot_script, rot_drop_port,
+                                       FALSE, FALSE, FALSE, FALSE, 2, TRUE);
+    if (rot_split_proc == NULL || rot_drop_proc == NULL)
+    {
+        ok = FALSE;
+        goto cleanup;
+    }
+
     rot_fail = rotctld_client_new("mock-rot-fail");
+    rot_split = rotctld_client_new("mock-rot-split");
+    rot_drop = rotctld_client_new("mock-rot-drop");
     if (rot_fail == NULL)
+    {
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (rot_split == NULL || rot_drop == NULL)
     {
         ok = FALSE;
         goto cleanup;
@@ -741,15 +863,93 @@ int main(void)
         }
     }
 
+    if (!connect_rotctld_with_retry(rot_split, "127.0.0.1", rot_split_port))
+    {
+        g_printerr("failed to connect to rotctld mock (split replies)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    for (gint i = 0; i < 3; i++)
+    {
+        if (!rotctld_client_get_pos(rot_split, &az, &el))
+        {
+            g_printerr("rotctld get pos failed with split replies\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+    }
+    if (!rotctld_client_set_pos(rot_split, 25.0, 10.0))
+    {
+        g_printerr("rotctld set pos failed with split replies\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+
+    if (!connect_rotctld_with_retry(rot_drop, "127.0.0.1", rot_drop_port))
+    {
+        g_printerr("failed to connect to rotctld mock (disconnect)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!rotctld_client_get_pos(rot_drop, &az, &el))
+    {
+        g_printerr("rotctld get pos failed before disconnect\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    (void)rotctld_client_set_pos(rot_drop, 12.0, 7.0);
+    if (rotctld_client_get_pos(rot_drop, &az, &el))
+    {
+        g_printerr("rotctld disconnect test expected failure after drop\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    rotctld_client_close(rot_drop);
+    if (rot_drop_proc != NULL)
+    {
+        if (!g_subprocess_wait_check(rot_drop_proc, NULL, &error))
+        {
+            g_printerr("rotctld mock disconnect exit error: %s\n",
+                       error ? error->message : "unknown");
+            ok = FALSE;
+            g_clear_error(&error);
+            goto cleanup;
+        }
+        g_clear_object(&rot_drop_proc);
+    }
+    rot_drop_proc = spawn_rotctld_mock(python, rot_script, rot_drop_port,
+                                       FALSE, FALSE, FALSE, FALSE, 0, TRUE);
+    if (rot_drop_proc == NULL)
+    {
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!connect_rotctld_with_retry(rot_drop, "127.0.0.1", rot_drop_port))
+    {
+        g_printerr("failed to reconnect to rotctld mock after drop\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!rotctld_client_get_pos(rot_drop, &az, &el))
+    {
+        g_printerr("rotctld get pos failed after reconnect\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+
 cleanup:
     rigctld_client_close(rig);
     rigctld_client_close(rig_select);
     rotctld_client_close(rot);
     rotctld_client_close(rot_fail);
+    rotctld_client_close(rot_split);
+    rotctld_client_close(rot_drop);
     rigctld_client_free(&rig);
     rigctld_client_free(&rig_select);
     rotctld_client_free(&rot);
     rotctld_client_free(&rot_fail);
+    rotctld_client_free(&rot_split);
+    rotctld_client_free(&rot_drop);
 
     if (rig_proc != NULL && ok &&
         !g_subprocess_wait_check(rig_proc, NULL, &error))
@@ -783,6 +983,22 @@ cleanup:
         ok = FALSE;
         g_clear_error(&error);
     }
+    if (rot_split_proc != NULL && ok &&
+        !g_subprocess_wait_check(rot_split_proc, NULL, &error))
+    {
+        g_printerr("rotctld mock split exit error: %s\n",
+                   error ? error->message : "unknown");
+        ok = FALSE;
+        g_clear_error(&error);
+    }
+    if (rot_drop_proc != NULL && ok &&
+        !g_subprocess_wait_check(rot_drop_proc, NULL, &error))
+    {
+        g_printerr("rotctld mock disconnect exit error: %s\n",
+                   error ? error->message : "unknown");
+        ok = FALSE;
+        g_clear_error(&error);
+    }
 
     if (rig_proc != NULL && !ok)
     {
@@ -804,10 +1020,23 @@ cleanup:
         g_subprocess_force_exit(rot_fail_proc);
         (void)g_subprocess_wait(rot_fail_proc, NULL, NULL);
     }
+    if (rot_split_proc != NULL && !ok)
+    {
+        g_subprocess_force_exit(rot_split_proc);
+        (void)g_subprocess_wait(rot_split_proc, NULL, NULL);
+    }
+    if (rot_drop_proc != NULL && !ok)
+    {
+        g_subprocess_force_exit(rot_drop_proc);
+        (void)g_subprocess_wait(rot_drop_proc, NULL, NULL);
+    }
 
     g_clear_object(&rig_proc);
     g_clear_object(&rig_select_proc);
     g_clear_object(&rot_proc);
+    g_clear_object(&rot_fail_proc);
+    g_clear_object(&rot_split_proc);
+    g_clear_object(&rot_drop_proc);
     g_free(python);
     g_free(rig_script);
     g_free(rot_script);

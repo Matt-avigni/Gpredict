@@ -156,6 +156,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
+        .disable_pos_feedback_checks = FALSE,
         .last_good_device = NULL,
         .last_good_baud = 0,
     };

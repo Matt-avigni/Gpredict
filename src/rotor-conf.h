@@ -90,6 +90,7 @@ typedef struct {
     gint            rotor_stale_hold_ms; /*!< Hold threshold for stale position */
     gint            rotor_stale_park_ms; /*!< Park/disconnect threshold for stale position */
     gint            rotor_stale_resume_ms; /*!< Fresh period required to resume after hold */
+    gboolean        disable_pos_feedback_checks; /*!< Disable position/encoder feedback checks */
     gchar          *last_good_device; /*!< Last validated serial device */
     gint            last_good_baud; /*!< Last validated baud rate */
 } rotor_conf_t;

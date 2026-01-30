@@ -125,7 +125,7 @@
 #define ROT_TRACK_LOOKAHEAD_SEC 2.0
 #define ROT_CMD_MIN_AZ_DEG 0.8
 #define ROT_CMD_MIN_EL_DEG 0.5
-#define ROT_CMD_RESEND_MS 1200
+#define ROT_CMD_RESEND_MS 3000
 #define ROT_CMD_DEADBAND_AZ_DEG 1.0
 #define ROT_CMD_DEADBAND_EL_DEG 0.7
 #define ROT_CMD_DEADBAND_PRETRACK_AZ_DEG 2.0
@@ -134,6 +134,12 @@
 #define ROT_CMD_MAX_HZ 1.0
 #define ROT_CMD_POS_FRESH_MS 1500
 #define ROT_CMD_AZ_EPS_MIN_DEG 1.5
+#define ROT_CMD_MIN_PERIOD_MS 250
+#define ROT_CMD_MAX_SILENCE_MS 3000
+#define ROT_CMD_POS_TIMEOUT_MS 1000
+#define ROT_CMD_STUCK_TIMEOUT_MS 2000
+#define ROT_CMD_MOVE_GRACE_MS 500
+#define ROT_CMD_DISCREPANCY_STRIKES 3
 #define ROT_STALE_ENTER_MS 7000
 #define ROT_STALE_EXIT_MS 2500
 #define ROT_STALE_READY_CONFIRM_POLLS 2
@@ -202,8 +208,9 @@ static const gdouble k_meas_tol_deg = 1.5;
 #define ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS 1000
 #define ROTCTLD_AUTODETECT_MAX_CANDIDATES 5
 #define ROTCTLD_KEEPALIVE_US 2000000
-#define ROT_SEND_MIN_INTERVAL_US 400000
+#define ROT_SEND_MIN_INTERVAL_US ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000)
 #define ROT_TRACK_RESEND_US 2000000
+#define ROT_TRACK_STALL_MS 1500
 #define ROT_LANE_ENDSTOP_MARGIN_DEG 5.0
 #define ROT_LANE_SWITCH_PENALTY_DEG 30.0
 #define ROTCTRL_MAX_BACKEND_IOERR 5
@@ -259,7 +266,32 @@ typedef struct {
     gdouble         last_cmd_ok_el;
     gint64          last_cmd_ok_us;
     gdouble         last_cmd_backend_az;
+    gdouble         last_cmd_backend_el;
     gboolean        last_cmd_backend_valid;
+    gdouble         desired_user_az;
+    gdouble         desired_user_el;
+    gdouble         desired_backend_az;
+    gdouble         desired_backend_el;
+    gdouble         desired_raw_az;
+    gdouble         desired_raw_el;
+    gboolean        desired_valid;
+    gboolean        desired_allow;
+    gboolean        desired_tracking;
+    gboolean        force_pending;
+    gint64          desired_update_us;
+    gdouble         last_err_deg;
+    gint64          last_err_us;
+    gint64          stall_since_us;
+    gdouble         last_pos_user_az;
+    gdouble         last_pos_user_el;
+    gint64          last_pos_sample_us;
+    gdouble         last_err_to_cmd;
+    gint64          last_err_time_us;
+    gint64          move_grace_until_us;
+    guint           discrepancy_streak;
+    guint           wrong_way_count;
+    gboolean        discrepancy_pending;
+    gboolean        feedback_disabled_logged;
     gboolean        pos_valid;
     gboolean        pos_invalid;
     gboolean        pos_unknown;
@@ -559,6 +591,7 @@ struct _GtkRotCtrl {
     RotctldMgr     *rotctld_mgr;
     gboolean        verbose_logging;
     gint            selected_child_pid;
+    gint            selected_child_port;
     gint            last_stop_pid;
     gchar          *last_stop_reason;
     gint64          last_stop_us;
@@ -881,6 +914,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data);
 static guint64  rotctld_get_engage_generation(GtkRotCtrl *ctrl);
 static gboolean rotctld_generation_stale(GtkRotCtrl *ctrl,
                                          guint64 generation);
+static gint     rotctld_effective_port(GtkRotCtrl *ctrl);
 static gdouble  norm360(gdouble a);
 static gdouble  ang_delta_deg(gdouble a, gdouble b);
 static gboolean rotctrl_samples_cross_endstop(const GArray *samples,
@@ -979,6 +1013,7 @@ static gchar **rotctld_build_argv_from_command(GtkRotCtrl *ctrl,
 static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
                                         const gchar *device_override,
                                         gint baud_override,
+                                        gint port_override,
                                         gchar **spawn_summary_out);
 
 /* Offset controls callbacks */
@@ -1709,6 +1744,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     gint64 now_us = 0;
     gint64 pos_age_ms = -1;
     gboolean stale_suppressed = FALSE;
+    gboolean feedback_disabled = FALSE;
     gboolean stale_enter = FALSE;
     gboolean stale_exit = FALSE;
     gboolean stale_active = FALSE;
@@ -1718,6 +1754,8 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
 
     if (ctrl == NULL)
         return;
+
+    feedback_disabled = (ctrl->conf && ctrl->conf->disable_pos_feedback_checks);
 
     (void)pos_unknown;
     (void)pos_cmd_ok;
@@ -1804,6 +1842,14 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     first_pos_deadline_us = ctrl->client.first_pos_deadline_us;
     g_mutex_unlock(&ctrl->client.mutex);
 
+    if (feedback_disabled)
+    {
+        pos_invalid = FALSE;
+        pos_degraded = FALSE;
+        handshake_pos_ok = TRUE;
+        first_pos_deadline_us = 0;
+    }
+
     if (backend_ioerr_pending)
     {
         rot_session_set_state(ctrl, ROT_SESSION_DEGRADED,
@@ -1811,14 +1857,14 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
         return;
     }
 
-    if (pos_invalid)
+    if (!feedback_disabled && pos_invalid)
     {
         rot_session_set_state(ctrl, ROT_SESSION_DEGRADED,
                               "pos_invalid", FALSE);
         return;
     }
 
-    if (pos_degraded)
+    if (!feedback_disabled && pos_degraded)
     {
         rot_session_set_state(ctrl, ROT_SESSION_DEGRADED,
                               "get_position retry limit", FALSE);
@@ -1865,7 +1911,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
         return;
     }
 
-    if (!handshake_pos_ok &&
+    if (!feedback_disabled && !handshake_pos_ok &&
         first_pos_deadline_us > 0 &&
         g_get_monotonic_time() > first_pos_deadline_us)
     {
@@ -1882,7 +1928,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
         return;
     }
 
-    if (!handshake_pos_ok)
+    if (!feedback_disabled && !handshake_pos_ok)
     {
         rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
                               "waiting for first position", FALSE);
@@ -5553,6 +5599,9 @@ static gboolean rotctrl_stale_suppressed(const GtkRotCtrl *ctrl)
     if (ctrl == NULL)
         return TRUE;
 
+    if (ctrl->conf && ctrl->conf->disable_pos_feedback_checks)
+        return TRUE;
+
     if (ctrl->cal_active || ctrl->cal_hold_active)
         return TRUE;
 
@@ -6379,7 +6428,9 @@ struct RotctldProbeState {
     guint        autodetect_count;
     gchar       *autodetect_device;
     gint         autodetect_baud;
+    gint         autodetect_port;
     guint        autodetect_baud_index;
+    GString     *autodetect_attempts;
     gboolean     validate_inflight;
     gboolean     validate_done;
     rotctld_pos_result_t validate_result;
@@ -7016,11 +7067,32 @@ static gpointer rotctld_client_thread(gpointer data)
     ctrl->client.last_cmd_ok_el = 0.0;
     ctrl->client.last_cmd_ok_us = 0;
     ctrl->client.last_cmd_backend_az = 0.0;
+    ctrl->client.last_cmd_backend_el = 0.0;
     ctrl->client.last_cmd_backend_valid = FALSE;
-    ctrl->client.last_cmd_backend_az = 0.0;
-    ctrl->client.last_cmd_backend_valid = FALSE;
-    ctrl->client.last_cmd_backend_az = 0.0;
-    ctrl->client.last_cmd_backend_valid = FALSE;
+    ctrl->client.desired_user_az = 0.0;
+    ctrl->client.desired_user_el = 0.0;
+    ctrl->client.desired_backend_az = 0.0;
+    ctrl->client.desired_backend_el = 0.0;
+    ctrl->client.desired_raw_az = 0.0;
+    ctrl->client.desired_raw_el = 0.0;
+    ctrl->client.desired_valid = FALSE;
+    ctrl->client.desired_allow = FALSE;
+    ctrl->client.desired_tracking = FALSE;
+    ctrl->client.force_pending = FALSE;
+    ctrl->client.desired_update_us = 0;
+    ctrl->client.last_err_deg = 0.0;
+    ctrl->client.last_err_us = 0;
+    ctrl->client.stall_since_us = 0;
+    ctrl->client.last_pos_user_az = 0.0;
+    ctrl->client.last_pos_user_el = 0.0;
+    ctrl->client.last_pos_sample_us = 0;
+    ctrl->client.last_err_to_cmd = 0.0;
+    ctrl->client.last_err_time_us = 0;
+    ctrl->client.move_grace_until_us = 0;
+    ctrl->client.discrepancy_streak = 0;
+    ctrl->client.wrong_way_count = 0;
+    ctrl->client.discrepancy_pending = FALSE;
+    ctrl->client.feedback_disabled_logged = FALSE;
     if (ctrl->client.client == NULL)
         ctrl->client.client = rotctld_client_new("rotctld");
     ctrl->client.cmd_rejected = FALSE;
@@ -7062,12 +7134,12 @@ static gpointer rotctld_client_thread(gpointer data)
     rot_term_log_verbose(ctrl, "gpredict:rx",
                          "rotctld client thread started for %s:%d",
                          ctrl->conf ? ctrl->conf->host : "(null)",
-                         ctrl->conf ? ctrl->conf->port : 0);
+                         rotctld_effective_port(ctrl));
     if (ctrl->verbose_logging)
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "rotctld client thread started for %s:%d",
                     ctrl->conf ? ctrl->conf->host : "(null)",
-                    ctrl->conf ? ctrl->conf->port : 0);
+                    rotctld_effective_port(ctrl));
 
     while (ctrl->client.running && !rotctld_stop_requested(ctrl))
     {
@@ -7094,7 +7166,7 @@ static gpointer rotctld_client_thread(gpointer data)
 
             ctrl->client.socket = rotctld_socket_open(ctrl,
                                                       ctrl->conf->host,
-                                                      ctrl->conf->port);
+                                                      rotctld_effective_port(ctrl));
             if (rotctld_stop_requested(ctrl) ||
                 rotctld_generation_stale(ctrl, session_gen))
                 goto out_stop;
@@ -7131,7 +7203,7 @@ static gpointer rotctld_client_thread(gpointer data)
                 rot_term_log(ctrl, "gpredict:err",
                              "rotctld connect failed to %s:%d (attempt %u/%u); retrying in %.1fs",
                              ctrl->conf ? ctrl->conf->host : "(null)",
-                             ctrl->conf ? ctrl->conf->port : 0,
+                             rotctld_effective_port(ctrl),
                              reconnect_attempts,
                              ROTCTLD_RECONNECT_MAX_RETRIES,
                              backoff_sec);
@@ -7218,7 +7290,7 @@ static gpointer rotctld_client_thread(gpointer data)
                             __func__,
                             ctrl->client.conn_id,
                             ctrl->conf ? ctrl->conf->host : "(null)",
-                            ctrl->conf ? ctrl->conf->port : 0);
+                            rotctld_effective_port(ctrl));
                 dump_state[0] = '\0';
             for (gint attempt = 0; attempt < 2; attempt++)
             {
@@ -7272,7 +7344,7 @@ static gpointer rotctld_client_thread(gpointer data)
                     rotctld_clear_rxbuf(ctrl);
                     ctrl->client.socket = rotctld_socket_open(ctrl,
                                                               ctrl->conf->host,
-                                                              ctrl->conf->port);
+                                                              rotctld_effective_port(ctrl));
                     if (rotctld_stop_requested(ctrl) ||
                         rotctld_generation_stale(ctrl, session_gen))
                         goto out_stop;
@@ -7325,10 +7397,10 @@ static gpointer rotctld_client_thread(gpointer data)
                                 "%s: non-rotctld daemon on %s:%d",
                                 __func__,
                                 ctrl->conf ? ctrl->conf->host : "(null)",
-                                ctrl->conf ? ctrl->conf->port : 0);
+                                rotctld_effective_port(ctrl));
                     rot_term_log(ctrl, "gpredict:err",
                                  "Port %d already in use by non-rotctld service (host=%s)",
-                                 ctrl->conf ? ctrl->conf->port : 0,
+                                 rotctld_effective_port(ctrl),
                                  ctrl->conf ? ctrl->conf->host : "(null)");
                     rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
                     rotctld_clear_rxbuf(ctrl);
@@ -7338,7 +7410,7 @@ static gpointer rotctld_client_thread(gpointer data)
                     g_mutex_unlock(&ctrl->client.mutex);
                     rot_schedule_wrong_daemon(ctrl,
                                               ctrl->conf ? ctrl->conf->host : NULL,
-                                              ctrl->conf ? ctrl->conf->port : 0);
+                                              rotctld_effective_port(ctrl));
                     ctrl->client.running = FALSE;
                     break;
                 }
@@ -7367,11 +7439,11 @@ static gpointer rotctld_client_thread(gpointer data)
                                     "%s: rotctld handshake failed on %s:%d; retrying",
                                     __func__,
                                     ctrl->conf ? ctrl->conf->host : "(null)",
-                                    ctrl->conf ? ctrl->conf->port : 0);
+                                    rotctld_effective_port(ctrl));
                         rot_term_log(ctrl, "gpredict:err",
                                      "rotctld handshake failed on %s:%d; retrying",
                                      ctrl->conf ? ctrl->conf->host : "(null)",
-                                     ctrl->conf ? ctrl->conf->port : 0);
+                                     rotctld_effective_port(ctrl));
                         reconnect_attempts++;
                         rot_log_rate_limited(ctrl, &reconnect_rate,
                                              ROTCTLD_FAILURE_LOG_INTERVAL_US,
@@ -7756,43 +7828,143 @@ static gpointer rotctld_client_thread(gpointer data)
         gboolean backoff_active = FALSE;
         gboolean have_trg = FALSE;
         gboolean allow_no_pos = FALSE;
+        gboolean feedback_disabled = FALSE;
         gboolean use_setpos = FALSE;
         gboolean apply_calib = FALSE;
         gboolean stop_pending = FALSE;
         const gchar *cmd_name = "move";
+        const gchar *send_reason = "none";
         gint64 now_us = g_get_monotonic_time();
         gint64 backoff_until = 0;
         gint64 backoff_log_us = 0;
         gdouble raw_azi = 0.0;
         gdouble raw_ele = 0.0;
+        gdouble desired_user_az = 0.0;
+        gdouble desired_user_el = 0.0;
+        gdouble desired_backend_az = 0.0;
+        gdouble desired_backend_el = 0.0;
+        gboolean desired_allow = FALSE;
+        gboolean desired_tracking = FALSE;
+        gboolean desired_valid = FALSE;
+        gboolean force_pending = FALSE;
         gboolean pos_valid = FALSE;
+        gboolean pos_degraded = FALSE;
         gboolean session_degraded = FALSE;
+        gboolean backend_ioerr_pending = FALSE;
+        gboolean reconnect_degraded = FALSE;
         gboolean daemon_ok = FALSE;
+        gboolean refresh_send = FALSE;
+        gint64 last_pos_us = 0;
+        gdouble cur_user_az = 0.0;
+        gdouble cur_user_el = 0.0;
+        gdouble last_cmd_backend_az = 0.0;
+        gdouble last_cmd_backend_el = 0.0;
+        gboolean last_cmd_backend_valid = FALSE;
+        gint64 last_cmd_ok_us = 0;
+        gdouble last_cmd_ok_az = 0.0;
+        gdouble last_cmd_ok_el = 0.0;
+        gint64 last_set_attempt_us = 0;
+        gboolean new_trg = FALSE;
+        gdouble fallback_az = 0.0;
+        gdouble fallback_el = 0.0;
+        gdouble fallback_raw_az = 0.0;
+        gdouble fallback_raw_el = 0.0;
+        gboolean discrepancy_pending = FALSE;
+        gboolean pos_fresh = FALSE;
+        gdouble delta_backend_az = 0.0;
+        gdouble delta_backend_el = 0.0;
+        gint64 since_cmd_us = G_MAXINT64;
+        gint64 since_cmd_ms = -1;
 
         g_mutex_lock(&ctrl->client.mutex);
-        azi = ctrl->client.azi_out;
-        ele = ctrl->client.ele_out;
-        if (ctrl->client.new_trg)
-        {
-            have_trg = TRUE;
-            raw_azi = ctrl->client.raw_azi_out;
-            raw_ele = ctrl->client.raw_ele_out;
-            backoff_until = ctrl->client.reject_backoff_until_us;
-            backoff_log_us = ctrl->client.reject_backoff_log_us;
-            pos_valid = ctrl->client.pos_valid;
-            allow_no_pos = ctrl->client.allow_send_no_pos;
-            session_degraded = ctrl->client.backend_ioerr_disengage_pending ||
-                               ctrl->client.pos_degraded ||
-                               ctrl->client.reconnect_degraded;
-            daemon_ok = ctrl->client.daemon_ok;
-            use_setpos = ctrl->client.use_setpos;
-            apply_calib = ctrl->client.apply_calib;
-        }
+        desired_user_az = ctrl->client.desired_user_az;
+        desired_user_el = ctrl->client.desired_user_el;
+        desired_backend_az = ctrl->client.desired_backend_az;
+        desired_backend_el = ctrl->client.desired_backend_el;
+        raw_azi = ctrl->client.desired_raw_az;
+        raw_ele = ctrl->client.desired_raw_el;
+        desired_valid = ctrl->client.desired_valid;
+        desired_allow = ctrl->client.desired_allow;
+        desired_tracking = ctrl->client.desired_tracking;
+        force_pending = ctrl->client.force_pending;
+        new_trg = ctrl->client.new_trg;
+        backoff_until = ctrl->client.reject_backoff_until_us;
+        backoff_log_us = ctrl->client.reject_backoff_log_us;
+        pos_valid = ctrl->client.pos_valid;
+        allow_no_pos = ctrl->client.allow_send_no_pos;
+        backend_ioerr_pending = ctrl->client.backend_ioerr_disengage_pending;
+        pos_degraded = ctrl->client.pos_degraded;
+        reconnect_degraded = ctrl->client.reconnect_degraded;
+        daemon_ok = ctrl->client.daemon_ok;
+        use_setpos = ctrl->client.use_setpos;
+        apply_calib = ctrl->client.apply_calib;
+        last_pos_us = ctrl->client.last_pos_us;
+        cur_user_az = ctrl->client.azi_in;
+        cur_user_el = ctrl->client.ele_in;
+        last_cmd_backend_az = ctrl->client.last_cmd_backend_az;
+        last_cmd_backend_el = ctrl->client.last_cmd_backend_el;
+        last_cmd_backend_valid = ctrl->client.last_cmd_backend_valid;
+        last_cmd_ok_us = ctrl->client.last_cmd_ok_us;
+        last_cmd_ok_az = ctrl->client.last_cmd_ok_az;
+        last_cmd_ok_el = ctrl->client.last_cmd_ok_el;
+        last_set_attempt_us = ctrl->client.last_set_attempt_us;
         stop_pending = ctrl->client.stop_pending;
+        fallback_az = ctrl->client.azi_out;
+        fallback_el = ctrl->client.ele_out;
+        fallback_raw_az = ctrl->client.raw_azi_out;
+        fallback_raw_el = ctrl->client.raw_ele_out;
+        discrepancy_pending = ctrl->client.discrepancy_pending;
         if (stop_pending)
             ctrl->client.new_trg = FALSE;
         ctrl->client.stop_pending = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
+
+        feedback_disabled = (ctrl->conf && ctrl->conf->disable_pos_feedback_checks);
+        if (feedback_disabled && !ctrl->client.feedback_disabled_logged)
+        {
+            rot_term_log(ctrl, "gpredict:rx",
+                         "pos feedback checks disabled (no encoder)");
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.feedback_disabled_logged = TRUE;
+            g_mutex_unlock(&ctrl->client.mutex);
+        }
+
+        session_degraded = backend_ioerr_pending ||
+                           (!feedback_disabled && pos_degraded) ||
+                           reconnect_degraded;
+        if (feedback_disabled)
+            allow_no_pos = TRUE;
+
+        if (feedback_disabled)
+        {
+            pos_fresh = TRUE;
+        }
+        else if (pos_valid && last_pos_us > 0 && now_us > last_pos_us)
+        {
+            gint warn_ms = rotctrl_stale_warn_ms(ctrl);
+            pos_fresh = ((now_us - last_pos_us) <= ((gint64)warn_ms * 1000));
+        }
+
+        if (!desired_valid && new_trg)
+        {
+            desired_backend_az = fallback_az;
+            desired_backend_el = fallback_el;
+            raw_azi = fallback_raw_az;
+            raw_ele = fallback_raw_el;
+            desired_user_az = desired_backend_az;
+            desired_user_el = desired_backend_el;
+            desired_valid = TRUE;
+            desired_allow = TRUE;
+            desired_tracking = FALSE;
+            force_pending = TRUE;
+            g_mutex_lock(&ctrl->client.mutex);
+            ctrl->client.new_trg = FALSE;
+            g_mutex_unlock(&ctrl->client.mutex);
+        }
+
+        azi = desired_backend_az;
+        ele = desired_backend_el;
+        have_trg = desired_valid;
 
         if (stop_pending)
         {
@@ -7815,13 +7987,110 @@ static gpointer rotctld_client_thread(gpointer data)
         }
 
         if (have_trg)
-            send_cmd = TRUE;
+        {
+            gdouble aim_deadband =
+                (ctrl->threshold > 0.0) ? ctrl->threshold : 0.10;
+            gboolean have_last_cmd = last_cmd_backend_valid || (last_cmd_ok_us > 0);
+            gdouble ref_az = last_cmd_backend_valid ? last_cmd_backend_az : last_cmd_ok_az;
+            gdouble ref_el = last_cmd_backend_valid ? last_cmd_backend_el : last_cmd_ok_el;
+            gint64 last_attempt_us =
+                (last_set_attempt_us > 0) ? last_set_attempt_us : last_cmd_ok_us;
+            delta_backend_az = have_last_cmd
+                                   ? fabs(shortest_az_delta(desired_backend_az, ref_az))
+                                   : 0.0;
+            delta_backend_el = have_last_cmd
+                                   ? fabs(desired_backend_el - ref_el)
+                                   : 0.0;
+            since_cmd_us =
+                (last_attempt_us > 0 && now_us > last_attempt_us)
+                    ? (now_us - last_attempt_us)
+                    : G_MAXINT64;
+            if (since_cmd_us != G_MAXINT64)
+                since_cmd_ms = since_cmd_us / 1000;
+            gboolean aim_change =
+                (!have_last_cmd ||
+                 delta_backend_az >= aim_deadband ||
+                 delta_backend_el >= aim_deadband);
+            gboolean min_step_ok =
+                (!have_last_cmd ||
+                 delta_backend_az >= ROT_CMD_MIN_AZ_DEG ||
+                 delta_backend_el >= ROT_CMD_MIN_EL_DEG);
+            gboolean min_period_ok =
+                (last_attempt_us == 0 ||
+                 since_cmd_us >= ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000));
+            gboolean refresh_due =
+                (last_attempt_us == 0 ||
+                 since_cmd_us >= ((gint64)ROT_CMD_MAX_SILENCE_MS * 1000));
+
+            if (!desired_allow && !force_pending)
+            {
+                send_cmd = FALSE;
+                send_reason = "not_allowed";
+            }
+            else if (!min_period_ok)
+            {
+                send_cmd = FALSE;
+                send_reason = "cooldown";
+            }
+            else if (!pos_fresh)
+            {
+                if (refresh_due)
+                {
+                    send_cmd = TRUE;
+                    send_reason = "refresh";
+                    if (have_last_cmd)
+                    {
+                        azi = ref_az;
+                        ele = ref_el;
+                    }
+                }
+                else
+                {
+                    send_cmd = FALSE;
+                    send_reason = "no_pos";
+                }
+            }
+            else if (force_pending)
+            {
+                send_cmd = TRUE;
+                send_reason = "force";
+            }
+            else if (aim_change && min_step_ok)
+            {
+                send_cmd = TRUE;
+                send_reason = "aim_change";
+            }
+            else if (!feedback_disabled && discrepancy_pending)
+            {
+                send_cmd = TRUE;
+                send_reason = "discrepancy";
+            }
+            else if (refresh_due)
+            {
+                send_cmd = TRUE;
+                send_reason = "refresh";
+                if (have_last_cmd)
+                {
+                    azi = ref_az;
+                    ele = ref_el;
+                }
+            }
+            else
+            {
+                send_cmd = FALSE;
+                send_reason = "hold";
+            }
+        }
 
         if (use_setpos)
             cmd_name = "set_position";
 
         if (send_cmd && now_us < backoff_until)
             backoff_active = TRUE;
+
+        if (send_cmd && send_reason != NULL &&
+            g_strcmp0(send_reason, "refresh") == 0)
+            refresh_send = TRUE;
 
         if (send_cmd)
         {
@@ -7834,7 +8103,7 @@ static gpointer rotctld_client_thread(gpointer data)
                                      "rotctld connection not verified; skipping %s",
                                      cmd_name);
             }
-            else if (session_degraded && !allow_no_pos)
+            else if (session_degraded && !allow_no_pos && !refresh_send)
             {
                 send_cmd = FALSE;
                 rot_log_rate_limited(ctrl, &pos_skip_rate,
@@ -7843,7 +8112,7 @@ static gpointer rotctld_client_thread(gpointer data)
                                      "%s deferred: session degraded",
                                      cmd_name);
             }
-            else if (!pos_valid && !allow_no_pos)
+            else if (!pos_valid && !allow_no_pos && !refresh_send)
             {
                 send_cmd = FALSE;
                 rot_log_rate_limited(ctrl, &pos_skip_rate,
@@ -7866,6 +8135,18 @@ static gpointer rotctld_client_thread(gpointer data)
                 g_mutex_unlock(&ctrl->client.mutex);
             }
             send_cmd = FALSE;
+        }
+
+        if (send_cmd && ctrl->verbose_logging)
+        {
+            rot_term_log(ctrl, "gpredict:tx",
+                         "rot_supervise: send reason=%s dt_ms=%lld delta=(%.2f, %.2f) target=(%.2f, %.2f)",
+                         send_reason,
+                         (long long)since_cmd_ms,
+                         delta_backend_az,
+                         delta_backend_el,
+                         azi,
+                         ele);
         }
 
         if (send_cmd)
@@ -7925,7 +8206,7 @@ static gpointer rotctld_client_thread(gpointer data)
                                  "rotctld connection not verified; skipping %s to %s:%d",
                                  cmd_name,
                                  ctrl->conf ? ctrl->conf->host : "(null)",
-                                 ctrl->conf ? ctrl->conf->port : 0);
+                                 rotctld_effective_port(ctrl));
                     rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
                     rotctld_clear_rxbuf(ctrl);
                     g_mutex_lock(&ctrl->client.mutex);
@@ -7947,6 +8228,10 @@ static gpointer rotctld_client_thread(gpointer data)
 
                 g_mutex_lock(&ctrl->client.mutex);
                 ctrl->client.last_set_attempt_us = now_us;
+                ctrl->client.last_cmd_backend_az = azi;
+                ctrl->client.last_cmd_backend_el = ele;
+                ctrl->client.last_cmd_backend_valid = TRUE;
+                ctrl->client.force_pending = FALSE;
                 g_mutex_unlock(&ctrl->client.mutex);
 
                 gint rprt_code = 0;
@@ -8076,7 +8361,11 @@ static gpointer rotctld_client_thread(gpointer data)
                     ctrl->client.last_cmd_ok_el = ele;
                     ctrl->client.last_cmd_ok_us = now_us;
                     ctrl->client.last_cmd_backend_az = azi;
+                    ctrl->client.last_cmd_backend_el = ele;
                     ctrl->client.last_cmd_backend_valid = TRUE;
+                    ctrl->client.move_grace_until_us =
+                        now_us + ((gint64)ROT_CMD_MOVE_GRACE_MS * 1000);
+                    ctrl->client.discrepancy_pending = FALSE;
                 }
                 if (clear_trg)
                     ctrl->client.new_trg = FALSE;
@@ -8248,18 +8537,22 @@ static gpointer rotctld_client_thread(gpointer data)
                     gdouble user_az = rot_az_to_conf(ctrl->conf, world_az);
 
                     g_mutex_lock(&ctrl->client.mutex);
+                    gint64 pos_now_us = g_get_monotonic_time();
                     ctrl->client.azi_mech_in = mech_az;
                     ctrl->client.ele_mech_in = mech_el;
                     ctrl->client.azi_in = user_az;
                     ctrl->client.azi_az360 = gp_backend_to_az360(cur_az);
                     ctrl->client.ele_in = world_el;
+                    ctrl->client.last_pos_user_az = user_az;
+                    ctrl->client.last_pos_user_el = world_el;
+                    ctrl->client.last_pos_sample_us = pos_now_us;
                     ctrl->client.pos_valid = TRUE;
                     ctrl->client.pos_invalid = FALSE;
                     ctrl->client.pos_unknown = FALSE;
                     ctrl->client.pos_cmd_ok = TRUE;
                     ctrl->client.handshake_pos_ok = TRUE;
                     ctrl->client.first_pos_deadline_us = 0;
-                    ctrl->client.last_pos_us = g_get_monotonic_time();
+                    ctrl->client.last_pos_us = pos_now_us;
                     ctrl->client.last_pos_error[0] = '\0';
                     g_mutex_unlock(&ctrl->client.mutex);
                     rotctld_note_io_ok(ctrl);
@@ -8425,6 +8718,164 @@ static gpointer rotctld_client_thread(gpointer data)
                                          pos_failures,
                                          ROTCTLD_POS_MAX_FAIL,
                                          delay_sec);
+                }
+
+                if (!feedback_disabled)
+                {
+                    gboolean have_last_cmd =
+                        last_cmd_backend_valid || (last_cmd_ok_us > 0);
+                    gdouble cmd_az =
+                        last_cmd_backend_valid ? last_cmd_backend_az : last_cmd_ok_az;
+                    gdouble cmd_el =
+                        last_cmd_backend_valid ? last_cmd_backend_el : last_cmd_ok_el;
+                    gboolean discrepancy_hit = FALSE;
+                    const gchar *disc_reason = NULL;
+                    gdouble err_deg = 0.0;
+
+                    if (pos_res != ROTCTLD_POS_OK)
+                    {
+                        discrepancy_hit = TRUE;
+                        if (pos_timeout)
+                            disc_reason = "pos_timeout";
+                        else if (pos_rprt_err)
+                            disc_reason = "pos_rprt";
+                        else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
+                            disc_reason = "pos_parse";
+                        else
+                            disc_reason = "pos_fail";
+                    }
+                    else if (have_last_cmd)
+                    {
+                        gdouble az_err = fabs(shortest_az_delta(cur_az, cmd_az));
+                        gdouble el_err = fabs(cur_el - cmd_el);
+                        gdouble aim_deadband =
+                            (ctrl->threshold > 0.0) ? ctrl->threshold : 0.10;
+                        gdouble accept =
+                            MAX(aim_deadband * 2.0, 0.5);
+                        gint64 grace_until = 0;
+                        gdouble last_err = 0.0;
+                        gint64 last_err_time = 0;
+                        guint wrong_way = 0;
+
+                        err_deg = MAX(az_err, el_err);
+
+                        g_mutex_lock(&ctrl->client.mutex);
+                        grace_until = ctrl->client.move_grace_until_us;
+                        last_err = ctrl->client.last_err_to_cmd;
+                        last_err_time = ctrl->client.last_err_time_us;
+                        wrong_way = ctrl->client.wrong_way_count;
+                        g_mutex_unlock(&ctrl->client.mutex);
+
+                        if (now_us < grace_until)
+                        {
+                            last_err_time = now_us;
+                            wrong_way = 0;
+                        }
+                        else if (err_deg <= accept)
+                        {
+                            last_err_time = now_us;
+                            wrong_way = 0;
+                        }
+                        else
+                        {
+                            if (last_err_time == 0)
+                                last_err_time = now_us;
+                            if (last_err > 0.0)
+                            {
+                                if (err_deg <= (last_err - 0.1))
+                                {
+                                    last_err_time = now_us;
+                                    wrong_way = 0;
+                                }
+                                else if (err_deg >= (last_err + 0.1))
+                                {
+                                    if (wrong_way < G_MAXUINT)
+                                        wrong_way++;
+                                }
+                            }
+                            if ((now_us - last_err_time) >=
+                                ((gint64)ROT_CMD_STUCK_TIMEOUT_MS * 1000))
+                            {
+                                discrepancy_hit = TRUE;
+                                disc_reason = "stuck";
+                            }
+                            else if (wrong_way >= 3)
+                            {
+                                discrepancy_hit = TRUE;
+                                disc_reason = "wrong_way";
+                            }
+                        }
+
+                        g_mutex_lock(&ctrl->client.mutex);
+                        ctrl->client.last_err_to_cmd = err_deg;
+                        ctrl->client.last_err_time_us = last_err_time;
+                        ctrl->client.wrong_way_count = wrong_way;
+                        g_mutex_unlock(&ctrl->client.mutex);
+                    }
+                    else
+                    {
+                        g_mutex_lock(&ctrl->client.mutex);
+                        ctrl->client.last_err_to_cmd = 0.0;
+                        ctrl->client.last_err_time_us = 0;
+                        ctrl->client.wrong_way_count = 0;
+                        g_mutex_unlock(&ctrl->client.mutex);
+                    }
+
+                    if (discrepancy_hit)
+                    {
+                        guint streak = 0;
+                        g_mutex_lock(&ctrl->client.mutex);
+                        if (ctrl->client.discrepancy_streak < G_MAXUINT)
+                            ctrl->client.discrepancy_streak++;
+                        ctrl->client.discrepancy_pending = TRUE;
+                        streak = ctrl->client.discrepancy_streak;
+                        g_mutex_unlock(&ctrl->client.mutex);
+
+                        sat_log_log(SAT_LOG_LEVEL_WARN,
+                                    "rot discrepancy: reason=%s streak=%u err=%.2f",
+                                    disc_reason ? disc_reason : "unknown",
+                                    streak,
+                                    err_deg);
+                        rot_term_log(ctrl, "gpredict:warn",
+                                     "rot discrepancy: reason=%s streak=%u err=%.2f",
+                                     disc_reason ? disc_reason : "unknown",
+                                     streak,
+                                     err_deg);
+
+                        if (streak >= ROT_CMD_DISCREPANCY_STRIKES &&
+                            !rotctld_stop_requested(ctrl))
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_ERROR,
+                                        "rot discrepancy: %u consecutive discrepancies; disconnecting",
+                                        streak);
+                            rot_term_log(ctrl, "gpredict:err",
+                                         "rot discrepancy: %u consecutive discrepancies; disconnecting",
+                                         streak);
+                            g_mutex_lock(&ctrl->client.mutex);
+                            g_strlcpy(ctrl->client.io_error_reason,
+                                      "3 consecutive discrepancies",
+                                      sizeof(ctrl->client.io_error_reason));
+                            g_mutex_unlock(&ctrl->client.mutex);
+                            rotctld_request_thread_stop(ctrl, TRUE);
+                        }
+                    }
+                    else
+                    {
+                        g_mutex_lock(&ctrl->client.mutex);
+                        ctrl->client.discrepancy_streak = 0;
+                        ctrl->client.discrepancy_pending = FALSE;
+                        g_mutex_unlock(&ctrl->client.mutex);
+                    }
+                }
+                else
+                {
+                    g_mutex_lock(&ctrl->client.mutex);
+                    ctrl->client.discrepancy_streak = 0;
+                    ctrl->client.discrepancy_pending = FALSE;
+                    ctrl->client.wrong_way_count = 0;
+                    ctrl->client.last_err_time_us = 0;
+                    ctrl->client.last_err_to_cmd = 0.0;
+                    g_mutex_unlock(&ctrl->client.mutex);
                 }
             }
 
@@ -10113,6 +10564,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             {
                 g_mutex_lock(&ctrl->client.mutex);
                 ctrl->client.last_cmd_backend_az = meas_backend_az;
+                ctrl->client.last_cmd_backend_el = meas_backend_el;
                 ctrl->client.last_cmd_backend_valid = TRUE;
                 g_mutex_unlock(&ctrl->client.mutex);
                 last_cmd_backend = meas_backend_az;
@@ -10268,6 +10720,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             if (!ctrl->client.last_cmd_backend_valid)
             {
                 ctrl->client.last_cmd_backend_az = meas_backend_az;
+                ctrl->client.last_cmd_backend_el = meas_backend_el;
                 ctrl->client.last_cmd_backend_valid = TRUE;
                 if (ctrl->verbose_logging)
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -11240,6 +11693,28 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 gate = ROT_CMD_ACTION_SUPPRESS;
                 reason = ROT_CMD_REASON_DEADBAND;
             }
+        }
+
+        if (g_mutex_trylock(&ctrl->client.mutex))
+        {
+            ctrl->client.desired_user_az = desired_user_az;
+            ctrl->client.desired_user_el = desired_user_el;
+            ctrl->client.desired_backend_az = cmdaz;
+            ctrl->client.desired_backend_el = cmdel;
+            ctrl->client.desired_raw_az = raw_cmd_az;
+            ctrl->client.desired_raw_el = raw_cmd_el;
+            ctrl->client.desired_valid = have_target;
+            ctrl->client.desired_allow = allow_send;
+            ctrl->client.desired_tracking = ctrl->tracking;
+            ctrl->client.desired_update_us = now_us;
+            ctrl->client.allow_send_no_pos = manual_override;
+            if (force_send && !ctrl->client.force_pending)
+            {
+                ctrl->client.force_pending = TRUE;
+                if (ctrl->force_next_send)
+                    ctrl->force_next_send = FALSE;
+            }
+            g_mutex_unlock(&ctrl->client.mutex);
         }
 
         if (allow_send && !send_ok && ctrl->verbose_logging)
@@ -12490,7 +12965,10 @@ static void rotctld_note_stop(GtkRotCtrl *ctrl, gint pid, const gchar *reason)
     ctrl->last_stop_reason = reason ? g_strdup(reason) : NULL;
 
     if (pid > 0 && ctrl->selected_child_pid == pid)
+    {
         ctrl->selected_child_pid = -1;
+        ctrl->selected_child_port = 0;
+    }
 }
 
 static void rotctld_log_exit(GtkRotCtrl *ctrl,
@@ -12541,7 +13019,10 @@ static void rotctld_log_exit(GtkRotCtrl *ctrl,
                  owner ? owner : "unknown");
 
     if (pid > 0 && ctrl->selected_child_pid == pid)
+    {
         ctrl->selected_child_pid = -1;
+        ctrl->selected_child_port = 0;
+    }
 
     g_free(stderr_tail);
 }
@@ -13413,6 +13894,63 @@ static GSList *rotctld_autodetect_filter_candidates(GSList *candidates,
     return g_slist_sort(filtered, rotctld_autodetect_compare_candidates);
 }
 
+static gint rotctld_pick_ephemeral_port(gint avoid_port)
+{
+    gint selected = -1;
+
+    for (gint attempt = 0; attempt < 5; attempt++)
+    {
+        GSocket *sock = NULL;
+        GInetAddress *addr = NULL;
+        GSocketAddress *sockaddr = NULL;
+        GSocketAddress *local = NULL;
+        GError *error = NULL;
+        gint port = -1;
+
+        sock = g_socket_new(G_SOCKET_FAMILY_IPV4,
+                            G_SOCKET_TYPE_STREAM,
+                            G_SOCKET_PROTOCOL_TCP,
+                            &error);
+        if (sock == NULL)
+        {
+            g_clear_error(&error);
+            continue;
+        }
+
+        addr = g_inet_address_new_from_string("127.0.0.1");
+        sockaddr = g_inet_socket_address_new(addr, 0);
+        g_object_unref(addr);
+
+        if (!g_socket_bind(sock, sockaddr, FALSE, &error))
+        {
+            g_clear_error(&error);
+            g_object_unref(sockaddr);
+            g_object_unref(sock);
+            continue;
+        }
+
+        local = g_socket_get_local_address(sock, &error);
+        if (local != NULL && G_IS_INET_SOCKET_ADDRESS(local))
+        {
+            port = (gint) g_inet_socket_address_get_port(
+                G_INET_SOCKET_ADDRESS(local));
+        }
+        g_clear_error(&error);
+        g_clear_object(&local);
+        g_object_unref(sockaddr);
+        g_socket_close(sock, NULL);
+        g_object_unref(sock);
+
+        if (port > 0 && port != avoid_port)
+        {
+            selected = port;
+            break;
+        }
+    }
+
+    return selected;
+}
+
 static GSList *rotctld_autodetect_prefer_device(GSList *list,
                                                 const gchar *device)
 {
@@ -13581,28 +14119,56 @@ static void rotctld_autodetect_log_candidate(GtkRotCtrl *ctrl,
                                              gint baud)
 {
     gint64 now_us = g_get_monotonic_time();
+    gint port = state ? state->autodetect_port : 0;
+    gint model = 0;
 
     if (device == NULL || *device == '\0')
         return;
 
     if (state)
+    {
         state->autodetect_candidate_start_us = now_us;
+        if (state->autodetect_attempts == NULL)
+            state->autodetect_attempts = g_string_new(NULL);
+        if (state->autodetect_attempts->len > 0)
+            g_string_append(state->autodetect_attempts, ", ");
+        if (baud > 0)
+            g_string_append_printf(state->autodetect_attempts,
+                                   "%s@%d:%d", device, baud, port);
+        else
+            g_string_append_printf(state->autodetect_attempts,
+                                   "%s:%d", device, port);
+    }
+
+    if (ctrl && ctrl->conf)
+        model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+
+    rot_term_log(ctrl, "gpredict:rx",
+                 "rotor probe: trying device=%s tcp_port=%d",
+                 device, port);
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotor probe: trying device=%s tcp_port=%d",
+                device, port);
 
     if (baud > 0)
         rot_term_log(ctrl, "gpredict:rx",
-                     "autodetect: candidate %s baud=%d",
-                     device, baud);
+                     "autodetect attempt=%llu candidate %s baud=%d port=%d model=%d",
+                     (unsigned long long)(state ? state->autodetect_generation : 0),
+                     device, baud, port, model);
     else
         rot_term_log(ctrl, "gpredict:rx",
-                     "autodetect: candidate %s",
-                     device);
+                     "autodetect attempt=%llu candidate %s port=%d model=%d",
+                     (unsigned long long)(state ? state->autodetect_generation : 0),
+                     device, port, model);
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
-                "autodetect[%llu:%llu] candidate device=%s baud=%d ts=%.3fs",
+                "autodetect[%llu:%llu] candidate device=%s baud=%d port=%d model=%d ts=%.3fs",
                 (unsigned long long) (state ? state->generation : 0),
                 (unsigned long long) (state ? state->autodetect_generation : 0),
                 device,
                 baud,
+                port,
+                model,
                 now_us / 1000000.0);
 }
 
@@ -13795,23 +14361,27 @@ static void rotctld_autodetect_apply_success(GtkRotCtrl *ctrl,
 
     if (state->autodetect_baud > 0)
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "%s: autodetect selected device %s (validated) baud=%d",
+                    "%s: autodetect selected device %s (validated) baud=%d port=%d",
                     __func__,
                     state->autodetect_device,
-                    state->autodetect_baud);
+                    state->autodetect_baud,
+                    state->autodetect_port);
     else
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "%s: autodetect selected device %s (validated)",
-                    __func__, state->autodetect_device);
+                    "%s: autodetect selected device %s (validated) port=%d",
+                    __func__, state->autodetect_device,
+                    state->autodetect_port);
     if (state->autodetect_baud > 0)
         rot_term_log(ctrl, "gpredict:rx",
-                     "autodetect: selected %s (validated) baud=%d",
+                     "autodetect: selected %s (validated) baud=%d port=%d",
                      state->autodetect_device,
-                     state->autodetect_baud);
+                     state->autodetect_baud,
+                     state->autodetect_port);
     else
         rot_term_log(ctrl, "gpredict:rx",
-                     "autodetect: selected %s (validated)",
-                     state->autodetect_device);
+                     "autodetect: selected %s (validated) port=%d",
+                     state->autodetect_device,
+                     state->autodetect_port);
 
     if (state->autodetect_start_us > 0)
         total_ms = (now_us - state->autodetect_start_us) / 1000.0;
@@ -13825,6 +14395,7 @@ static void rotctld_autodetect_apply_success(GtkRotCtrl *ctrl,
         pid = rotctld_mgr_pid(ctrl->rotctld_mgr);
 
     ctrl->selected_child_pid = pid;
+    ctrl->selected_child_port = state->autodetect_port;
     state->scanning_child_pid = -1;
     state->scanning_child_validated = FALSE;
     state->spawned = FALSE;
@@ -13885,6 +14456,12 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
     g_free(state->last_good_device);
     state->last_good_device = NULL;
     state->last_good_baud = 0;
+    state->autodetect_port = 0;
+    if (state->autodetect_attempts)
+    {
+        g_string_free(state->autodetect_attempts, TRUE);
+        state->autodetect_attempts = NULL;
+    }
     state->autodetect_limited = FALSE;
     if (state->autodetect_list_full)
     {
@@ -13956,6 +14533,12 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
     filtered_list = rotctld_autodetect_join_list(state->autodetect_list);
     if (filtered_list != NULL)
     {
+        rot_term_log(ctrl, "gpredict:rx",
+                     "rotor probe: enumerated devices: %s",
+                     filtered_list);
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rotor probe: enumerated devices: %s",
+                    filtered_list);
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "autodetect list=%s prefer=%s",
                     filtered_list,
@@ -13965,6 +14548,13 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
                              filtered_list,
                              prefer_cu ? "cu" : "tty");
         g_free(filtered_list);
+    }
+    else
+    {
+        rot_term_log(ctrl, "gpredict:rx",
+                     "rotor probe: enumerated devices: (none)");
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rotor probe: enumerated devices: (none)");
     }
 }
 
@@ -14014,6 +14604,8 @@ static void rotctld_probe_state_finalize(RotctldProbeState *state)
     g_free(state->best_device);
     g_free(state->last_good_device);
     g_free(state->validate_reason);
+    if (state->autodetect_attempts)
+        g_string_free(state->autodetect_attempts, TRUE);
     g_free(state);
 }
 
@@ -14056,6 +14648,8 @@ static void rotctld_probe_cancel(GtkRotCtrl *ctrl)
     if (ctrl->rotctld_probe_state)
     {
         RotctldProbeState *state = ctrl->rotctld_probe_state;
+        if (state->spawned && ctrl->rotctld_mgr)
+            rotctld_process_stop_async(ctrl, "probe_cancel");
         state->cancelled = TRUE;
         rotctld_probe_state_detach(state);
         rotctld_probe_state_unref(state);
@@ -14131,6 +14725,16 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->client.last_cmd_ok_us = 0;
     ctrl->client.last_cmd_backend_az = 0.0;
     ctrl->client.last_cmd_backend_valid = FALSE;
+    ctrl->client.last_pos_user_az = 0.0;
+    ctrl->client.last_pos_user_el = 0.0;
+    ctrl->client.last_pos_sample_us = 0;
+    ctrl->client.last_err_to_cmd = 0.0;
+    ctrl->client.last_err_time_us = 0;
+    ctrl->client.move_grace_until_us = 0;
+    ctrl->client.discrepancy_streak = 0;
+    ctrl->client.wrong_way_count = 0;
+    ctrl->client.discrepancy_pending = FALSE;
+    ctrl->client.feedback_disabled_logged = FALSE;
     g_mutex_unlock(&ctrl->client.mutex);
 
     ctrl->last_cmd_az360 = 0.0;
@@ -14245,7 +14849,7 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     rot_term_log(ctrl, "gpredict:rx",
                  "rotctld engage started %s:%d",
                  ctrl->conf ? ctrl->conf->host : "(null)",
-                 ctrl->conf ? ctrl->conf->port : 0);
+                 rotctld_effective_port(ctrl));
 }
 
 static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
@@ -14262,6 +14866,7 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     ctrl->az_hold_active = FALSE;
     ctrl->az_hold_value = 0.0;
     ctrl->axis_swap_warned = FALSE;
+    ctrl->selected_child_port = 0;
     g_mutex_lock(&ctrl->client.mutex);
     ctrl->client.send_quit = FALSE;
     g_mutex_unlock(&ctrl->client.mutex);
@@ -14277,6 +14882,7 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
 static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
                                         const gchar *device_override,
                                         gint baud_override,
+                                        gint port_override,
                                         gchar **spawn_summary_out)
 {
     gchar *device = NULL;
@@ -14284,6 +14890,7 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
     gboolean auto_picked = FALSE;
     const gchar *env_cmd = g_getenv("GPREDICT_ROTCTLD_CMD");
     gchar **argv = NULL;
+    gint port = 0;
 
     if (spawn_summary_out)
         *spawn_summary_out = NULL;
@@ -14379,6 +14986,7 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
         if (ctrl->rotctld_mgr)
             rotctld_process_stop(ctrl);
 
+        port = port_override > 0 ? port_override : ctrl->conf->port;
         if (spawn_summary_out)
         {
             const gchar *bind_host = rotctld_bind_host(ctrl->conf->host);
@@ -14386,7 +14994,7 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
                 g_strdup_printf("rotctld -m %d -r %s -s %d -C timeout=1200 -T %s -t %d",
                                 model, device, baud,
                                 bind_host ? bind_host : "",
-                                ctrl->conf->port);
+                                port);
         }
         if (spawn_summary_out && *spawn_summary_out)
             rot_term_log_verbose(ctrl, "gpredict:tx",
@@ -14398,7 +15006,7 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
                     rot_protocol_model_name(ctrl->conf->protocol));
         ctrl->rotctld_mgr =
             rotctld_mgr_spawn(ctrl->conf->host,
-                              ctrl->conf->port,
+                              port,
                               model,
                               device,
                               baud,
@@ -14443,6 +15051,86 @@ typedef struct {
     gint               retry_delay_ms;
     gint               settle_ms;
 } RotctldAutodetectWorker;
+
+static rotctld_pos_result_t
+rotctld_probe_position(const gchar *host,
+                       gint port,
+                       gint timeout_ms,
+                       gint retries,
+                       gint retry_delay_ms,
+                       gint *rprt_out,
+                       gchar **reason_out)
+{
+    RotctldClient *probe = NULL;
+    gchar *errmsg = NULL;
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+    rotctld_pos_result_t res = ROTCTLD_POS_IO_ERR;
+    gint rprt = 0;
+    const gchar *bind_host = NULL;
+
+    if (rprt_out)
+        *rprt_out = 0;
+    if (reason_out)
+        *reason_out = NULL;
+
+    probe = rotctld_client_new("rotctld-probe");
+    if (probe == NULL)
+    {
+        if (reason_out)
+            *reason_out = g_strdup("alloc");
+        return ROTCTLD_POS_IO_ERR;
+    }
+
+    bind_host = rotctld_bind_host(host);
+    if (!rotctld_client_connect(probe,
+                                bind_host ? bind_host : host,
+                                port,
+                                timeout_ms,
+                                &errmsg))
+    {
+        if (reason_out)
+            *reason_out = g_strdup_printf("connect: %s",
+                                          errmsg ? errmsg : "failed");
+        g_free(errmsg);
+        rotctld_client_free(&probe);
+        return ROTCTLD_POS_IO_ERR;
+    }
+
+    res = rotctld_client_get_position_timed(probe,
+                                            timeout_ms,
+                                            retries,
+                                            retry_delay_ms,
+                                            &az,
+                                            &el,
+                                            &rprt);
+    if (rprt_out)
+        *rprt_out = rprt;
+    if (reason_out)
+    {
+        switch (res)
+        {
+        case ROTCTLD_POS_OK:
+            break;
+        case ROTCTLD_POS_RPRT_ERR:
+            *reason_out = g_strdup_printf("rprt %d", rprt);
+            break;
+        case ROTCTLD_POS_PARSE_FAIL:
+            *reason_out = g_strdup("parse_fail");
+            break;
+        case ROTCTLD_POS_TIMEOUT:
+            *reason_out = g_strdup("timeout");
+            break;
+        case ROTCTLD_POS_IO_ERR:
+        default:
+            *reason_out = g_strdup("io_error");
+            break;
+        }
+    }
+
+    rotctld_client_free(&probe);
+    return res;
+}
 
 static gboolean rotctld_autodetect_worker_done_cb(gpointer data)
 {
@@ -14642,6 +15330,13 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
         }
         if (state->autodetect_baud_index == 0)
             rotctld_autodetect_reset_baud(state, ctrl->conf);
+        state->autodetect_port = rotctld_pick_ephemeral_port(ctrl->conf->port);
+        if (state->autodetect_port <= 0)
+        {
+            rot_term_log(ctrl, "gpredict:err",
+                         "autodetect failed: unable to reserve probe port");
+            return ROTCTLD_AUTODETECT_STEP_FAIL;
+        }
         state->autodetect_generation++;
         state->non_rotctld_count = 0;
         rotctld_autodetect_log_candidate(ctrl, state,
@@ -14685,12 +15380,28 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             return ROTCTLD_AUTODETECT_STEP_CONTINUE;
         }
 
+        if (state->autodetect_port <= 0)
+        {
+            state->autodetect_port = rotctld_pick_ephemeral_port(ctrl->conf->port);
+            if (state->autodetect_port <= 0)
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "autodetect failed: unable to reserve probe port");
+                rotctld_autodetect_transition(ctrl, state,
+                                              ROTCTLD_AUTODETECT_ABORT,
+                                              "port_alloc_fail");
+                return ROTCTLD_AUTODETECT_STEP_FAIL;
+            }
+        }
+
         if (state->autodetect_port_free_deadline_us == 0)
             state->autodetect_port_free_deadline_us =
                 now_us + ((gint64) ROTCTLD_AUTODETECT_PORT_FREE_TIMEOUT_MS * 1000);
 
         result = rotctld_probe_identity(ctrl->conf->host,
-                                        ctrl->conf->port,
+                                        state->autodetect_port > 0
+                                            ? state->autodetect_port
+                                            : rotctld_effective_port(ctrl),
                                         ROTCTLD_AUTODETECT_TICK_MS,
                                         &first_line,
                                         &full_text);
@@ -14721,6 +15432,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             rotctld_spawn_autostart(ctrl,
                                     state->autodetect_device,
                                     state->autodetect_baud,
+                                    state->autodetect_port,
                                     &state->spawn_summary);
         if (!state->spawned)
         {
@@ -14786,7 +15498,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             return ROTCTLD_AUTODETECT_STEP_CONTINUE;
 
         result = rotctld_probe_identity(ctrl->conf->host,
-                                        ctrl->conf->port,
+                                        state->autodetect_port > 0
+                                            ? state->autodetect_port
+                                            : rotctld_effective_port(ctrl),
                                         ROTCTLD_AUTODETECT_TICK_MS,
                                         &first_line,
                                         &full_text);
@@ -14794,7 +15508,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
         rot_term_log_verbose(ctrl, "gpredict:rx",
                              "autodetect probe host=%s port=%d result=%s first_line=%s",
                              ctrl->conf ? ctrl->conf->host : "(null)",
-                             ctrl->conf ? ctrl->conf->port : 0,
+                             state->autodetect_port > 0
+                                 ? state->autodetect_port
+                                 : rotctld_effective_port(ctrl),
                              rotctld_probe_result_name(result),
                              trunc ? trunc : "(none)");
         g_free(trunc);
@@ -14813,7 +15529,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                              "rotctld model mismatch (expected %d, got %d) at %s:%d",
                              desired_model, detected_model,
                              ctrl->conf ? ctrl->conf->host : "(null)",
-                             ctrl->conf ? ctrl->conf->port : 0);
+                             state->autodetect_port > 0
+                                 ? state->autodetect_port
+                                 : rotctld_effective_port(ctrl));
                 if (state->spawned)
                     rotctld_autodetect_stop_child(ctrl, state,
                                                   "autodetect_model_mismatch");
@@ -14848,12 +15566,16 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
         {
             rot_term_log(ctrl, "gpredict:err",
                          "Port %d already in use by non-rotctld service (host=%s, probe=%s)",
-                         ctrl->conf ? ctrl->conf->port : 0,
+                         state->autodetect_port > 0
+                             ? state->autodetect_port
+                             : rotctld_effective_port(ctrl),
                          ctrl->conf ? ctrl->conf->host : "(null)",
                          rotctld_probe_result_name(result));
             rot_schedule_wrong_daemon(ctrl,
                                       ctrl->conf ? ctrl->conf->host : NULL,
-                                      ctrl->conf ? ctrl->conf->port : 0);
+                                      state->autodetect_port > 0
+                                          ? state->autodetect_port
+                                          : rotctld_effective_port(ctrl));
             if (state->spawned)
                 rotctld_autodetect_stop_child(ctrl, state,
                                               "autodetect_non_rotctld");
@@ -14867,7 +15589,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             rot_term_log(ctrl, "gpredict:err",
                          "autodetect: tcp_deadline host=%s port=%d (spawn: %s)",
                          ctrl->conf ? ctrl->conf->host : "(null)",
-                         ctrl->conf ? ctrl->conf->port : 0,
+                         state->autodetect_port > 0
+                             ? state->autodetect_port
+                             : rotctld_effective_port(ctrl),
                          state->spawn_summary ? state->spawn_summary : "unknown");
             rotctld_autodetect_transition(ctrl, state,
                                           ROTCTLD_AUTODETECT_FAIL_NEXT,
@@ -14914,7 +15638,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             worker->generation = state->generation;
             worker->autodetect_generation = state->autodetect_generation;
             worker->host = g_strdup(ctrl->conf->host);
-            worker->port = ctrl->conf->port;
+            worker->port = state->autodetect_port > 0
+                           ? state->autodetect_port
+                           : rotctld_effective_port(ctrl);
             worker->timeout_ms = state->validate_timeout_ms;
             worker->retries = state->validate_retries;
             worker->retry_delay_ms = state->validate_retry_delay_ms;
@@ -14989,27 +15715,36 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                             saw_timeout ? 1 : 0,
                             elapsed_ms);
                 rot_term_log(ctrl, "gpredict:rx",
-                             "autodetect: candidate ok: %s baud=%d (%.0fms)",
+                             "autodetect: candidate ok: %s baud=%d port=%d (%.0fms)",
                              state->autodetect_device,
                              state->autodetect_baud,
+                             state->autodetect_port,
                              elapsed_ms);
+                rot_term_log(ctrl, "gpredict:rx",
+                             "rotor probe: device=%s SUCCESS",
+                             state->autodetect_device);
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            "rotor probe: device=%s SUCCESS",
+                            state->autodetect_device);
 
                 if (state->scanning_child_pid > 0)
                     pid = state->scanning_child_pid;
                 else if (ctrl->rotctld_mgr)
                     pid = rotctld_mgr_pid(ctrl->rotctld_mgr);
                 rot_term_log(ctrl, "gpredict:rx",
-                             "autodetect: VALIDATE_IO OK -> SUCCESS selected pid=%d dev=%s baud=%d",
+                             "autodetect: VALIDATE_IO OK -> SUCCESS selected pid=%d dev=%s baud=%d port=%d",
                              pid,
                              state->autodetect_device ? state->autodetect_device : "(null)",
-                             state->autodetect_baud);
+                             state->autodetect_baud,
+                             state->autodetect_port);
                 sat_log_log(SAT_LOG_LEVEL_INFO,
-                            "autodetect[%llu:%llu] VALIDATE_IO OK -> SUCCESS selected pid=%d dev=%s baud=%d",
+                            "autodetect[%llu:%llu] VALIDATE_IO OK -> SUCCESS selected pid=%d dev=%s baud=%d port=%d",
                             (unsigned long long) state->generation,
                             (unsigned long long) state->autodetect_generation,
                             pid,
                             state->autodetect_device ? state->autodetect_device : "(null)",
-                            state->autodetect_baud);
+                            state->autodetect_baud,
+                            state->autodetect_port);
 
                 state->scanning_child_validated = TRUE;
                 g_free(reason);
@@ -15032,17 +15767,40 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
 
                 if (state->autodetect_baud > 0)
                     rot_term_log(ctrl, "gpredict:err",
-                                 "autodetect: candidate failed: %s baud=%d (%s, %.0fms)",
+                                 "autodetect: candidate failed: %s baud=%d port=%d (%s, %.0fms)",
                                  state->autodetect_device,
                                  state->autodetect_baud,
+                                 state->autodetect_port,
                                  reason ? reason : "unknown",
                                  elapsed_ms);
                 else
                     rot_term_log(ctrl, "gpredict:err",
-                                 "autodetect: candidate failed: %s (%s, %.0fms)",
+                                 "autodetect: candidate failed: %s port=%d (%s, %.0fms)",
                                  state->autodetect_device,
+                                 state->autodetect_port,
                                  reason ? reason : "unknown",
                                  elapsed_ms);
+
+                if (dump_ok)
+                {
+                    rot_term_log(ctrl, "gpredict:err",
+                                 "rotor probe: device=%s get_position failed rprt=%d",
+                                 state->autodetect_device,
+                                 rprt);
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                "rotor probe: device=%s get_position failed rprt=%d",
+                                state->autodetect_device,
+                                rprt);
+                }
+                else
+                {
+                    rot_term_log(ctrl, "gpredict:err",
+                                 "rotor probe: device=%s dump_state failed",
+                                 state->autodetect_device);
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                "rotor probe: device=%s dump_state failed",
+                                state->autodetect_device);
+                }
 
                 sat_log_log(SAT_LOG_LEVEL_WARN,
                             "autodetect[%llu:%llu] candidate failed reason=%s rprt=%d res=%d time=%.1fms",
@@ -15134,6 +15892,16 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             g_free(state->autodetect_device);
             state->autodetect_device = rotctld_autodetect_next_device(state);
             rotctld_autodetect_reset_baud(state, ctrl->conf);
+            state->autodetect_port = rotctld_pick_ephemeral_port(ctrl->conf->port);
+            if (state->autodetect_port <= 0)
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "autodetect failed: unable to reserve probe port");
+                rotctld_autodetect_transition(ctrl, state,
+                                              ROTCTLD_AUTODETECT_ABORT,
+                                              "port_alloc_fail");
+                return ROTCTLD_AUTODETECT_STEP_FAIL;
+            }
             state->spawn_attempted = FALSE;
             state->spawned = FALSE;
             g_free(state->spawn_summary);
@@ -15204,7 +15972,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                 now_us + ((gint64) ROTCTLD_AUTODETECT_PORT_FREE_TIMEOUT_MS * 1000);
 
         result = rotctld_probe_identity(ctrl->conf->host,
-                                        ctrl->conf->port,
+                                        state->autodetect_port > 0
+                                            ? state->autodetect_port
+                                            : rotctld_effective_port(ctrl),
                                         ROTCTLD_AUTODETECT_TICK_MS,
                                         &first_line,
                                         &full_text);
@@ -15227,6 +15997,16 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             state->autodetect_port_free_deadline_us = 0;
             state->autodetect_generation++;
             state->non_rotctld_count = 0;
+            state->autodetect_port = rotctld_pick_ephemeral_port(ctrl->conf->port);
+            if (state->autodetect_port <= 0)
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "autodetect failed: unable to reserve probe port");
+                rotctld_autodetect_transition(ctrl, state,
+                                              ROTCTLD_AUTODETECT_ABORT,
+                                              "port_alloc_fail");
+                return ROTCTLD_AUTODETECT_STEP_FAIL;
+            }
             rotctld_autodetect_log_candidate(ctrl, state,
                                              state->autodetect_device,
                                              state->autodetect_baud);
@@ -15251,6 +16031,16 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             state->autodetect_port_free_deadline_us = 0;
             state->autodetect_generation++;
             state->non_rotctld_count = 0;
+            state->autodetect_port = rotctld_pick_ephemeral_port(ctrl->conf->port);
+            if (state->autodetect_port <= 0)
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "autodetect failed: unable to reserve probe port");
+                rotctld_autodetect_transition(ctrl, state,
+                                              ROTCTLD_AUTODETECT_ABORT,
+                                              "port_alloc_fail");
+                return ROTCTLD_AUTODETECT_STEP_FAIL;
+            }
             rotctld_autodetect_log_candidate(ctrl, state,
                                              state->autodetect_device,
                                              state->autodetect_baud);
@@ -15305,6 +16095,16 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             state->autodetect_port_free_deadline_us = 0;
             state->autodetect_generation++;
             state->non_rotctld_count = 0;
+            state->autodetect_port = rotctld_pick_ephemeral_port(ctrl->conf->port);
+            if (state->autodetect_port <= 0)
+            {
+                rot_term_log(ctrl, "gpredict:err",
+                             "autodetect failed: unable to reserve probe port");
+                rotctld_autodetect_transition(ctrl, state,
+                                              ROTCTLD_AUTODETECT_ABORT,
+                                              "port_alloc_fail");
+                return ROTCTLD_AUTODETECT_STEP_FAIL;
+            }
             rotctld_autodetect_log_candidate(ctrl, state,
                                              state->autodetect_device,
                                              state->autodetect_baud);
@@ -15350,6 +16150,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
     gchar *trunc = NULL;
     gint probe_timeout_ms = 100;
     rotctld_autodetect_step_t autodetect_step = ROTCTLD_AUTODETECT_STEP_CONTINUE;
+    gint probe_port = 0;
 
     if (ctrl == NULL)
     {
@@ -15392,8 +16193,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
         return G_SOURCE_REMOVE;
     }
 
-    if (state->autodetect_state != ROTCTLD_AUTODETECT_IDLE &&
-        state->autodetect_state != ROTCTLD_AUTODETECT_ABORT)
+    if (state->autodetect_enabled)
     {
         autodetect_step = rotctld_autodetect_step(ctrl, state, now_us);
         if (autodetect_step == ROTCTLD_AUTODETECT_STEP_SUCCESS)
@@ -15406,8 +16206,31 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
         }
         if (autodetect_step == ROTCTLD_AUTODETECT_STEP_FAIL)
         {
+            gboolean reported = FALSE;
+            if (state->autodetect_attempts &&
+                state->autodetect_attempts->len > 0)
+            {
+                gint model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+                rot_term_log(ctrl, "gpredict:err",
+                             "rotor probe: failed; attempted: %s",
+                             state->autodetect_attempts->str);
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "rotor probe: failed; attempted: %s",
+                            state->autodetect_attempts->str);
+                gchar *detail = g_strdup_printf(
+                    _("Rotor probe failed: no compatible rotor response "
+                      "(dump_state + get_position). Model=%d. Tried: %s"),
+                    model,
+                    state->autodetect_attempts->str);
+                rot_show_message(ctrl,
+                                 GTK_MESSAGE_ERROR,
+                                 _("Rotor error"),
+                                 detail);
+                g_free(detail);
+                reported = TRUE;
+            }
             rotctld_probe_state_detach(state);
-            rotctld_fail_engage(ctrl, TRUE);
+            rotctld_fail_engage(ctrl, reported);
             rotctld_probe_state_unref(state);
             return G_SOURCE_REMOVE;
         }
@@ -15424,9 +16247,10 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
 
     state->attempt++;
     probe_timeout_ms = ROTCTLD_AUTODETECT_TICK_MS;
+    probe_port = rotctld_effective_port(ctrl);
 
     result = rotctld_probe_identity(ctrl->conf->host,
-                                    ctrl->conf->port,
+                                    probe_port,
                                     probe_timeout_ms,
                                     &first_line,
                                     &full_text);
@@ -15436,7 +16260,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
                  "probe #%u host=%s port=%d cmd=\\dump_state result=%s first_line=%s",
                  state->attempt,
                  ctrl->conf ? ctrl->conf->host : "(null)",
-                 ctrl->conf ? ctrl->conf->port : 0,
+                 probe_port,
                  rotctld_probe_result_name(result),
                  trunc ? trunc : "(none)");
     g_free(trunc);
@@ -15448,6 +16272,10 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
         gchar *line1 = NULL;
         gchar *line2 = NULL;
         gboolean have_model = FALSE;
+        rotctld_pos_result_t pos_res = ROTCTLD_POS_IO_ERR;
+        gint rprt = 0;
+        gchar *pos_reason = NULL;
+        gboolean pos_ok = FALSE;
 
         have_model = rotctld_extract_model(full_text, &detected_model);
         rotctld_extract_first_lines(full_text, &line1, &line2);
@@ -15464,7 +16292,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
                          "rotctld model mismatch (expected %d, got %d) at %s:%d line1=%s line2=%s",
                          desired_model, detected_model,
                          ctrl->conf ? ctrl->conf->host : "(null)",
-                         ctrl->conf ? ctrl->conf->port : 0,
+                         probe_port,
                          line1 ? line1 : "(none)",
                          line2 ? line2 : "(none)");
             sat_log_log(SAT_LOG_LEVEL_WARN,
@@ -15484,14 +16312,75 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
             return G_SOURCE_REMOVE;
         }
 
-        g_free(first_line);
-        g_free(full_text);
+        pos_res = rotctld_probe_position(ctrl->conf->host,
+                                         probe_port,
+                                         ROTCTLD_AUTODETECT_VALIDATE_TIMEOUT_MS,
+                                         ROTCTLD_AUTODETECT_VALIDATE_RETRIES,
+                                         ROTCTLD_AUTODETECT_VALIDATE_RETRY_DELAY_MS,
+                                         &rprt,
+                                         &pos_reason);
+        pos_ok = (pos_res == ROTCTLD_POS_OK);
+        if (!pos_ok)
+        {
+            rot_term_log(ctrl, "gpredict:err",
+                         "rotctld probe get_position failed host=%s port=%d (%s rprt=%d)",
+                         ctrl->conf ? ctrl->conf->host : "(null)",
+                         probe_port,
+                         pos_reason ? pos_reason : "error",
+                         rprt);
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "rotctld probe get_position failed host=%s port=%d res=%d rprt=%d reason=%s",
+                        ctrl->conf ? ctrl->conf->host : "(null)",
+                        probe_port,
+                        pos_res,
+                        rprt,
+                        pos_reason ? pos_reason : "error");
+
+            if (pos_res == ROTCTLD_POS_RPRT_ERR ||
+                pos_res == ROTCTLD_POS_PARSE_FAIL)
+            {
+                if (pos_reason && *pos_reason)
+                {
+                    gchar *detail = g_strdup_printf("get_position failed: %s", pos_reason);
+                    rot_schedule_cmd_reject(ctrl, detail);
+                    g_free(detail);
+                }
+                else
+                {
+                    rot_schedule_cmd_reject(ctrl, NULL);
+                }
+                if (state->spawned && ctrl->rotctld_mgr)
+                    rotctld_process_stop_async(ctrl, "probe_pos_reject");
+
+                g_free(pos_reason);
+                g_free(first_line);
+                g_free(full_text);
+                g_free(line1);
+                g_free(line2);
+                rotctld_probe_state_detach(state);
+                rotctld_fail_engage(ctrl, TRUE);
+                rotctld_probe_state_unref(state);
+                return G_SOURCE_REMOVE;
+            }
+
+            result = ROTCTLD_PROBE_NOT_READY;
+        }
+
+        g_free(pos_reason);
+        if (pos_ok)
+        {
+            g_free(first_line);
+            g_free(full_text);
+            g_free(line1);
+            g_free(line2);
+            rotctld_probe_state_detach(state);
+            rotctld_finish_engage(ctrl);
+            rotctld_probe_state_unref(state);
+            return G_SOURCE_REMOVE;
+        }
+
         g_free(line1);
         g_free(line2);
-        rotctld_probe_state_detach(state);
-        rotctld_finish_engage(ctrl);
-        rotctld_probe_state_unref(state);
-        return G_SOURCE_REMOVE;
     }
 
     if (result == ROTCTLD_PROBE_NOT_ROTCTLD)
@@ -15516,12 +16405,12 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
     {
         rot_term_log(ctrl, "gpredict:err",
                      "Port %d already in use by non-rotctld service (host=%s, probe=%s)",
-                     ctrl->conf ? ctrl->conf->port : 0,
+                     probe_port,
                      ctrl->conf ? ctrl->conf->host : "(null)",
                      rotctld_probe_result_name(result));
         rot_schedule_wrong_daemon(ctrl,
                                   ctrl->conf ? ctrl->conf->host : NULL,
-                                  ctrl->conf ? ctrl->conf->port : 0);
+                                  probe_port);
         if (state->spawned)
             rotctld_process_stop_async(ctrl, "probe_non_rotctld");
         g_free(first_line);
@@ -15539,14 +16428,14 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
             rot_term_log(ctrl, "gpredict:err",
                          "rotctld did not bind port host=%s port=%d argv=%s",
                          ctrl->conf ? ctrl->conf->host : "(null)",
-                         ctrl->conf ? ctrl->conf->port : 0,
+                         probe_port,
                          state->spawn_summary ? state->spawn_summary : "unknown");
         }
 
         rot_term_log(ctrl, "gpredict:err",
                      "rotctld not reachable at %s:%d (spawn: %s)",
                      ctrl->conf ? ctrl->conf->host : "(null)",
-                     ctrl->conf ? ctrl->conf->port : 0,
+                     probe_port,
                      state->spawn_summary ? state->spawn_summary : "unknown");
         if (state->spawned)
             rotctld_process_stop_async(ctrl, "probe_tcp_deadline");
@@ -15620,7 +16509,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
         state->spawn_summary = NULL;
         state->spawn_attempted = TRUE;
         state->spawned =
-            rotctld_spawn_autostart(ctrl, NULL, 0, &state->spawn_summary);
+            rotctld_spawn_autostart(ctrl, NULL, 0, 0, &state->spawn_summary);
         if (!state->spawned)
         {
             g_free(first_line);
@@ -15878,6 +16767,15 @@ static gboolean rot_host_is_local(const gchar *host)
     return rotctld_mgr_host_is_local(host);
 }
 
+static gint rotctld_effective_port(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return 0;
+    if (ctrl->selected_child_port > 0)
+        return ctrl->selected_child_port;
+    return (ctrl->conf != NULL) ? ctrl->conf->port : 0;
+}
+
 /**
  * Ensure rotctld is running.
  *
@@ -15931,9 +16829,8 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
         return ROTCTLD_ENSURE_FAILED;
     }
 
-    if (ctrl->rotctld_mgr != NULL &&
-        !rotctld_mgr_is_running(ctrl->rotctld_mgr))
-        rotctld_process_stop_async(ctrl, "ensure_cleanup");
+    if (ctrl->rotctld_mgr != NULL)
+        rotctld_process_stop_async(ctrl, "probe_restart");
 
     if (ctrl->rotctld_probe_state)
         return ROTCTLD_ENSURE_PENDING;
@@ -15947,7 +16844,18 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
     state->delay_ms = 50;
     state->ref_count = 1;
     state->cancelled = FALSE;
-    state->autodetect_enabled = rotctld_should_autodetect(ctrl->conf);
+    if (ctrl->conf->host && *ctrl->conf->host &&
+        !rotctld_mgr_host_is_local(ctrl->conf->host))
+    {
+        rot_term_log(ctrl, "gpredict:err",
+                     "rotor probe requires local host for serial scan (host=%s)",
+                     ctrl->conf->host);
+        rot_show_conf_error(ctrl, _("Rotor probe requires a local host."));
+        rotctld_probe_state_unref(state);
+        return ROTCTLD_ENSURE_FAILED;
+    }
+
+    state->autodetect_enabled = TRUE;
     state->autodetect_state = ROTCTLD_AUTODETECT_IDLE;
     state->autodetect_generation = 0;
     state->autodetect_state_since_us = 0;
@@ -15984,6 +16892,8 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
     state->autodetect_candidate_start_us = 0;
     state->autodetect_list_full = NULL;
     state->autodetect_limited = FALSE;
+    state->autodetect_port = 0;
+    state->autodetect_attempts = NULL;
     state->spawn_summary = NULL;
 
     ctrl->rotctld_probe_state = state;
@@ -17724,6 +18634,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->rotctld_mgr = NULL;
     ctrl->verbose_logging = FALSE;
     ctrl->selected_child_pid = -1;
+    ctrl->selected_child_port = 0;
     ctrl->last_stop_pid = -1;
     ctrl->last_stop_reason = NULL;
     ctrl->last_stop_us = 0;
@@ -18607,6 +19518,17 @@ static gboolean rotctrl_autocal_queue_move(GtkRotCtrl *ctrl,
     ctrl->client.raw_azi_out = az;
     ctrl->client.raw_ele_out = el;
     ctrl->client.new_trg = TRUE;
+    ctrl->client.desired_user_az = az;
+    ctrl->client.desired_user_el = el;
+    ctrl->client.desired_backend_az = az;
+    ctrl->client.desired_backend_el = el;
+    ctrl->client.desired_raw_az = az;
+    ctrl->client.desired_raw_el = el;
+    ctrl->client.desired_valid = TRUE;
+    ctrl->client.desired_allow = TRUE;
+    ctrl->client.desired_tracking = FALSE;
+    ctrl->client.force_pending = TRUE;
+    ctrl->client.desired_update_us = g_get_monotonic_time();
     ctrl->client.allow_send_no_pos = TRUE;
     ctrl->client.use_setpos = FALSE;
     ctrl->client.apply_calib = FALSE;

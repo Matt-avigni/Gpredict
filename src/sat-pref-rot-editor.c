@@ -61,6 +61,7 @@ typedef struct {
     GtkWidget *minel_label;
     GtkWidget *maxel_label;
     GtkWidget *axismode;
+    GtkWidget *disable_pos_feedback;
     gboolean device_scan_in_progress;
     gboolean ui_updating;
     guint pending_ui_refresh_id;
@@ -887,6 +888,9 @@ static void update_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), conf->axis_mode,
                               G_CALLBACK(axismode_changed_cb));
     update_el_limits_sensitivity(ui);
+    if (ui->disable_pos_feedback)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback),
+                                     conf->disable_pos_feedback_checks);
 
     rot_pref_ui_end_update(ui, "update_widgets");
     rot_pref_update_ok_button(ui);
@@ -922,6 +926,9 @@ static void clear_widgets(RotPrefUi *ui)
     rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), ROT_AXIS_MODE_AZ_EL,
                               G_CALLBACK(axismode_changed_cb));
     update_el_limits_sensitivity(ui);
+    if (ui->disable_pos_feedback)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback),
+                                     FALSE);
 
     rot_pref_ui_end_update(ui, "clear_widgets");
     rot_pref_update_ok_button(ui);
@@ -1343,6 +1350,20 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     g_signal_connect(ui->maxel, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
+    gtk_grid_attach(GTK_GRID(table),
+                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                    0, 16, 4, 1);
+
+    ui->disable_pos_feedback =
+        gtk_check_button_new_with_label(_("Disable position feedback checks (no encoder)"));
+    gtk_widget_set_tooltip_text(ui->disable_pos_feedback,
+                                _("Allow sending commands even when no position feedback is available. "
+                                  "Disables position discrepancy disconnect logic."));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->disable_pos_feedback, 0, 17, 4, 1);
+    g_signal_connect(ui->disable_pos_feedback, "toggled",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+
 
     if (conf->name != NULL)
         update_widgets(ui, conf);
@@ -1442,6 +1463,11 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
 
     /* axis mode */
     conf->axis_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(ui->axismode));
+
+    /* position feedback checks */
+    if (ui->disable_pos_feedback)
+        conf->disable_pos_feedback_checks =
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback));
 
     /* axis inversion */
 

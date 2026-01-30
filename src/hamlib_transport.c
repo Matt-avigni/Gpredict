@@ -844,12 +844,20 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
 {
     gssize total = 0;
     gint err = 0;
+    gboolean locked = FALSE;
 
     if (err_out)
         *err_out = 0;
 
     if (transport == NULL || !hamlib_transport_is_ready(transport))
         return -1;
+
+    g_mutex_lock(&transport->io_lock);
+    while (transport->busy)
+        g_cond_wait(&transport->io_cond, &transport->io_lock);
+    transport->busy = TRUE;
+    locked = TRUE;
+    g_mutex_unlock(&transport->io_lock);
 
     if (idle_timeout_ms <= 0)
         idle_timeout_ms = 50;
@@ -880,15 +888,31 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
         total += size;
     }
 
+    if (locked)
+    {
+        g_mutex_lock(&transport->io_lock);
+        transport->busy = FALSE;
+        g_cond_signal(&transport->io_cond);
+        g_mutex_unlock(&transport->io_lock);
+    }
+
     return total;
 }
 
 gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
 {
     gssize total = 0;
+    gboolean locked = FALSE;
 
     if (transport == NULL || !hamlib_transport_is_ready(transport))
         return -1;
+
+    g_mutex_lock(&transport->io_lock);
+    while (transport->busy)
+        g_cond_wait(&transport->io_cond, &transport->io_lock);
+    transport->busy = TRUE;
+    locked = TRUE;
+    g_mutex_unlock(&transport->io_lock);
 
     if (transport->rxbuf)
         g_string_set_size(transport->rxbuf, 0);
@@ -913,6 +937,14 @@ gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
         }
 
         total += size;
+    }
+
+    if (locked)
+    {
+        g_mutex_lock(&transport->io_lock);
+        transport->busy = FALSE;
+        g_cond_signal(&transport->io_cond);
+        g_mutex_unlock(&transport->io_lock);
     }
 
     return total;
