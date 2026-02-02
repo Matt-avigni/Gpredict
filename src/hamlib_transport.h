@@ -23,6 +23,7 @@ typedef struct {
     gboolean used_multiline;
     gint     err;
     gint64   rtt_us;
+    gsize    bytes;
 } HamlibResponseInfo;
 
 HamlibTransport *hamlib_transport_new(void);

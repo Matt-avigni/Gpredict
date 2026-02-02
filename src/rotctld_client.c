@@ -16,6 +16,8 @@
 #define ROTCTLD_SETPOS_TIMEOUT_MS 1500
 #define ROTCTLD_SETPOS_RETRIES 1
 #define ROTCTLD_SETPOS_RETRY_DELAY_MS 100
+#define ROTCTLD_SETPOS_LOG_THROTTLE_US 1000000
+#define ROTCTLD_PARSE_DUMP_LIMIT 256
 
 struct _RotctldClient {
     HamlibTransport        *transport;
@@ -26,6 +28,8 @@ struct _RotctldClient {
     gint64                  last_failure_log_us;
     gint64                  last_parse_log_us;
     gchar                  *last_parse_class;
+    gint64                  last_setpos_empty_log_us;
+    gint64                  last_setpos_warn_log_us;
     gint64                  invalid_backoff_until_us;
     guint                   invalid_backoff_ms;
     gboolean                recovery_triggered;
@@ -145,6 +149,14 @@ static gboolean rotctld_client_parse_first_number(const gchar *line,
     return FALSE;
 }
 
+static gchar **rotctld_client_split_lines(const gchar *text)
+{
+    if (text == NULL)
+        return NULL;
+
+    return g_strsplit_set(text, "\r\n", -1);
+}
+
 static gboolean rotctld_client_line_parse_rprt(const gchar *line,
                                                gint *code_out)
 {
@@ -192,7 +204,7 @@ static void rotctld_client_parse_limits(RotCaps *caps, const gchar *text)
     if (caps == NULL || text == NULL || *text == '\0')
         return;
 
-    lines = g_strsplit(text, "\n", -1);
+    lines = rotctld_client_split_lines(text);
     for (gint i = 0; lines[i] != NULL; i++)
     {
         gchar *line = g_strstrip(lines[i]);
@@ -393,7 +405,7 @@ static gboolean rotctld_client_parse_pos(const gchar *text,
     if (text == NULL || *text == '\0')
         return FALSE;
 
-    gchar **lines = g_strsplit(text, "\n", -1);
+    gchar **lines = rotctld_client_split_lines(text);
     for (gint i = 0; lines[i] != NULL; i++)
     {
         gchar *line = g_strstrip(lines[i]);
@@ -551,6 +563,34 @@ static guint rotctld_client_count_lines(const gchar *text)
     return lines;
 }
 
+static const gchar *rotctld_client_read_mode_name(hamlib_read_mode_t mode)
+{
+    switch (mode)
+    {
+        case HAMLIB_READ_SINGLE:
+            return "single";
+        case HAMLIB_READ_MULTILINE_RPRT:
+            return "multiline_rprt";
+        case HAMLIB_READ_MULTILINE_IDLE:
+            return "multiline_idle";
+        default:
+            return "unknown";
+    }
+}
+
+static const gchar *rotctld_client_term_name(hamlib_term_t term)
+{
+    switch (term)
+    {
+        case HAMLIB_TERM_RPRT:
+            return "rprt";
+        case HAMLIB_TERM_RPRT_OR_DONE:
+            return "rprt_or_done";
+        default:
+            return "unknown";
+    }
+}
+
 static gboolean rotctld_client_scan_rprt(const gchar *reply, gint *code_out)
 {
     gchar **lines = NULL;
@@ -559,7 +599,7 @@ static gboolean rotctld_client_scan_rprt(const gchar *reply, gint *code_out)
     if (reply == NULL || *reply == '\0')
         return FALSE;
 
-    lines = g_strsplit(reply, "\n", -1);
+    lines = rotctld_client_split_lines(reply);
     for (gint i = 0; lines[i] != NULL; i++)
     {
         gint code = 0;
@@ -676,7 +716,7 @@ static gboolean rotctld_dump_state_first_line_is_one(const gchar *text)
     if (text == NULL || *text == '\0')
         return FALSE;
 
-    lines = g_strsplit(text, "\n", -1);
+    lines = rotctld_client_split_lines(text);
     for (gint i = 0; lines[i] != NULL; i++)
     {
         gchar *line = g_strstrip(lines[i]);
@@ -700,7 +740,7 @@ static gboolean rotctld_dump_state_has_done(const gchar *text)
     if (text == NULL || *text == '\0')
         return FALSE;
 
-    lines = g_strsplit(text, "\n", -1);
+    lines = rotctld_client_split_lines(text);
     for (gint i = 0; lines[i] != NULL; i++)
     {
         gchar *line = g_strstrip(lines[i]);
@@ -758,12 +798,98 @@ static void rotctld_client_log_failure(RotctldClient *client,
     g_free(snippet);
 }
 
+static void rotctld_client_build_reply_debug(const gchar *reply,
+                                             gsize *len_out,
+                                             gchar **printable_out,
+                                             gchar **hex_out)
+{
+    gsize len = 0;
+    gsize limit = 0;
+    GString *printable = NULL;
+    GString *hex = NULL;
+
+    if (len_out)
+        *len_out = 0;
+    if (printable_out)
+        *printable_out = NULL;
+    if (hex_out)
+        *hex_out = NULL;
+
+    if (reply == NULL || *reply == '\0')
+    {
+        if (printable_out)
+            *printable_out = g_strdup("(none)");
+        if (hex_out)
+            *hex_out = g_strdup("(none)");
+        return;
+    }
+
+    len = strlen(reply);
+    limit = MIN(len, (gsize)ROTCTLD_PARSE_DUMP_LIMIT);
+    printable = g_string_sized_new(limit * 2 + 8);
+    hex = g_string_sized_new(limit * 3 + 8);
+
+    for (gsize i = 0; i < limit; i++)
+    {
+        unsigned char c = (unsigned char)reply[i];
+
+        if (c == '\n')
+            g_string_append(printable, "\\n");
+        else if (c == '\r')
+            g_string_append(printable, "\\r");
+        else if (c == '\t')
+            g_string_append(printable, "\\t");
+        else if (g_ascii_isprint(c))
+            g_string_append_c(printable, (gchar)c);
+        else
+            g_string_append_c(printable, '.');
+
+        g_string_append_printf(hex, "%02X", c);
+        if (i + 1 < limit)
+            g_string_append_c(hex, ' ');
+    }
+
+    if (len > limit)
+        g_string_append(printable, "...");
+
+    if (len_out)
+        *len_out = len;
+    if (printable_out)
+        *printable_out = g_string_free(printable, FALSE);
+    else
+        g_string_free(printable, TRUE);
+    if (hex_out)
+        *hex_out = g_string_free(hex, FALSE);
+    else
+        g_string_free(hex, TRUE);
+}
+
+static gboolean rotctld_client_rate_limit(gint64 *last_us,
+                                          gint64 throttle_us)
+{
+    gint64 now_us = g_get_monotonic_time();
+
+    if (last_us != NULL &&
+        *last_us > 0 &&
+        (now_us - *last_us) < throttle_us)
+        return FALSE;
+
+    if (last_us != NULL)
+        *last_us = now_us;
+
+    return TRUE;
+}
+
 static void rotctld_client_log_parse_debug(RotctldClient *client,
                                            const gchar *label,
+                                           const gchar *cmd,
                                            const gchar *reply,
                                            const gchar *class_id)
 {
     gint64 now_us = g_get_monotonic_time();
+    gsize raw_len = 0;
+    gchar *printable = NULL;
+    gchar *hex = NULL;
 
     if (client != NULL &&
         client->last_parse_log_us > 0 &&
@@ -778,14 +904,24 @@ static void rotctld_client_log_parse_debug(RotctldClient *client,
         client->last_parse_class = g_strdup(class_id);
     }
 
+    rotctld_client_build_reply_debug(reply, &raw_len, &printable, &hex);
+
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                "%s: raw reply=%s",
+                "%s: cmd=%s len=%" G_GSIZE_FORMAT " class=%s view=%s hex=%s",
                 label ? label : "parse failed",
-                (reply && *reply) ? reply : "(none)");
+                cmd ? cmd : "(null)",
+                raw_len,
+                class_id ? class_id : "(none)",
+                printable ? printable : "(none)",
+                hex ? hex : "(none)");
+
+    g_free(printable);
+    g_free(hex);
 }
 
 static void rotctld_client_note_invalid_reply(RotctldClient *client,
                                               const gchar *label,
+                                              const gchar *cmd,
                                               const gchar *reply,
                                               const gchar *class_id)
 {
@@ -803,7 +939,7 @@ static void rotctld_client_note_invalid_reply(RotctldClient *client,
     client->invalid_backoff_ms =
         MIN(client->invalid_backoff_ms * 2, 500u);
 
-    rotctld_client_log_parse_debug(client, label, reply, class_id);
+    rotctld_client_log_parse_debug(client, label, cmd, reply, class_id);
 }
 
 static void rotctld_client_note_valid_reply(RotctldClient *client)
@@ -873,6 +1009,8 @@ RotctldClient *rotctld_client_new(const gchar *label)
     client->last_failure_log_us = 0;
     client->last_parse_log_us = 0;
     client->last_parse_class = NULL;
+    client->last_setpos_empty_log_us = 0;
+    client->last_setpos_warn_log_us = 0;
     client->invalid_backoff_until_us = 0;
     client->invalid_backoff_ms = 0;
     client->recovery_triggered = FALSE;
@@ -906,6 +1044,8 @@ void rotctld_client_reset(RotctldClient *client)
     client->last_parse_log_us = 0;
     g_free(client->last_parse_class);
     client->last_parse_class = NULL;
+    client->last_setpos_empty_log_us = 0;
+    client->last_setpos_warn_log_us = 0;
     client->invalid_backoff_until_us = 0;
     client->invalid_backoff_ms = 0;
     client->recovery_triggered = FALSE;
@@ -1388,6 +1528,9 @@ rotctld_pos_result_t rotctld_client_get_pos_ex_timeout(RotctldClient *client,
             return ROTCTLD_POS_RPRT_ERR;
         }
 
+        if (parsed && !saw_rprt && !local.saw_done)
+            parsed = FALSE;
+
         if (parsed)
         {
             if (rotctld_client_is_gs232b_model(client->caps.model_id))
@@ -1429,11 +1572,13 @@ rotctld_pos_result_t rotctld_client_get_pos_ex_timeout(RotctldClient *client,
         if (invalid)
             rotctld_client_note_invalid_reply(client,
                                               "get_position invalid reply",
+                                              "p",
                                               reply,
                                               class_id);
         else
             rotctld_client_log_parse_debug(client,
                                            "get_position parse failed",
+                                           "p",
                                            reply,
                                            class_id);
 
@@ -1572,6 +1717,9 @@ rotctld_pos_result_t rotctld_client_get_position_timed(RotctldClient *client,
             return ROTCTLD_POS_RPRT_ERR;
         }
 
+        if (parsed && !saw_rprt && !info.saw_done)
+            parsed = FALSE;
+
         if (parsed)
         {
             if (rotctld_client_is_gs232b_model(client->caps.model_id))
@@ -1611,11 +1759,13 @@ rotctld_pos_result_t rotctld_client_get_position_timed(RotctldClient *client,
         if (invalid)
             rotctld_client_note_invalid_reply(client,
                                               "get_position invalid reply",
+                                              "p",
                                               reply,
                                               class_id);
         else
             rotctld_client_log_parse_debug(client,
                                            "get_position parse failed",
+                                           "p",
                                            reply,
                                            class_id);
 
@@ -1666,6 +1816,9 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
     HamlibResponseInfo local = { 0 };
     gboolean ok = FALSE;
     gint retry_delay_ms = ROTCTLD_SETPOS_RETRY_DELAY_MS;
+    hamlib_read_mode_t mode = HAMLIB_READ_SINGLE;
+    hamlib_term_t term = HAMLIB_TERM_RPRT;
+    gchar cmd_log[96];
 
     if (rprt_code_out)
         *rprt_code_out = 0;
@@ -1688,6 +1841,7 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
     rotctld_client_wait_invalid_backoff(client, retry_delay_ms);
 
     g_snprintf(cmd, sizeof(cmd), "P %.2f %.2f\n", az, el);
+    g_snprintf(cmd_log, sizeof(cmd_log), "P %.2f %.2f", az, el);
 
     for (gint attempt = 0; attempt <= ROTCTLD_SETPOS_RETRIES; attempt++)
     {
@@ -1701,8 +1855,8 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
 
         ok = rotctld_client_exchange(client,
                                      cmd,
-                                     HAMLIB_READ_SINGLE,
-                                     HAMLIB_TERM_RPRT,
+                                     mode,
+                                     term,
                                      ROTCTLD_SETPOS_TIMEOUT_MS,
                                      0,
                                      0,
@@ -1748,11 +1902,34 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
             rotctld_client_note_valid_reply(client);
             if (local.rprt_code != 0)
                 return FALSE;
+            if (rotctld_client_reply_is_empty(reply) &&
+                client != NULL &&
+                rotctld_client_rate_limit(&client->last_setpos_empty_log_us,
+                                          ROTCTLD_SETPOS_LOG_THROTTLE_US))
+            {
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            "set_position empty reply: cmd=%s mode=%s term=%s bytes=%" G_GSIZE_FORMAT,
+                            cmd_log,
+                            rotctld_client_read_mode_name(mode),
+                            rotctld_client_term_name(term),
+                            local.bytes);
+            }
             return TRUE;
         }
 
         if (rotctld_client_reply_is_empty(reply))
         {
+            if (client != NULL &&
+                rotctld_client_rate_limit(&client->last_setpos_warn_log_us,
+                                          ROTCTLD_SETPOS_LOG_THROTTLE_US))
+            {
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "set_position empty reply without RPRT: cmd=%s mode=%s term=%s bytes=%" G_GSIZE_FORMAT,
+                            cmd_log,
+                            rotctld_client_read_mode_name(mode),
+                            rotctld_client_term_name(term),
+                            local.bytes);
+            }
             invalid = TRUE;
             class_id = "empty";
         }
@@ -1786,6 +1963,7 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
         if (invalid)
             rotctld_client_note_invalid_reply(client,
                                               "set_position invalid reply",
+                                              "P",
                                               reply,
                                               class_id);
 

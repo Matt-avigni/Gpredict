@@ -173,6 +173,7 @@ static gboolean connect_rotctld_with_retry(RotctldClient *client,
 typedef struct {
     RotctldClient *client;
     gboolean ok;
+    gint loops;
 } RotThreadCtx;
 
 static gpointer rot_thread_getpos(gpointer data)
@@ -184,7 +185,9 @@ static gpointer rot_thread_getpos(gpointer data)
     if (ctx == NULL || ctx->client == NULL)
         return NULL;
 
-    for (gint i = 0; i < 25; i++)
+    gint loops = (ctx->loops > 0) ? ctx->loops : 1;
+
+    for (gint i = 0; i < loops; i++)
     {
         if (!rotctld_client_get_pos(ctx->client, &az, &el))
         {
@@ -202,7 +205,9 @@ static gpointer rot_thread_setpos(gpointer data)
     if (ctx == NULL || ctx->client == NULL)
         return NULL;
 
-    for (gint i = 0; i < 25; i++)
+    gint loops = (ctx->loops > 0) ? ctx->loops : 1;
+
+    for (gint i = 0; i < loops; i++)
     {
         gdouble az = (gdouble)(i % 10) * 3.0;
         gdouble el = (gdouble)(i % 5) * 2.0;
@@ -641,8 +646,8 @@ int main(void)
         }
     }
     {
-        RotThreadCtx ctx_get = { rot, TRUE };
-        RotThreadCtx ctx_set = { rot, TRUE };
+        RotThreadCtx ctx_get = { rot, TRUE, 25 };
+        RotThreadCtx ctx_set = { rot, TRUE, 25 };
         GThread *t_get = NULL;
         GThread *t_set = NULL;
 
@@ -883,6 +888,24 @@ int main(void)
         g_printerr("rotctld set pos failed with split replies\n");
         ok = FALSE;
         goto cleanup;
+    }
+    {
+        RotThreadCtx ctx_get = { rot_split, TRUE, 200 };
+        RotThreadCtx ctx_set = { rot_split, TRUE, 200 };
+        GThread *t_get = NULL;
+        GThread *t_set = NULL;
+
+        t_get = g_thread_new("rot-split-getpos", rot_thread_getpos, &ctx_get);
+        t_set = g_thread_new("rot-split-setpos", rot_thread_setpos, &ctx_set);
+        g_thread_join(t_get);
+        g_thread_join(t_set);
+
+        if (!ctx_get.ok || !ctx_set.ok)
+        {
+            g_printerr("rotctld split-reply concurrent request test failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
     }
 
     if (!connect_rotctld_with_retry(rot_drop, "127.0.0.1", rot_drop_port))
