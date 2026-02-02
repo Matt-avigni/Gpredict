@@ -10,10 +10,6 @@
 #include <unistd.h>
 #endif
 
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
-
 #ifdef G_OS_UNIX
 #include <signal.h>
 #endif
@@ -77,85 +73,6 @@ typedef struct {
     GMainLoop   *loop;
 } RotctldMgrWaitCtx;
 
-#ifndef __APPLE__
-static gchar *rotctld_mgr_find_bundled_rotctld(void)
-{
-    gchar *exe_path = NULL;
-    gchar *dir = NULL;
-    gchar *candidate = NULL;
-
-#ifdef __APPLE__
-    {
-        uint32_t size = PATH_MAX;
-        char buf[PATH_MAX];
-
-        if (_NSGetExecutablePath(buf, &size) == 0)
-            exe_path = g_strdup(buf);
-        else
-        {
-            char *dyn = g_malloc(size);
-            if (_NSGetExecutablePath(dyn, &size) == 0)
-                exe_path = g_strdup(dyn);
-            g_free(dyn);
-        }
-    }
-#elif defined(G_OS_UNIX)
-    {
-        char buf[PATH_MAX];
-        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (len > 0)
-        {
-            buf[len] = '\0';
-            exe_path = g_strdup(buf);
-        }
-    }
-#endif
-
-    if (exe_path == NULL)
-        exe_path = g_find_program_in_path(g_get_prgname());
-
-    if (exe_path == NULL)
-        return NULL;
-
-    dir = g_path_get_dirname(exe_path);
-#ifdef G_OS_WIN32
-    candidate = g_build_filename(dir, "rotctld.exe", NULL);
-#else
-    candidate = g_build_filename(dir, "rotctld", NULL);
-#endif
-
-    if (!g_file_test(candidate, G_FILE_TEST_IS_EXECUTABLE))
-    {
-        g_free(candidate);
-        candidate = NULL;
-    }
-
-    g_free(dir);
-    g_free(exe_path);
-    return candidate;
-}
-#endif
-
-static gchar *rotctld_mgr_preferred_rotctld_path(void)
-{
-#ifdef __APPLE__
-    const gchar *home = g_get_home_dir();
-    gchar *candidate = NULL;
-
-    if (home == NULL || *home == '\0')
-        return NULL;
-
-    candidate = g_build_filename(home, "hamlib-local", "bin", "rotctld", NULL);
-    if (g_file_test(candidate, G_FILE_TEST_IS_EXECUTABLE))
-        return candidate;
-
-    g_free(candidate);
-    return NULL;
-#else
-    return NULL;
-#endif
-}
-
 static gchar *rotctld_mgr_preferred_hamlib_libdir(void)
 {
 #ifdef __APPLE__
@@ -174,6 +91,100 @@ static gchar *rotctld_mgr_preferred_hamlib_libdir(void)
 #else
     return NULL;
 #endif
+}
+
+static gchar *rotctld_mgr_resolve_rotctld_path(gchar **source_out,
+                                               gchar **error_out)
+{
+    const gchar *env_path = g_getenv("ROTCTLD_BIN");
+
+    if (source_out)
+        *source_out = NULL;
+
+    if (env_path && *env_path)
+    {
+        if (!g_path_is_absolute(env_path))
+        {
+            if (error_out)
+                *error_out = g_strdup_printf(
+                    "ROTCTLD_BIN must be an absolute path: %s", env_path);
+            return NULL;
+        }
+        if (!g_file_test(env_path, G_FILE_TEST_IS_EXECUTABLE))
+        {
+            if (error_out)
+                *error_out = g_strdup_printf(
+                    "ROTCTLD_BIN path is not executable: %s", env_path);
+            return NULL;
+        }
+        if (source_out)
+            *source_out = g_strdup("ROTCTLD_BIN");
+        return g_strdup(env_path);
+    }
+
+    {
+        gchar *path = g_find_program_in_path("rotctld");
+        if (path == NULL)
+        {
+            if (error_out)
+                *error_out = g_strdup("rotctld not found in PATH.");
+            return NULL;
+        }
+        if (source_out)
+            *source_out = g_strdup("PATH");
+        return path;
+    }
+}
+
+static void rotctld_mgr_log_version(const gchar *path)
+{
+    gchar *stdout_data = NULL;
+    gchar *stderr_data = NULL;
+    gint status = 0;
+    GError *error = NULL;
+    gchar *argv[] = { (gchar *) path, "-V", NULL };
+    const gchar *output = NULL;
+    gchar *line = NULL;
+
+    if (path == NULL || *path == '\0')
+        return;
+
+    if (!g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL,
+                      &stdout_data, &stderr_data, &status, &error))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld_mgr: rotctld -V failed: %s",
+                    error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_free(stdout_data);
+        g_free(stderr_data);
+        return;
+    }
+
+    if (stdout_data && *stdout_data)
+        output = stdout_data;
+    else if (stderr_data && *stderr_data)
+        output = stderr_data;
+
+    if (output && *output)
+    {
+        const gchar *newline = strchr(output, '\n');
+        if (newline)
+            line = g_strndup(output, (gsize)(newline - output));
+        else
+            line = g_strdup(output);
+    }
+
+    if (line && *line)
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rotctld_mgr: rotctld -V: %s", line);
+    else if (status != 0)
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rotctld_mgr: rotctld -V exited with status %d", status);
+
+    g_free(line);
+    g_free(stdout_data);
+    g_free(stderr_data);
 }
 
 static gchar *prepend_path_env_if_missing(const gchar *existing,
@@ -755,12 +766,16 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
                                          G_SUBPROCESS_FLAGS_STDERR_PIPE);
     libdir = rotctld_mgr_preferred_hamlib_libdir();
     {
+        const gchar *path_existing = g_getenv("PATH");
         const gchar *dyld_existing = g_getenv("DYLD_LIBRARY_PATH");
         const gchar *fallback_existing = g_getenv("DYLD_FALLBACK_LIBRARY_PATH");
         const gchar *dyld_final = dyld_existing;
         const gchar *fallback_final = fallback_existing;
         gchar *dyld_updated = NULL;
         gchar *fallback_updated = NULL;
+
+        if (path_existing && *path_existing)
+            g_subprocess_launcher_setenv(launcher, "PATH", path_existing, TRUE);
 
         if (libdir != NULL)
         {
@@ -789,9 +804,12 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
                     (const gchar * const *) argv->pdata);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         "rotctld_mgr: spawn detail: path=%s argv=%s "
-                        "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
+                        "PATH=%s DYLD_LIBRARY_PATH=%s "
+                        "DYLD_FALLBACK_LIBRARY_PATH=%s",
                         path ? path : "(null)",
                         cmdline ? cmdline : "(null)",
+                        (path_existing && *path_existing) ? path_existing
+                                                          : "(unset)",
                         (dyld_final && *dyld_final) ? dyld_final : "(unset)",
                         (fallback_final && *fallback_final) ? fallback_final
                                                            : "(unset)");
@@ -882,6 +900,7 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
 {
     GPtrArray *argv_copy = NULL;
     gchar *path = NULL;
+    gchar *source = NULL;
 
     if (argv == NULL || argv[0] == NULL || argv[0][0] == '\0')
     {
@@ -890,40 +909,14 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
         return NULL;
     }
 
-#ifdef __APPLE__
-    path = rotctld_mgr_preferred_rotctld_path();
+    path = rotctld_mgr_resolve_rotctld_path(&source, error_out);
     if (path == NULL)
-    {
-        if (error_out)
-            *error_out = g_strdup(
-                "rotctld not found at $HOME/hamlib-local/bin/rotctld.");
         return NULL;
-    }
 
-    if (!g_path_is_absolute(path) ||
-        !g_file_test(path, G_FILE_TEST_IS_EXECUTABLE))
-    {
-        if (error_out)
-            *error_out = g_strdup_printf(
-                "rotctld path is not executable: %s",
-                path ? path : "(null)");
-        g_free(path);
-        return NULL;
-    }
-#else
-    if (g_path_is_absolute(argv[0]))
-        path = g_strdup(argv[0]);
-    else
-    {
-        path = g_find_program_in_path(argv[0]);
-        if (path == NULL)
-        {
-            if (error_out)
-                *error_out = g_strdup("rotctld not found in PATH.");
-            return NULL;
-        }
-    }
-#endif
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotctld_mgr: resolved rotctld path=%s source=%s",
+                path, source ? source : "(unknown)");
+    rotctld_mgr_log_version(path);
 
     argv_copy = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(argv_copy, g_strdup(path));
@@ -944,6 +937,7 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
     RotctldMgr *mgr = rotctld_mgr_spawn_internal(argv_copy, path, error_out);
     g_ptr_array_free(argv_copy, TRUE);
     g_free(path);
+    g_free(source);
     return mgr;
 }
 
@@ -953,6 +947,7 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
 {
     GPtrArray *argv = NULL;
     gchar *path = NULL;
+    gchar *source = NULL;
 
     if (model <= 0)
     {
@@ -975,37 +970,14 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
         return NULL;
     }
 
-#ifdef __APPLE__
-    path = rotctld_mgr_preferred_rotctld_path();
+    path = rotctld_mgr_resolve_rotctld_path(&source, error_out);
     if (path == NULL)
-    {
-        if (error_out)
-            *error_out = g_strdup(
-                "rotctld not found at $HOME/hamlib-local/bin/rotctld.");
         return NULL;
-    }
 
-    if (!g_path_is_absolute(path) ||
-        !g_file_test(path, G_FILE_TEST_IS_EXECUTABLE))
-    {
-        if (error_out)
-            *error_out = g_strdup_printf(
-                "rotctld path is not executable: %s",
-                path ? path : "(null)");
-        g_free(path);
-        return NULL;
-    }
-#else
-    path = rotctld_mgr_find_bundled_rotctld();
-    if (path == NULL)
-        path = g_find_program_in_path("rotctld");
-    if (path == NULL)
-    {
-        if (error_out)
-            *error_out = g_strdup("rotctld not found (bundle or PATH).");
-        return NULL;
-    }
-#endif
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "rotctld_mgr: resolved rotctld path=%s source=%s",
+                path, source ? source : "(unknown)");
+    rotctld_mgr_log_version(path);
 
     argv = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(argv, g_strdup(path));
@@ -1049,6 +1021,7 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
     RotctldMgr *mgr = rotctld_mgr_spawn_internal(argv, path, error_out);
     g_ptr_array_free(argv, TRUE);
     g_free(path);
+    g_free(source);
     return mgr;
 }
 
