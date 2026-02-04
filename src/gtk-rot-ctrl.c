@@ -6638,10 +6638,13 @@ static rot_daemon_type_t G_GNUC_UNUSED rotctld_dump_state(GtkRotCtrl *ctrl,
     return rotctld_detect_daemon(reply);
 }
 
-static gboolean G_GNUC_UNUSED rotctld_parse_position_reply(const gchar *reply,
-                                                          gdouble *az_out,
-                                                          gdouble *el_out,
-                                                          gint *rprt_code_out)
+static gboolean G_GNUC_UNUSED rotctld_parse_position_reply_ex(const gchar *reply,
+                                                              gdouble *az_out,
+                                                              gdouble *el_out,
+                                                              gint *rprt_code_out,
+                                                              gboolean *have_az_out,
+                                                              gboolean *have_el_out,
+                                                              gboolean *have_rprt_out)
 {
     gboolean have_az = FALSE;
     gboolean have_el = FALSE;
@@ -6651,10 +6654,13 @@ static gboolean G_GNUC_UNUSED rotctld_parse_position_reply(const gchar *reply,
     if (reply == NULL)
         return FALSE;
 
-    gchar **lines = g_strsplit(reply, "\n", -1);
+    gchar **lines = g_strsplit_set(reply, "\r\n", -1);
     for (gint i = 0; lines[i] != NULL; i++) {
         gchar *line = g_strstrip(lines[i]);
         if (line[0] == '\0')
+            continue;
+
+        if (g_ascii_strcasecmp(line, "done") == 0)
             continue;
 
         if (g_str_has_prefix(line, "RPRT")) {
@@ -6676,8 +6682,54 @@ static gboolean G_GNUC_UNUSED rotctld_parse_position_reply(const gchar *reply,
 
     if (rprt_code_out)
         *rprt_code_out = have_code ? rprt_code : 0;
+    if (have_az_out)
+        *have_az_out = have_az;
+    if (have_el_out)
+        *have_el_out = have_el;
+    if (have_rprt_out)
+        *have_rprt_out = have_code;
 
     return have_az && have_el;
+}
+
+static gboolean G_GNUC_UNUSED rotctld_parse_position_reply(const gchar *reply,
+                                                          gdouble *az_out,
+                                                          gdouble *el_out,
+                                                          gint *rprt_code_out)
+{
+    return rotctld_parse_position_reply_ex(reply, az_out, el_out,
+                                           rprt_code_out,
+                                           NULL, NULL, NULL);
+}
+
+static gchar *rotctld_sanitize_reply(const gchar *reply, gsize max_len)
+{
+    if (reply == NULL || *reply == '\0')
+        return g_strdup("(none)");
+
+    gsize len = strlen(reply);
+    gsize limit = MIN(len, max_len);
+    GString *out = g_string_sized_new(limit * 2 + 8);
+
+    for (gsize i = 0; i < limit; i++)
+    {
+        unsigned char c = (unsigned char)reply[i];
+        if (c == '\n')
+            g_string_append(out, "\\n");
+        else if (c == '\r')
+            g_string_append(out, "\\r");
+        else if (c == '\t')
+            g_string_append(out, "\\t");
+        else if (g_ascii_isprint(c))
+            g_string_append_c(out, (gchar)c);
+        else
+            g_string_append_c(out, '.');
+    }
+
+    if (len > limit)
+        g_string_append(out, "...");
+
+    return g_string_free(out, FALSE);
 }
 
 static gboolean G_GNUC_UNUSED rotctld_handshake(GtkRotCtrl *ctrl,
@@ -15161,6 +15213,7 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
     gdouble az = 0.0;
     gdouble el = 0.0;
     rotctld_pos_result_t res = ROTCTLD_POS_IO_ERR;
+    rotctld_pos_result_t pos_res = ROTCTLD_POS_IO_ERR;
     gint rprt = 0;
     HamlibResponseInfo info = { 0 };
     gchar dump_state[4096];
@@ -15198,59 +15251,136 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
     if (worker->settle_ms > 0)
         g_usleep((gulong) worker->settle_ms * 1000);
 
-    memset(&info, 0, sizeof(info));
-    dump_state[0] = '\0';
-    dump_ok = rotctld_client_request_raw(probe, "\\dump_state\n",
-                                         dump_state, sizeof(dump_state),
-                                         &info);
-    if (dump_ok)
     {
-        score += 2;
-    }
-    else if (info.err == EAGAIN || info.err == EWOULDBLOCK || info.err == ETIMEDOUT)
-    {
-        saw_timeout = TRUE;
-        reason = g_strdup("dump_timeout");
-    }
-    else
-    {
-        reason = g_strdup("dump_state");
-    }
+        gchar pos_reply[512];
+        HamlibResponseInfo pos_info = { 0 };
+        gboolean have_az = FALSE;
+        gboolean have_el = FALSE;
+        gboolean have_rprt = FALSE;
+        gint parsed_rprt = 0;
 
-    if (dump_ok)
-    {
-        rotctld_pos_result_t pos_res =
-            rotctld_client_get_position_timed(probe,
-                                              worker->timeout_ms,
-                                              worker->retries,
-                                              worker->retry_delay_ms,
-                                              &az,
-                                              &el,
-                                              &rprt);
-        if (pos_res == ROTCTLD_POS_OK)
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "autodetect validate_io: send cmd=p timeout=%d retries=%d",
+                    worker->timeout_ms,
+                    worker->retries);
+
+        pos_reply[0] = '\0';
+        pos_res = rotctld_client_get_pos_ex_timeout(probe,
+                                                    &az,
+                                                    &el,
+                                                    &pos_info,
+                                                    pos_reply,
+                                                    sizeof(pos_reply),
+                                                    worker->timeout_ms,
+                                                    0);
+
+        if (pos_reply[0] != '\0')
         {
-            pos_ok = TRUE;
-        }
-        else if (pos_res == ROTCTLD_POS_RPRT_ERR)
-        {
-            reason = g_strdup_printf("rprt %d", rprt);
-        }
-        else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
-        {
-            reason = g_strdup("parse_fail");
-        }
-        else if (pos_res == ROTCTLD_POS_TIMEOUT)
-        {
-            saw_timeout = TRUE;
-            if (rprt != 0)
-                reason = g_strdup_printf("rprt %d", rprt);
-            else
-                reason = g_strdup("io_timeout");
+            gchar *view = rotctld_sanitize_reply(pos_reply, 512);
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "autodetect validate_io: p reply bytes=%" G_GSIZE_FORMAT " rprt=%d saw=%d err=%d view=%s",
+                        pos_info.bytes,
+                        pos_info.rprt_code,
+                        pos_info.saw_rprt ? 1 : 0,
+                        pos_info.err,
+                        view ? view : "(none)");
+            g_free(view);
         }
         else
         {
-            reason = g_strdup("io_error");
+            sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                        "autodetect validate_io: p reply empty err=%d",
+                        pos_info.err);
         }
+
+        (void)rotctld_parse_position_reply_ex(pos_reply,
+                                              &az,
+                                              &el,
+                                              &parsed_rprt,
+                                              &have_az,
+                                              &have_el,
+                                              &have_rprt);
+
+        rprt = parsed_rprt;
+        if (state && state->ctrl)
+            rot_term_log(state->ctrl, "gpredict:rx",
+                         "autodetect validate: parsed az=%s el=%s rprt=%d flags[az=%d el=%d rprt=%d]",
+                         have_az ? "yes" : "no",
+                         have_el ? "yes" : "no",
+                         parsed_rprt,
+                         have_az ? 1 : 0,
+                         have_el ? 1 : 0,
+                         have_rprt ? 1 : 0);
+
+        if (pos_res == ROTCTLD_POS_OK)
+        {
+            pos_ok = TRUE;
+            if (have_rprt && parsed_rprt != 0)
+            {
+                pos_ok = FALSE;
+                pos_res = ROTCTLD_POS_RPRT_ERR;
+            }
+        }
+
+        if (!pos_ok)
+        {
+            if (pos_res == ROTCTLD_POS_TIMEOUT)
+            {
+                saw_timeout = TRUE;
+                reason = g_strdup(have_az ? "timeout_wait_el" : "timeout_wait_az");
+            }
+            else if (pos_res == ROTCTLD_POS_RPRT_ERR)
+            {
+                reason = g_strdup("rprt_err");
+            }
+            else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
+            {
+                if (have_az && !have_el)
+                {
+                    saw_timeout = TRUE;
+                    reason = g_strdup("timeout_wait_el");
+                }
+                else if (!have_az && have_el)
+                {
+                    saw_timeout = TRUE;
+                    reason = g_strdup("timeout_wait_az");
+                }
+                else
+                {
+                    reason = g_strdup("invalid_numeric");
+                }
+            }
+            else
+            {
+                reason = g_strdup("io_error");
+            }
+        }
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "autodetect validate_io: p parsed az=%d el=%d rprt=%d code=%d res=%d reason=%s",
+                    have_az ? 1 : 0,
+                    have_el ? 1 : 0,
+                    have_rprt ? 1 : 0,
+                    parsed_rprt,
+                    pos_res,
+                    reason ? reason : "ok");
+    }
+
+    if (pos_ok)
+    {
+        memset(&info, 0, sizeof(info));
+        dump_state[0] = '\0';
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "autodetect validate_io: send cmd=\\dump_state (post-validate)");
+        dump_ok = rotctld_client_request_raw(probe, "\\dump_state\n",
+                                             dump_state, sizeof(dump_state),
+                                             &info);
+        if (dump_ok)
+            score += 2;
+        else
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "autodetect: dump_state probe failed after validation (err=%d)",
+                        info.err);
     }
 
     if (pos_ok)
@@ -15259,11 +15389,23 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         score -= 3;
 
     if (pos_ok)
+    {
+        saw_timeout = FALSE;
+        g_free(reason);
+        reason = NULL;
         res = ROTCTLD_POS_OK;
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "autodetect validate_io: accept az=%.2f el=%.2f rprt=%d",
+                    az, el, rprt);
+    }
+    else if (pos_res == ROTCTLD_POS_RPRT_ERR)
+        res = ROTCTLD_POS_RPRT_ERR;
+    else if (pos_res == ROTCTLD_POS_IO_ERR)
+        res = ROTCTLD_POS_IO_ERR;
     else if (saw_timeout)
         res = ROTCTLD_POS_TIMEOUT;
     else
-        res = ROTCTLD_POS_IO_ERR;
+        res = ROTCTLD_POS_PARSE_FAIL;
 
 done:
     if (probe)
@@ -15633,7 +15775,16 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
 
         if (!inflight && !done && thread == NULL)
         {
+            gint validate_timeout_ms = state->validate_timeout_ms;
             RotctldAutodetectWorker *worker = g_new0(RotctldAutodetectWorker, 1);
+
+            if (validate_timeout_ms < ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS)
+                validate_timeout_ms = ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS;
+            if (validate_timeout_ms < 2500)
+                validate_timeout_ms = 2500;
+            if (validate_timeout_ms > 8000)
+                validate_timeout_ms = 8000;
+
             worker->state = rotctld_probe_state_ref(state);
             worker->generation = state->generation;
             worker->autodetect_generation = state->autodetect_generation;
@@ -15641,7 +15792,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             worker->port = state->autodetect_port > 0
                            ? state->autodetect_port
                            : rotctld_effective_port(ctrl);
-            worker->timeout_ms = state->validate_timeout_ms;
+            worker->timeout_ms = validate_timeout_ms;
             worker->retries = state->validate_retries;
             worker->retry_delay_ms = state->validate_retry_delay_ms;
             worker->settle_ms =
@@ -15667,7 +15818,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             g_mutex_unlock(&state->validate_mutex);
 
             rot_term_log(ctrl, "gpredict:rx",
-                         "autodetect: validating rotor IO (dump_state + p)...");
+                         "autodetect: validating rotor IO (p)...");
             return ROTCTLD_AUTODETECT_STEP_CONTINUE;
         }
 
@@ -15781,26 +15932,14 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                                  reason ? reason : "unknown",
                                  elapsed_ms);
 
-                if (dump_ok)
-                {
-                    rot_term_log(ctrl, "gpredict:err",
-                                 "rotor probe: device=%s get_position failed rprt=%d",
-                                 state->autodetect_device,
-                                 rprt);
-                    sat_log_log(SAT_LOG_LEVEL_WARN,
-                                "rotor probe: device=%s get_position failed rprt=%d",
-                                state->autodetect_device,
-                                rprt);
-                }
-                else
-                {
-                    rot_term_log(ctrl, "gpredict:err",
-                                 "rotor probe: device=%s dump_state failed",
-                                 state->autodetect_device);
-                    sat_log_log(SAT_LOG_LEVEL_WARN,
-                                "rotor probe: device=%s dump_state failed",
-                                state->autodetect_device);
-                }
+                rot_term_log(ctrl, "gpredict:err",
+                             "rotor probe: device=%s get_position failed rprt=%d",
+                             state->autodetect_device,
+                             rprt);
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "rotor probe: device=%s get_position failed rprt=%d",
+                            state->autodetect_device,
+                            rprt);
 
                 sat_log_log(SAT_LOG_LEVEL_WARN,
                             "autodetect[%llu:%llu] candidate failed reason=%s rprt=%d res=%d time=%.1fms",
@@ -16312,13 +16451,24 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
             return G_SOURCE_REMOVE;
         }
 
-        pos_res = rotctld_probe_position(ctrl->conf->host,
-                                         probe_port,
-                                         ROTCTLD_AUTODETECT_VALIDATE_TIMEOUT_MS,
-                                         ROTCTLD_AUTODETECT_VALIDATE_RETRIES,
-                                         ROTCTLD_AUTODETECT_VALIDATE_RETRY_DELAY_MS,
-                                         &rprt,
-                                         &pos_reason);
+        {
+            gint validate_timeout_ms = ROTCTLD_AUTODETECT_VALIDATE_TIMEOUT_MS;
+
+            if (validate_timeout_ms < ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS)
+                validate_timeout_ms = ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS;
+            if (validate_timeout_ms < 2500)
+                validate_timeout_ms = 2500;
+            if (validate_timeout_ms > 8000)
+                validate_timeout_ms = 8000;
+
+            pos_res = rotctld_probe_position(ctrl->conf->host,
+                                             probe_port,
+                                             validate_timeout_ms,
+                                             ROTCTLD_AUTODETECT_VALIDATE_RETRIES,
+                                             ROTCTLD_AUTODETECT_VALIDATE_RETRY_DELAY_MS,
+                                             &rprt,
+                                             &pos_reason);
+        }
         pos_ok = (pos_res == ROTCTLD_POS_OK);
         if (!pos_ok)
         {

@@ -533,6 +533,23 @@ static gboolean rotctld_client_reply_is_ok(const gchar *reply)
     return ok;
 }
 
+static gboolean rotctld_client_cmd_is_get_pos(const gchar *cmd)
+{
+    const gchar *p = cmd;
+
+    if (p == NULL)
+        return FALSE;
+
+    while (*p != '\0' && g_ascii_isspace(*p))
+        p++;
+
+    if (*p != 'p')
+        return FALSE;
+
+    p++;
+    return (*p == '\0' || *p == '\n' || g_ascii_isspace(*p));
+}
+
 static gboolean rotctld_client_err_is_disconnect(gint err)
 {
     return (err == EPIPE ||
@@ -1528,9 +1545,6 @@ rotctld_pos_result_t rotctld_client_get_pos_ex_timeout(RotctldClient *client,
             return ROTCTLD_POS_RPRT_ERR;
         }
 
-        if (parsed && !saw_rprt && !local.saw_done)
-            parsed = FALSE;
-
         if (parsed)
         {
             if (rotctld_client_is_gs232b_model(client->caps.model_id))
@@ -1716,9 +1730,6 @@ rotctld_pos_result_t rotctld_client_get_position_timed(RotctldClient *client,
             rotctld_client_note_valid_reply(client);
             return ROTCTLD_POS_RPRT_ERR;
         }
-
-        if (parsed && !saw_rprt && !info.saw_done)
-            parsed = FALSE;
 
         if (parsed)
         {
@@ -2045,6 +2056,8 @@ gboolean rotctld_client_request_raw(RotctldClient *client,
     if (client == NULL || cmd == NULL)
         return FALSE;
 
+    if (rotctld_client_cmd_is_get_pos(cmd))
+        mode = HAMLIB_READ_MULTILINE_IDLE;
     if (g_str_has_prefix(cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
 
