@@ -46,6 +46,9 @@ typedef struct {
     GtkWidget *port;         /* port number */
     GtkWidget *autostart;
     GtkWidget *protocol;
+    GtkWidget *hamlib_model;
+    GtkWidget *hamlib_model_label;
+    gint       hamlib_model_custom;
     GtkWidget *baud;
     GtkWidget *device_combo;
     GtkWidget *device_refresh;
@@ -84,6 +87,10 @@ static gboolean rot_pref_form_is_valid(RotPrefUi *ui);
 static void rot_pref_update_ok_button(RotPrefUi *ui);
 static void rot_pref_on_field_changed(GtkWidget *widget, gpointer data);
 static void protocol_changed_cb(GtkComboBox *box, gpointer data);
+static void rot_pref_update_hamlib_model_ui(RotPrefUi *ui,
+                                            rot_protocol_t proto,
+                                            gint stored_model);
+static void hamlib_model_changed_cb(GtkSpinButton *spin, gpointer data);
 static void device_combo_changed_cb(GtkComboBox *box, gpointer data);
 static void device_refresh_cb(GtkButton *button, gpointer data);
 static void device_autopick_toggled_cb(GtkToggleButton *toggle, gpointer data);
@@ -354,6 +361,8 @@ static const gchar *rot_protocol_id(rot_protocol_t protocol)
         return "rot1prog";
     case ROT_PROTOCOL_SPID_ROT2PROG:
         return "rot2prog";
+    case ROT_PROTOCOL_OTHER:
+        return "other";
     case ROT_PROTOCOL_GS232B:
     default:
         return "gs232b";
@@ -366,6 +375,8 @@ static rot_protocol_t rot_protocol_from_id(const gchar *id)
         return ROT_PROTOCOL_SPID_ROT1PROG;
     if (g_strcmp0(id, "rot2prog") == 0)
         return ROT_PROTOCOL_SPID_ROT2PROG;
+    if (g_strcmp0(id, "other") == 0)
+        return ROT_PROTOCOL_OTHER;
     return ROT_PROTOCOL_GS232B;
 }
 
@@ -377,6 +388,77 @@ static rot_protocol_t rot_protocol_from_combo(GtkComboBox *combo)
         id = gtk_combo_box_get_active_id(combo);
 
     return rot_protocol_from_id(id);
+}
+
+static void rot_pref_update_hamlib_model_ui(RotPrefUi *ui,
+                                            rot_protocol_t proto,
+                                            gint stored_model)
+{
+    gboolean editable = FALSE;
+    gint model = 0;
+    gboolean was_updating = FALSE;
+
+    if (ui == NULL || ui->hamlib_model == NULL)
+        return;
+
+    if (proto == ROT_PROTOCOL_OTHER)
+    {
+        editable = TRUE;
+        if (stored_model > 0)
+            ui->hamlib_model_custom = stored_model;
+        if (ui->hamlib_model_custom > 0)
+            model = ui->hamlib_model_custom;
+        else
+            model = rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+    }
+    else
+    {
+        model = rot_protocol_to_hamlib_model(proto);
+        if (model <= 0)
+            model = rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+    }
+
+    was_updating = ui->ui_updating;
+    if (!was_updating)
+        rot_pref_ui_begin_update(ui, "hamlib_model");
+
+    g_signal_handlers_block_by_func(ui->hamlib_model,
+                                    (gpointer)G_CALLBACK(hamlib_model_changed_cb),
+                                    ui);
+    g_signal_handlers_block_by_func(ui->hamlib_model,
+                                    (gpointer)G_CALLBACK(rot_pref_on_field_changed),
+                                    ui);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->hamlib_model), model);
+    g_signal_handlers_unblock_by_func(ui->hamlib_model,
+                                      (gpointer)G_CALLBACK(rot_pref_on_field_changed),
+                                      ui);
+    g_signal_handlers_unblock_by_func(ui->hamlib_model,
+                                      (gpointer)G_CALLBACK(hamlib_model_changed_cb),
+                                      ui);
+
+    gtk_widget_set_sensitive(ui->hamlib_model, editable);
+    if (ui->hamlib_model_label)
+        gtk_widget_set_sensitive(ui->hamlib_model_label, editable);
+
+    if (!was_updating)
+        rot_pref_ui_end_update(ui, "hamlib_model");
+}
+
+static void hamlib_model_changed_cb(GtkSpinButton *spin, gpointer data)
+{
+    RotPrefUi *ui = data;
+
+    if (ui == NULL || ui->ui_updating)
+        return;
+
+    if (ui->protocol &&
+        rot_protocol_from_combo(GTK_COMBO_BOX(ui->protocol)) == ROT_PROTOCOL_OTHER)
+    {
+        ui->hamlib_model_custom =
+            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin));
+    }
+
+    rot_pref_on_field_changed(GTK_WIDGET(spin), data);
 }
 
 static void rot_pref_update_device_status(RotPrefUi *ui,
@@ -774,13 +856,18 @@ static void rotctld_test_connection_cb(GtkButton *button, gpointer data)
         gint baud_val = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->baud));
         gchar *error = NULL;
 
+        if (proto == ROT_PROTOCOL_OTHER && ui->hamlib_model)
+            model = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->hamlib_model));
+        if (model <= 0)
+            model = rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+
         if (baud_val <= 0)
             baud_val = rot_protocol_default_baud(proto);
 
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rotctld spawn: protocol=%s model=%s",
+                    "rotctld spawn: protocol=%s model=%d",
                     rot_protocol_name(proto),
-                    rot_protocol_model_name(proto));
+                    model);
         mgr = rotctld_mgr_spawn(spawn_host, port_val, model, device, baud_val,
                                 TRUE, &error);
         if (mgr == NULL)
@@ -861,6 +948,8 @@ static void update_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     rot_pref_combo_set_active_id(GTK_COMBO_BOX(ui->protocol),
                                  rot_protocol_id(conf->protocol),
                                  G_CALLBACK(protocol_changed_cb));
+    ui->hamlib_model_custom = conf->hamlib_model;
+    rot_pref_update_hamlib_model_ui(ui, conf->protocol, conf->hamlib_model);
     if (conf->baud > 0)
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud), conf->baud);
     else
@@ -911,6 +1000,9 @@ static void clear_widgets(RotPrefUi *ui)
     rot_pref_combo_set_active_id(GTK_COMBO_BOX(ui->protocol),
                                  rot_protocol_id(ROT_PROTOCOL_GS232B),
                                  G_CALLBACK(protocol_changed_cb));
+    ui->hamlib_model_custom = rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+    rot_pref_update_hamlib_model_ui(ui, ROT_PROTOCOL_GS232B,
+                                    ui->hamlib_model_custom);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                               rot_protocol_default_baud(ROT_PROTOCOL_GS232B));
     gtk_entry_set_text(GTK_ENTRY(ui->device_manual), "");
@@ -984,6 +1076,9 @@ static void protocol_changed_cb(GtkComboBox * box, gpointer data)
     if (ui != NULL && ui->baud)
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                                   rot_protocol_default_baud(proto));
+
+    if (ui != NULL && ui->hamlib_model)
+        rot_pref_update_hamlib_model_ui(ui, proto, ui->hamlib_model_custom);
 }
 
 static void device_refresh_cb(GtkButton *button, gpointer data)
@@ -1175,6 +1270,8 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
                               "rot1prog", _("SPID Rot1Prog"));
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->protocol),
                               "rot2prog", _("SPID Rot2Prog"));
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->protocol),
+                              "other", _("Other"));
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(ui->protocol),
                                 rot_protocol_id(ROT_PROTOCOL_GS232B));
     gtk_grid_attach(GTK_GRID(table), ui->protocol, 1, 4, 2, 1);
@@ -1185,17 +1282,36 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
                      G_CALLBACK(rot_pref_on_field_changed), ui);
     gp_ui_quarantine_register_combo(ui->dialog, GTK_COMBO_BOX(ui->protocol));
 
+    /* Hamlib model */
+    ui->hamlib_model_label = gtk_label_new(_("Hamlib model"));
+    g_object_set(ui->hamlib_model_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->hamlib_model_label, 0, 5, 1, 1);
+
+    ui->hamlib_model = gtk_spin_button_new_with_range(1, 99999, 1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ui->hamlib_model), 0);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->hamlib_model), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->hamlib_model), FALSE);
+    gtk_widget_set_tooltip_text(ui->hamlib_model,
+                                _("Hamlib rotator model ID (numeric)."));
+    gtk_grid_attach(GTK_GRID(table), ui->hamlib_model, 1, 5, 1, 1);
+    g_signal_connect(ui->hamlib_model, "value-changed",
+                     G_CALLBACK(hamlib_model_changed_cb), ui);
+
+    ui->hamlib_model_custom = rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+    rot_pref_update_hamlib_model_ui(ui, ROT_PROTOCOL_GS232B,
+                                    ui->hamlib_model_custom);
+
     /* Baud */
     label = gtk_label_new(_("Baud"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
 
     ui->baud = gtk_spin_button_new_with_range(300, 921600, 100);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
                               rot_protocol_default_baud(ROT_PROTOCOL_GS232B));
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ui->baud), 0);
     gtk_widget_set_tooltip_text(ui->baud, _("Serial baud rate for rotctld."));
-    gtk_grid_attach(GTK_GRID(table), ui->baud, 1, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->baud, 1, 6, 1, 1);
     g_signal_connect(ui->baud, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
@@ -1207,7 +1323,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     ui->device_combo = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ui->device_combo,
                                 _("Select the serial device for your rotor."));
-    gtk_grid_attach(GTK_GRID(table), ui->device_combo, 1, 6, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->device_combo, 1, 7, 2, 1);
     g_signal_connect(ui->device_combo, "changed",
                      G_CALLBACK(device_combo_changed_cb), ui);
     g_signal_connect(ui->device_combo, "changed",
@@ -1217,7 +1333,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     ui->device_refresh = gtk_button_new_with_label(_("Find port"));
     gtk_widget_set_tooltip_text(ui->device_refresh,
                                 _("Scan for serial devices and pick the best match."));
-    gtk_grid_attach(GTK_GRID(table), ui->device_refresh, 3, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->device_refresh, 3, 7, 1, 1);
     g_signal_connect(ui->device_refresh, "clicked",
                      G_CALLBACK(device_refresh_cb), ui);
 
@@ -1240,13 +1356,13 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     gtk_revealer_set_transition_type(GTK_REVEALER(ui->device_manual_revealer),
                                      GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
     gtk_container_add(GTK_CONTAINER(ui->device_manual_revealer), device_manual_row);
-    gtk_grid_attach(GTK_GRID(table), ui->device_manual_revealer, 0, 7, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->device_manual_revealer, 0, 8, 4, 1);
 
     ui->device_autopick = gtk_check_button_new_with_label(_("Auto-detect port when empty"));
     gtk_widget_set_tooltip_text(ui->device_autopick,
                                 _("Leave the device field empty and detect a serial port when connecting."));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->device_autopick), TRUE);
-    gtk_grid_attach(GTK_GRID(table), ui->device_autopick, 1, 8, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->device_autopick, 1, 9, 2, 1);
     g_signal_connect(ui->device_autopick, "toggled",
                      G_CALLBACK(device_autopick_toggled_cb), ui);
     g_signal_connect(ui->device_autopick, "toggled",
@@ -1254,21 +1370,21 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
 
     ui->device_status = gtk_label_new("");
     g_object_set(ui->device_status, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), ui->device_status, 1, 9, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->device_status, 1, 10, 3, 1);
 
     gtk_grid_attach(GTK_GRID(table),
                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
-                    0, 10, 4, 1);
+                    0, 11, 4, 1);
 
     /* Tracking geometry */
     label = gtk_label_new(_("Tracking geometry"));
     g_object_set(label, "xalign", 0.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 11, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 4, 1);
 
     /* Axis mode */
     label = gtk_label_new(_("Axis mode"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 12, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
 
     ui->axismode = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->axismode),
@@ -1278,7 +1394,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     gtk_combo_box_set_active(GTK_COMBO_BOX(ui->axismode), ROT_AXIS_MODE_AZ_EL);
     gtk_widget_set_tooltip_text(ui->axismode,
                                 _("Select whether this rotor supports both azimuth and elevation."));
-    gtk_grid_attach(GTK_GRID(table), ui->axismode, 1, 12, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->axismode, 1, 13, 2, 1);
     g_signal_connect(G_OBJECT(ui->axismode), "changed",
                      G_CALLBACK(axismode_changed_cb), ui);
     g_signal_connect(G_OBJECT(ui->axismode), "changed",
@@ -1287,7 +1403,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
 
     label = gtk_label_new(_("Wrap type"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 13, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
 
     ui->aztype = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->aztype),
@@ -1298,7 +1414,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     gtk_widget_set_tooltip_text(ui->aztype,
                                 _("Select the azimuth wrap convention. "
                                   "0\302\260 is at North, clockwise is positive."));
-    gtk_grid_attach(GTK_GRID(table), ui->aztype, 1, 13, 2, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->aztype, 1, 14, 2, 1);
     g_signal_connect(G_OBJECT(ui->aztype), "changed",
                      G_CALLBACK(aztype_changed_cb), ui);
     g_signal_connect(G_OBJECT(ui->aztype), "changed",
@@ -1308,51 +1424,51 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     /* Az and El limits */
     label = gtk_label_new(_(" Min Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 15, 1, 1);
     ui->minaz = gtk_spin_button_new_with_range(-200, 100, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->minaz), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->minaz), FALSE);
-    gtk_grid_attach(GTK_GRID(table), ui->minaz, 1, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->minaz, 1, 15, 1, 1);
     g_signal_connect(ui->minaz, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
     label = gtk_label_new(_(" Max Az"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 2, 15, 1, 1);
     ui->maxaz = gtk_spin_button_new_with_range(0, 480, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->maxaz), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->maxaz), FALSE);
-    gtk_grid_attach(GTK_GRID(table), ui->maxaz, 3, 14, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->maxaz, 3, 15, 1, 1);
     g_signal_connect(ui->maxaz, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
     ui->minel_label = gtk_label_new(_(" Min El"));
     g_object_set(ui->minel_label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), ui->minel_label, 0, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->minel_label, 0, 16, 1, 1);
     ui->minel = gtk_spin_button_new_with_range(-10, 180, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), 0);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->minel), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->minel), FALSE);
-    gtk_grid_attach(GTK_GRID(table), ui->minel, 1, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->minel, 1, 16, 1, 1);
     g_signal_connect(ui->minel, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
     ui->maxel_label = gtk_label_new(_(" Max El"));
     g_object_set(ui->maxel_label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), ui->maxel_label, 2, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->maxel_label, 2, 16, 1, 1);
     ui->maxel = gtk_spin_button_new_with_range(-10, 180, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 90);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->maxel), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->maxel), FALSE);
-    gtk_grid_attach(GTK_GRID(table), ui->maxel, 3, 15, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->maxel, 3, 16, 1, 1);
     g_signal_connect(ui->maxel, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
     gtk_grid_attach(GTK_GRID(table),
                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
-                    0, 16, 4, 1);
+                    0, 17, 4, 1);
 
     ui->disable_pos_feedback =
         gtk_check_button_new_with_label(_("Disable position feedback checks (no encoder)"));
@@ -1360,7 +1476,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
                                 _("Allow sending commands even when no position feedback is available. "
                                   "Disables position discrepancy disconnect logic."));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback), FALSE);
-    gtk_grid_attach(GTK_GRID(table), ui->disable_pos_feedback, 0, 17, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->disable_pos_feedback, 0, 18, 4, 1);
     g_signal_connect(ui->disable_pos_feedback, "toggled",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
@@ -1405,6 +1521,13 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
     conf->autostart =
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->autostart));
     conf->protocol = rot_protocol_from_combo(GTK_COMBO_BOX(ui->protocol));
+    if (conf->protocol == ROT_PROTOCOL_OTHER && ui->hamlib_model)
+        conf->hamlib_model =
+            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->hamlib_model));
+    else
+        conf->hamlib_model = rot_protocol_to_hamlib_model(conf->protocol);
+    if (conf->hamlib_model <= 0)
+        conf->hamlib_model = rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
     conf->baud = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ui->baud));
     if (conf->baud <= 0)
         conf->baud = rot_protocol_default_baud(conf->protocol);

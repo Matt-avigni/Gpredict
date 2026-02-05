@@ -57,6 +57,7 @@ typedef enum {
     ROT_LIST_COL_STALE_DEBOUNCE, /*!< Stale debounce count. */
     ROT_LIST_COL_ANGLE_EPSILON, /*!< Angle epsilon in degrees. */
     ROT_LIST_COL_ELEV_FLOOR,   /*!< Elevation floor in degrees. */
+    ROT_LIST_COL_HAMLIB_MODEL, /*!< Hamlib model ID. */
     ROT_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rotor_list_col_t;
 

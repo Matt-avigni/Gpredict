@@ -47,7 +47,8 @@ typedef enum {
 typedef enum {
     ROT_PROTOCOL_GS232B = 0,
     ROT_PROTOCOL_SPID_ROT1PROG = 1,
-    ROT_PROTOCOL_SPID_ROT2PROG = 2
+    ROT_PROTOCOL_SPID_ROT2PROG = 2,
+    ROT_PROTOCOL_OTHER = 3
 } rot_protocol_t;
 
 /** \brief Rotator configuration. */
@@ -56,6 +57,7 @@ typedef struct {
     gchar          *host;       /*!< hostname */
     gint            port;       /*!< port number */
     rot_protocol_t  protocol;   /*!< Rotator protocol selection */
+    gint            hamlib_model; /*!< Hamlib model ID (used when protocol=Other) */
     gint            baud;       /*!< Serial baud rate */
     gchar          *device;     /*!< Selected serial device */
     gchar          *device_manual; /*!< Manual device override */
@@ -103,5 +105,6 @@ const gchar    *rot_protocol_name(rot_protocol_t protocol);
 const gchar    *rot_protocol_model_name(rot_protocol_t protocol);
 gint            rot_protocol_to_hamlib_model(rot_protocol_t protocol);
 gint            rot_protocol_default_baud(rot_protocol_t protocol);
+gint            rot_conf_hamlib_model(const rotor_conf_t *conf);
 
 #endif

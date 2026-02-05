@@ -76,6 +76,7 @@ static void rot_pref_store_set(GtkListStore *store,
                        ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf->rotor_stale_debounce_count,
                        ROT_LIST_COL_ANGLE_EPSILON, conf->rotor_angle_epsilon_deg,
                        ROT_LIST_COL_ELEV_FLOOR, conf->rotor_elev_floor_deg,
+                       ROT_LIST_COL_HAMLIB_MODEL, conf->hamlib_model,
                        -1);
 }
 
@@ -132,6 +133,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .host = NULL,
         .port = 4533,
         .protocol = ROT_PROTOCOL_GS232B,
+        .hamlib_model = 0,
         .baud = 0,
         .device = NULL,
         .device_manual = NULL,
@@ -162,6 +164,7 @@ static void add_cb(GtkWidget * button, gpointer data)
     };
 
     conf->baud = rot_protocol_default_baud(conf->protocol);
+    conf->hamlib_model = rot_conf_hamlib_model(conf);
 
     ctx->store =
         GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(rotlist)));
@@ -224,6 +227,7 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .host = NULL,
         .port = 4533,
         .protocol = ROT_PROTOCOL_GS232B,
+        .hamlib_model = 0,
         .baud = 0,
         .device = NULL,
         .device_manual = NULL,
@@ -253,12 +257,14 @@ static void edit_cb(GtkWidget * button, gpointer data)
     };
 
     conf->baud = rot_protocol_default_baud(conf->protocol);
+    conf->hamlib_model = rot_conf_hamlib_model(conf);
 
     gtk_tree_model_get(model, &iter,
                        ROT_LIST_COL_NAME, &conf->name,
                        ROT_LIST_COL_HOST, &conf->host,
                        ROT_LIST_COL_PORT, &conf->port,
                        ROT_LIST_COL_PROTOCOL, &conf->protocol,
+                       ROT_LIST_COL_HAMLIB_MODEL, &conf->hamlib_model,
                        ROT_LIST_COL_BAUD, &conf->baud,
                        ROT_LIST_COL_DEVICE, &conf->device,
                        ROT_LIST_COL_DEVICE_MANUAL, &conf->device_manual,
@@ -384,7 +390,8 @@ static GtkTreeModel *create_and_fill_model(void)
                                    G_TYPE_INT,          // Position stale ms
                                    G_TYPE_INT,          // Stale debounce
                                    G_TYPE_DOUBLE,       // Angle epsilon
-                                   G_TYPE_DOUBLE        // Elevation floor
+                                   G_TYPE_DOUBLE,       // Elevation floor
+                                   G_TYPE_INT           // Hamlib model
         );
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
                                          ROT_LIST_COL_NAME,
@@ -434,6 +441,7 @@ static GtkTreeModel *create_and_fill_model(void)
                                        ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf.rotor_stale_debounce_count,
                                        ROT_LIST_COL_ANGLE_EPSILON, conf.rotor_angle_epsilon_deg,
                                        ROT_LIST_COL_ELEV_FLOOR, conf.rotor_elev_floor_deg,
+                                       ROT_LIST_COL_HAMLIB_MODEL, conf.hamlib_model,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -724,6 +732,7 @@ void sat_pref_rot_ok(void)
         .host = NULL,
         .port = 4533,
         .protocol = ROT_PROTOCOL_GS232B,
+        .hamlib_model = 0,
         .baud = 0,
         .device = NULL,
         .device_manual = NULL,
@@ -753,6 +762,7 @@ void sat_pref_rot_ok(void)
     };
 
     conf.baud = rot_protocol_default_baud(conf.protocol);
+    conf.hamlib_model = rot_conf_hamlib_model(&conf);
 
 
     /* delete all .rot files */
@@ -794,6 +804,7 @@ void sat_pref_rot_ok(void)
                                ROT_LIST_COL_HOST, &conf.host,
                                ROT_LIST_COL_PORT, &conf.port,
                                ROT_LIST_COL_PROTOCOL, &conf.protocol,
+                               ROT_LIST_COL_HAMLIB_MODEL, &conf.hamlib_model,
                                ROT_LIST_COL_BAUD, &conf.baud,
                                ROT_LIST_COL_DEVICE, &conf.device,
                                ROT_LIST_COL_DEVICE_MANUAL, &conf.device_manual,

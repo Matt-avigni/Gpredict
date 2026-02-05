@@ -13475,8 +13475,7 @@ static gchar **rotctld_build_argv_from_command(GtkRotCtrl *ctrl,
     if (ctrl && ctrl->conf)
     {
         argv = rotctld_force_model(argv,
-                                   rot_protocol_to_hamlib_model(
-                                       ctrl->conf->protocol));
+                                   rot_conf_hamlib_model(ctrl->conf));
         argv = rotctld_force_bind_host(argv, ctrl->conf->host);
     }
     return argv;
@@ -14193,7 +14192,7 @@ static void rotctld_autodetect_log_candidate(GtkRotCtrl *ctrl,
     }
 
     if (ctrl && ctrl->conf)
-        model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+        model = rot_conf_hamlib_model(ctrl->conf);
 
     rot_term_log(ctrl, "gpredict:rx",
                  "rotor probe: trying device=%s tcp_port=%d",
@@ -14991,7 +14990,7 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
     }
 
     {
-        gint model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+        gint model = rot_conf_hamlib_model(ctrl->conf);
         gint baud = 0;
         const gchar *env_device = g_getenv("GPREDICT_ROT_SERIAL");
         const gchar *env_baud = g_getenv("GPREDICT_ROT_BAUD");
@@ -15661,7 +15660,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
         {
             gint detected_model = 0;
             gint desired_model =
-                rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+                rot_conf_hamlib_model(ctrl->conf);
             gboolean have_model = rotctld_extract_model(full_text,
                                                         &detected_model);
             if (have_model && detected_model > 0 && desired_model > 0 &&
@@ -16349,7 +16348,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
             if (state->autodetect_attempts &&
                 state->autodetect_attempts->len > 0)
             {
-                gint model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+                gint model = rot_conf_hamlib_model(ctrl->conf);
                 rot_term_log(ctrl, "gpredict:err",
                              "rotor probe: failed; attempted: %s",
                              state->autodetect_attempts->str);
@@ -16407,7 +16406,7 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
     if (result == ROTCTLD_PROBE_OK_ROTCTLD)
     {
         gint detected_model = 0;
-        gint desired_model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+        gint desired_model = rot_conf_hamlib_model(ctrl->conf);
         gchar *line1 = NULL;
         gchar *line2 = NULL;
         gboolean have_model = FALSE;
@@ -16948,7 +16947,7 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
     }
 
     {
-        gint model = rot_protocol_to_hamlib_model(ctrl->conf->protocol);
+        gint model = rot_conf_hamlib_model(ctrl->conf);
         gint baud = ctrl->conf->baud > 0 ? ctrl->conf->baud
                                          : rot_protocol_default_baud(
                                              ctrl->conf->protocol);

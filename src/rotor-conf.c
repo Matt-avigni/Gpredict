@@ -40,6 +40,7 @@
 #define KEY_HOST        "Host"
 #define KEY_PORT        "Port"
 #define KEY_PROTOCOL    "Protocol"
+#define KEY_HAMLIB_MODEL "HamlibModel"
 #define KEY_BAUD        "Baud"
 #define KEY_DEVICE      "Device"
 #define KEY_DEVICE_MANUAL "DeviceManual"
@@ -106,7 +107,7 @@
 gboolean rot_protocol_is_valid(rot_protocol_t protocol)
 {
     return protocol >= ROT_PROTOCOL_GS232B &&
-           protocol <= ROT_PROTOCOL_SPID_ROT2PROG;
+           protocol <= ROT_PROTOCOL_OTHER;
 }
 
 const gchar *rot_protocol_name(rot_protocol_t protocol)
@@ -120,6 +121,8 @@ const gchar *rot_protocol_name(rot_protocol_t protocol)
     case ROT_PROTOCOL_GS232B:
     default:
         return "gs232b";
+    case ROT_PROTOCOL_OTHER:
+        return "other";
     }
 }
 
@@ -134,6 +137,8 @@ const gchar *rot_protocol_model_name(rot_protocol_t protocol)
     case ROT_PROTOCOL_GS232B:
     default:
         return "ROT_MODEL_GS232B";
+    case ROT_PROTOCOL_OTHER:
+        return "ROT_MODEL_CUSTOM";
     }
 }
 
@@ -147,9 +152,26 @@ gint rot_protocol_to_hamlib_model(rot_protocol_t protocol)
         return ROT_HAMLIB_MODEL_SPID_ROT2;
     case ROT_PROTOCOL_SPID_ROT1PROG:
         return ROT_HAMLIB_MODEL_SPID_ROT1;
+    case ROT_PROTOCOL_OTHER:
+        return ROT_HAMLIB_MODEL_GS232B;
     default:
         return ROT_HAMLIB_MODEL_GS232B;
     }
+}
+
+gint rot_conf_hamlib_model(const rotor_conf_t *conf)
+{
+    if (conf == NULL)
+        return rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+
+    if (conf->protocol == ROT_PROTOCOL_OTHER)
+    {
+        if (conf->hamlib_model > 0)
+            return conf->hamlib_model;
+        return rot_protocol_to_hamlib_model(ROT_PROTOCOL_GS232B);
+    }
+
+    return rot_protocol_to_hamlib_model(conf->protocol);
 }
 
 gint rot_protocol_default_baud(rot_protocol_t protocol)
@@ -238,9 +260,25 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     }
 
     if (conf->protocol < ROT_PROTOCOL_GS232B ||
-        conf->protocol > ROT_PROTOCOL_SPID_ROT2PROG)
+        conf->protocol > ROT_PROTOCOL_OTHER)
     {
         conf->protocol = DEFAULT_PROTOCOL;
+    }
+
+    conf->hamlib_model = rot_protocol_to_hamlib_model(conf->protocol);
+    if (conf->protocol == ROT_PROTOCOL_OTHER &&
+        g_key_file_has_key(cfg, GROUP, KEY_HAMLIB_MODEL, NULL))
+    {
+        conf->hamlib_model =
+            g_key_file_get_integer(cfg, GROUP, KEY_HAMLIB_MODEL, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: HamlibModel not defined for %s. Using protocol default."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->hamlib_model = rot_protocol_to_hamlib_model(conf->protocol);
+        }
     }
 
     conf->baud = 0;
@@ -827,6 +865,7 @@ void rotor_conf_save(rotor_conf_t * conf)
     g_key_file_set_string(cfg, GROUP, KEY_HOST, conf->host);
     g_key_file_set_integer(cfg, GROUP, KEY_PORT, conf->port);
     g_key_file_set_integer(cfg, GROUP, KEY_PROTOCOL, conf->protocol);
+    g_key_file_set_integer(cfg, GROUP, KEY_HAMLIB_MODEL, conf->hamlib_model);
     g_key_file_set_integer(cfg, GROUP, KEY_BAUD, conf->baud);
     g_key_file_set_boolean(cfg, GROUP, KEY_DEVICE_AUTOPICK,
                            conf->device_autopick);
