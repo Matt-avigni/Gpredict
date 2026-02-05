@@ -21,6 +21,10 @@ gboolean     rotctld_mgr_get_exit_info(RotctldMgr *mgr,
 RotctldMgr  *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
                                const gchar *device, gint baud,
                                gboolean verbose, gchar **error_out);
+RotctldMgr  *rotctld_mgr_spawn_timeout(const gchar *host, gint port, gint model,
+                                      const gchar *device, gint baud,
+                                      gboolean verbose, gint timeout_ms,
+                                      gchar **error_out);
 RotctldMgr  *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out);
 gboolean     rotctld_mgr_is_running(const RotctldMgr *mgr);
 const gchar *rotctld_mgr_get_identifier(const RotctldMgr *mgr);

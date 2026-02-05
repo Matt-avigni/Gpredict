@@ -941,13 +941,17 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
     return mgr;
 }
 
-RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
-                              const gchar *device, gint baud,
-                              gboolean verbose, gchar **error_out)
+RotctldMgr *rotctld_mgr_spawn_timeout(const gchar *host, gint port, gint model,
+                                      const gchar *device, gint baud,
+                                      gboolean verbose, gint timeout_ms,
+                                      gchar **error_out)
 {
     GPtrArray *argv = NULL;
     gchar *path = NULL;
     gchar *source = NULL;
+
+    if (timeout_ms <= 0)
+        timeout_ms = 1200;
 
     if (model <= 0)
     {
@@ -991,7 +995,7 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
         g_ptr_array_add(argv, g_strdup_printf("%d", baud));
     }
     g_ptr_array_add(argv, g_strdup("-C"));
-    g_ptr_array_add(argv, g_strdup("timeout=1200"));
+    g_ptr_array_add(argv, g_strdup_printf("timeout=%d", timeout_ms));
     {
         const gchar *bind_host = rotctld_mgr_bind_host(host);
         if (host && *host && g_strcmp0(host, bind_host) != 0)
@@ -1023,6 +1027,14 @@ RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
     g_free(path);
     g_free(source);
     return mgr;
+}
+
+RotctldMgr *rotctld_mgr_spawn(const gchar *host, gint port, gint model,
+                              const gchar *device, gint baud,
+                              gboolean verbose, gchar **error_out)
+{
+    return rotctld_mgr_spawn_timeout(host, port, model, device, baud,
+                                     verbose, 1200, error_out);
 }
 
 gboolean rotctld_mgr_is_running(const RotctldMgr *mgr)

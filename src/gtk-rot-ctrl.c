@@ -207,6 +207,8 @@ static const gdouble k_meas_tol_deg = 1.5;
 #define ROTCTLD_AUTODETECT_COOLDOWN_MS 150
 #define ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS 1000
 #define ROTCTLD_AUTODETECT_MAX_CANDIDATES 5
+#define ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS 3000
+#define ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS 500
 #define ROTCTRL_DEFAULT_MIN_EL -5.0
 #define ROTCTRL_DEFAULT_MAX_EL 185.0
 #define ROTCTLD_KEEPALIVE_US 2000000
@@ -878,6 +880,7 @@ static gboolean rotctld_autodetect_is_candidate(const gchar *candidate);
 static gboolean rotctld_autodetect_is_tty(const gchar *candidate);
 static gboolean rotctld_autodetect_is_cu(const gchar *candidate);
 static gchar   *rotctld_autodetect_tty_equivalent(const gchar *candidate);
+static gchar   *rotctld_autodetect_cu_equivalent(const gchar *candidate);
 static gchar   *rotctld_autodetect_candidate_key(const gchar *candidate);
 static gboolean rotctld_autodetect_prefer_cu(const rotor_conf_t *conf,
                                              const gchar *cached);
@@ -6389,6 +6392,53 @@ static gboolean rot_parse_first_number(const gchar *line, gdouble *out)
     return TRUE;
 }
 
+static gboolean rot_parse_first_two_numbers(const gchar *line,
+                                            gdouble *a,
+                                            gdouble *b)
+{
+    const gchar *p = line;
+    gchar *endptr = NULL;
+    gdouble first = 0.0;
+    gdouble second = 0.0;
+    gboolean have_first = FALSE;
+    gboolean have_second = FALSE;
+
+    if (line == NULL || a == NULL || b == NULL)
+        return FALSE;
+
+    while (*p != '\0')
+    {
+        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+')
+        {
+            gdouble v = g_ascii_strtod(p, &endptr);
+            if (endptr != p)
+            {
+                if (!have_first)
+                {
+                    first = v;
+                    have_first = TRUE;
+                }
+                else
+                {
+                    second = v;
+                    have_second = TRUE;
+                    break;
+                }
+                p = endptr;
+                continue;
+            }
+        }
+        p++;
+    }
+
+    if (!have_first || !have_second)
+        return FALSE;
+
+    *a = first;
+    *b = second;
+    return TRUE;
+}
+
 typedef enum {
     ROT_DAEMON_UNKNOWN = 0,
     ROT_DAEMON_ROTCTLD = 1,
@@ -6652,6 +6702,8 @@ static gboolean G_GNUC_UNUSED rotctld_parse_position_reply_ex(const gchar *reply
     gboolean have_el = FALSE;
     gint rprt_code = 0;
     gboolean have_code = FALSE;
+    gdouble a = 0.0;
+    gdouble b = 0.0;
 
     if (reply == NULL)
         return FALSE;
@@ -6668,6 +6720,18 @@ static gboolean G_GNUC_UNUSED rotctld_parse_position_reply_ex(const gchar *reply
         if (g_str_has_prefix(line, "RPRT")) {
             if (rot_parse_rprt_code(line, &rprt_code))
                 have_code = TRUE;
+            continue;
+        }
+
+        if (!have_az && !have_el &&
+            rot_parse_first_two_numbers(line, &a, &b))
+        {
+            if (az_out)
+                *az_out = a;
+            if (el_out)
+                *el_out = b;
+            have_az = TRUE;
+            have_el = TRUE;
             continue;
         }
 
@@ -12976,9 +13040,9 @@ static gchar *rotctld_autodetect_device(GtkRotCtrl *ctrl)
     {
         lookup_current = current;
 #ifdef __APPLE__
-        if (rotctld_autodetect_is_cu(current))
+        if (rotctld_autodetect_is_tty(current))
         {
-            preferred_current = rotctld_autodetect_tty_equivalent(current);
+            preferred_current = rotctld_autodetect_cu_equivalent(current);
             if (preferred_current && rotctld_list_contains(list, preferred_current))
                 lookup_current = preferred_current;
         }
@@ -13408,10 +13472,15 @@ static gchar **rotctld_force_model(gchar **argv, gint model)
     }
 }
 
-static gchar *rotctld_merge_config(const gchar *existing)
+static gchar *rotctld_merge_config_timeout(const gchar *existing,
+                                           gint timeout_ms,
+                                           gboolean force_timeout)
 {
     gboolean have_timeout = FALSE;
     GString *out = g_string_new(NULL);
+
+    if (timeout_ms <= 0)
+        timeout_ms = 1200;
 
     if (existing && *existing)
     {
@@ -13422,7 +13491,11 @@ static gchar *rotctld_merge_config(const gchar *existing)
             if (trim[0] == '\0')
                 continue;
             if (g_str_has_prefix(trim, "timeout="))
+            {
+                if (force_timeout)
+                    continue;
                 have_timeout = TRUE;
+            }
             if (g_str_has_prefix(trim, "retries="))
                 continue;
             if (out->len > 0)
@@ -13432,17 +13505,24 @@ static gchar *rotctld_merge_config(const gchar *existing)
         g_strfreev(parts);
     }
 
-    if (!have_timeout)
+    if (force_timeout || !have_timeout)
     {
         if (out->len > 0)
             g_string_append_c(out, ',');
-        g_string_append(out, "timeout=1200");
+        g_string_append_printf(out, "timeout=%d", timeout_ms);
     }
 
     return g_string_free(out, FALSE);
 }
 
-static gchar **rotctld_force_config(gchar **argv)
+static gchar *rotctld_merge_config(const gchar *existing)
+{
+    return rotctld_merge_config_timeout(existing, 1200, FALSE);
+}
+
+static gchar **rotctld_force_config_timeout(gchar **argv,
+                                            gint timeout_ms,
+                                            gboolean force_timeout)
 {
     gint len;
 
@@ -13457,12 +13537,16 @@ static gchar **rotctld_force_config(gchar **argv)
             gchar *merged = NULL;
             if (i + 1 < len && argv[i + 1] && argv[i + 1][0] != '-')
             {
-                merged = rotctld_merge_config(argv[i + 1]);
+                merged = rotctld_merge_config_timeout(argv[i + 1],
+                                                      timeout_ms,
+                                                      force_timeout);
                 g_free(argv[i + 1]);
                 argv[i + 1] = merged;
                 return argv;
             }
-            merged = rotctld_merge_config(NULL);
+            merged = rotctld_merge_config_timeout(NULL,
+                                                  timeout_ms,
+                                                  force_timeout);
             gchar **out = g_new0(gchar *, len + 2);
             for (gint j = 0; j <= i; j++)
                 out[j] = g_strdup(argv[j]);
@@ -13480,11 +13564,18 @@ static gchar **rotctld_force_config(gchar **argv)
         for (gint i = 0; i < len; i++)
             out[i] = g_strdup(argv[i]);
         out[len] = g_strdup("-C");
-        out[len + 1] = rotctld_merge_config(NULL);
+        out[len + 1] = rotctld_merge_config_timeout(NULL,
+                                                    timeout_ms,
+                                                    force_timeout);
         out[len + 2] = NULL;
         g_strfreev(argv);
         return out;
     }
+}
+
+static gchar **rotctld_force_config(gchar **argv)
+{
+    return rotctld_force_config_timeout(argv, 1200, FALSE);
 }
 
 static gchar **rotctld_build_argv_from_command(GtkRotCtrl *ctrl,
@@ -13763,6 +13854,70 @@ static gchar *rotctld_autodetect_tty_equivalent(const gchar *candidate)
 #endif
 }
 
+static gchar *rotctld_autodetect_cu_equivalent(const gchar *candidate)
+{
+#ifdef __APPLE__
+    gchar *base = NULL;
+    gchar *dir = NULL;
+    gchar *lower = NULL;
+    const gchar *suffix = NULL;
+    gchar *cu_base = NULL;
+    gchar *out = NULL;
+    gboolean has_dot = FALSE;
+
+    if (candidate == NULL || *candidate == '\0')
+        return NULL;
+
+    base = g_path_get_basename(candidate);
+    dir = g_path_get_dirname(candidate);
+    lower = g_ascii_strdown(base ? base : candidate, -1);
+    if (lower == NULL)
+    {
+        g_free(base);
+        g_free(dir);
+        return NULL;
+    }
+
+    if (g_str_has_prefix(lower, "tty."))
+    {
+        suffix = base + 4;
+        has_dot = TRUE;
+    }
+    else if (g_str_has_prefix(lower, "tty"))
+    {
+        suffix = base + 3;
+        has_dot = FALSE;
+    }
+
+    if (suffix == NULL)
+    {
+        g_free(lower);
+        g_free(base);
+        g_free(dir);
+        return NULL;
+    }
+
+    if (has_dot)
+        cu_base = g_strdup_printf("cu.%s", suffix);
+    else
+        cu_base = g_strdup_printf("cu%s", suffix);
+
+    if (dir && *dir && g_strcmp0(dir, ".") != 0)
+        out = g_build_filename(dir, cu_base, NULL);
+    else
+        out = g_strdup(cu_base);
+
+    g_free(cu_base);
+    g_free(lower);
+    g_free(base);
+    g_free(dir);
+    return out;
+#else
+    (void)candidate;
+    return NULL;
+#endif
+}
+
 static gchar *rotctld_autodetect_candidate_key(const gchar *candidate)
 {
     gchar *base = NULL;
@@ -13802,7 +13957,7 @@ static gboolean rotctld_autodetect_prefer_cu(const rotor_conf_t *conf,
 #ifdef __APPLE__
     (void)conf;
     (void)cached;
-    return FALSE;
+    return TRUE;
 #else
     (void)conf;
     (void)cached;
@@ -13871,11 +14026,11 @@ static gint rotctld_autodetect_candidate_score(const gchar *candidate)
         return 0;
 
 #ifdef __APPLE__
-    if (g_str_has_prefix(lower, "/dev/tty.") ||
-        g_str_has_prefix(lower, "tty."))
-        score += 15;
     if (g_str_has_prefix(lower, "/dev/cu.") ||
         g_str_has_prefix(lower, "cu."))
+        score += 15;
+    if (g_str_has_prefix(lower, "/dev/tty.") ||
+        g_str_has_prefix(lower, "tty."))
         score += 5;
 #endif
     if (g_str_has_prefix(lower, "/dev/tty") &&
@@ -13949,10 +14104,10 @@ static GSList *rotctld_autodetect_filter_candidates(GSList *candidates,
         else
         {
 #ifdef __APPLE__
-            gboolean cand_tty = rotctld_autodetect_is_tty(candidate);
-            gboolean exist_tty = rotctld_autodetect_is_tty(existing);
+            gboolean cand_cu = rotctld_autodetect_is_cu(candidate);
+            gboolean exist_cu = rotctld_autodetect_is_cu(existing);
 
-            if (cand_tty && !exist_tty)
+            if (cand_cu && !exist_cu)
             {
                 g_hash_table_replace(by_key, g_strdup(key),
                                      g_strdup(candidate));
@@ -14051,9 +14206,9 @@ static GSList *rotctld_autodetect_prefer_device(GSList *list,
         return list;
 
 #ifdef __APPLE__
-    if (rotctld_autodetect_is_cu(device))
+    if (rotctld_autodetect_is_tty(device))
     {
-        preferred = rotctld_autodetect_tty_equivalent(device);
+        preferred = rotctld_autodetect_cu_equivalent(device);
         if (preferred && rotctld_list_contains(list, preferred))
             lookup = preferred;
     }
@@ -14979,6 +15134,8 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
     const gchar *env_cmd = g_getenv("GPREDICT_ROTCTLD_CMD");
     gchar **argv = NULL;
     gint port = 0;
+    gint rotctld_timeout_ms =
+        (port_override > 0) ? ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS : 1200;
 
     if (spawn_summary_out)
         *spawn_summary_out = NULL;
@@ -15005,12 +15162,17 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
 
     if (argv != NULL)
     {
+        if (rotctld_timeout_ms != 1200)
+            argv = rotctld_force_config_timeout(argv,
+                                                rotctld_timeout_ms,
+                                                TRUE);
         if (spawn_summary_out)
             *spawn_summary_out = rotctld_argv_to_string(argv);
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rotctld spawn: protocol=%s model=%s",
+                    "rotctld spawn: protocol=%s model=%d timeout=%d",
                     rot_protocol_name(ctrl->conf->protocol),
-                    rot_protocol_model_name(ctrl->conf->protocol));
+                    rot_conf_hamlib_model(ctrl->conf),
+                    rotctld_timeout_ms);
         if (!rotctld_spawn_process(ctrl, argv))
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -15079,8 +15241,9 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
         {
             const gchar *bind_host = rotctld_bind_host(ctrl->conf->host);
             *spawn_summary_out =
-                g_strdup_printf("rotctld -m %d -r %s -s %d -C timeout=1200 -T %s -t %d",
+                g_strdup_printf("rotctld -m %d -r %s -s %d -C timeout=%d -T %s -t %d",
                                 model, device, baud,
+                                rotctld_timeout_ms,
                                 bind_host ? bind_host : "",
                                 port);
         }
@@ -15089,17 +15252,19 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
                                  "spawn rotctld: %s", *spawn_summary_out);
 
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rotctld spawn: protocol=%s model=%s",
+                    "rotctld spawn: protocol=%s model=%d timeout=%d",
                     rot_protocol_name(ctrl->conf->protocol),
-                    rot_protocol_model_name(ctrl->conf->protocol));
+                    model,
+                    rotctld_timeout_ms);
         ctrl->rotctld_mgr =
-            rotctld_mgr_spawn(ctrl->conf->host,
-                              port,
-                              model,
-                              device,
-                              baud,
-                              ctrl->verbose_logging,
-                              &errmsg);
+            rotctld_mgr_spawn_timeout(ctrl->conf->host,
+                                      port,
+                                      model,
+                                      device,
+                                      baud,
+                                      ctrl->verbose_logging,
+                                      rotctld_timeout_ms,
+                                      &errmsg);
         if (ctrl->rotctld_mgr == NULL)
         {
             sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -15155,12 +15320,20 @@ rotctld_probe_position(const gchar *host,
     gdouble el = 0.0;
     rotctld_pos_result_t res = ROTCTLD_POS_IO_ERR;
     gint rprt = 0;
+    HamlibResponseInfo info = { 0 };
+    gchar reply[512];
+    gboolean have_az = FALSE;
+    gboolean have_el = FALSE;
+    gboolean have_rprt = FALSE;
+    gint parsed_rprt = 0;
+    gboolean no_reply = FALSE;
     const gchar *bind_host = NULL;
 
     if (rprt_out)
         *rprt_out = 0;
     if (reason_out)
         *reason_out = NULL;
+    (void)retry_delay_ms;
 
     probe = rotctld_client_new("rotctld-probe");
     if (probe == NULL)
@@ -15185,13 +15358,28 @@ rotctld_probe_position(const gchar *host,
         return ROTCTLD_POS_IO_ERR;
     }
 
-    res = rotctld_client_get_position_timed(probe,
-                                            timeout_ms,
-                                            retries,
-                                            retry_delay_ms,
+    reply[0] = '\0';
+    res = rotctld_client_get_pos_ex_timeout(probe,
                                             &az,
                                             &el,
-                                            &rprt);
+                                            &info,
+                                            reply,
+                                            sizeof(reply),
+                                            timeout_ms,
+                                            retries);
+    (void)rotctld_parse_position_reply_ex(reply,
+                                          &az,
+                                          &el,
+                                          &parsed_rprt,
+                                          &have_az,
+                                          &have_el,
+                                          &have_rprt);
+    rprt = parsed_rprt;
+    if (res == ROTCTLD_POS_OK && have_rprt && parsed_rprt != 0)
+        res = ROTCTLD_POS_RPRT_ERR;
+    if (res != ROTCTLD_POS_RPRT_ERR && have_az && have_el)
+        res = ROTCTLD_POS_OK;
+    no_reply = (info.bytes == 0 && reply[0] == '\0');
     if (rprt_out)
         *rprt_out = rprt;
     if (reason_out)
@@ -15204,10 +15392,20 @@ rotctld_probe_position(const gchar *host,
             *reason_out = g_strdup_printf("rprt %d", rprt);
             break;
         case ROTCTLD_POS_PARSE_FAIL:
-            *reason_out = g_strdup("parse_fail");
+            if (no_reply && !have_az && !have_el)
+                *reason_out = g_strdup("io_timeout");
+            else if (have_az && !have_el)
+                *reason_out = g_strdup("timeout_wait_el");
+            else if (!have_az && have_el)
+                *reason_out = g_strdup("timeout_wait_az");
+            else
+                *reason_out = g_strdup("parse_fail");
             break;
         case ROTCTLD_POS_TIMEOUT:
-            *reason_out = g_strdup("timeout");
+            if (no_reply)
+                *reason_out = g_strdup("io_timeout");
+            else
+                *reason_out = g_strdup("timeout");
             break;
         case ROTCTLD_POS_IO_ERR:
         default:
@@ -15294,6 +15492,9 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         gboolean have_el = FALSE;
         gboolean have_rprt = FALSE;
         gint parsed_rprt = 0;
+        gint64 start_us = 0;
+        gint64 elapsed_ms = 0;
+        gboolean no_reply = FALSE;
 
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "autodetect validate_io: send cmd=p timeout=%d retries=%d",
@@ -15301,6 +15502,7 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
                     worker->retries);
 
         pos_reply[0] = '\0';
+        start_us = g_get_monotonic_time();
         pos_res = rotctld_client_get_pos_ex_timeout(probe,
                                                     &az,
                                                     &el,
@@ -15308,14 +15510,17 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
                                                     pos_reply,
                                                     sizeof(pos_reply),
                                                     worker->timeout_ms,
-                                                    0);
+                                                    worker->retries);
+        elapsed_ms = (g_get_monotonic_time() - start_us) / 1000;
+        no_reply = (pos_info.bytes == 0 && pos_reply[0] == '\0');
 
         if (pos_reply[0] != '\0')
         {
             gchar *view = rotctld_sanitize_reply(pos_reply, 512);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "autodetect validate_io: p reply bytes=%" G_GSIZE_FORMAT " rprt=%d saw=%d err=%d view=%s",
+                        "autodetect validate_io: p reply bytes=%" G_GSIZE_FORMAT " ms=%lld rprt=%d saw=%d err=%d view=%s",
                         pos_info.bytes,
+                        (long long) elapsed_ms,
                         pos_info.rprt_code,
                         pos_info.saw_rprt ? 1 : 0,
                         pos_info.err,
@@ -15325,7 +15530,9 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         else
         {
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "autodetect validate_io: p reply empty err=%d",
+                        "autodetect validate_io: p reply empty bytes=%" G_GSIZE_FORMAT " ms=%lld err=%d",
+                        pos_info.bytes,
+                        (long long) elapsed_ms,
                         pos_info.err);
         }
 
@@ -15339,35 +15546,49 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
 
         rprt = parsed_rprt;
         if (state && state->ctrl)
-            rot_term_log(state->ctrl, "gpredict:rx",
-                         "autodetect validate: parsed az=%s el=%s rprt=%d flags[az=%d el=%d rprt=%d]",
-                         have_az ? "yes" : "no",
-                         have_el ? "yes" : "no",
-                         parsed_rprt,
-                         have_az ? 1 : 0,
-                         have_el ? 1 : 0,
-                         have_rprt ? 1 : 0);
-
-        if (pos_res == ROTCTLD_POS_OK)
         {
-            pos_ok = TRUE;
-            if (have_rprt && parsed_rprt != 0)
-            {
-                pos_ok = FALSE;
-                pos_res = ROTCTLD_POS_RPRT_ERR;
-            }
+            gchar az_buf[G_ASCII_DTOSTR_BUF_SIZE];
+            gchar el_buf[G_ASCII_DTOSTR_BUF_SIZE];
+            const gchar *az_txt = have_az
+                                  ? g_ascii_dtostr(az_buf, sizeof(az_buf), az)
+                                  : "n/a";
+            const gchar *el_txt = have_el
+                                  ? g_ascii_dtostr(el_buf, sizeof(el_buf), el)
+                                  : "n/a";
+            rot_term_log_verbose(state->ctrl, "gpredict:rx",
+                                 "autodetect validate: az=%s el=%s rprt=%d flags[az=%d el=%d rprt=%d] bytes=%" G_GSIZE_FORMAT " ms=%lld",
+                                 az_txt,
+                                 el_txt,
+                                 parsed_rprt,
+                                 have_az ? 1 : 0,
+                                 have_el ? 1 : 0,
+                                 have_rprt ? 1 : 0,
+                                 pos_info.bytes,
+                                 (long long) elapsed_ms);
+        }
+
+        pos_ok = (pos_res == ROTCTLD_POS_OK) || (have_az && have_el);
+        if (pos_ok && have_rprt && parsed_rprt != 0)
+        {
+            pos_ok = FALSE;
+            pos_res = ROTCTLD_POS_RPRT_ERR;
         }
 
         if (!pos_ok)
         {
-            if (pos_res == ROTCTLD_POS_TIMEOUT)
+            if (pos_res == ROTCTLD_POS_RPRT_ERR)
+            {
+                reason = g_strdup("rprt_err");
+            }
+            else if (no_reply && !have_az && !have_el)
+            {
+                saw_timeout = TRUE;
+                reason = g_strdup("io_timeout");
+            }
+            else if (pos_res == ROTCTLD_POS_TIMEOUT)
             {
                 saw_timeout = TRUE;
                 reason = g_strdup(have_az ? "timeout_wait_el" : "timeout_wait_az");
-            }
-            else if (pos_res == ROTCTLD_POS_RPRT_ERR)
-            {
-                reason = g_strdup("rprt_err");
             }
             else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
             {
@@ -15393,13 +15614,17 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         }
 
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "autodetect validate_io: p parsed az=%d el=%d rprt=%d code=%d res=%d reason=%s",
+                    "autodetect validate_io: p parsed az=%.2f el=%.2f flags[az=%d el=%d rprt=%d] rprt=%d res=%d reason=%s bytes=%" G_GSIZE_FORMAT " ms=%lld",
+                    az,
+                    el,
                     have_az ? 1 : 0,
                     have_el ? 1 : 0,
                     have_rprt ? 1 : 0,
                     parsed_rprt,
                     pos_res,
-                    reason ? reason : "ok");
+                    reason ? reason : "ok",
+                    pos_info.bytes,
+                    (long long) elapsed_ms);
     }
 
     if (pos_ok)
@@ -15430,6 +15655,10 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         g_free(reason);
         reason = NULL;
         res = ROTCTLD_POS_OK;
+        if (state && state->ctrl)
+            rot_term_log_verbose(state->ctrl, "gpredict:rx",
+                                 "autodetect validate: accept az=%.2f el=%.2f",
+                                 az, el);
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "autodetect validate_io: accept az=%.2f el=%.2f rprt=%d",
                     az, el, rprt);
@@ -15696,8 +15925,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
         if (result == ROTCTLD_PROBE_OK_ROTCTLD)
         {
             gint detected_model = 0;
-            gint desired_model =
-                rot_conf_hamlib_model(ctrl->conf);
+            gint desired_model = rot_conf_hamlib_model(ctrl->conf);
             gboolean have_model = rotctld_extract_model(full_text,
                                                         &detected_model);
             if (have_model && detected_model > 0 && desired_model > 0 &&
@@ -15818,6 +16046,10 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                 validate_timeout_ms = ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS;
             if (validate_timeout_ms < 2500)
                 validate_timeout_ms = 2500;
+            if (validate_timeout_ms < (ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
+                                       ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS))
+                validate_timeout_ms = ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
+                                      ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS;
             if (validate_timeout_ms > 8000)
                 validate_timeout_ms = 8000;
 
@@ -15854,7 +16086,8 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             g_mutex_unlock(&state->validate_mutex);
 
             rot_term_log(ctrl, "gpredict:rx",
-                         "autodetect: validating rotor IO (p)...");
+                         "autodetect: validating rotor IO (p, timeout=%dms)...",
+                         validate_timeout_ms);
             return ROTCTLD_AUTODETECT_STEP_CONTINUE;
         }
 
@@ -16494,6 +16727,10 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
                 validate_timeout_ms = ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS;
             if (validate_timeout_ms < 2500)
                 validate_timeout_ms = 2500;
+            if (validate_timeout_ms < (ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
+                                       ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS))
+                validate_timeout_ms = ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
+                                      ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS;
             if (validate_timeout_ms > 8000)
                 validate_timeout_ms = 8000;
 
