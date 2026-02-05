@@ -1013,8 +1013,8 @@ static void clear_widgets(RotPrefUi *ui)
                               G_CALLBACK(aztype_changed_cb));
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), 0);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 90);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), -5);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 185);
     rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), ROT_AXIS_MODE_AZ_EL,
                               G_CALLBACK(axismode_changed_cb));
     update_el_limits_sensitivity(ui);
@@ -1447,8 +1447,8 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     ui->minel_label = gtk_label_new(_(" Min El"));
     g_object_set(ui->minel_label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), ui->minel_label, 0, 16, 1, 1);
-    ui->minel = gtk_spin_button_new_with_range(-10, 180, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), 0);
+    ui->minel = gtk_spin_button_new_with_range(-5, 185, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), -5);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->minel), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->minel), FALSE);
     gtk_grid_attach(GTK_GRID(table), ui->minel, 1, 16, 1, 1);
@@ -1458,8 +1458,8 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     ui->maxel_label = gtk_label_new(_(" Max El"));
     g_object_set(ui->maxel_label, "xalign", 1.0, "yalign", 0.5, NULL);
     gtk_grid_attach(GTK_GRID(table), ui->maxel_label, 2, 16, 1, 1);
-    ui->maxel = gtk_spin_button_new_with_range(-10, 180, 1);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 90);
+    ui->maxel = gtk_spin_button_new_with_range(-5, 185, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 185);
     gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->maxel), TRUE);
     gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->maxel), FALSE);
     gtk_grid_attach(GTK_GRID(table), ui->maxel, 3, 16, 1, 1);

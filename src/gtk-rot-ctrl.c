@@ -207,6 +207,8 @@ static const gdouble k_meas_tol_deg = 1.5;
 #define ROTCTLD_AUTODETECT_COOLDOWN_MS 150
 #define ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS 1000
 #define ROTCTLD_AUTODETECT_MAX_CANDIDATES 5
+#define ROTCTRL_DEFAULT_MIN_EL -5.0
+#define ROTCTRL_DEFAULT_MAX_EL 185.0
 #define ROTCTLD_KEEPALIVE_US 2000000
 #define ROT_SEND_MIN_INTERVAL_US ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000)
 #define ROT_TRACK_RESEND_US 2000000
@@ -3991,8 +3993,8 @@ static SpanConfig rotctrl_span_from_limits(const rotor_conf_t *conf,
     SpanConfig cfg;
     gdouble az_min = 0.0;
     gdouble az_max = 360.0;
-    gdouble el_min = 0.0;
-    gdouble el_max = 180.0;
+    gdouble el_min = ROTCTRL_DEFAULT_MIN_EL;
+    gdouble el_max = ROTCTRL_DEFAULT_MAX_EL;
     const gdouble eps = 1e-6;
     gdouble span = 360.0;
 
@@ -6851,13 +6853,18 @@ static void format_rotctld_setpos(GtkRotCtrl *ctrl,
     gboolean caps_valid = FALSE;
     gdouble az_min = 0.0;
     gdouble az_max = 360.0;
-    gdouble el_min = 0.0;
-    gdouble el_max = 180.0;
+    gdouble el_min = ROTCTRL_DEFAULT_MIN_EL;
+    gdouble el_max = ROTCTRL_DEFAULT_MAX_EL;
     gchar azbuf[G_ASCII_DTOSTR_BUF_SIZE];
     gchar elbuf[G_ASCII_DTOSTR_BUF_SIZE];
 
     if (ctrl != NULL)
     {
+        if (ctrl->conf)
+        {
+            el_min = ctrl->conf->minel;
+            el_max = ctrl->conf->maxel;
+        }
         g_mutex_lock(&ctrl->client.mutex);
         if (ctrl->client.limits_valid)
         {
@@ -6872,12 +6879,24 @@ static void format_rotctld_setpos(GtkRotCtrl *ctrl,
 
     if (caps_valid)
     {
+        if (ctrl && ctrl->conf)
+        {
+            el_min = MAX(el_min, ctrl->conf->minel);
+            el_max = MIN(el_max, ctrl->conf->maxel);
+        }
+        if (el_min > el_max)
+        {
+            gdouble tmp = el_min;
+            el_min = el_max;
+            el_max = tmp;
+        }
         el = CLAMP(el, el_min, el_max);
         az = rotctrl_normalize_az_to_limits(az, az_min, az_max);
         az = rotctrl_normalize_backend_az(az, az_min, az_max);
     }
     else
     {
+        el = CLAMP(el, el_min, el_max);
         az = rotctrl_normalize_backend_az(az, 0.0, 360.0);
     }
 
@@ -7042,11 +7061,17 @@ static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
     gboolean caps_valid = FALSE;
     gdouble az_min = 0.0;
     gdouble az_max = 0.0;
-    gdouble el_min = 0.0;
-    gdouble el_max = 0.0;
+    gdouble el_min = ROTCTRL_DEFAULT_MIN_EL;
+    gdouble el_max = ROTCTRL_DEFAULT_MAX_EL;
 
     if (ctrl == NULL || ctrl->client.client == NULL)
         return FALSE;
+
+    if (ctrl->conf)
+    {
+        el_min = ctrl->conf->minel;
+        el_max = ctrl->conf->maxel;
+    }
 
     if (ctrl->tracking_active)
     {
@@ -7072,12 +7097,24 @@ static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
 
     if (caps_valid)
     {
+        if (ctrl->conf)
+        {
+            el_min = MAX(el_min, ctrl->conf->minel);
+            el_max = MIN(el_max, ctrl->conf->maxel);
+        }
+        if (el_min > el_max)
+        {
+            gdouble tmp = el_min;
+            el_min = el_max;
+            el_max = tmp;
+        }
         send_el = CLAMP(send_el, el_min, el_max);
         send_az = rotctrl_normalize_az_to_limits(send_az, az_min, az_max);
         send_az = rotctrl_normalize_backend_az(send_az, az_min, az_max);
     }
     else
     {
+        send_el = CLAMP(send_el, el_min, el_max);
         send_az = rotctrl_normalize_backend_az(send_az, 0.0, 360.0);
     }
 
@@ -9545,8 +9582,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean caps_south_zero = FALSE;
     gdouble backend_az_min = 0.0;
     gdouble backend_az_max = 360.0;
-    gdouble backend_el_min = 0.0;
-    gdouble backend_el_max = 180.0;
+    gdouble backend_el_min = ROTCTRL_DEFAULT_MIN_EL;
+    gdouble backend_el_max = ROTCTRL_DEFAULT_MAX_EL;
     GtkWidget *status_label =
         g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
     gboolean plan_active = rot_plan_matches_pass(ctrl);
@@ -18267,6 +18304,8 @@ static void rotctrl_preset_dialog_open(GtkRotCtrl *ctrl, gint index)
     GtkWidget *entry = NULL;
     GtkWidget *az_spin = NULL;
     GtkWidget *el_spin = NULL;
+    gdouble preset_min_el = ROTCTRL_DEFAULT_MIN_EL;
+    gdouble preset_max_el = ROTCTRL_DEFAULT_MAX_EL;
     GtkWidget *delete_btn = NULL;
     gboolean is_edit = FALSE;
 
@@ -18310,7 +18349,21 @@ static void rotctrl_preset_dialog_open(GtkRotCtrl *ctrl, gint index)
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(grid), label, 0, 2, 1, 1);
 
-    el_spin = gtk_spin_button_new_with_range(-90.0, 180.0, 0.1);
+    if (ctrl && ctrl->conf)
+    {
+        preset_min_el = ctrl->conf->minel;
+        preset_max_el = ctrl->conf->maxel;
+    }
+    if (preset_min_el > preset_max_el)
+    {
+        gdouble tmp = preset_min_el;
+        preset_min_el = preset_max_el;
+        preset_max_el = tmp;
+    }
+
+    el_spin = gtk_spin_button_new_with_range(preset_min_el,
+                                             preset_max_el,
+                                             0.1);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(el_spin), 2);
     gtk_grid_attach(GTK_GRID(grid), el_spin, 1, 2, 1, 1);
 
@@ -18615,8 +18668,8 @@ static void rotctld_selftest(GtkRotCtrl *ctrl)
         ctrl->client.limits_valid = TRUE;
         ctrl->client.az_min = -180.0;
         ctrl->client.az_max = 450.0;
-        ctrl->client.el_min = 0.0;
-        ctrl->client.el_max = 180.0;
+        ctrl->client.el_min = ROTCTRL_DEFAULT_MIN_EL;
+        ctrl->client.el_max = ROTCTRL_DEFAULT_MAX_EL;
         g_mutex_unlock(&ctrl->client.mutex);
 
         format_rotctld_setpos(ctrl, 540.0, 190.0, NULL, NULL, cmd, sizeof(cmd));
@@ -18630,8 +18683,15 @@ static void rotctld_selftest(GtkRotCtrl *ctrl)
         g_mutex_unlock(&ctrl->client.mutex);
     }
 
-    if (g_strcmp0(cmd, "P 180.00 180.00\n") != 0)
-        ok = FALSE;
+    {
+        gdouble expect_el = ROTCTRL_DEFAULT_MAX_EL;
+        if (ctrl->conf)
+            expect_el = MIN(expect_el, ctrl->conf->maxel);
+        gchar expected[64];
+        g_snprintf(expected, sizeof(expected), "P 180.00 %.2f\n", expect_el);
+        if (g_strcmp0(cmd, expected) != 0)
+            ok = FALSE;
+    }
 
     sat_log_log(ok ? SAT_LOG_LEVEL_INFO : SAT_LOG_LEVEL_WARN,
                 "rotctld selftest %s", ok ? "ok" : "failed");

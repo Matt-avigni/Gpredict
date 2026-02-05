@@ -98,6 +98,8 @@
 #define DEFAULT_ANGLE_EPSILON_DEG 1.5
 #define DEFAULT_ELEV_FLOOR_DEG 1.0
 #define DEFAULT_DISABLE_POS_FEEDBACK FALSE
+#define DEFAULT_MIN_EL -5.0
+#define DEFAULT_MAX_EL 185.0
 
 /* Hamlib rotator model IDs from hamlib/rotlist.h. */
 #define ROT_HAMLIB_MODEL_GS232B    ROT_MODEL_GS232B
@@ -616,20 +618,20 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     if (error != NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: MinEl not defined for %s. Assuming 0\302\260."),
+                    _("%s: MinEl not defined for %s. Assuming %.0f\302\260."),
                     __func__, conf->name);
         g_clear_error(&error);
-        conf->minel = 0.0;
+        conf->minel = DEFAULT_MIN_EL;
     }
 
     conf->maxel = g_key_file_get_double(cfg, GROUP, KEY_MAXEL, &error);
     if (error != NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: MaxEl not defined for %s. Assuming 90\302\260."),
+                    _("%s: MaxEl not defined for %s. Assuming %.0f\302\260."),
                     __func__, conf->name);
         g_clear_error(&error);
-        conf->maxel = 90.0;
+        conf->maxel = DEFAULT_MAX_EL;
     }
 
     conf->azstoppos = g_key_file_get_double(cfg, GROUP, KEY_AZSTOPPOS, &error);
@@ -796,8 +798,8 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
             conf->pretrack_min_el = DEFAULT_PRETRACK_MIN_EL;
         }
     }
-    if (conf->pretrack_min_el < 0.0)
-        conf->pretrack_min_el = 0.0;
+    if (conf->pretrack_min_el < conf->minel)
+        conf->pretrack_min_el = conf->minel;
 
     conf->last_good_device = NULL;
     if (g_key_file_has_key(cfg, GROUP, KEY_LAST_GOOD_DEVICE, NULL))
