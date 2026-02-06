@@ -116,6 +116,12 @@ gboolean              rotctld_client_request_raw(RotctldClient *client,
                                                  gchar *out,
                                                  gsize out_len,
                                                  HamlibResponseInfo *info);
+gboolean              rotctld_client_request_raw_timeout(RotctldClient *client,
+                                                         const gchar *cmd,
+                                                         gint timeout_ms,
+                                                         gchar *out,
+                                                         gsize out_len,
+                                                         HamlibResponseInfo *info);
 
 gint64                rotctld_client_last_rtt_us(const RotctldClient *client);
 gboolean              rotctld_client_recovery_triggered(const RotctldClient *client);

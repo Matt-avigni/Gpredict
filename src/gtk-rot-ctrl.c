@@ -365,6 +365,15 @@ typedef enum {
 } rot_session_state_t;
 
 typedef enum {
+    ROT_COMM_DISENGAGED = 0,
+    ROT_COMM_STANDBY,
+    ROT_COMM_MOVING,
+    ROT_COMM_ON_TARGET,
+    ROT_COMM_DEGRADED,
+    ROT_COMM_LINK_LOST
+} rot_comm_status_t;
+
+typedef enum {
     ROT_PLAN_MODE_NORMAL = 0,
     ROT_PLAN_MODE_FLIP   = 1
 } rot_plan_mode_t;
@@ -493,6 +502,12 @@ struct _GtkRotCtrl {
     rot_session_state_t session_state;
     gboolean        tracking_active;
     gboolean        force_next_send;
+    gboolean        hold_position_on_engage;
+    gboolean        hold_position_log_emitted;
+    rot_comm_status_t comm_status;
+    guint           ok_streak;
+    guint           bad_streak;
+    guint           timeout_streak;
     rot_target_state_t target_state;
     gint64          target_state_since_us;
     gint64          target_valid_since_us;
@@ -1268,6 +1283,20 @@ static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason)
                     reason ? reason : "(none)");
 }
 
+static gboolean rotctrl_link_lost_popup_cb(gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    if (ctrl == NULL)
+        return G_SOURCE_REMOVE;
+
+    rot_show_message(ctrl,
+                     GTK_MESSAGE_ERROR,
+                     _("Rotor link lost"),
+                     _("Lost rotor feedback. Check rotor model, serial device, baud rate, and power. Re-engage to retry."));
+    return G_SOURCE_REMOVE;
+}
+
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason)
 {
     if (ctrl == NULL)
@@ -1723,6 +1752,15 @@ static void rot_session_set_state(GtkRotCtrl *ctrl,
                          send_quit ? "yes" : "no");
 
     ctrl->session_state = state;
+    if (state == ROT_SESSION_CONNECTING)
+    {
+        ctrl->hold_position_on_engage = TRUE;
+        ctrl->hold_position_log_emitted = FALSE;
+        ctrl->ok_streak = 0;
+        ctrl->bad_streak = 0;
+        ctrl->timeout_streak = 0;
+        ctrl->comm_status = ROT_COMM_STANDBY;
+    }
 }
 
 static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
@@ -6299,6 +6337,7 @@ static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
 
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
+    ctrl->hold_position_on_engage = FALSE;
     return FALSE;
 }
 
@@ -6377,7 +6416,7 @@ static gboolean rot_parse_first_number(const gchar *line, gdouble *out)
         return FALSE;
 
     const gchar *p = line;
-    while (*p != '\0' && !g_ascii_isdigit(*p) && *p != '-' && *p != '+')
+    while (*p != '\0' && !g_ascii_isdigit(*p) && *p != '-' && *p != '+' && *p != '.')
         p++;
 
     if (*p == '\0')
@@ -6408,7 +6447,7 @@ static gboolean rot_parse_first_two_numbers(const gchar *line,
 
     while (*p != '\0')
     {
-        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+')
+        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+' || *p == '.')
         {
             gdouble v = g_ascii_strtod(p, &endptr);
             if (endptr != p)
@@ -8160,6 +8199,40 @@ static gpointer rotctld_client_thread(gpointer data)
         if (send_cmd && now_us < backoff_until)
             backoff_active = TRUE;
 
+        {
+            gboolean explicit_user_cmd = FALSE;
+            rot_comm_status_t comm_state = ROT_COMM_STANDBY;
+            if (desired_tracking || allow_no_pos ||
+                ctrl->park_requested || ctrl->cal_active ||
+                ctrl->cal_hold_active)
+                explicit_user_cmd = TRUE;
+
+            g_mutex_lock(&ctrl->client.mutex);
+            comm_state = ctrl->comm_status;
+            g_mutex_unlock(&ctrl->client.mutex);
+
+            if (ctrl->hold_position_on_engage && explicit_user_cmd)
+            {
+                ctrl->hold_position_on_engage = FALSE;
+                ctrl->hold_position_log_emitted = FALSE;
+            }
+
+            if (send_cmd && comm_state == ROT_COMM_LINK_LOST)
+            {
+                send_cmd = FALSE;
+            }
+            else if (send_cmd && ctrl->hold_position_on_engage && !explicit_user_cmd)
+            {
+                if (ctrl->verbose_logging)
+                    rot_term_log_verbose(ctrl, "gpredict:rx",
+                                         "hold: suppress setpos az=%.2f el=%.2f reason=%s",
+                                         desired_backend_az,
+                                         desired_backend_el,
+                                         send_reason ? send_reason : "none");
+                send_cmd = FALSE;
+            }
+        }
+
         if (send_cmd)
         {
             if (!daemon_ok)
@@ -8560,6 +8633,16 @@ static gpointer rotctld_client_thread(gpointer data)
                                                     &info,
                                                     pos_reply,
                                                     sizeof(pos_reply));
+                if (ctrl->verbose_logging && pos_res == ROTCTLD_POS_OK)
+                {
+                    gchar *view = rotctld_sanitize_reply(pos_reply, 120);
+                    rot_term_log_verbose(ctrl, "gpredict:rx",
+                                         "get_position reply=%s parsed az=%.2f el=%.2f",
+                                         view ? view : "(none)",
+                                         cur_az,
+                                         cur_el);
+                    g_free(view);
+                }
                 if (rotctld_stop_requested(ctrl) ||
                     rotctld_generation_stale(ctrl, session_gen))
                     goto out_stop;
@@ -8821,6 +8904,79 @@ static gpointer rotctld_client_thread(gpointer data)
                                          pos_failures,
                                          ROTCTLD_POS_MAX_FAIL,
                                          delay_sec);
+                }
+
+                {
+                    gboolean poll_ok = (pos_res == ROTCTLD_POS_OK);
+                    gboolean poll_timeout = (pos_res == ROTCTLD_POS_TIMEOUT &&
+                                             info.bytes == 0 &&
+                                             pos_reply[0] == '\0');
+                    gboolean poll_bad = (!poll_ok && !poll_timeout);
+                    rot_comm_status_t prev_status;
+                    rot_comm_status_t new_status;
+                    gboolean enter_link_lost = FALSE;
+
+                    g_mutex_lock(&ctrl->client.mutex);
+                    prev_status = ctrl->comm_status;
+                    if (poll_ok)
+                    {
+                        if (ctrl->ok_streak < G_MAXUINT)
+                            ctrl->ok_streak++;
+                        ctrl->bad_streak = 0;
+                        ctrl->timeout_streak = 0;
+                    }
+                    else if (poll_timeout)
+                    {
+                        if (ctrl->timeout_streak < G_MAXUINT)
+                            ctrl->timeout_streak++;
+                        ctrl->ok_streak = 0;
+                        ctrl->bad_streak = 0;
+                    }
+                    else if (poll_bad)
+                    {
+                        if (ctrl->bad_streak < G_MAXUINT)
+                            ctrl->bad_streak++;
+                        ctrl->ok_streak = 0;
+                        ctrl->timeout_streak = 0;
+                    }
+
+                    new_status = prev_status;
+                    if (!ctrl->engaged)
+                    {
+                        new_status = ROT_COMM_DISENGAGED;
+                    }
+                    else if (ctrl->timeout_streak >= 5)
+                    {
+                        new_status = ROT_COMM_LINK_LOST;
+                    }
+                    else if (ctrl->bad_streak >= 3 || ctrl->timeout_streak >= 3)
+                    {
+                        new_status = ROT_COMM_DEGRADED;
+                    }
+                    else if (ctrl->ok_streak >= 2 && prev_status == ROT_COMM_DEGRADED)
+                    {
+                        new_status = ROT_COMM_STANDBY;
+                    }
+                    else if (poll_ok && prev_status == ROT_COMM_DISENGAGED)
+                    {
+                        new_status = ROT_COMM_STANDBY;
+                    }
+
+                    ctrl->comm_status = new_status;
+                    enter_link_lost = (prev_status != ROT_COMM_LINK_LOST &&
+                                       new_status == ROT_COMM_LINK_LOST);
+                    g_mutex_unlock(&ctrl->client.mutex);
+
+                    if (enter_link_lost)
+                    {
+                        ctrl->hold_position_on_engage = TRUE;
+                        ctrl->hold_position_log_emitted = FALSE;
+                        rotctld_request_thread_stop(ctrl, TRUE);
+                        g_idle_add_full(G_PRIORITY_DEFAULT,
+                                        rotctrl_link_lost_popup_cb,
+                                        g_object_ref(ctrl),
+                                        g_object_unref);
+                    }
                 }
 
                 if (!feedback_disabled)
@@ -9380,6 +9536,8 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     }
 
     ctrl->tracking = requested;
+    if (requested)
+        ctrl->hold_position_on_engage = FALSE;
     gtk_widget_set_sensitive(ctrl->MonitorCheckBox,
                              !(ctrl->tracking || locked));
     gtk_widget_set_sensitive(ctrl->AzSet, !ctrl->tracking);
@@ -9586,6 +9744,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean pos_recent = FALSE;
     gint64 last_pos_us = 0;
     guint pos_failures = 0;
+    rot_comm_status_t comm_status = ROT_COMM_DISENGAGED;
     gboolean az_clamped = FALSE;
     gboolean el_clamped = FALSE;
     gboolean safety_clamped = FALSE;
@@ -10168,6 +10327,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             pos_cmd_ok = ctrl->client.pos_cmd_ok;
             last_pos_us = ctrl->client.last_pos_us;
             pos_failures = ctrl->client.pos_failures;
+            comm_status = ctrl->comm_status;
             g_strlcpy(last_pos_error, ctrl->client.last_pos_error,
                       sizeof(last_pos_error));
             if (ctrl->client.limits_valid)
@@ -10188,8 +10348,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (error)
         {
             rotpos_valid = FALSE;
-            gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("ERROR"));
-            gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("ERROR"));
+            gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("UNKNOWN"));
+            gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("UNKNOWN"));
             gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
                                          -10.0, -10.0);
         }
@@ -10288,10 +10448,10 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             {
                 gdouble rotaz_disp =
                     az_abs_to_span(ctrl->az_abs_cur, ctrl->span_mode);
-                text = g_strdup_printf("%.2f\302\260", rotaz_disp);
+                text = g_strdup_printf("%.1f\302\260", rotaz_disp);
                 gtk_label_set_text(GTK_LABEL(ctrl->AzRead), text);
                 g_free(text);
-                text = g_strdup_printf("%.2f\302\260", rotel);
+                text = g_strdup_printf("%.1f\302\260", rotel);
                 gtk_label_set_text(GTK_LABEL(ctrl->ElRead), text);
                 g_free(text);
 
@@ -10308,10 +10468,25 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
             else
             {
-                gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("UNKNOWN"));
-                gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("UNKNOWN"));
-                gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                             -10.0, -10.0);
+                if (comm_status == ROT_COMM_DEGRADED ||
+                    comm_status == ROT_COMM_LINK_LOST)
+                {
+                    gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("UNKNOWN"));
+                    gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("UNKNOWN"));
+                    gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
+                                                 -10.0, -10.0);
+                }
+                else
+                {
+                    gdouble rotaz_disp =
+                        az_abs_to_span(ctrl->az_abs_cur, ctrl->span_mode);
+                    text = g_strdup_printf("%.1f\302\260", rotaz_disp);
+                    gtk_label_set_text(GTK_LABEL(ctrl->AzRead), text);
+                    g_free(text);
+                    text = g_strdup_printf("%.1f\302\260", rotel);
+                    gtk_label_set_text(GTK_LABEL(ctrl->ElRead), text);
+                    g_free(text);
+                }
             }
         }
 
@@ -11376,6 +11551,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
 
         manual_override = rotctrl_manual_override_active(ctrl);
+        if (ctrl->hold_position_on_engage &&
+            (ctrl->tracking || manual_override))
+        {
+            ctrl->hold_position_on_engage = FALSE;
+            ctrl->hold_position_log_emitted = FALSE;
+        }
 
         eps_az = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.5;
         eps_el = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.0;
@@ -11516,6 +11697,24 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         park_active = ctrl->park_requested;
         if (park_active)
             force_send = TRUE;
+        if (ctrl->hold_position_on_engage &&
+            !ctrl->tracking &&
+            !manual_override &&
+            !park_active &&
+            !cal_hold_active)
+        {
+            if (!ctrl->hold_position_log_emitted)
+            {
+                ctrl->hold_position_log_emitted = TRUE;
+                rot_term_log_verbose(ctrl, "gpredict:rx",
+                                     "engage: holding position until user command");
+                if (ctrl->verbose_logging)
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "engage: holding position until user command");
+            }
+            allow_send = FALSE;
+            force_send = FALSE;
+        }
 
         if (ctrl->tracking || park_active)
         {
@@ -12180,51 +12379,32 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             const gchar *status_text = NULL;
             gboolean has_error = error || (ctrl->errcnt > 0);
 
-            gchar status_buf[128] = { 0 };
-
             if (!ctrl->engaged)
                 status_text = _("DISENGAGED");
-            else if (cmd_rejected)
-                status_text = _("CMD REJECTED");
-            else if (has_error)
-                status_text = _("LINK DOWN");
-            else if (!pos_recent)
-            {
-                if (last_pos_error[0] != '\0')
-                    g_snprintf(status_buf, sizeof(status_buf),
-                               _("NO POSITION (waiting for p: %s)"),
-                               last_pos_error);
-                else
-                    g_snprintf(status_buf, sizeof(status_buf),
-                               _("NO POSITION (waiting for p)"));
-                status_text = status_buf;
-            }
+            else if (comm_status == ROT_COMM_LINK_LOST || has_error)
+                status_text = _("LINK LOST");
+            else if (comm_status == ROT_COMM_DEGRADED)
+                status_text = _("DEGRADED FEEDBACK");
             else if (ctrl->session_state == ROT_SESSION_CONNECTING)
                 status_text = _("CONNECTING");
             else if (ctrl->session_state == ROT_SESSION_ENGAGING)
                 status_text = _("ENGAGING");
-            else if (ctrl->session_state == ROT_SESSION_DEGRADED)
-                status_text = _("DEGRADED");
-            else if (ctrl->tracking &&
-                     ctrl->target_state == ROT_TARGET_STATE_HOLD)
-                status_text = _("HOLD");
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_PRETRACK)
-                status_text = _("PRETRACK");
+                status_text = _("MOVING");
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED)
-                status_text = _("TRACKING DEGRADED");
-            else if (ctrl->out_of_range)
-                status_text = _("OUT OF RANGE");
-            else if (ctrl->tracking && plan_active &&
-                     ctrl->trajectory_plan.valid &&
-                     ctrl->trajectory_plan.status != ROT_PLAN_STATUS_FULL_TRACK)
-                status_text = _("PARTIAL");
+                status_text = _("MOVING");
             else if (rotpos_valid &&
                      (fabs(shortest_az_delta(az_abs_cmd, ctrl->az_abs_cur)) >
                           rotctrl_angle_epsilon(ctrl) ||
                       fabs(cmdel - rotel_backend) > rotctrl_angle_epsilon(ctrl)))
                 status_text = _("MOVING");
+            else if (ctrl->engaged &&
+                     !ctrl->tracking &&
+                     !ctrl->setpoint_valid &&
+                     !ctrl->park_requested)
+                status_text = _("STANDBY");
             else
                 status_text = _("ON TARGET");
 
@@ -12257,6 +12437,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         /* client not running: ensure rotor pos is not visible */
         gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot), -10.0, -10.0);
         ctrl->axis_swap_warned = FALSE;
+        gtk_label_set_text(GTK_LABEL(ctrl->AzRead), "\342\200\224");
+        gtk_label_set_text(GTK_LABEL(ctrl->ElRead), "\342\200\224");
 
         if (status_label)
         {
@@ -12696,6 +12878,8 @@ static void wrap_mode_changed_cb(GtkComboBox *box, gpointer data)
     ctrl->setpoint_backend_el = 0.0;
     ctrl->setpoint_valid = FALSE;
     ctrl->force_next_send = FALSE;
+    ctrl->hold_position_on_engage = FALSE;
+    ctrl->hold_position_log_emitted = FALSE;
     ctrl->committed_user_az = 0.0;
     ctrl->committed_user_el = 0.0;
     ctrl->committed_raw_az360 = 0.0;
@@ -15110,6 +15294,19 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     ctrl->az_hold_value = 0.0;
     ctrl->axis_swap_warned = FALSE;
     ctrl->selected_child_port = 0;
+    ctrl->hold_position_on_engage = FALSE;
+    ctrl->hold_position_log_emitted = FALSE;
+    ctrl->ok_streak = 0;
+    ctrl->bad_streak = 0;
+    ctrl->timeout_streak = 0;
+    ctrl->comm_status = ROT_COMM_DISENGAGED;
+    if (ctrl->LockBut &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
+    {
+        rotctrl_ui_begin_update(ctrl, "engage_failed");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+        rotctrl_ui_end_update(ctrl, "engage_failed");
+    }
     g_mutex_lock(&ctrl->client.mutex);
     ctrl->client.send_quit = FALSE;
     g_mutex_unlock(&ctrl->client.mutex);
@@ -15496,67 +15693,143 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         gint64 elapsed_ms = 0;
         gboolean no_reply = FALSE;
 
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "autodetect validate_io: send cmd=p timeout=%d retries=%d",
-                    worker->timeout_ms,
-                    worker->retries);
-
-        pos_reply[0] = '\0';
-        start_us = g_get_monotonic_time();
-        pos_res = rotctld_client_get_pos_ex_timeout(probe,
-                                                    &az,
-                                                    &el,
-                                                    &pos_info,
-                                                    pos_reply,
-                                                    sizeof(pos_reply),
-                                                    worker->timeout_ms,
-                                                    worker->retries);
-        elapsed_ms = (g_get_monotonic_time() - start_us) / 1000;
-        no_reply = (pos_info.bytes == 0 && pos_reply[0] == '\0');
-
-        if (pos_reply[0] != '\0')
         {
-            gchar *view = rotctld_sanitize_reply(pos_reply, 512);
+            const gint max_attempts = 3;
+            const gint retry_sleep_ms = 100;
+
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "autodetect validate_io: p reply bytes=%" G_GSIZE_FORMAT " ms=%lld rprt=%d saw=%d err=%d view=%s",
-                        pos_info.bytes,
-                        (long long) elapsed_ms,
-                        pos_info.rprt_code,
-                        pos_info.saw_rprt ? 1 : 0,
-                        pos_info.err,
-                        view ? view : "(none)");
-            g_free(view);
-        }
-        else
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "autodetect validate_io: p reply empty bytes=%" G_GSIZE_FORMAT " ms=%lld err=%d",
-                        pos_info.bytes,
-                        (long long) elapsed_ms,
-                        pos_info.err);
+                        "autodetect validate_io: send cmd=p timeout=%d attempts=%d",
+                        worker->timeout_ms,
+                        max_attempts);
+
+            for (gint attempt = 0; attempt < max_attempts; attempt++)
+            {
+                gboolean ok = FALSE;
+                gboolean timeout_err = FALSE;
+                gboolean any_bytes = FALSE;
+                const gchar *status = "unknown";
+
+                memset(&pos_info, 0, sizeof(pos_info));
+                pos_reply[0] = '\0';
+                have_az = FALSE;
+                have_el = FALSE;
+                have_rprt = FALSE;
+                parsed_rprt = 0;
+
+                start_us = g_get_monotonic_time();
+                ok = rotctld_client_request_raw_timeout(probe,
+                                                        "p\n",
+                                                        worker->timeout_ms,
+                                                        pos_reply,
+                                                        sizeof(pos_reply),
+                                                        &pos_info);
+                elapsed_ms = (g_get_monotonic_time() - start_us) / 1000;
+                no_reply = (pos_info.bytes == 0 && pos_reply[0] == '\0');
+                any_bytes = (pos_info.bytes > 0 || pos_reply[0] != '\0');
+
+                (void)rotctld_parse_position_reply_ex(pos_reply,
+                                                      &az,
+                                                      &el,
+                                                      &parsed_rprt,
+                                                      &have_az,
+                                                      &have_el,
+                                                      &have_rprt);
+
+                timeout_err = (pos_info.err == EAGAIN ||
+                               pos_info.err == EWOULDBLOCK ||
+                               pos_info.err == ETIMEDOUT);
+
+                if (have_az && have_el)
+                {
+                    pos_ok = TRUE;
+                    pos_res = ROTCTLD_POS_OK;
+                }
+                else if (have_rprt && parsed_rprt != 0)
+                {
+                    pos_ok = FALSE;
+                    pos_res = ROTCTLD_POS_RPRT_ERR;
+                }
+                else if (!any_bytes && timeout_err)
+                {
+                    pos_ok = FALSE;
+                    pos_res = ROTCTLD_POS_TIMEOUT;
+                }
+                else if (!ok && !timeout_err)
+                {
+                    pos_ok = FALSE;
+                    pos_res = ROTCTLD_POS_IO_ERR;
+                }
+                else
+                {
+                    pos_ok = FALSE;
+                    pos_res = ROTCTLD_POS_PARSE_FAIL;
+                }
+
+                if (pos_ok && have_rprt && parsed_rprt != 0)
+                {
+                    pos_ok = FALSE;
+                    pos_res = ROTCTLD_POS_RPRT_ERR;
+                }
+
+                if (pos_res == ROTCTLD_POS_OK)
+                    status = "ok";
+                else if (pos_res == ROTCTLD_POS_TIMEOUT)
+                    status = "timeout";
+                else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
+                    status = "parse_fail";
+                else if (pos_res == ROTCTLD_POS_RPRT_ERR)
+                    status = "rprt_err";
+                else
+                    status = "io_error";
+
+                {
+                    gchar *view = rotctld_sanitize_reply(pos_reply, 80);
+                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                "autodetect validate_io: p attempt=%d/%d bytes=%" G_GSIZE_FORMAT " ms=%lld err=%d status=%s view=%s",
+                                attempt + 1,
+                                max_attempts,
+                                pos_info.bytes,
+                                (long long) elapsed_ms,
+                                pos_info.err,
+                                status,
+                                view ? view : "(none)");
+                    g_free(view);
+                }
+
+                if (pos_ok)
+                    break;
+
+                if (attempt + 1 < max_attempts)
+                    g_usleep((gulong) retry_sleep_ms * 1000);
+            }
         }
 
-        (void)rotctld_parse_position_reply_ex(pos_reply,
-                                              &az,
-                                              &el,
-                                              &parsed_rprt,
-                                              &have_az,
-                                              &have_el,
-                                              &have_rprt);
-
-        rprt = parsed_rprt;
+        rprt = have_rprt ? parsed_rprt : 0;
         if (state && state->ctrl)
         {
             gchar az_buf[G_ASCII_DTOSTR_BUF_SIZE];
             gchar el_buf[G_ASCII_DTOSTR_BUF_SIZE];
             const gchar *az_txt = have_az
-                                  ? g_ascii_dtostr(az_buf, sizeof(az_buf), az)
+                                  ? g_ascii_formatd(az_buf, sizeof(az_buf), "%.2f", az)
                                   : "n/a";
             const gchar *el_txt = have_el
-                                  ? g_ascii_dtostr(el_buf, sizeof(el_buf), el)
+                                  ? g_ascii_formatd(el_buf, sizeof(el_buf), "%.2f", el)
                                   : "n/a";
+            const gchar *status = "unknown";
+            gchar *view = NULL;
+            if (pos_res == ROTCTLD_POS_OK)
+                status = "ok";
+            else if (pos_res == ROTCTLD_POS_TIMEOUT)
+                status = "timeout";
+            else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
+                status = "parse_fail";
+            else if (pos_res == ROTCTLD_POS_RPRT_ERR)
+                status = "rprt_err";
+            else
+                status = "io_error";
+            view = rotctld_sanitize_reply(pos_reply, 80);
             rot_term_log_verbose(state->ctrl, "gpredict:rx",
-                                 "autodetect validate: az=%s el=%s rprt=%d flags[az=%d el=%d rprt=%d] bytes=%" G_GSIZE_FORMAT " ms=%lld",
+                                 "autodetect validate: az=%s el=%s rprt=%d flags[az=%d el=%d rprt=%d] bytes=%" G_GSIZE_FORMAT " ms=%lld status=%s view=%s",
                                  az_txt,
                                  el_txt,
                                  parsed_rprt,
@@ -15564,14 +15837,10 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
                                  have_el ? 1 : 0,
                                  have_rprt ? 1 : 0,
                                  pos_info.bytes,
-                                 (long long) elapsed_ms);
-        }
-
-        pos_ok = (pos_res == ROTCTLD_POS_OK) || (have_az && have_el);
-        if (pos_ok && have_rprt && parsed_rprt != 0)
-        {
-            pos_ok = FALSE;
-            pos_res = ROTCTLD_POS_RPRT_ERR;
+                                 (long long) elapsed_ms,
+                                 status,
+                                 view ? view : "(none)");
+            g_free(view);
         }
 
         if (!pos_ok)
@@ -17621,6 +17890,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         }
         if (status_label)
             gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
+        ctrl->hold_position_on_engage = FALSE;
+        ctrl->hold_position_log_emitted = FALSE;
     }
     else
     {
@@ -17666,6 +17937,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         /* ensure we are not in monitor mode when engaging by default */
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->MonitorCheckBox), FALSE);
         ctrl->monitor = FALSE;
+        ctrl->hold_position_on_engage = TRUE;
+        ctrl->hold_position_log_emitted = FALSE;
 
         {
             ctrl->engage_pending = TRUE;
@@ -18203,6 +18476,7 @@ rot_park_zenith_cb(GtkButton *button, gpointer data)
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), park_user_el);
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
+    ctrl->hold_position_on_engage = FALSE;
     ctrl->park_requested = TRUE;
     ctrl->force_next_send = TRUE;
 
@@ -18669,6 +18943,7 @@ static void rotctrl_preset_move(GtkRotCtrl *ctrl, gint index)
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), el);
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
+    ctrl->hold_position_on_engage = FALSE;
     ctrl->park_requested = FALSE;
     ctrl->force_next_send = TRUE;
 
@@ -19067,6 +19342,10 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->engage_pending = FALSE;
     ctrl->engage_generation = 0;
     ctrl->session_state = ROT_SESSION_DISCONNECTED;
+    ctrl->comm_status = ROT_COMM_DISENGAGED;
+    ctrl->ok_streak = 0;
+    ctrl->bad_streak = 0;
+    ctrl->timeout_streak = 0;
     ctrl->delay = 300;      /* default: 300 ms control cycle */
     ctrl->timerid = 0;
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */

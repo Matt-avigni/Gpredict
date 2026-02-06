@@ -91,7 +91,7 @@ static gboolean rotctld_client_parse_first_two_numbers(const gchar *line,
 
     while (*p != '\0')
     {
-        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+')
+        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+' || *p == '.')
         {
             gdouble val = g_ascii_strtod(p, &endptr);
             if (endptr != p)
@@ -134,7 +134,7 @@ static gboolean rotctld_client_parse_first_number(const gchar *line,
 
     while (*p != '\0')
     {
-        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+')
+        if (g_ascii_isdigit(*p) || *p == '-' || *p == '+' || *p == '.')
         {
             value = g_ascii_strtod(p, &endptr);
             if (endptr != p)
@@ -2066,6 +2066,40 @@ gboolean rotctld_client_request_raw(RotctldClient *client,
                                  mode,
                                  HAMLIB_TERM_RPRT_OR_DONE,
                                  1000,
+                                 0,
+                                 0,
+                                 out, out_len,
+                                 info);
+    return ok;
+}
+
+gboolean rotctld_client_request_raw_timeout(RotctldClient *client,
+                                            const gchar *cmd,
+                                            gint timeout_ms,
+                                            gchar *out,
+                                            gsize out_len,
+                                            HamlibResponseInfo *info)
+{
+    hamlib_read_mode_t mode = HAMLIB_READ_MULTILINE_RPRT;
+    gboolean ok = FALSE;
+
+    if (info)
+        memset(info, 0, sizeof(*info));
+
+    if (client == NULL || cmd == NULL)
+        return FALSE;
+
+    if (timeout_ms <= 0)
+        timeout_ms = 1000;
+
+    if (g_str_has_prefix(cmd, "\\dump_state"))
+        mode = HAMLIB_READ_MULTILINE_IDLE;
+
+    ok = rotctld_client_exchange(client,
+                                 cmd,
+                                 mode,
+                                 HAMLIB_TERM_RPRT_OR_DONE,
+                                 timeout_ms,
                                  0,
                                  0,
                                  out, out_len,
