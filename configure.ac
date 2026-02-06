@@ -93,17 +93,35 @@ fi
 if $PKG_CONFIG --exists hamlib; then
     HAMLIB_CFLAGS=`$PKG_CONFIG --cflags hamlib`
     HAMLIB_LIBS=`$PKG_CONFIG --libs hamlib`
+    HAMLIB_PREFIX=`$PKG_CONFIG --variable=prefix hamlib`
+    HAMLIB_LIBDIR=`$PKG_CONFIG --variable=libdir hamlib`
 else
     AC_MSG_ERROR(Gpredict requires hamlib via pkg-config)
 fi
 
 case "$host_os" in
     darwin*)
-        case "$HAMLIB_CFLAGS $HAMLIB_LIBS" in
-    *"/opt/homebrew/"*|*"/usr/local/"*)
-        AC_MSG_ERROR([Refusing to link against Homebrew hamlib; expected /hamlib-local])
-        ;;
- esac
+        HAMLIB_INSTALL_NAME=
+        if test -n "$HAMLIB_LIBDIR" &&
+           test -f "$HAMLIB_LIBDIR/libhamlib.dylib"; then
+            HAMLIB_INSTALL_NAME=`otool -D "$HAMLIB_LIBDIR/libhamlib.dylib" 2>/dev/null | sed -n '2p'`
+        fi
+
+        case "$HAMLIB_PREFIX" in
+            /opt/homebrew|/opt/homebrew/*)
+                AC_MSG_ERROR([Refusing to link against Homebrew hamlib; expected /hamlib-local])
+                ;;
+        esac
+        case "$HAMLIB_LIBDIR" in
+            /opt/homebrew|/opt/homebrew/*)
+                AC_MSG_ERROR([Refusing to link against Homebrew hamlib; expected /hamlib-local])
+                ;;
+        esac
+        case "$HAMLIB_INSTALL_NAME" in
+            /opt/homebrew|/opt/homebrew/*)
+                AC_MSG_ERROR([Refusing to link against Homebrew hamlib; expected /hamlib-local])
+                ;;
+        esac
         if test -d "$HAMLIB_LOCAL_PREFIX/lib"; then
             LDFLAGS="$LDFLAGS -Wl,-rpath,$HAMLIB_LOCAL_PREFIX/lib"
         fi

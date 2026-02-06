@@ -24,9 +24,6 @@ AM_CPPFLAGS = \
 bin_PROGRAMS = gpredict
 
 gpredict_SOURCES = \
-    rotor-autocal-direct.c \
-    rotor-decision.c \
-    rotor-target.c \
     rot-angle.c rot-angle.h \
     rot_math.c rot_math.h \
     ui-popup-quarantine.c ui-popup-quarantine.h \
