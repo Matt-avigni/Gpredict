@@ -13,6 +13,8 @@ typedef struct {
     gint64 quarantine_until_us;
     gboolean swallowed_press;
     gboolean swallowed_release;
+    GtkComboBox *pending_combo;
+    gboolean pending_press_swallowed;
     gboolean filter_installed;
     gulong realize_id;
     gulong unrealize_id;
@@ -58,6 +60,71 @@ static void gp_ui_quarantine_reset_swallow(GpUiQuarantine *state)
     state->swallowed_release = FALSE;
 }
 
+static void gp_ui_quarantine_set_pending_combo(GpUiQuarantine *state,
+                                               GtkComboBox *combo)
+{
+    if (state == NULL)
+        return;
+
+    if (state->pending_combo != NULL)
+        g_object_remove_weak_pointer(G_OBJECT(state->pending_combo),
+                                     (gpointer *)&state->pending_combo);
+
+    state->pending_combo = combo;
+    state->pending_press_swallowed = FALSE;
+
+    if (state->pending_combo != NULL)
+        g_object_add_weak_pointer(G_OBJECT(state->pending_combo),
+                                  (gpointer *)&state->pending_combo);
+}
+
+static gboolean gp_ui_quarantine_event_on_widget(GpUiQuarantine *state,
+                                                 GtkWidget *widget,
+                                                 GdkEventButton *event)
+{
+    GtkAllocation alloc;
+    gint wx = 0;
+    gint wy = 0;
+    gint toplevel_x = 0;
+    gint toplevel_y = 0;
+    gint64 ex = 0;
+    gint64 ey = 0;
+
+    if (state == NULL || widget == NULL || event == NULL)
+        return FALSE;
+    if (state->toplevel == NULL || state->window == NULL)
+        return FALSE;
+    if (!gtk_widget_get_mapped(widget))
+        return FALSE;
+    if (!gtk_widget_translate_coordinates(widget, state->toplevel, 0, 0, &wx, &wy))
+        return FALSE;
+
+    gtk_widget_get_allocation(widget, &alloc);
+    gdk_window_get_origin(state->window, &toplevel_x, &toplevel_y);
+
+    ex = (gint64)event->x_root;
+    ey = (gint64)event->y_root;
+
+    return ex >= (gint64)(toplevel_x + wx) &&
+           ex < (gint64)(toplevel_x + wx + alloc.width) &&
+           ey >= (gint64)(toplevel_y + wy) &&
+           ey < (gint64)(toplevel_y + wy + alloc.height);
+}
+
+static gboolean gp_ui_quarantine_popup_idle(gpointer data)
+{
+    GtkComboBox *combo = GTK_COMBO_BOX(data);
+    GtkWidget *widget = GTK_WIDGET(combo);
+
+    if (combo == NULL)
+        return G_SOURCE_REMOVE;
+
+    if (gtk_widget_get_realized(widget) && gtk_widget_get_visible(widget))
+        gtk_combo_box_popup(combo);
+
+    return G_SOURCE_REMOVE;
+}
+
 static GdkFilterReturn gp_ui_quarantine_filter(GdkXEvent *xevent,
                                                GdkEvent *event,
                                                gpointer data)
@@ -77,6 +144,33 @@ static GdkFilterReturn gp_ui_quarantine_filter(GdkXEvent *xevent,
     button_event = (GdkEventButton *)event;
     if (button_event->button != 1)
         return GDK_FILTER_CONTINUE;
+
+    if (state->pending_combo != NULL &&
+        !gp_ui_quarantine_popup_shown(state->pending_combo) &&
+        gp_ui_quarantine_event_on_widget(state,
+                                         GTK_WIDGET(state->pending_combo),
+                                         button_event))
+    {
+        if (event->type == GDK_BUTTON_PRESS && !state->pending_press_swallowed)
+        {
+            state->pending_press_swallowed = TRUE;
+            GP_UI_LOG("%s: swallow pending-combo press\n", __func__);
+            return GDK_FILTER_REMOVE;
+        }
+
+        if (event->type == GDK_BUTTON_RELEASE && state->pending_press_swallowed)
+        {
+            GtkComboBox *combo = state->pending_combo;
+
+            GP_UI_LOG("%s: swallow pending-combo release + reopen\n", __func__);
+            gp_ui_quarantine_set_pending_combo(state, NULL);
+            g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+                            gp_ui_quarantine_popup_idle,
+                            g_object_ref(combo),
+                            g_object_unref);
+            return GDK_FILTER_REMOVE;
+        }
+    }
 
     now_us = g_get_monotonic_time();
     if (now_us >= state->quarantine_until_us)
@@ -157,6 +251,7 @@ static void gp_ui_quarantine_state_free(gpointer data)
     if (state == NULL)
         return;
 
+    gp_ui_quarantine_set_pending_combo(state, NULL);
     gp_ui_quarantine_remove_filter(state);
     g_free(state);
 }
@@ -184,8 +279,13 @@ static void gp_ui_quarantine_popup_notify(GObject *object,
         state->last_popup_popdown_us = now_us;
         state->quarantine_until_us = now_us + 250000;
         gp_ui_quarantine_reset_swallow(state);
+        gp_ui_quarantine_set_pending_combo(state, combo);
         GP_UI_LOG("%s: popdown quarantine until=%lld us\n", __func__,
                   (long long)state->quarantine_until_us);
+    }
+    else if (shown && combo == state->pending_combo)
+    {
+        gp_ui_quarantine_set_pending_combo(state, NULL);
     }
 
     g_object_set_data(object, GP_UI_QUARANTINE_POPUP_KEY,

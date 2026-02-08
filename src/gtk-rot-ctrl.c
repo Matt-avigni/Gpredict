@@ -483,6 +483,11 @@ struct _GtkRotCtrl {
     GtkWidget      *max_el_spin;
     GtkWidget      *az_endstop_spin;
     GtkWidget      *preset_grid;
+    gint            ui_base_width;
+    gint            ui_base_height;
+    gint            ui_plot_base_size;
+    gdouble         ui_last_scale;
+    PangoFontDescription *ui_base_font;
 
     RotPreset       presets[ROT_PRESET_MAX];
     guint           preset_count;
@@ -739,6 +744,13 @@ static void     rotctrl_preset_edit_cb(GtkButton *button, gpointer data);
 static void     rotctrl_preset_activate_cb(GtkButton *button, gpointer data);
 static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
+static void rotctrl_scale_capture_base(GtkRotCtrl *ctrl);
+static void rotctrl_update_ui_scale(GtkRotCtrl *ctrl,
+                                    gint width,
+                                    gint height);
+static void rotctrl_size_allocate_cb(GtkWidget *widget,
+                                     GtkAllocation *alloc,
+                                     gpointer data);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
                                   rot_session_state_t state,
                                   const gchar *reason,
@@ -790,7 +802,6 @@ static gint     rotctrl_stale_hold_ms(const GtkRotCtrl *ctrl);
 static gint     rotctrl_stale_park_ms(const GtkRotCtrl *ctrl);
 static gint     rotctrl_stale_resume_ms(const GtkRotCtrl *ctrl);
 static gint     rotctrl_stale_ms(const GtkRotCtrl *ctrl);
-static guint    rotctrl_stale_debounce(const GtkRotCtrl *ctrl);
 static gdouble  rotctrl_angle_epsilon(const GtkRotCtrl *ctrl);
 static gdouble  rotctrl_elev_floor(const GtkRotCtrl *ctrl);
 static gdouble  rotctrl_clamp_el_for_backend(GtkRotCtrl *ctrl,
@@ -1308,6 +1319,121 @@ static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason)
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rotctrl ui_end_update %s",
                     reason ? reason : "(none)");
+}
+
+static void rotctrl_scale_capture_base(GtkRotCtrl *ctrl)
+{
+    GtkStyleContext *context = NULL;
+    PangoFontDescription *font = NULL;
+    GtkRequisition min_req;
+    GtkRequisition nat_req;
+    gint plot_base = 0;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0)
+    {
+        gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+        ctrl->ui_base_width = MAX(1, nat_req.width);
+        ctrl->ui_base_height = MAX(1, nat_req.height);
+    }
+
+    if (ctrl->ui_plot_base_size <= 0 && ctrl->plot != NULL)
+    {
+        gtk_widget_get_preferred_size(ctrl->plot, &min_req, &nat_req);
+        plot_base = MIN(nat_req.width, nat_req.height);
+        if (plot_base <= 0)
+            plot_base = 200;
+        ctrl->ui_plot_base_size = plot_base;
+    }
+
+    if (ctrl->ui_base_font == NULL)
+    {
+        context = gtk_widget_get_style_context(GTK_WIDGET(ctrl));
+        gtk_style_context_get(context,
+                              GTK_STATE_FLAG_NORMAL,
+                              "font", &font,
+                              NULL);
+        if (font == NULL)
+            font = pango_font_description_from_string("Sans 10");
+        ctrl->ui_base_font = font;
+    }
+}
+
+static void rotctrl_update_ui_scale(GtkRotCtrl *ctrl,
+                                    gint width,
+                                    gint height)
+{
+    gdouble scale;
+    gdouble sx;
+    gdouble sy;
+    PangoFontDescription *font;
+    gint size;
+    gint scaled_plot;
+
+    if (ctrl == NULL)
+        return;
+
+    rotctrl_scale_capture_base(ctrl);
+
+    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0 ||
+        ctrl->ui_base_font == NULL)
+        return;
+
+    sx = (gdouble) width / (gdouble) ctrl->ui_base_width;
+    sy = (gdouble) height / (gdouble) ctrl->ui_base_height;
+    scale = MIN(sx, sy);
+
+    if (scale < 0.5)
+        scale = 0.5;
+    if (scale > 3.0)
+        scale = 3.0;
+
+    if (fabs(scale - ctrl->ui_last_scale) < 0.02)
+        return;
+
+    ctrl->ui_last_scale = scale;
+
+    font = pango_font_description_copy(ctrl->ui_base_font);
+    size = pango_font_description_get_size(font);
+    if (size > 0)
+    {
+        if (pango_font_description_get_size_is_absolute(font))
+            pango_font_description_set_absolute_size(font, size * scale);
+        else
+            pango_font_description_set_size(font, (gint) (size * scale));
+    }
+    gtk_widget_override_font(GTK_WIDGET(ctrl), font);
+
+    if (ctrl->plot != NULL)
+    {
+        gchar *font_str = pango_font_description_to_string(font);
+        gtk_polar_plot_set_font(GTK_POLAR_PLOT(ctrl->plot), font_str);
+        g_free(font_str);
+    }
+
+    pango_font_description_free(font);
+
+    if (ctrl->plot != NULL && ctrl->ui_plot_base_size > 0)
+    {
+        scaled_plot = (gint) (ctrl->ui_plot_base_size * scale);
+        gtk_widget_set_size_request(ctrl->plot, scaled_plot, scaled_plot);
+    }
+}
+
+static void rotctrl_size_allocate_cb(GtkWidget *widget,
+                                     GtkAllocation *alloc,
+                                     gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    (void)widget;
+
+    if (alloc == NULL)
+        return;
+
+    rotctrl_update_ui_scale(ctrl, alloc->width, alloc->height);
 }
 
 static gboolean rotctrl_combo_popup_shown(GtkComboBox *box)
@@ -5484,6 +5610,8 @@ static gint rotctrl_poll_period_ms(const GtkRotCtrl *ctrl)
 
     if (ctrl && ctrl->conf && ctrl->conf->rotor_poll_period_ms > 0)
         val = ctrl->conf->rotor_poll_period_ms;
+    else if (ctrl && ctrl->delay > 0)
+        val = (gint)ctrl->delay;
 
     if (val < 100)
         val = 100;
@@ -5615,19 +5743,6 @@ static gboolean rot_should_send(GtkRotCtrl *ctrl,
     if (reason_out)
         *reason_out = "HOLD_THRESHOLD";
     return FALSE;
-}
-
-static guint rotctrl_stale_debounce(const GtkRotCtrl *ctrl)
-{
-    guint val = ROTCTLD_DEFAULT_STALE_DEBOUNCE;
-
-    if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_debounce_count > 0)
-        val = ctrl->conf->rotor_stale_debounce_count;
-
-    if (val < 1)
-        val = 1;
-
-    return val;
 }
 
 static gdouble rotctrl_angle_epsilon(const GtkRotCtrl *ctrl)
@@ -7029,11 +7144,6 @@ static void format_rotctld_setpos(GtkRotCtrl *ctrl,
 
     if (caps_valid)
     {
-        if (ctrl && ctrl->conf)
-        {
-            el_min = MAX(el_min, ctrl->conf->minel);
-            el_max = MIN(el_max, ctrl->conf->maxel);
-        }
         if (el_min > el_max)
         {
             gdouble tmp = el_min;
@@ -7119,6 +7229,13 @@ static rot_set_result_t rotctrl_send_position(GtkRotCtrl *ctrl,
     format_rotctld_setpos(ctrl, az_mech, el_mech,
                           &az_send, &el_send,
                           txbuf, sizeof(txbuf));
+    {
+        gchar txline[sizeof(txbuf)];
+
+        g_strlcpy(txline, txbuf, sizeof(txline));
+        g_strchomp(txline);
+        rot_term_log(ctrl, "gpredict:tx", "rotctld cmd: %s", txline);
+    }
 
     rot_format_deg_2(send_az_str, sizeof(send_az_str), az_send);
     rot_format_deg_2(send_el_str, sizeof(send_el_str), el_send);
@@ -7208,6 +7325,7 @@ static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
 {
     gdouble send_az = az;
     gdouble send_el = el;
+    gchar txbuf[64];
     gboolean caps_valid = FALSE;
     gdouble az_min = 0.0;
     gdouble az_max = 0.0;
@@ -7247,11 +7365,6 @@ static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
 
     if (caps_valid)
     {
-        if (ctrl->conf)
-        {
-            el_min = MAX(el_min, ctrl->conf->minel);
-            el_max = MIN(el_max, ctrl->conf->maxel);
-        }
         if (el_min > el_max)
         {
             gdouble tmp = el_min;
@@ -7266,6 +7379,17 @@ static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
     {
         send_el = CLAMP(send_el, el_min, el_max);
         send_az = rotctrl_normalize_backend_az(send_az, 0.0, 360.0);
+    }
+
+    format_rotctld_setpos(ctrl, send_az, send_el,
+                          &send_az, &send_el,
+                          txbuf, sizeof(txbuf));
+    {
+        gchar txline[sizeof(txbuf)];
+
+        g_strlcpy(txline, txbuf, sizeof(txline));
+        g_strchomp(txline);
+        rot_term_log(ctrl, "gpredict:tx", "rotctld cmd: %s", txline);
     }
 
     return rotctld_client_set_pos(ctrl->client.client, send_az, send_el);
@@ -8193,8 +8317,8 @@ static gpointer rotctld_client_thread(gpointer data)
                  delta_backend_el >= aim_deadband);
             gboolean min_step_ok =
                 (!have_last_cmd ||
-                 delta_backend_az >= ROT_CMD_MIN_AZ_DEG ||
-                 delta_backend_el >= ROT_CMD_MIN_EL_DEG);
+                 delta_backend_az >= aim_deadband ||
+                 delta_backend_el >= aim_deadband);
             gboolean min_period_ok =
                 (last_attempt_us == 0 ||
                  since_cmd_us >= ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000));
@@ -9221,11 +9345,11 @@ get_pos_done:
         ctrl->client.io_error = io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
-        /* keep poll cadence deterministic while keeping duty cycle <= 50% */
+        /* keep poll cadence deterministic; do not add extra duty-cycle delay */
         elapsed_time = g_timer_elapsed(ctrl->client.timer, NULL);
         gdouble poll_sec = rotctrl_poll_period_ms(ctrl) / 1000.0;
-        gdouble sleep_sec = elapsed_time;
-        if ((elapsed_time + sleep_sec) < poll_sec)
+        gdouble sleep_sec = 0.0;
+        if (elapsed_time < poll_sec)
             sleep_sec = poll_sec - elapsed_time;
         rotctld_sleep_us(ctrl, (gint64)(sleep_sec * 1e6));
     }
@@ -9922,7 +10046,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     ui_mode = (ctrl->conf && ctrl->conf->aztype == ROT_AZ_TYPE_180)
               ? ROT_UI_NORTH_CENTERED
               : ROT_UI_360;
-    elev_floor = rotctrl_elev_floor(ctrl);
+    elev_floor = (ctrl->conf != NULL)
+                     ? ctrl->conf->minel
+                     : ROTCTRL_DEFAULT_MIN_EL;
 
     if (ctrl->tracking && ctrl->target && ctrl->conf)
     {
@@ -10214,7 +10340,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         display_el = target_el;
         if (pred_valid)
         {
-            gdouble xform_floor = hold_below ? elev_floor : -1.0;
+            gdouble xform_floor = -1.0;
             if (gp_rot_transform_target(ctrl,
                                         target_az360,
                                         target_el,
@@ -10441,12 +10567,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             backend_az_max = caps_valid ? caps_az_max : user_span_cfg.az_max;
             backend_el_min = caps_valid ? caps_el_min : user_span_cfg.el_min;
             backend_el_max = caps_valid ? caps_el_max : user_span_cfg.el_max;
-            if (ctrl->conf != NULL)
-            {
-                backend_el_min = MAX(backend_el_min, ctrl->conf->minel);
-                backend_el_max = MIN(backend_el_max, ctrl->conf->maxel);
-            }
-
             ctrl->span_extended = backend_span_extended;
             ctrl->span_mode = rotctrl_span_from_conf(ctrl->conf);
             rotpos_valid = pos_recent;
@@ -10578,6 +10698,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gboolean send_ok = FALSE;
         gboolean force_send = FALSE;
         gboolean force_transition = FALSE;
+        gboolean allow_no_pos_manual = FALSE;
         gboolean have_target = FALSE;
         gboolean not_at_target = FALSE;
         gboolean manual_override = FALSE;
@@ -10601,7 +10722,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         const gchar *state_reason = "idle";
         rot_cmd_action_t gate = ROT_CMD_ACTION_SUPPRESS;
         rot_cmd_reason_t reason = ROT_CMD_REASON_DEADBAND;
-        const gchar *sched_reason = "HOLD_EPS";
+        const gchar *sched_reason = "HOLD_THRESHOLD";
 
         caps_valid = FALSE;
         g_mutex_lock(&ctrl->client.mutex);
@@ -10705,13 +10826,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         backend_az_max = caps_valid ? caps_az_max : user_span_cfg.az_max;
         backend_el_min = caps_valid ? caps_el_min : user_span_cfg.el_min;
         backend_el_max = caps_valid ? caps_el_max : user_span_cfg.el_max;
-        if (ctrl->conf != NULL)
-        {
-            backend_el_min = MAX(backend_el_min, ctrl->conf->minel);
-            backend_el_max = MIN(backend_el_max, ctrl->conf->maxel);
-        }
-
-
         rotctrl_update_safety(ctrl, use_caps, caps_az_min, caps_az_max);
 
         ctrl->span_extended = backend_span_extended;
@@ -11043,11 +11157,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         desired_raw_el = target_cmd_el;
         desired_user_az = rot_az360_to_ui(display_az360, ui_mode);
         desired_user_el = display_el;
-        if (desired_state == ROT_TARGET_STATE_PRETRACK)
-        {
-            deadband_az = ROT_CMD_DEADBAND_PRETRACK_AZ_DEG;
-            deadband_el = ROT_CMD_DEADBAND_PRETRACK_EL_DEG;
-        }
+        threshold_deg = (ctrl->threshold > 0.0) ? ctrl->threshold : 0.10;
+        eps_az = threshold_deg;
+        eps_el = threshold_deg;
+        deadband_az = threshold_deg;
+        deadband_el = threshold_deg;
 
         rotctrl_build_target_caps(ctrl, &decision_caps);
 
@@ -11282,7 +11396,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                ctrl->locked_lane_k,
                                ROT_LANE_ENDSTOP_MARGIN_DEG,
                                ROT_LANE_SWITCH_PENALTY_DEG,
-                               hold_below,
+                               FALSE,
                                &desired_pipeline);
 
         seam_cross_active =
@@ -11594,6 +11708,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
 
         manual_override = rotctrl_manual_override_active(ctrl);
+        allow_no_pos_manual =
+            (!ctrl->tracking) &&
+            (manual_override || ctrl->have_user_command);
         {
             gboolean user_cmd_allowed =
                 ctrl->have_user_command ||
@@ -11609,10 +11726,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 ctrl->hold_position_log_emitted = FALSE;
             }
         }
-
-        eps_az = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.5;
-        eps_el = (ctrl->threshold > 0.0) ? ctrl->threshold : 1.0;
-        eps_az = MAX(eps_az, ROT_CMD_AZ_EPS_MIN_DEG);
 
         if (ctrl->wrap_acquire_active &&
             (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
@@ -11699,8 +11812,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         min_step_exceeded =
             (!ctrl->setpoint_valid ||
-             delta_backend_az >= ROT_CMD_MIN_AZ_DEG ||
-             delta_backend_el >= ROT_CMD_MIN_EL_DEG);
+             delta_backend_az >= threshold_deg ||
+             delta_backend_el >= threshold_deg);
 
         if (ctrl->tracking && ctrl->setpoint_valid && pos_fresh)
         {
@@ -11710,9 +11823,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                                           setpoint_backend_az));
             err_backend_el = fabs(meas_backend_el - setpoint_backend_el);
             gboolean reached =
-                ((err_backend_az <= eps_az && err_backend_el <= eps_el) ||
-                 (err_backend_az <= ROT_CMD_MIN_AZ_DEG &&
-                  err_backend_el <= ROT_CMD_MIN_EL_DEG));
+                (err_backend_az <= eps_az && err_backend_el <= eps_el);
             not_at_target = !reached;
         }
 
@@ -11720,7 +11831,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             allow_send = ctrl->engaged && !ctrl->monitor;
         else
             allow_send = ctrl->engaged && !ctrl->monitor &&
-                         (session_ready ? pos_send_ok : manual_override);
+                         (pos_send_ok ||
+                          pos_cmd_ok ||
+                          allow_no_pos_manual);
         if (cal_hold_active)
             allow_send = ctrl->engaged && !ctrl->monitor;
         if (ctrl->cal_active)
@@ -11780,9 +11893,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                                           setpoint_backend_az));
                 gdouble err_el = fabs(meas_backend_el - setpoint_backend_el);
                 gboolean reached =
-                    ((err_az <= eps_az && err_el <= eps_el) ||
-                     (err_az <= ROT_CMD_MIN_AZ_DEG &&
-                      err_el <= ROT_CMD_MIN_EL_DEG));
+                    (err_az <= eps_az && err_el <= eps_el);
 
                 err_backend_az = err_az;
                 err_backend_el = err_el;
@@ -11882,9 +11993,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                                         &wrap_candidate,
                                                         &wrap_candidate_k))
                         {
-                            gdouble wrap_eps =
-                                MAX((ctrl->threshold > 0.0) ? ctrl->threshold : 1.5,
-                                    ROT_CMD_AZ_EPS_MIN_DEG);
+                            gdouble wrap_eps = threshold_deg;
                             gdouble wrap_tol = MAX(k_meas_tol_deg, k_meas_quantum_deg);
                             gdouble diff_backend =
                                 fabs(shortest_az_delta(meas_backend_az,
@@ -11995,10 +12104,10 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 decision_in.delta_backend_el = delta_backend_el;
                 decision_in.deadband_az = deadband_az;
                 decision_in.deadband_el = deadband_el;
-                decision_in.min_step_az = ROT_CMD_MIN_AZ_DEG;
-                decision_in.min_step_el = ROT_CMD_MIN_EL_DEG;
-                decision_in.target_change_az = deadband_az * 2.0;
-                decision_in.target_change_el = deadband_el * 2.0;
+                decision_in.min_step_az = threshold_deg;
+                decision_in.min_step_el = threshold_deg;
+                decision_in.target_change_az = deadband_az;
+                decision_in.target_change_el = deadband_el;
                 decision_in.caps = caps_for_decision;
 
                 rot_cmd_decision_eval(&decision_in, &decision_out);
@@ -12110,7 +12219,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->client.desired_allow = allow_send;
             ctrl->client.desired_tracking = ctrl->tracking;
             ctrl->client.desired_update_us = now_us;
-            ctrl->client.allow_send_no_pos = manual_override;
+            ctrl->client.allow_send_no_pos = allow_no_pos_manual;
             if (force_send && !ctrl->client.force_pending)
             {
                 ctrl->client.force_pending = TRUE;
@@ -12167,7 +12276,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         last_cmd_user_az_log, last_cmd_user_el_log,
                         delta_user_az, delta_user_el,
                         deadband_az, deadband_el,
-                        ROT_CMD_MIN_AZ_DEG, ROT_CMD_MIN_EL_DEG,
+                        threshold_deg, threshold_deg,
                         rot_cmd_action_name(gate),
                         rot_cmd_reason_name(reason));
         }
@@ -12266,7 +12375,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->client.raw_azi_out = raw_cmd_az;
             ctrl->client.raw_ele_out = raw_cmd_el;
             ctrl->client.new_trg = TRUE;
-            ctrl->client.allow_send_no_pos = manual_override;
+            ctrl->client.allow_send_no_pos = allow_no_pos_manual;
             ctrl->client.use_setpos = cal_force_send;
             ctrl->client.apply_calib = FALSE;
             ctrl->client.last_cmd_us = now_us;
@@ -19328,6 +19437,11 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->max_el_spin = NULL;
     ctrl->az_endstop_spin = NULL;
     ctrl->preset_grid = NULL;
+    ctrl->ui_base_width = 0;
+    ctrl->ui_base_height = 0;
+    ctrl->ui_plot_base_size = 0;
+    ctrl->ui_last_scale = 1.0;
+    ctrl->ui_base_font = NULL;
     ctrl->preset_count = 0;
 
     ctrl->tracking = FALSE;
@@ -19663,6 +19777,12 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         ctrl->resize_idle_id = 0;
     }
 
+    if (ctrl->ui_base_font != NULL)
+    {
+        pango_font_description_free(ctrl->ui_base_font);
+        ctrl->ui_base_font = NULL;
+    }
+
     rot_plan_reset(&ctrl->trajectory_plan);
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
@@ -19710,6 +19830,7 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 {
     GtkRotCtrl     *rot_ctrl;
     GtkWidget      *table;
+    GtkWidget      *plot_frame;
 
     /* check that we have rot conf */
     if (!have_conf())
@@ -19767,9 +19888,13 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     gtk_grid_attach(GTK_GRID(table), create_aoslos_banner_widgets(rot_ctrl),
                     0, 4, 3, 1);
 
-    gtk_box_pack_start(GTK_BOX(rot_ctrl), create_plot_widget(rot_ctrl),
-                       TRUE, TRUE, 5);
-    gtk_box_pack_start(GTK_BOX(rot_ctrl), table, FALSE, FALSE, 5);
+    plot_frame = create_plot_widget(rot_ctrl);
+    gtk_widget_set_hexpand(plot_frame, TRUE);
+    gtk_widget_set_vexpand(plot_frame, TRUE);
+    gtk_box_pack_start(GTK_BOX(rot_ctrl), plot_frame, TRUE, TRUE, 5);
+    gtk_widget_set_hexpand(table, TRUE);
+    gtk_widget_set_vexpand(table, TRUE);
+    gtk_box_pack_start(GTK_BOX(rot_ctrl), table, TRUE, TRUE, 5);
     gtk_container_set_border_width(GTK_CONTAINER(rot_ctrl), 5);
 
     /* load initial rotator configuration */
@@ -19784,6 +19909,11 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
                                           rot_ctrl_timeout_cb,
                                           rot_ctrl);
     }
+
+    g_signal_connect(G_OBJECT(rot_ctrl),
+                     "size-allocate",
+                     G_CALLBACK(rotctrl_size_allocate_cb),
+                     rot_ctrl);
 
     return GTK_WIDGET(rot_ctrl);
 }

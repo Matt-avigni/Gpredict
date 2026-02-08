@@ -700,6 +700,13 @@ static gboolean rigctrl_log_at_least(const GtkRigCtrl *ctrl,
                                      rig_log_level_t level);
 static void     rigctrl_ui_begin_update(GtkRigCtrl *ctrl, const gchar *reason);
 static void     rigctrl_ui_end_update(GtkRigCtrl *ctrl, const gchar *reason);
+static void     rigctrl_scale_capture_base(GtkRigCtrl *ctrl);
+static void     rigctrl_update_ui_scale(GtkRigCtrl *ctrl,
+                                        gint width,
+                                        gint height);
+static void     rigctrl_size_allocate_cb(GtkWidget *widget,
+                                         GtkAllocation *alloc,
+                                         gpointer data);
 static void     rigctrl_schedule_trsp_refresh(GtkRigCtrl *ctrl);
 static void     rigctrl_set_freq_knob_value(GtkRigCtrl *ctrl,
                                             gboolean uplink,
@@ -809,8 +816,6 @@ static gint     rigctrl_trsp_popup_get_max_height(GtkWidget *anchor);
 static gint     rigctrl_trsp_tree_row_count(GtkWidget *tree);
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
                                           GType child_type);
-static void     rigctrl_trsp_fix_expansion(GtkWidget *widget,
-                                           GtkWidget *list);
 static void     rigctrl_trsp_popup_set_ts(GtkWidget *widget, const gchar *key);
 static guint    rigctrl_trsp_popup_bump_seq(GtkWidget *widget);
 static guint    rigctrl_trsp_popup_get_seq(GtkWidget *widget);
@@ -1399,6 +1404,96 @@ static void rigctrl_ui_end_update(GtkRigCtrl *ctrl, const gchar *reason)
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rigctrl ui_end_update %s",
                     reason ? reason : "(none)");
+}
+
+static void rigctrl_scale_capture_base(GtkRigCtrl *ctrl)
+{
+    GtkStyleContext *context = NULL;
+    PangoFontDescription *font = NULL;
+    GtkRequisition min_req;
+    GtkRequisition nat_req;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0)
+    {
+        gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+        ctrl->ui_base_width = MAX(1, nat_req.width);
+        ctrl->ui_base_height = MAX(1, nat_req.height);
+    }
+
+    if (ctrl->ui_base_font == NULL)
+    {
+        context = gtk_widget_get_style_context(GTK_WIDGET(ctrl));
+        gtk_style_context_get(context,
+                              GTK_STATE_FLAG_NORMAL,
+                              "font", &font,
+                              NULL);
+        if (font == NULL)
+            font = pango_font_description_from_string("Sans 10");
+        ctrl->ui_base_font = font;
+    }
+}
+
+static void rigctrl_update_ui_scale(GtkRigCtrl *ctrl,
+                                    gint width,
+                                    gint height)
+{
+    gdouble scale;
+    gdouble sx;
+    gdouble sy;
+    PangoFontDescription *font;
+    gint size;
+
+    if (ctrl == NULL)
+        return;
+
+    rigctrl_scale_capture_base(ctrl);
+
+    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0 ||
+        ctrl->ui_base_font == NULL)
+        return;
+
+    sx = (gdouble) width / (gdouble) ctrl->ui_base_width;
+    sy = (gdouble) height / (gdouble) ctrl->ui_base_height;
+    scale = MIN(sx, sy);
+
+    if (scale < 0.5)
+        scale = 0.5;
+    if (scale > 3.0)
+        scale = 3.0;
+
+    if (fabs(scale - ctrl->ui_last_scale) < 0.02)
+        return;
+
+    ctrl->ui_last_scale = scale;
+
+    font = pango_font_description_copy(ctrl->ui_base_font);
+    size = pango_font_description_get_size(font);
+    if (size > 0)
+    {
+        if (pango_font_description_get_size_is_absolute(font))
+            pango_font_description_set_absolute_size(font, size * scale);
+        else
+            pango_font_description_set_size(font, (gint) (size * scale));
+    }
+    gtk_widget_override_font(GTK_WIDGET(ctrl), font);
+    pango_font_description_free(font);
+}
+
+static void rigctrl_size_allocate_cb(GtkWidget *widget,
+                                     GtkAllocation *alloc,
+                                     gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    (void)widget;
+
+    if (alloc == NULL)
+        return;
+
+    rigctrl_update_ui_scale(ctrl, alloc->width, alloc->height);
 }
 
 typedef struct {
@@ -2479,6 +2574,12 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->trsplist = NULL;
     }
 
+    if (ctrl->ui_base_font != NULL)
+    {
+        pango_font_description_free(ctrl->ui_base_font);
+        ctrl->ui_base_font = NULL;
+    }
+
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }
 
@@ -2564,6 +2665,10 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->log_verbose_toggle = NULL;
     ctrl->log_level = RIG_LOG_QUIET;
     rigctld_client_set_log_level(ctrl->log_level);
+    ctrl->ui_base_width = 0;
+    ctrl->ui_base_height = 0;
+    ctrl->ui_last_scale = 1.0;
+    ctrl->ui_base_font = NULL;
     ctrl->ui_updating = FALSE;
     ctrl->pending_ui_refresh_id = 0;
     ctrl->resize_idle_id = 0;
@@ -4078,23 +4183,19 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
                 gtk_scrolled_window_set_min_content_width(
                     GTK_SCROLLED_WINDOW(scrolled), popup_width);
 #endif
-            gtk_widget_set_size_request(scrolled, popup_width,
-                                        needs_scroll ? max_height : -1);
+            gtk_widget_set_size_request(scrolled, -1, -1);
         }
 
         if (GTK_IS_TREE_VIEW(tree))
         {
             gtk_widget_add_events(tree, GDK_SCROLL_MASK);
             gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
-            gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(tree), TRUE);
+            gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(tree), FALSE);
             gtk_tree_view_set_search_column(GTK_TREE_VIEW(tree), 0);
-            gtk_tree_view_set_activate_on_single_click(GTK_TREE_VIEW(tree), TRUE);
+            gtk_tree_view_set_activate_on_single_click(GTK_TREE_VIEW(tree), FALSE);
             gtk_tree_view_set_enable_search(GTK_TREE_VIEW(tree),
                                             rows > RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD);
         }
-
-        if (tree != NULL)
-            rigctrl_trsp_fix_expansion(popup_widget, tree);
 
         if (rows >= RIGCTRL_TRSP_POPUP_SCROLL_CHECK_THRESHOLD)
         {
@@ -4182,6 +4283,8 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
         gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL,
                                      TRUE, 0.0, 0.0);
         gtk_tree_path_free(path);
+        gtk_widget_queue_resize(tree);
+        gtk_widget_queue_draw(tree);
     }
 
     gtk_widget_get_preferred_height(widget, &popup_min, &popup_nat);
@@ -4329,34 +4432,6 @@ static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget, GType child_type)
 
     g_list_free(children);
     return child;
-}
-
-static void rigctrl_trsp_fix_expansion(GtkWidget *widget, GtkWidget *list)
-{
-    GList *children = NULL;
-    GList *entry = NULL;
-
-    if (widget == NULL)
-        return;
-
-    if (widget != list)
-    {
-        gtk_widget_set_hexpand(widget, FALSE);
-        gtk_widget_set_vexpand(widget, FALSE);
-    }
-    else
-    {
-        gtk_widget_set_hexpand(widget, TRUE);
-        gtk_widget_set_vexpand(widget, TRUE);
-    }
-
-    if (!GTK_IS_CONTAINER(widget))
-        return;
-
-    children = gtk_container_get_children(GTK_CONTAINER(widget));
-    for (entry = children; entry != NULL; entry = entry->next)
-        rigctrl_trsp_fix_expansion(GTK_WIDGET(entry->data), list);
-    g_list_free(children);
 }
 
 static gint rigctld_parse_identifier_pid(const gchar *identifier)
@@ -12994,6 +13069,8 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
     gtk_grid_set_row_spacing(GTK_GRID(table), 5);
     gtk_grid_set_column_spacing(GTK_GRID(table), 5);
     gtk_container_set_border_width(GTK_CONTAINER(table), 10);
+    gtk_widget_set_hexpand(table, TRUE);
+    gtk_widget_set_vexpand(table, TRUE);
     gtk_grid_attach(GTK_GRID(table), create_downlink_widgets(rigctrl),
                     0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(table), create_uplink_widgets(rigctrl),
@@ -13010,6 +13087,11 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
 
     if (module->target > 0)
         gtk_rig_ctrl_select_sat(rigctrl, module->target);
+
+    g_signal_connect(G_OBJECT(rigctrl),
+                     "size-allocate",
+                     G_CALLBACK(rigctrl_size_allocate_cb),
+                     rigctrl);
 
     return widget;
 }

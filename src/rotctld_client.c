@@ -1821,6 +1821,8 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
                                    gsize reply_len)
 {
     gchar cmd[96];
+    gchar azbuf[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar elbuf[G_ASCII_DTOSTR_BUF_SIZE];
     gchar reply_local[128];
     gchar *reply = reply_local;
     gsize reply_cap = sizeof(reply_local);
@@ -1851,8 +1853,11 @@ gboolean rotctld_client_set_pos_ex(RotctldClient *client,
 
     rotctld_client_wait_invalid_backoff(client, retry_delay_ms);
 
-    g_snprintf(cmd, sizeof(cmd), "P %.2f %.2f\n", az, el);
-    g_snprintf(cmd_log, sizeof(cmd_log), "P %.2f %.2f", az, el);
+    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az);
+    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el);
+    g_warn_if_fail(strchr(azbuf, ',') == NULL && strchr(elbuf, ',') == NULL);
+    g_snprintf(cmd, sizeof(cmd), "P %s %s\n", azbuf, elbuf);
+    g_snprintf(cmd_log, sizeof(cmd_log), "P %s %s", azbuf, elbuf);
 
     for (gint attempt = 0; attempt <= ROTCTLD_SETPOS_RETRIES; attempt++)
     {

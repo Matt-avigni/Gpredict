@@ -142,6 +142,24 @@ int main(void)
     assert(out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "target");
 
+    /* Threshold-only path: 0.30 deg delta must send when threshold is 0.10 */
+    in = base_input();
+    in.deadband_az = 0.1;
+    in.deadband_el = 0.1;
+    in.min_step_az = 0.1;
+    in.min_step_el = 0.1;
+    in.target_change_az = 0.1;
+    in.target_change_el = 0.1;
+    in.desired_user_az = 10.3;
+    in.desired_user_el = 5.0;
+    in.setpoint_user_az = 10.0;
+    in.setpoint_user_el = 5.0;
+    in.delta_backend_az = 0.3;
+    in.delta_backend_el = 0.0;
+    rot_cmd_decision_eval(&in, &out);
+    assert(out.send);
+    expect_reason(rot_cmd_reason_name(out.reason), "target_change");
+
     /* In-flight suppression */
     in = base_input();
     in.desired_user_az = 13.0;

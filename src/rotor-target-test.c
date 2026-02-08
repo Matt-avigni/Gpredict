@@ -44,6 +44,21 @@ int main(void)
     assert(!ok);
     assert(reason == ROT_TARGET_INVALID_EL_BELOW_MIN);
 
+    rot_target_caps_t caps_neg = caps_norm;
+    caps_neg.el_min_deg = -5.0;
+    caps_neg.el_max_deg = 185.0;
+
+    ok = rot_target_is_valid(&caps_neg, 10.0, -2.5, NULL, &reason);
+    assert(ok);
+
+    ok = rot_target_is_valid(&caps_neg, 10.0, -5.1, NULL, &reason);
+    assert(!ok);
+    assert(reason == ROT_TARGET_INVALID_EL_BELOW_MIN);
+
+    ok = rot_target_is_valid(&caps_neg, 10.0, 185.1, NULL, &reason);
+    assert(!ok);
+    assert(reason == ROT_TARGET_INVALID_EL_ABOVE_MAX);
+
     rot_target_caps_t caps = { 0 };
     caps.az_min_deg = -180.0;
     caps.az_max_deg = 180.0;

@@ -837,6 +837,25 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
 
     gtk_container_add(GTK_CONTAINER(module->rigctrlwin), module->rigctrl);
 
+    {
+        GtkRequisition min_req;
+        GtkRequisition nat_req;
+        GdkGeometry geom = {0};
+        gdouble aspect = 0.0;
+
+        gtk_widget_get_preferred_size(module->rigctrl, &min_req, &nat_req);
+        if (nat_req.width > 0 && nat_req.height > 0)
+        {
+            aspect = (gdouble) nat_req.width / (gdouble) nat_req.height;
+            geom.min_aspect = aspect;
+            geom.max_aspect = aspect;
+            gtk_window_set_geometry_hints(GTK_WINDOW(module->rigctrlwin),
+                                          module->rigctrl,
+                                          &geom,
+                                          GDK_HINT_ASPECT);
+        }
+    }
+
     gtk_widget_show_all(module->rigctrlwin);
 }
 
@@ -916,6 +935,25 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
     g_free(buff);
 
     gtk_container_add(GTK_CONTAINER(module->rotctrlwin), module->rotctrl);
+
+    {
+        GtkRequisition min_req;
+        GtkRequisition nat_req;
+        GdkGeometry geom = {0};
+        gdouble aspect = 0.0;
+
+        gtk_widget_get_preferred_size(module->rotctrl, &min_req, &nat_req);
+        if (nat_req.width > 0 && nat_req.height > 0)
+        {
+            aspect = (gdouble) nat_req.width / (gdouble) nat_req.height;
+            geom.min_aspect = aspect;
+            geom.max_aspect = aspect;
+            gtk_window_set_geometry_hints(GTK_WINDOW(module->rotctrlwin),
+                                          module->rotctrl,
+                                          &geom,
+                                          GDK_HINT_ASPECT);
+        }
+    }
 
     gtk_widget_show_all(module->rotctrlwin);
 }

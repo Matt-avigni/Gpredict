@@ -1139,6 +1139,37 @@ void gtk_polar_plot_set_rotor_pos(GtkPolarPlot * plot, gdouble az, gdouble el)
     }
 }
 
+void gtk_polar_plot_set_font(GtkPolarPlot * plot, const gchar *font)
+{
+    guint i;
+
+    if (plot == NULL || font == NULL || *font == '\0')
+        return;
+
+    if (!G_VALUE_HOLDS_STRING(&plot->font))
+        g_value_init(&plot->font, G_TYPE_STRING);
+    g_value_set_string(&plot->font, font);
+
+    if (plot->N)
+        g_object_set(plot->N, "font", font, NULL);
+    if (plot->S)
+        g_object_set(plot->S, "font", font, NULL);
+    if (plot->E)
+        g_object_set(plot->E, "font", font, NULL);
+    if (plot->W)
+        g_object_set(plot->W, "font", font, NULL);
+    if (plot->locnam)
+        g_object_set(plot->locnam, "font", font, NULL);
+    if (plot->curs)
+        g_object_set(plot->curs, "font", font, NULL);
+
+    for (i = 0; i < TRACK_TICK_NUM; i++)
+    {
+        if (plot->trtick[i])
+            g_object_set(plot->trtick[i], "font", font, NULL);
+    }
+}
+
 /**
  * Show/hide time tick
  *

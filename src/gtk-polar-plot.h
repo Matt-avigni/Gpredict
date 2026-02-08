@@ -118,6 +118,8 @@ void            gtk_polar_plot_set_ctrl_pos(GtkPolarPlot * plot, gdouble az,
                                             gdouble el);
 void            gtk_polar_plot_set_rotor_pos(GtkPolarPlot * plot, gdouble az,
                                              gdouble el);
+void            gtk_polar_plot_set_font(GtkPolarPlot * plot,
+                                        const gchar *font);
 void            gtk_polar_plot_show_time_ticks(GtkPolarPlot * plot,
                                                gboolean show);
 
