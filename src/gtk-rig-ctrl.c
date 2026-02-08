@@ -1957,15 +1957,7 @@ static gchar *rigctrl_combo_get_active_id(GtkComboBox *box,
 
 static gboolean rigctrl_combo_popup_shown(GtkComboBox *box)
 {
-    gboolean shown = FALSE;
-
-    if (box == NULL)
-        return FALSE;
-
-    if (g_object_class_find_property(G_OBJECT_GET_CLASS(box), "popup-shown"))
-        g_object_get(box, "popup-shown", &shown, NULL);
-
-    return shown;
+    return gp_ui_combo_popup_shown(box);
 }
 
 
@@ -4830,6 +4822,8 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
     GtkTreeIter     iter;
     guint           i, n;
     guint           rows = 0;
+    const gchar    *empty_label = NULL;
+    const gchar    *tooltip = NULL;
     gboolean        was_updating = FALSE;
 
     if (ctrl == NULL || ctrl->TrspSel == NULL)
@@ -4849,6 +4843,8 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
     }
 
     store = gtk_list_store_new(1, G_TYPE_STRING);
+    tooltip = _("Select a payload preset. "
+                "Its baseline RX/TX frequencies are applied.");
 
     /* check if there is a target satellite */
     if (ctrl->target == NULL)
@@ -4856,6 +4852,8 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     _("%s:%s: GtkSatModule has no target satellite."),
                     __FILE__, __func__);
+        empty_label = _("No target selected");
+        tooltip = _("Select a target satellite to load payload presets.");
         goto apply_model;
     }
 
@@ -4886,6 +4884,12 @@ static void load_trsp_list(GtkRigCtrl * ctrl)
         ctrl->trsp = (trsp_t *) g_slist_nth_data(ctrl->trsplist, 0);
         rigctrl_apply_trsp_preset(ctrl, FALSE);
     }
+    else
+    {
+        empty_label = _("No transponder data (Tools -> Update Transponder Data)");
+        tooltip = _("No transponder data available. "
+                    "Use Tools -> Update Transponder Data.");
+    }
 
     if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -4899,14 +4903,21 @@ apply_model:
     g_signal_handlers_block_by_func(ctrl->TrspSel,
                                     (gpointer)G_CALLBACK(trsp_selected_cb),
                                     ctrl);
+    if (rows == 0 && empty_label != NULL)
+    {
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter, 0, empty_label, -1);
+    }
     gtk_combo_box_set_model(GTK_COMBO_BOX(ctrl->TrspSel), GTK_TREE_MODEL(store));
-    if (rows > 0)
+    if (rows > 0 || empty_label != NULL)
         gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->TrspSel), 0);
     g_signal_handlers_unblock_by_func(ctrl->TrspSel,
                                       (gpointer)G_CALLBACK(trsp_selected_cb),
                                       ctrl);
     if (!was_updating)
         rigctrl_ui_end_update(ctrl, "trsp_list");
+    if (ctrl->TrspSel != NULL && tooltip != NULL)
+        gtk_widget_set_tooltip_text(ctrl->TrspSel, tooltip);
     g_object_unref(store);
 
     if (ctrl->TrspSel != NULL)
@@ -5101,6 +5112,12 @@ static void trsp_selected_cb(GtkComboBox * box, gpointer data)
 
     i = gtk_combo_box_get_active(box);
     n = g_slist_length(ctrl->trsplist);
+
+    if (n == 0)
+    {
+        ctrl->trsp = NULL;
+        return;
+    }
 
     if (i == -1)
     {

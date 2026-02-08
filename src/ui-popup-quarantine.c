@@ -41,17 +41,61 @@ static gboolean gp_ui_quarantine_debug_enabled(void)
             sat_log_log(SAT_LOG_LEVEL_DEBUG, __VA_ARGS__);          \
     } while (0)
 
-static gboolean gp_ui_quarantine_popup_shown(GtkComboBox *combo)
+static gboolean gp_ui_combo_get_popup_property(GtkComboBox *combo,
+                                                gboolean *has_prop)
 {
     gboolean shown = FALSE;
+
+    if (has_prop != NULL)
+        *has_prop = FALSE;
 
     if (combo == NULL)
         return FALSE;
 
     if (g_object_class_find_property(G_OBJECT_GET_CLASS(combo), "popup-shown"))
+    {
         g_object_get(combo, "popup-shown", &shown, NULL);
+        if (has_prop != NULL)
+            *has_prop = TRUE;
+    }
 
     return shown;
+}
+
+static gboolean gp_ui_combo_get_tracked_state(GtkComboBox *combo)
+{
+    if (combo == NULL)
+        return FALSE;
+
+    return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(combo),
+                                             GP_UI_QUARANTINE_POPUP_KEY));
+}
+
+static void gp_ui_combo_set_tracked_state(GtkComboBox *combo, gboolean shown)
+{
+    if (combo == NULL)
+        return;
+
+    g_object_set_data(G_OBJECT(combo), GP_UI_QUARANTINE_POPUP_KEY,
+                      GINT_TO_POINTER(shown));
+}
+
+gboolean gp_ui_combo_popup_shown(GtkComboBox *combo)
+{
+    gboolean has_prop = FALSE;
+    gboolean shown_prop = FALSE;
+    gboolean shown_tracked = FALSE;
+
+    if (combo == NULL)
+        return FALSE;
+
+    shown_prop = gp_ui_combo_get_popup_property(combo, &has_prop);
+    shown_tracked = gp_ui_combo_get_tracked_state(combo);
+
+    if (has_prop)
+        return shown_prop || shown_tracked;
+
+    return shown_tracked;
 }
 
 static void gp_ui_quarantine_reset_swallow(GpUiQuarantine *state)
@@ -146,7 +190,7 @@ static GdkFilterReturn gp_ui_quarantine_filter(GdkXEvent *xevent,
         return GDK_FILTER_CONTINUE;
 
     if (state->pending_combo != NULL &&
-        !gp_ui_quarantine_popup_shown(state->pending_combo) &&
+        !gp_ui_combo_popup_shown(state->pending_combo) &&
         gp_ui_quarantine_event_on_widget(state,
                                          GTK_WIDGET(state->pending_combo),
                                          button_event))
@@ -193,6 +237,48 @@ static GdkFilterReturn gp_ui_quarantine_filter(GdkXEvent *xevent,
     }
 
     return GDK_FILTER_CONTINUE;
+}
+
+static void gp_ui_quarantine_update_combo_state(GpUiQuarantine *state,
+                                                GtkComboBox *combo,
+                                                gboolean shown)
+{
+    gboolean prev_shown;
+    gint64 now_us;
+
+    if (state == NULL || combo == NULL)
+        return;
+
+    prev_shown = gp_ui_combo_get_tracked_state(combo);
+    if (prev_shown == shown)
+        return;
+
+    if (prev_shown && !shown)
+    {
+        now_us = g_get_monotonic_time();
+        state->last_popup_popdown_us = now_us;
+        state->quarantine_until_us = now_us + 250000;
+        gp_ui_quarantine_reset_swallow(state);
+        gp_ui_quarantine_set_pending_combo(state, combo);
+        GP_UI_LOG("%s: popdown quarantine until=%lld us\n", __func__,
+                  (long long)state->quarantine_until_us);
+    }
+    else if (shown && combo == state->pending_combo)
+    {
+        gp_ui_quarantine_set_pending_combo(state, NULL);
+    }
+
+    gp_ui_combo_set_tracked_state(combo, shown);
+}
+
+static void gp_ui_quarantine_combo_popup(GtkComboBox *combo, gpointer data)
+{
+    gp_ui_quarantine_update_combo_state(data, combo, TRUE);
+}
+
+static void gp_ui_quarantine_combo_popdown(GtkComboBox *combo, gpointer data)
+{
+    gp_ui_quarantine_update_combo_state(data, combo, FALSE);
 }
 
 static void gp_ui_quarantine_remove_filter(GpUiQuarantine *state)
@@ -262,34 +348,15 @@ static void gp_ui_quarantine_popup_notify(GObject *object,
 {
     GpUiQuarantine *state = data;
     GtkComboBox *combo = GTK_COMBO_BOX(object);
-    gint64 now_us = g_get_monotonic_time();
     gboolean shown;
-    gboolean prev_shown;
 
     (void)pspec;
 
     if (state == NULL || combo == NULL)
         return;
 
-    shown = gp_ui_quarantine_popup_shown(combo);
-    prev_shown = GPOINTER_TO_INT(g_object_get_data(object, GP_UI_QUARANTINE_POPUP_KEY));
-
-    if (prev_shown && !shown)
-    {
-        state->last_popup_popdown_us = now_us;
-        state->quarantine_until_us = now_us + 250000;
-        gp_ui_quarantine_reset_swallow(state);
-        gp_ui_quarantine_set_pending_combo(state, combo);
-        GP_UI_LOG("%s: popdown quarantine until=%lld us\n", __func__,
-                  (long long)state->quarantine_until_us);
-    }
-    else if (shown && combo == state->pending_combo)
-    {
-        gp_ui_quarantine_set_pending_combo(state, NULL);
-    }
-
-    g_object_set_data(object, GP_UI_QUARANTINE_POPUP_KEY,
-                      GINT_TO_POINTER(shown));
+    shown = gp_ui_combo_get_popup_property(combo, NULL);
+    gp_ui_quarantine_update_combo_state(state, combo, shown);
 }
 
 void gp_ui_quarantine_install(GtkWidget *toplevel)
@@ -323,6 +390,7 @@ void gp_ui_quarantine_install(GtkWidget *toplevel)
 void gp_ui_quarantine_register_combo(GtkWidget *toplevel, GtkComboBox *combo)
 {
     GpUiQuarantine *state;
+    gboolean has_prop = FALSE;
     gboolean shown;
 
     if (toplevel == NULL || combo == NULL)
@@ -338,12 +406,16 @@ void gp_ui_quarantine_register_combo(GtkWidget *toplevel, GtkComboBox *combo)
 
     g_object_set_data(G_OBJECT(combo), GP_UI_QUARANTINE_COMBO_KEY, state);
 
-    shown = gp_ui_quarantine_popup_shown(combo);
-    g_object_set_data(G_OBJECT(combo), GP_UI_QUARANTINE_POPUP_KEY,
-                      GINT_TO_POINTER(shown));
+    shown = gp_ui_combo_get_popup_property(combo, &has_prop);
+    gp_ui_combo_set_tracked_state(combo, shown);
 
-    g_signal_connect(combo, "notify::popup-shown",
-                     G_CALLBACK(gp_ui_quarantine_popup_notify), state);
+    if (has_prop)
+        g_signal_connect(combo, "notify::popup-shown",
+                         G_CALLBACK(gp_ui_quarantine_popup_notify), state);
+    g_signal_connect(combo, "popup",
+                     G_CALLBACK(gp_ui_quarantine_combo_popup), state);
+    g_signal_connect(combo, "popdown",
+                     G_CALLBACK(gp_ui_quarantine_combo_popdown), state);
 
     GP_UI_LOG("%s: combo registered %p\n", __func__, (void *)combo);
 }

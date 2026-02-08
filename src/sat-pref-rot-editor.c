@@ -121,15 +121,7 @@ static void rot_pref_ui_end_update(RotPrefUi *ui, const gchar *reason)
 
 static gboolean rot_pref_combo_popup_shown(GtkComboBox *combo)
 {
-    gboolean shown = FALSE;
-
-    if (combo == NULL)
-        return FALSE;
-
-    if (g_object_class_find_property(G_OBJECT_GET_CLASS(combo), "popup-shown"))
-        g_object_get(combo, "popup-shown", &shown, NULL);
-
-    return shown;
+    return gp_ui_combo_popup_shown(combo);
 }
 
 

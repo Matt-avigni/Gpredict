@@ -1463,15 +1463,7 @@ static void rotctrl_update_detached_labels(GtkRotCtrl *ctrl)
 
 static gboolean rotctrl_combo_popup_shown(GtkComboBox *box)
 {
-    gboolean shown = FALSE;
-
-    if (box == NULL)
-        return FALSE;
-
-    if (g_object_class_find_property(G_OBJECT_GET_CLASS(box), "popup-shown"))
-        g_object_get(box, "popup-shown", &shown, NULL);
-
-    return shown;
+    return gp_ui_combo_popup_shown(box);
 }
 
 static void rotctrl_detached_plot_destroy(GtkWidget *widget, gpointer data)
