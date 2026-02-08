@@ -1809,7 +1809,6 @@ static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
 {
     GtkWidget *toplevel;
     GtkRequisition min_req;
-    GtkRequisition nat_req;
     gint cur_w = 0;
     gint cur_h = 0;
     gint new_w = 0;
@@ -1823,7 +1822,7 @@ static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
         return;
 
     gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
-    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, NULL);
 
     new_w = cur_w;
     new_h = cur_h;
@@ -1832,8 +1831,6 @@ static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
         new_w = min_req.width;
     if (new_h < min_req.height)
         new_h = min_req.height;
-    if (new_h < nat_req.height)
-        new_h = nat_req.height;
 
     if (new_w != cur_w || new_h != cur_h)
         gtk_window_resize(GTK_WINDOW(toplevel), new_w, new_h);

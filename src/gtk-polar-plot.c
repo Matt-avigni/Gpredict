@@ -54,6 +54,7 @@
 
 #define POLV_DEFAULT_SIZE 200
 #define POLV_DEFAULT_MARGIN 20
+#define POLV_LOCNAME_GAP 20
 
 /* extra size for line outside 0 deg circle (inside margin) */
 #define POLV_LINE_EXTRA 5
@@ -74,6 +75,8 @@ static void gtk_polar_plot_init(GtkPolarPlot * polview,
     polview->r = 0;
     polview->cx = 0;
     polview->cy = 0;
+    polview->margin = POLV_DEFAULT_MARGIN;
+    polview->satnam = NULL;
     polview->swap = 0;
     polview->qthinfo = FALSE;
     polview->cursinfo = FALSE;
@@ -419,7 +422,7 @@ static GooCanvasItemModel *create_canvas_model(GtkPolarPlot * polv)
 
     /* graph dimensions */
     polv->size = POLV_DEFAULT_SIZE;
-    polv->r = (polv->size / 2) - POLV_DEFAULT_MARGIN;
+        polv->r = (polv->size / 2) - polv->margin;
     polv->cx = POLV_DEFAULT_SIZE / 2;
     polv->cy = POLV_DEFAULT_SIZE / 2;
 
@@ -527,6 +530,17 @@ static GooCanvasItemModel *create_canvas_model(GtkPolarPlot * polv)
                                              "font", g_value_get_string(&polv->font),
                                              "fill-color-rgba", col, NULL);
 
+    /* satellite name (empty by default) */
+    polv->satnam = goo_canvas_text_model_new(root, "",
+                                             polv->cx - polv->r -
+                                             2 * POLV_LINE_EXTRA,
+                                             polv->cy - polv->r -
+                                             POLV_LINE_EXTRA + POLV_LOCNAME_GAP,
+                                             -1,
+                                             GOO_CANVAS_ANCHOR_SW,
+                                             "font", g_value_get_string(&polv->font),
+                                             "fill-color-rgba", col, NULL);
+
     return root;
 }
 
@@ -615,7 +629,7 @@ static void size_allocate_cb(GtkWidget * widget, GtkAllocation * allocation,
         polv = GTK_POLAR_PLOT(data);
 
         polv->size = MIN(allocation->width, allocation->height);
-        polv->r = (polv->size / 2) - POLV_DEFAULT_MARGIN;
+        polv->r = (polv->size / 2) - polv->margin;
         polv->cx = allocation->width / 2;
         polv->cy = allocation->height / 2;
 
@@ -688,6 +702,13 @@ static void size_allocate_cb(GtkWidget * widget, GtkAllocation * allocation,
         g_object_set(polv->locnam,
                      "x", (gfloat) (polv->cx - polv->r - 2 * POLV_LINE_EXTRA),
                      "y", (gfloat) (polv->cy - polv->r - POLV_LINE_EXTRA),
+                     NULL);
+
+        /* satellite name */
+        g_object_set(polv->satnam,
+                     "x", (gfloat) (polv->cx - polv->r - 2 * POLV_LINE_EXTRA),
+                     "y", (gfloat) (polv->cy - polv->r - POLV_LINE_EXTRA +
+                                    POLV_LOCNAME_GAP),
                      NULL);
 
         /* sky track */
@@ -1137,6 +1158,30 @@ void gtk_polar_plot_set_rotor_pos(GtkPolarPlot * plot, gdouble az, gdouble el)
                                                             1.0, NULL);
         }
     }
+}
+
+void gtk_polar_plot_set_margin(GtkPolarPlot * plot, guint margin)
+{
+    GtkAllocation aloc;
+
+    if (plot == NULL)
+        return;
+
+    plot->margin = margin;
+
+    if (plot->canvas != NULL)
+    {
+        gtk_widget_get_allocation(plot->canvas, &aloc);
+        size_allocate_cb(plot->canvas, &aloc, plot);
+    }
+}
+
+void gtk_polar_plot_set_sat_name(GtkPolarPlot * plot, const gchar *name)
+{
+    if (plot == NULL || plot->satnam == NULL)
+        return;
+
+    g_object_set(plot->satnam, "text", name ? name : "", NULL);
 }
 
 /**

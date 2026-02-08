@@ -78,6 +78,7 @@ struct _GtkPolarPlot {
     GooCanvasItemModel *hl, *vl;        /*!< horizontal and vertical lines */
     GooCanvasItemModel *N, *S, *E, *W;  /*!< North, South, East and West labels */
     GooCanvasItemModel *locnam; /*!< Location name */
+    GooCanvasItemModel *satnam; /*!< Satellite name */
     GooCanvasItemModel *curs;   /*!< cursor tracking text */
 
     pass_t         *pass;
@@ -94,6 +95,7 @@ struct _GtkPolarPlot {
     guint           cy;         /*!< center Y */
     guint           r;          /*!< radius */
     guint           size;       /*!< Size of the box = min(h,w) */
+    guint           margin;     /*!< Inner margin around plot area */
 
 
     polar_plot_swap_t swap;
@@ -118,6 +120,9 @@ void            gtk_polar_plot_set_ctrl_pos(GtkPolarPlot * plot, gdouble az,
                                             gdouble el);
 void            gtk_polar_plot_set_rotor_pos(GtkPolarPlot * plot, gdouble az,
                                              gdouble el);
+void            gtk_polar_plot_set_margin(GtkPolarPlot * plot, guint margin);
+void            gtk_polar_plot_set_sat_name(GtkPolarPlot * plot,
+                                            const gchar *name);
 void            gtk_polar_plot_show_time_ticks(GtkPolarPlot * plot,
                                                gboolean show);
 

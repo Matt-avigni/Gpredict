@@ -483,6 +483,7 @@ struct _GtkRotCtrl {
     GtkWidget      *max_el_spin;
     GtkWidget      *az_endstop_spin;
     GtkWidget      *preset_grid;
+    GList          *detached_plots;
 
     RotPreset       presets[ROT_PRESET_MAX];
     guint           preset_count;
@@ -712,6 +713,13 @@ struct _GtkRotCtrlClass {
 static GtkVBoxClass *parent_class = NULL;
 static guint64 rotctld_conn_seq = 0;
 
+typedef struct {
+    GtkRotCtrl     *ctrl;
+    GtkWidget      *window;
+    GtkWidget      *plot;
+    GtkWidget      *aoslos_label;
+} RotDetachedPlot;
+
 /* Forward declaration for error dialog helper */
 
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl);
@@ -738,10 +746,20 @@ static void     rotctrl_presets_refresh(GtkRotCtrl *ctrl);
 static void     rotctrl_preset_create_cb(GtkButton *button, gpointer data);
 static void     rotctrl_preset_edit_cb(GtkButton *button, gpointer data);
 static void     rotctrl_preset_activate_cb(GtkButton *button, gpointer data);
+static void     rotctrl_detach_plot_cb(GtkButton *button, gpointer data);
 static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_capture_log_closed_height(GtkRotCtrl *ctrl);
 static void rotctrl_restore_log_height(GtkRotCtrl *ctrl);
+static void     rotctrl_set_pass_on_plots(GtkRotCtrl *ctrl, pass_t *pass);
+static void     rotctrl_set_rotor_pos_on_plots(GtkRotCtrl *ctrl,
+                                               gdouble az, gdouble el);
+static void     rotctrl_set_target_pos_on_plots(GtkRotCtrl *ctrl,
+                                                gdouble az, gdouble el);
+static void     rotctrl_set_ctrl_pos_on_plots(GtkRotCtrl *ctrl,
+                                              gdouble az, gdouble el);
+static void     rotctrl_queue_draw_plots(GtkRotCtrl *ctrl);
+static void     rotctrl_update_detached_labels(GtkRotCtrl *ctrl);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
                                   rot_session_state_t state,
                                   const gchar *reason,
@@ -1312,6 +1330,137 @@ static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason)
                     reason ? reason : "(none)");
 }
 
+static void rotctrl_set_pass_on_plots(GtkRotCtrl *ctrl, pass_t *pass)
+{
+    GList *node;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->plot != NULL)
+        gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), pass);
+
+    for (node = ctrl->detached_plots; node != NULL; node = node->next)
+    {
+        RotDetachedPlot *entry = node->data;
+        if (entry != NULL && entry->plot != NULL)
+            gtk_polar_plot_set_pass(GTK_POLAR_PLOT(entry->plot), pass);
+    }
+}
+
+static void rotctrl_set_rotor_pos_on_plots(GtkRotCtrl *ctrl,
+                                           gdouble az, gdouble el)
+{
+    GList *node;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->plot != NULL)
+        gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot), az, el);
+
+    for (node = ctrl->detached_plots; node != NULL; node = node->next)
+    {
+        RotDetachedPlot *entry = node->data;
+        if (entry != NULL && entry->plot != NULL)
+            gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(entry->plot), az, el);
+    }
+}
+
+static void rotctrl_set_target_pos_on_plots(GtkRotCtrl *ctrl,
+                                            gdouble az, gdouble el)
+{
+    GList *node;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->plot != NULL)
+        gtk_polar_plot_set_target_pos(GTK_POLAR_PLOT(ctrl->plot), az, el);
+
+    for (node = ctrl->detached_plots; node != NULL; node = node->next)
+    {
+        RotDetachedPlot *entry = node->data;
+        if (entry != NULL && entry->plot != NULL)
+            gtk_polar_plot_set_target_pos(GTK_POLAR_PLOT(entry->plot), az, el);
+    }
+}
+
+static void rotctrl_set_ctrl_pos_on_plots(GtkRotCtrl *ctrl,
+                                          gdouble az, gdouble el)
+{
+    GList *node;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->plot != NULL)
+        gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot), az, el);
+
+    for (node = ctrl->detached_plots; node != NULL; node = node->next)
+    {
+        RotDetachedPlot *entry = node->data;
+        if (entry != NULL && entry->plot != NULL)
+            gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(entry->plot), az, el);
+    }
+}
+
+static void rotctrl_queue_draw_plots(GtkRotCtrl *ctrl)
+{
+    GList *node;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->plot != NULL)
+        gtk_widget_queue_draw(ctrl->plot);
+
+    for (node = ctrl->detached_plots; node != NULL; node = node->next)
+    {
+        RotDetachedPlot *entry = node->data;
+        if (entry != NULL && entry->plot != NULL)
+            gtk_widget_queue_draw(entry->plot);
+    }
+}
+
+static void rotctrl_update_detached_labels(GtkRotCtrl *ctrl)
+{
+    GList *node;
+    const gchar *sat_name = NULL;
+    gchar *buff = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->target != NULL)
+        sat_name = ctrl->target->nickname;
+    else
+        sat_name = "--";
+
+    for (node = ctrl->detached_plots; node != NULL; node = node->next)
+    {
+        RotDetachedPlot *entry = node->data;
+
+        if (entry == NULL)
+            continue;
+
+        if (entry->plot != NULL)
+            gtk_polar_plot_set_sat_name(GTK_POLAR_PLOT(entry->plot), sat_name);
+
+        if (entry->aoslos_label != NULL)
+        {
+            g_free(buff);
+            buff = predict_format_aoslos_countdown(ctrl->target,
+                                                   ctrl->t, TRUE, TRUE);
+            if (buff == NULL)
+                buff = g_strdup(ROTCTRL_AOSLOS_PLACEHOLDER);
+            gp_safe_label_set_markup(entry->aoslos_label, buff);
+        }
+    }
+
+    g_free(buff);
+}
+
 static gboolean rotctrl_combo_popup_shown(GtkComboBox *box)
 {
     gboolean shown = FALSE;
@@ -1323,6 +1472,135 @@ static gboolean rotctrl_combo_popup_shown(GtkComboBox *box)
         g_object_get(box, "popup-shown", &shown, NULL);
 
     return shown;
+}
+
+static void rotctrl_detached_plot_destroy(GtkWidget *widget, gpointer data)
+{
+    RotDetachedPlot *entry = data;
+
+    (void)widget;
+
+    if (entry == NULL)
+        return;
+
+    if (entry->ctrl != NULL)
+        entry->ctrl->detached_plots =
+            g_list_remove(entry->ctrl->detached_plots, entry);
+
+    g_free(entry);
+}
+
+static void rotctrl_detach_plot_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
+    GtkWidget      *window;
+    GtkWidget      *frame;
+    GtkWidget      *pad;
+    GtkWidget      *plot;
+    GtkWidget      *aoslos_frame;
+    GtkWidget      *aoslos_label;
+    GtkWidget      *outer;
+    GtkWidget      *parent;
+    const gchar    *parent_title = NULL;
+    gchar          *title = NULL;
+    GtkRequisition  min_req;
+    GtkRequisition  nat_req;
+    RotDetachedPlot *entry;
+
+    (void)button;
+
+    if (ctrl == NULL)
+        return;
+
+    plot = gtk_polar_plot_new(ctrl->qth, ctrl->pass);
+    gtk_polar_plot_set_margin(GTK_POLAR_PLOT(plot), 32);
+    gtk_widget_set_hexpand(plot, TRUE);
+    gtk_widget_set_vexpand(plot, TRUE);
+
+    aoslos_label = gtk_label_new(NULL);
+    gp_safe_label_set_markup(aoslos_label, ROTCTRL_AOSLOS_PLACEHOLDER);
+    gtk_widget_set_tooltip_text(aoslos_label,
+                                _("The time remaining until the next AOS or "
+                                  "LOS event"));
+    g_object_set(aoslos_label, "xalign", 0.5f, "yalign", 0.5f, NULL);
+    gtk_widget_set_margin_top(aoslos_label, 3);
+    gtk_widget_set_margin_bottom(aoslos_label, 3);
+
+    aoslos_frame = gtk_frame_new(NULL);
+    gtk_container_add(GTK_CONTAINER(aoslos_frame), aoslos_label);
+
+    frame = gtk_frame_new(NULL);
+    gtk_widget_set_margin_top(frame, 8);
+    gtk_widget_set_margin_bottom(frame, 8);
+    gtk_widget_set_margin_start(frame, 6);
+    gtk_widget_set_margin_end(frame, 6);
+    pad = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_set_border_width(GTK_CONTAINER(pad), 12);
+    gtk_widget_set_hexpand(pad, TRUE);
+    gtk_widget_set_vexpand(pad, TRUE);
+    gtk_container_add(GTK_CONTAINER(pad), plot);
+    gtk_container_add(GTK_CONTAINER(frame), pad);
+
+    outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_hexpand(outer, TRUE);
+    gtk_widget_set_vexpand(outer, TRUE);
+    gtk_box_pack_start(GTK_BOX(outer), frame, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), aoslos_frame, FALSE, FALSE, 0);
+
+    window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    parent = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (GTK_IS_WINDOW(parent))
+    {
+        parent_title = gtk_window_get_title(GTK_WINDOW(parent));
+        gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(parent));
+        gtk_window_set_destroy_with_parent(GTK_WINDOW(window), TRUE);
+    }
+
+    if (parent_title != NULL)
+        title = g_strdup_printf(_("%s (Plot)"), parent_title);
+    else
+        title = g_strdup(_("Gpredict Rotator Plot"));
+    gtk_window_set_title(GTK_WINDOW(window), title);
+    g_free(title);
+
+    gtk_widget_get_preferred_size(plot, &min_req, &nat_req);
+    if (nat_req.width < min_req.width)
+        nat_req.width = min_req.width;
+    if (nat_req.height < min_req.height)
+        nat_req.height = min_req.height;
+    if (nat_req.width > 0 && nat_req.height > 0)
+        gtk_window_set_default_size(GTK_WINDOW(window),
+                                    nat_req.width, nat_req.height);
+
+    gtk_container_add(GTK_CONTAINER(window), outer);
+
+    entry = g_new0(RotDetachedPlot, 1);
+    entry->ctrl = ctrl;
+    entry->window = window;
+    entry->plot = plot;
+    entry->aoslos_label = aoslos_label;
+    ctrl->detached_plots = g_list_append(ctrl->detached_plots, entry);
+    g_signal_connect(G_OBJECT(window), "destroy",
+                     G_CALLBACK(rotctrl_detached_plot_destroy), entry);
+
+    if (ctrl->pass != NULL)
+        rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
+    if (ctrl->target != NULL)
+        rotctrl_set_target_pos_on_plots(ctrl,
+                                        ctrl->target->az,
+                                        ctrl->target->el);
+    if (ctrl->conf != NULL)
+    {
+        gdouble dispaz = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+        gdouble dispel = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+        if (ctrl->conf->aztype == ROT_AZ_TYPE_180 && dispaz < 0.0)
+            dispaz += 360.0;
+        rotctrl_set_ctrl_pos_on_plots(ctrl, dispaz, dispel);
+    }
+    rotctrl_queue_draw_plots(ctrl);
+    rotctrl_update_detached_labels(ctrl);
+
+    gtk_widget_show_all(window);
 }
 
 
@@ -9352,6 +9630,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
 
         update_count_down(ctrl, t);
         update_aoslos_banner(ctrl, t);
+        rotctrl_update_detached_labels(ctrl);
 
         /*if the current pass is too far away */
         if ((ctrl->pass != NULL))
@@ -9365,8 +9644,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                 {
                     set_flipped_pass(ctrl);
                     /* update polar plot */
-                    gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot),
-                                            ctrl->pass);
+                    rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
                 }
             }
 
@@ -9386,8 +9664,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                     ctrl->pass = NULL;
                     ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, t);
                     set_flipped_pass(ctrl);
-                    gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot),
-                                            ctrl->pass);
+                    rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
                 }
                 else if ((ctrl->target->aos - ctrl->pass->aos) >
                          (ctrl->delay / secday / 1000 / 4.0))
@@ -9405,8 +9682,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                     ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
                     set_flipped_pass(ctrl);
                     /* update polar plot */
-                    gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot),
-                                            ctrl->pass);
+                    rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
                 }
             }
             else
@@ -9421,8 +9697,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                     ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
                     set_flipped_pass(ctrl);
                     /* update polar plot */
-                    gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot),
-                                            ctrl->pass);
+                    rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
                 }
             }
         }
@@ -9437,12 +9712,13 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
 
             set_flipped_pass(ctrl);
             /* update polar plot */
-            gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), ctrl->pass);
+            rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
         }
     }
     else
     {
         update_aoslos_banner(ctrl, t);
+        rotctrl_update_detached_labels(ctrl);
     }
 }
 
@@ -9732,7 +10008,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         {
             set_flipped_pass(ctrl);
             if (ctrl->plot != NULL)
-                gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), ctrl->pass);
+                rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
             return;
         }
 
@@ -9752,7 +10028,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->flipped = (ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP);
         set_flipped_pass(ctrl);
         if (ctrl->plot != NULL)
-            gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), ctrl->pass);
+            rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
 
     }
     else if (ctrl->tracking) {
@@ -10394,8 +10670,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             rotpos_valid = FALSE;
             gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("UNKNOWN"));
             gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("UNKNOWN"));
-            gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                         -10.0, -10.0);
+            rotctrl_set_rotor_pos_on_plots(ctrl, -10.0, -10.0);
         }
         else
         {
@@ -10495,8 +10770,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
                 gdouble rotaz_plot =
                     azel_normalize_az_0_360(ctrl->az_abs_cur);
-                gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                             rotaz_plot, rotel);
+                rotctrl_set_rotor_pos_on_plots(ctrl, rotaz_plot, rotel);
 
                 if (ctrl->conf != NULL)
                 {
@@ -10511,8 +10785,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 {
                     gtk_label_set_text(GTK_LABEL(ctrl->AzRead), _("UNKNOWN"));
                     gtk_label_set_text(GTK_LABEL(ctrl->ElRead), _("UNKNOWN"));
-                    gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                                 -10.0, -10.0);
+                    rotctrl_set_rotor_pos_on_plots(ctrl, -10.0, -10.0);
                 }
                 else
                 {
@@ -12474,7 +12747,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     else
     {
         /* client not running: ensure rotor pos is not visible */
-        gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot), -10.0, -10.0);
+        rotctrl_set_rotor_pos_on_plots(ctrl, -10.0, -10.0);
         ctrl->axis_swap_warned = FALSE;
         gtk_label_set_text(GTK_LABEL(ctrl->AzRead), "\342\200\224");
         gtk_label_set_text(GTK_LABEL(ctrl->ElRead), "\342\200\224");
@@ -12504,8 +12777,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     /* update target object on polar plot */
     if (ctrl->target != NULL)
     {
-        gtk_polar_plot_set_target_pos(GTK_POLAR_PLOT(ctrl->plot),
-                                      ctrl->target->az, ctrl->target->el);
+        rotctrl_set_target_pos_on_plots(ctrl, ctrl->target->az, ctrl->target->el);
     }
 
     /* update controller circle on polar plot */
@@ -12522,8 +12794,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 dispaz += 360.0;
         }
 
-        gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot), dispaz, dispel);
-        gtk_widget_queue_draw(ctrl->plot);
+        rotctrl_set_ctrl_pos_on_plots(ctrl, dispaz, dispel);
+        rotctrl_queue_draw_plots(ctrl);
     }
 
     return TRUE;
@@ -17818,7 +18090,6 @@ static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
 {
     GtkWidget *toplevel;
     GtkRequisition min_req;
-    GtkRequisition nat_req;
     gint cur_w = 0;
     gint cur_h = 0;
     gint new_w = 0;
@@ -17832,7 +18103,7 @@ static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
         return;
 
     gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
-    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, NULL);
 
     new_w = cur_w;
     new_h = cur_h;
@@ -17841,8 +18112,6 @@ static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
         new_w = min_req.width;
     if (new_h < min_req.height)
         new_h = min_req.height;
-    if (new_h < nat_req.height)
-        new_h = nat_req.height;
 
     if (new_w != cur_w || new_h != cur_h)
         gtk_window_resize(GTK_WINDOW(toplevel), new_w, new_h);
@@ -18195,7 +18464,7 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
 
     /* in either case, we set the new pass (even if NULL) on the polar plot */
     if (ctrl->plot != NULL)
-        gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), ctrl->pass);
+        rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
 }
 
 /* Create target widgets */
@@ -19216,11 +19485,28 @@ static GtkWidget *create_cal_widgets(GtkRotCtrl * ctrl)
 static GtkWidget *create_plot_widget(GtkRotCtrl * ctrl)
 {
     GtkWidget      *frame;
+    GtkWidget      *overlay;
+    GtkWidget      *detach_button;
 
     ctrl->plot = gtk_polar_plot_new(ctrl->qth, ctrl->pass);
 
+    overlay = gtk_overlay_new();
+    gtk_widget_set_hexpand(overlay, TRUE);
+    gtk_widget_set_vexpand(overlay, TRUE);
+    gtk_container_add(GTK_CONTAINER(overlay), ctrl->plot);
+
+    detach_button = gtk_button_new_with_label(_("Detach"));
+    gtk_widget_set_halign(detach_button, GTK_ALIGN_START);
+    gtk_widget_set_valign(detach_button, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(detach_button, 6);
+    gtk_widget_set_margin_top(detach_button, 6);
+    gtk_widget_set_margin_end(detach_button, 6);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), detach_button);
+    g_signal_connect(detach_button, "clicked",
+                     G_CALLBACK(rotctrl_detach_plot_cb), ctrl);
+
     frame = gtk_frame_new(NULL);
-    gtk_container_add(GTK_CONTAINER(frame), ctrl->plot);
+    gtk_container_add(GTK_CONTAINER(frame), overlay);
 
     return frame;
 }
@@ -19387,6 +19673,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->pass = NULL;
     ctrl->qth = NULL;
     ctrl->plot = NULL;
+    ctrl->detached_plots = NULL;
     ctrl->axis_mode_combo = NULL;
     ctrl->wrap_mode_combo = NULL;
     ctrl->min_az_spin = NULL;
@@ -19678,6 +19965,19 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         g_source_remove(ctrl->pending_ui_refresh_id);
         ctrl->pending_ui_refresh_id = 0;
     }
+
+    while (ctrl->detached_plots != NULL)
+    {
+        RotDetachedPlot *entry = ctrl->detached_plots->data;
+
+        if (entry != NULL && entry->window != NULL)
+            gtk_widget_destroy(entry->window);
+        else
+            ctrl->detached_plots =
+                g_list_delete_link(ctrl->detached_plots,
+                                   ctrl->detached_plots);
+    }
+    ctrl->detached_plots = NULL;
 
     /* free configuration */
     if (ctrl->conf != NULL)
