@@ -700,13 +700,8 @@ static gboolean rigctrl_log_at_least(const GtkRigCtrl *ctrl,
                                      rig_log_level_t level);
 static void     rigctrl_ui_begin_update(GtkRigCtrl *ctrl, const gchar *reason);
 static void     rigctrl_ui_end_update(GtkRigCtrl *ctrl, const gchar *reason);
-static void     rigctrl_scale_capture_base(GtkRigCtrl *ctrl);
-static void     rigctrl_update_ui_scale(GtkRigCtrl *ctrl,
-                                        gint width,
-                                        gint height);
-static void     rigctrl_size_allocate_cb(GtkWidget *widget,
-                                         GtkAllocation *alloc,
-                                         gpointer data);
+static void     rigctrl_capture_log_closed_height(GtkRigCtrl *ctrl);
+static void     rigctrl_restore_log_height(GtkRigCtrl *ctrl);
 static void     rigctrl_schedule_trsp_refresh(GtkRigCtrl *ctrl);
 static void     rigctrl_set_freq_knob_value(GtkRigCtrl *ctrl,
                                             gboolean uplink,
@@ -1406,96 +1401,6 @@ static void rigctrl_ui_end_update(GtkRigCtrl *ctrl, const gchar *reason)
                     reason ? reason : "(none)");
 }
 
-static void rigctrl_scale_capture_base(GtkRigCtrl *ctrl)
-{
-    GtkStyleContext *context = NULL;
-    PangoFontDescription *font = NULL;
-    GtkRequisition min_req;
-    GtkRequisition nat_req;
-
-    if (ctrl == NULL)
-        return;
-
-    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0)
-    {
-        gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
-        ctrl->ui_base_width = MAX(1, nat_req.width);
-        ctrl->ui_base_height = MAX(1, nat_req.height);
-    }
-
-    if (ctrl->ui_base_font == NULL)
-    {
-        context = gtk_widget_get_style_context(GTK_WIDGET(ctrl));
-        gtk_style_context_get(context,
-                              GTK_STATE_FLAG_NORMAL,
-                              "font", &font,
-                              NULL);
-        if (font == NULL)
-            font = pango_font_description_from_string("Sans 10");
-        ctrl->ui_base_font = font;
-    }
-}
-
-static void rigctrl_update_ui_scale(GtkRigCtrl *ctrl,
-                                    gint width,
-                                    gint height)
-{
-    gdouble scale;
-    gdouble sx;
-    gdouble sy;
-    PangoFontDescription *font;
-    gint size;
-
-    if (ctrl == NULL)
-        return;
-
-    rigctrl_scale_capture_base(ctrl);
-
-    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0 ||
-        ctrl->ui_base_font == NULL)
-        return;
-
-    sx = (gdouble) width / (gdouble) ctrl->ui_base_width;
-    sy = (gdouble) height / (gdouble) ctrl->ui_base_height;
-    scale = MIN(sx, sy);
-
-    if (scale < 0.5)
-        scale = 0.5;
-    if (scale > 3.0)
-        scale = 3.0;
-
-    if (fabs(scale - ctrl->ui_last_scale) < 0.02)
-        return;
-
-    ctrl->ui_last_scale = scale;
-
-    font = pango_font_description_copy(ctrl->ui_base_font);
-    size = pango_font_description_get_size(font);
-    if (size > 0)
-    {
-        if (pango_font_description_get_size_is_absolute(font))
-            pango_font_description_set_absolute_size(font, size * scale);
-        else
-            pango_font_description_set_size(font, (gint) (size * scale));
-    }
-    gtk_widget_override_font(GTK_WIDGET(ctrl), font);
-    pango_font_description_free(font);
-}
-
-static void rigctrl_size_allocate_cb(GtkWidget *widget,
-                                     GtkAllocation *alloc,
-                                     gpointer data)
-{
-    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
-
-    (void)widget;
-
-    if (alloc == NULL)
-        return;
-
-    rigctrl_update_ui_scale(ctrl, alloc->width, alloc->height);
-}
-
 typedef struct {
     GtkRigCtrl *ctrl;
     gboolean    uplink;
@@ -1815,8 +1720,15 @@ static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
         return;
 
     visible = gtk_toggle_button_get_active(button);
+    if (visible)
+        rigctrl_capture_log_closed_height(ctrl);
+
     gp_term_view_set_visible(ctrl->term_view, visible);
-    rigctrl_schedule_resize(ctrl);
+
+    if (visible)
+        rigctrl_schedule_resize(ctrl);
+    else
+        rigctrl_restore_log_height(ctrl);
 }
 
 static void rigctrl_set_log_level(GtkRigCtrl *ctrl, rig_log_level_t level)
@@ -1896,6 +1808,12 @@ static void rigctrl_apply_log_level_from_conf(GtkRigCtrl *ctrl,
 static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
 {
     GtkWidget *toplevel;
+    GtkRequisition min_req;
+    GtkRequisition nat_req;
+    gint cur_w = 0;
+    gint cur_h = 0;
+    gint new_w = 0;
+    gint new_h = 0;
 
     if (ctrl == NULL)
         return;
@@ -1904,9 +1822,77 @@ static void rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl)
     if (!GTK_IS_WINDOW(toplevel))
         return;
 
-    gtk_widget_set_size_request(toplevel, -1, -1);
-    gtk_widget_queue_resize(toplevel);
-    gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
+    gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
+    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+
+    new_w = cur_w;
+    new_h = cur_h;
+
+    if (new_w < min_req.width)
+        new_w = min_req.width;
+    if (new_h < min_req.height)
+        new_h = min_req.height;
+    if (new_h < nat_req.height)
+        new_h = nat_req.height;
+
+    if (new_w != cur_w || new_h != cur_h)
+        gtk_window_resize(GTK_WINDOW(toplevel), new_w, new_h);
+
+    gtk_widget_queue_resize(GTK_WIDGET(ctrl));
+}
+
+static void rigctrl_capture_log_closed_height(GtkRigCtrl *ctrl)
+{
+    GtkWidget *toplevel;
+    gint cur_w = 0;
+    gint cur_h = 0;
+
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
+    ctrl->log_closed_height = cur_h;
+}
+
+static void rigctrl_restore_log_height(GtkRigCtrl *ctrl)
+{
+    GtkWidget *toplevel;
+    GtkRequisition min_req;
+    GtkRequisition nat_req;
+    gint cur_w = 0;
+    gint cur_h = 0;
+    gint new_h = 0;
+    gint new_w = 0;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->log_closed_height <= 0)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
+    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+
+    new_w = cur_w;
+    new_h = ctrl->log_closed_height;
+
+    if (new_w < min_req.width)
+        new_w = min_req.width;
+    if (new_h < min_req.height)
+        new_h = min_req.height;
+
+    if (new_w != cur_w || new_h != cur_h)
+        gtk_window_resize(GTK_WINDOW(toplevel), new_w, new_h);
+
+    gtk_widget_queue_resize(GTK_WIDGET(ctrl));
 }
 
 static gboolean rigctrl_resize_idle(gpointer data)
@@ -2574,12 +2560,6 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         ctrl->trsplist = NULL;
     }
 
-    if (ctrl->ui_base_font != NULL)
-    {
-        pango_font_description_free(ctrl->ui_base_font);
-        ctrl->ui_base_font = NULL;
-    }
-
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }
 
@@ -2663,12 +2643,9 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
     ctrl->log_verbose_toggle = NULL;
+    ctrl->log_closed_height = 0;
     ctrl->log_level = RIG_LOG_QUIET;
     rigctld_client_set_log_level(ctrl->log_level);
-    ctrl->ui_base_width = 0;
-    ctrl->ui_base_height = 0;
-    ctrl->ui_last_scale = 1.0;
-    ctrl->ui_base_font = NULL;
     ctrl->ui_updating = FALSE;
     ctrl->pending_ui_refresh_id = 0;
     ctrl->resize_idle_id = 0;
@@ -4025,6 +4002,8 @@ static void rigctrl_show_log(GtkRigCtrl *ctrl)
     if (ctrl == NULL)
         return;
 
+    rigctrl_capture_log_closed_height(ctrl);
+
     if (ctrl->log_toggle != NULL)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->log_toggle), TRUE);
     else if (ctrl->term_view != NULL)
@@ -4672,6 +4651,12 @@ static GtkWidget *create_downlink_widgets(GtkRigCtrl * ctrl)
     GtkWidget      *frame;
     GtkWidget      *vbox;
     GtkWidget      *hbox1, *hbox2;
+    GtkWidget      *hbox2_wrap;
+    GtkWidget      *hbox2_spacer_left;
+    GtkWidget      *hbox2_spacer_right;
+    GtkWidget      *freq_wrap;
+    GtkWidget      *freq_spacer_left;
+    GtkWidget      *freq_spacer_right;
     GtkWidget      *label;
 
     label = gtk_label_new(NULL);
@@ -4679,17 +4664,37 @@ static GtkWidget *create_downlink_widgets(GtkRigCtrl * ctrl)
     frame = gtk_frame_new(NULL);
     gtk_frame_set_label_align(GTK_FRAME(frame), 0.5, 0.5);
     gtk_frame_set_label_widget(GTK_FRAME(frame), label);
+    gtk_widget_set_hexpand(frame, TRUE);
+    gtk_widget_set_halign(frame, GTK_ALIGN_FILL);
 
     vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
     hbox1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     hbox2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    hbox2_wrap = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(hbox2_wrap, TRUE);
+    hbox2_spacer_left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    hbox2_spacer_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(hbox2_spacer_left, TRUE);
+    gtk_widget_set_hexpand(hbox2_spacer_right, TRUE);
+    gtk_box_pack_start(GTK_BOX(hbox2_wrap), hbox2_spacer_left, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2_wrap), hbox2, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2_wrap), hbox2_spacer_right, TRUE, TRUE, 0);
 
     /* satellite downlink frequency */
     ctrl->SatFreqDown = gtk_freq_knob_new(145890000.0, TRUE);
     g_signal_connect(ctrl->SatFreqDown, "freq-changed",
                      G_CALLBACK(downlink_changed_cb), ctrl);
-    gtk_box_pack_start(GTK_BOX(vbox), ctrl->SatFreqDown, TRUE, TRUE, 0);
+    freq_wrap = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(freq_wrap, TRUE);
+    freq_spacer_left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    freq_spacer_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(freq_spacer_left, TRUE);
+    gtk_widget_set_hexpand(freq_spacer_right, TRUE);
+    gtk_box_pack_start(GTK_BOX(freq_wrap), freq_spacer_left, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(freq_wrap), ctrl->SatFreqDown, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(freq_wrap), freq_spacer_right, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), freq_wrap, FALSE, FALSE, 0);
 
     /* Downlink doppler */
     label = gtk_label_new(_("Doppler:"));
@@ -4716,13 +4721,13 @@ static GtkWidget *create_downlink_widgets(GtkRigCtrl * ctrl)
     gtk_label_set_markup(GTK_LABEL(label),
                          "<span size='large'><b>Radio:</b></span>");
     g_object_set(label, "xalign", 0.5f, "yalign", 1.0f, NULL);
-    gtk_box_pack_start(GTK_BOX(hbox2), label, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2), label, FALSE, FALSE, 0);
     ctrl->RigFreqDown = gtk_freq_knob_new(145890000.0, FALSE);
-    gtk_box_pack_start(GTK_BOX(hbox2), ctrl->RigFreqDown, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2), ctrl->RigFreqDown, FALSE, FALSE, 0);
 
     /* finish packing ... */
-    gtk_box_pack_start(GTK_BOX(vbox), hbox1, TRUE, TRUE, 10);
-    gtk_box_pack_start(GTK_BOX(vbox), hbox2, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox1, TRUE, TRUE, 12);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox2_wrap, FALSE, FALSE, 6);
     gtk_container_add(GTK_CONTAINER(frame), vbox);
 
     return frame;
@@ -4739,6 +4744,12 @@ static GtkWidget *create_uplink_widgets(GtkRigCtrl * ctrl)
     GtkWidget      *frame;
     GtkWidget      *vbox;
     GtkWidget      *hbox1, *hbox2;
+    GtkWidget      *hbox2_wrap;
+    GtkWidget      *hbox2_spacer_left;
+    GtkWidget      *hbox2_spacer_right;
+    GtkWidget      *freq_wrap;
+    GtkWidget      *freq_spacer_left;
+    GtkWidget      *freq_spacer_right;
     GtkWidget      *label;
 
     label = gtk_label_new(NULL);
@@ -4746,17 +4757,37 @@ static GtkWidget *create_uplink_widgets(GtkRigCtrl * ctrl)
     frame = gtk_frame_new(NULL);
     gtk_frame_set_label_align(GTK_FRAME(frame), 0.5, 0.5);
     gtk_frame_set_label_widget(GTK_FRAME(frame), label);
+    gtk_widget_set_hexpand(frame, TRUE);
+    gtk_widget_set_halign(frame, GTK_ALIGN_FILL);
 
     vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
     hbox1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     hbox2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    hbox2_wrap = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(hbox2_wrap, TRUE);
+    hbox2_spacer_left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    hbox2_spacer_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(hbox2_spacer_left, TRUE);
+    gtk_widget_set_hexpand(hbox2_spacer_right, TRUE);
+    gtk_box_pack_start(GTK_BOX(hbox2_wrap), hbox2_spacer_left, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2_wrap), hbox2, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2_wrap), hbox2_spacer_right, TRUE, TRUE, 0);
 
     /* satellite uplink frequency */
     ctrl->SatFreqUp = gtk_freq_knob_new(145890000.0, TRUE);
     g_signal_connect(ctrl->SatFreqUp, "freq-changed",
                      G_CALLBACK(uplink_changed_cb), ctrl);
-    gtk_box_pack_start(GTK_BOX(vbox), ctrl->SatFreqUp, TRUE, TRUE, 0);
+    freq_wrap = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(freq_wrap, TRUE);
+    freq_spacer_left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    freq_spacer_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(freq_spacer_left, TRUE);
+    gtk_widget_set_hexpand(freq_spacer_right, TRUE);
+    gtk_box_pack_start(GTK_BOX(freq_wrap), freq_spacer_left, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(freq_wrap), ctrl->SatFreqUp, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(freq_wrap), freq_spacer_right, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), freq_wrap, FALSE, FALSE, 0);
 
     /* Uplink doppler */
     label = gtk_label_new(_("Doppler:"));
@@ -4783,12 +4814,12 @@ static GtkWidget *create_uplink_widgets(GtkRigCtrl * ctrl)
     gtk_label_set_markup(GTK_LABEL(label),
                          "<span size='large'><b>Radio:</b></span>");
     g_object_set(label, "xalign", 0.5f, "yalign", 1.0f, NULL);
-    gtk_box_pack_start(GTK_BOX(hbox2), label, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2), label, FALSE, FALSE, 0);
     ctrl->RigFreqUp = gtk_freq_knob_new(145890000.0, FALSE);
-    gtk_box_pack_start(GTK_BOX(hbox2), ctrl->RigFreqUp, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox2), ctrl->RigFreqUp, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(vbox), hbox1, TRUE, TRUE, 10);
-    gtk_box_pack_start(GTK_BOX(vbox), hbox2, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox1, TRUE, TRUE, 12);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox2_wrap, FALSE, FALSE, 6);
     gtk_container_add(GTK_CONTAINER(frame), vbox);
 
     return frame;
@@ -5645,8 +5676,8 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(table), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(table), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(table), 8);
+    gtk_grid_set_row_spacing(GTK_GRID(table), 8);
 
     label = gtk_label_new(_("Target preset"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
@@ -5767,6 +5798,8 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
                                   " the satellite and the observer."));
 
     frame = gtk_frame_new(_("Target"));
+    gtk_widget_set_hexpand(frame, TRUE);
+    gtk_widget_set_halign(frame, GTK_ALIGN_FILL);
     gtk_container_add(GTK_CONTAINER(frame), table);
     g_object_unref(combo_group);
     g_free(buff);
@@ -6133,8 +6166,8 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(table), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(table), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(table), 8);
+    gtk_grid_set_row_spacing(GTK_GRID(table), 8);
 
     /* Primary device */
     label = gtk_label_new(_("Downlink device"));
@@ -6164,11 +6197,15 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(primary_rig_selected_cb), ctrl);
     gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
                                     GTK_COMBO_BOX(ctrl->DevSel));
+    gtk_widget_set_hexpand(ctrl->DevSel, TRUE);
+    gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel, 1, 0, 1, 1);
     g_signal_connect(ctrl->DevSel2, "changed",
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
     gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
                                     GTK_COMBO_BOX(ctrl->DevSel2));
+    gtk_widget_set_hexpand(ctrl->DevSel2, TRUE);
+    gtk_widget_set_halign(ctrl->DevSel2, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), ctrl->DevSel2, 1, 1, 1, 1);
 
     /* Logs toggle */
@@ -6192,6 +6229,8 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                 _("Enable detailed rig logging summaries"));
     g_signal_connect(ctrl->log_verbose_toggle, "toggled",
                      G_CALLBACK(rig_verbose_toggle_cb), ctrl);
+    gtk_widget_set_hexpand(ctrl->log_verbose_toggle, TRUE);
+    gtk_widget_set_halign(ctrl->log_verbose_toggle, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), ctrl->log_verbose_toggle, 1, 2, 1, 1);
 
     rigctrl_sync_log_toggles(ctrl);
@@ -6220,6 +6259,8 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(rigctrl_cycle_focus_out_cb), ctrl);
     g_signal_connect(ctrl->cycle_spin, "activate",
                      G_CALLBACK(rigctrl_cycle_activate_cb), ctrl);
+    gtk_widget_set_hexpand(ctrl->cycle_spin, TRUE);
+    gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), ctrl->cycle_spin, 1, 3, 1, 1);
 
     label = gtk_label_new(_("msec"));
@@ -6233,9 +6274,13 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 
     ctrl->status_label = gtk_label_new(_("OK"));
     g_object_set(ctrl->status_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_hexpand(ctrl->status_label, TRUE);
+    gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), ctrl->status_label, 1, 4, 2, 1);
 
     frame = gtk_frame_new(_("Settings"));
+    gtk_widget_set_hexpand(frame, TRUE);
+    gtk_widget_set_halign(frame, GTK_ALIGN_FILL);
     gtk_container_add(GTK_CONTAINER(frame), table);
 
     /* load primary config */
@@ -13040,6 +13085,9 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
     GtkRigCtrl     *rigctrl;
     GtkWidget      *widget;
     GtkWidget      *table;
+    GtkWidget      *outer;
+    GtkWidget      *spacer_top;
+    GtkWidget      *spacer_bottom;
 
     if (!have_conf())
         return NULL;
@@ -13066,32 +13114,50 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
 
     /* create contents */
     table = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(table), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(table), 12);
+    gtk_grid_set_column_spacing(GTK_GRID(table), 12);
+    gtk_grid_set_column_homogeneous(GTK_GRID(table), TRUE);
     gtk_container_set_border_width(GTK_CONTAINER(table), 10);
     gtk_widget_set_hexpand(table, TRUE);
-    gtk_widget_set_vexpand(table, TRUE);
-    gtk_grid_attach(GTK_GRID(table), create_downlink_widgets(rigctrl),
-                    0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_uplink_widgets(rigctrl),
-                    1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_target_widgets(rigctrl),
-                    0, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_conf_widgets(rigctrl), 1, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), gp_term_view_get_widget(rigctrl->term_view),
-                    0, 2, 2, 1);
-    gtk_grid_attach(GTK_GRID(table), create_count_down_widgets(rigctrl),
-                    0, 3, 2, 1);
+    gtk_widget_set_vexpand(table, FALSE);
+    {
+        GtkWidget *down = create_downlink_widgets(rigctrl);
+        GtkWidget *up = create_uplink_widgets(rigctrl);
+        GtkWidget *target = create_target_widgets(rigctrl);
+        GtkWidget *conf = create_conf_widgets(rigctrl);
+        GtkWidget *term = gp_term_view_get_widget(rigctrl->term_view);
+        GtkWidget *count = create_count_down_widgets(rigctrl);
 
-    gtk_container_add(GTK_CONTAINER(rigctrl), table);
+        gtk_widget_set_hexpand(down, TRUE);
+        gtk_widget_set_hexpand(up, TRUE);
+        gtk_widget_set_hexpand(target, TRUE);
+        gtk_widget_set_hexpand(conf, TRUE);
+        gtk_widget_set_hexpand(term, TRUE);
+        gtk_widget_set_hexpand(count, TRUE);
+
+        gtk_grid_attach(GTK_GRID(table), down, 0, 0, 1, 1);
+        gtk_grid_attach(GTK_GRID(table), up, 1, 0, 1, 1);
+        gtk_grid_attach(GTK_GRID(table), target, 0, 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(table), conf, 1, 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(table), term, 0, 2, 2, 1);
+        gtk_grid_attach(GTK_GRID(table), count, 0, 3, 2, 1);
+    }
+
+    outer = gtk_grid_new();
+    gtk_widget_set_hexpand(outer, TRUE);
+    gtk_widget_set_vexpand(outer, TRUE);
+    spacer_top = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    spacer_bottom = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_vexpand(spacer_top, TRUE);
+    gtk_widget_set_vexpand(spacer_bottom, TRUE);
+    gtk_grid_attach(GTK_GRID(outer), spacer_top, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(outer), table, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(outer), spacer_bottom, 0, 2, 1, 1);
+
+    gtk_box_pack_start(GTK_BOX(rigctrl), outer, TRUE, TRUE, 0);
 
     if (module->target > 0)
         gtk_rig_ctrl_select_sat(rigctrl, module->target);
-
-    g_signal_connect(G_OBJECT(rigctrl),
-                     "size-allocate",
-                     G_CALLBACK(rigctrl_size_allocate_cb),
-                     rigctrl);
 
     return widget;
 }

@@ -483,11 +483,6 @@ struct _GtkRotCtrl {
     GtkWidget      *max_el_spin;
     GtkWidget      *az_endstop_spin;
     GtkWidget      *preset_grid;
-    gint            ui_base_width;
-    gint            ui_base_height;
-    gint            ui_plot_base_size;
-    gdouble         ui_last_scale;
-    PangoFontDescription *ui_base_font;
 
     RotPreset       presets[ROT_PRESET_MAX];
     guint           preset_count;
@@ -610,6 +605,7 @@ struct _GtkRotCtrl {
 
     GpTermView     *term_view;
     GtkWidget      *log_toggle;
+    gint            log_closed_height;
     gboolean        ui_updating;
     guint           pending_ui_refresh_id;
     guint           resize_idle_id;
@@ -744,13 +740,8 @@ static void     rotctrl_preset_edit_cb(GtkButton *button, gpointer data);
 static void     rotctrl_preset_activate_cb(GtkButton *button, gpointer data);
 static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
-static void rotctrl_scale_capture_base(GtkRotCtrl *ctrl);
-static void rotctrl_update_ui_scale(GtkRotCtrl *ctrl,
-                                    gint width,
-                                    gint height);
-static void rotctrl_size_allocate_cb(GtkWidget *widget,
-                                     GtkAllocation *alloc,
-                                     gpointer data);
+static void rotctrl_capture_log_closed_height(GtkRotCtrl *ctrl);
+static void rotctrl_restore_log_height(GtkRotCtrl *ctrl);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
                                   rot_session_state_t state,
                                   const gchar *reason,
@@ -1319,121 +1310,6 @@ static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason)
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rotctrl ui_end_update %s",
                     reason ? reason : "(none)");
-}
-
-static void rotctrl_scale_capture_base(GtkRotCtrl *ctrl)
-{
-    GtkStyleContext *context = NULL;
-    PangoFontDescription *font = NULL;
-    GtkRequisition min_req;
-    GtkRequisition nat_req;
-    gint plot_base = 0;
-
-    if (ctrl == NULL)
-        return;
-
-    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0)
-    {
-        gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
-        ctrl->ui_base_width = MAX(1, nat_req.width);
-        ctrl->ui_base_height = MAX(1, nat_req.height);
-    }
-
-    if (ctrl->ui_plot_base_size <= 0 && ctrl->plot != NULL)
-    {
-        gtk_widget_get_preferred_size(ctrl->plot, &min_req, &nat_req);
-        plot_base = MIN(nat_req.width, nat_req.height);
-        if (plot_base <= 0)
-            plot_base = 200;
-        ctrl->ui_plot_base_size = plot_base;
-    }
-
-    if (ctrl->ui_base_font == NULL)
-    {
-        context = gtk_widget_get_style_context(GTK_WIDGET(ctrl));
-        gtk_style_context_get(context,
-                              GTK_STATE_FLAG_NORMAL,
-                              "font", &font,
-                              NULL);
-        if (font == NULL)
-            font = pango_font_description_from_string("Sans 10");
-        ctrl->ui_base_font = font;
-    }
-}
-
-static void rotctrl_update_ui_scale(GtkRotCtrl *ctrl,
-                                    gint width,
-                                    gint height)
-{
-    gdouble scale;
-    gdouble sx;
-    gdouble sy;
-    PangoFontDescription *font;
-    gint size;
-    gint scaled_plot;
-
-    if (ctrl == NULL)
-        return;
-
-    rotctrl_scale_capture_base(ctrl);
-
-    if (ctrl->ui_base_width <= 0 || ctrl->ui_base_height <= 0 ||
-        ctrl->ui_base_font == NULL)
-        return;
-
-    sx = (gdouble) width / (gdouble) ctrl->ui_base_width;
-    sy = (gdouble) height / (gdouble) ctrl->ui_base_height;
-    scale = MIN(sx, sy);
-
-    if (scale < 0.5)
-        scale = 0.5;
-    if (scale > 3.0)
-        scale = 3.0;
-
-    if (fabs(scale - ctrl->ui_last_scale) < 0.02)
-        return;
-
-    ctrl->ui_last_scale = scale;
-
-    font = pango_font_description_copy(ctrl->ui_base_font);
-    size = pango_font_description_get_size(font);
-    if (size > 0)
-    {
-        if (pango_font_description_get_size_is_absolute(font))
-            pango_font_description_set_absolute_size(font, size * scale);
-        else
-            pango_font_description_set_size(font, (gint) (size * scale));
-    }
-    gtk_widget_override_font(GTK_WIDGET(ctrl), font);
-
-    if (ctrl->plot != NULL)
-    {
-        gchar *font_str = pango_font_description_to_string(font);
-        gtk_polar_plot_set_font(GTK_POLAR_PLOT(ctrl->plot), font_str);
-        g_free(font_str);
-    }
-
-    pango_font_description_free(font);
-
-    if (ctrl->plot != NULL && ctrl->ui_plot_base_size > 0)
-    {
-        scaled_plot = (gint) (ctrl->ui_plot_base_size * scale);
-        gtk_widget_set_size_request(ctrl->plot, scaled_plot, scaled_plot);
-    }
-}
-
-static void rotctrl_size_allocate_cb(GtkWidget *widget,
-                                     GtkAllocation *alloc,
-                                     gpointer data)
-{
-    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
-
-    (void)widget;
-
-    if (alloc == NULL)
-        return;
-
-    rotctrl_update_ui_scale(ctrl, alloc->width, alloc->height);
 }
 
 static gboolean rotctrl_combo_popup_shown(GtkComboBox *box)
@@ -17918,6 +17794,7 @@ static void rot_show_plan_error(GtkRotCtrl *ctrl, const gchar *reason)
 static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gboolean visible;
 
     if (ctrl == NULL || ctrl->ui_updating)
         return;
@@ -17925,14 +17802,27 @@ static void rot_logs_toggle_cb(GtkToggleButton *button, gpointer data)
     if (ctrl == NULL || ctrl->term_view == NULL)
         return;
 
-    gp_term_view_set_visible(ctrl->term_view,
-                             gtk_toggle_button_get_active(button));
-    rotctrl_schedule_resize(ctrl);
+    visible = gtk_toggle_button_get_active(button);
+    if (visible)
+        rotctrl_capture_log_closed_height(ctrl);
+
+    gp_term_view_set_visible(ctrl->term_view, visible);
+
+    if (visible)
+        rotctrl_schedule_resize(ctrl);
+    else
+        rotctrl_restore_log_height(ctrl);
 }
 
 static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
 {
     GtkWidget *toplevel;
+    GtkRequisition min_req;
+    GtkRequisition nat_req;
+    gint cur_w = 0;
+    gint cur_h = 0;
+    gint new_w = 0;
+    gint new_h = 0;
 
     if (ctrl == NULL)
         return;
@@ -17941,9 +17831,77 @@ static void rotctrl_force_toplevel_resize(GtkRotCtrl *ctrl)
     if (!GTK_IS_WINDOW(toplevel))
         return;
 
-    gtk_widget_set_size_request(toplevel, -1, -1);
-    gtk_widget_queue_resize(toplevel);
-    gtk_window_resize(GTK_WINDOW(toplevel), 1, 1);
+    gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
+    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+
+    new_w = cur_w;
+    new_h = cur_h;
+
+    if (new_w < min_req.width)
+        new_w = min_req.width;
+    if (new_h < min_req.height)
+        new_h = min_req.height;
+    if (new_h < nat_req.height)
+        new_h = nat_req.height;
+
+    if (new_w != cur_w || new_h != cur_h)
+        gtk_window_resize(GTK_WINDOW(toplevel), new_w, new_h);
+
+    gtk_widget_queue_resize(GTK_WIDGET(ctrl));
+}
+
+static void rotctrl_capture_log_closed_height(GtkRotCtrl *ctrl)
+{
+    GtkWidget *toplevel;
+    gint cur_w = 0;
+    gint cur_h = 0;
+
+    if (ctrl == NULL)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
+    ctrl->log_closed_height = cur_h;
+}
+
+static void rotctrl_restore_log_height(GtkRotCtrl *ctrl)
+{
+    GtkWidget *toplevel;
+    GtkRequisition min_req;
+    GtkRequisition nat_req;
+    gint cur_w = 0;
+    gint cur_h = 0;
+    gint new_h = 0;
+    gint new_w = 0;
+
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->log_closed_height <= 0)
+        return;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gtk_window_get_size(GTK_WINDOW(toplevel), &cur_w, &cur_h);
+    gtk_widget_get_preferred_size(GTK_WIDGET(ctrl), &min_req, &nat_req);
+
+    new_w = cur_w;
+    new_h = ctrl->log_closed_height;
+
+    if (new_w < min_req.width)
+        new_w = min_req.width;
+    if (new_h < min_req.height)
+        new_h = min_req.height;
+
+    if (new_w != cur_w || new_h != cur_h)
+        gtk_window_resize(GTK_WINDOW(toplevel), new_w, new_h);
+
+    gtk_widget_queue_resize(GTK_WIDGET(ctrl));
 }
 
 static gboolean rotctrl_resize_idle(gpointer data)
@@ -19437,11 +19395,6 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->max_el_spin = NULL;
     ctrl->az_endstop_spin = NULL;
     ctrl->preset_grid = NULL;
-    ctrl->ui_base_width = 0;
-    ctrl->ui_base_height = 0;
-    ctrl->ui_plot_base_size = 0;
-    ctrl->ui_last_scale = 1.0;
-    ctrl->ui_base_font = NULL;
     ctrl->preset_count = 0;
 
     ctrl->tracking = FALSE;
@@ -19527,6 +19480,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->conf = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
+    ctrl->log_closed_height = 0;
     ctrl->ui_updating = FALSE;
     ctrl->pending_ui_refresh_id = 0;
     ctrl->resize_idle_id = 0;
@@ -19777,12 +19731,6 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         ctrl->resize_idle_id = 0;
     }
 
-    if (ctrl->ui_base_font != NULL)
-    {
-        pango_font_description_free(ctrl->ui_base_font);
-        ctrl->ui_base_font = NULL;
-    }
-
     rot_plan_reset(&ctrl->trajectory_plan);
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
@@ -19831,6 +19779,19 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     GtkRotCtrl     *rot_ctrl;
     GtkWidget      *table;
     GtkWidget      *plot_frame;
+    GtkWidget      *main_grid;
+    GtkWidget      *outer;
+    GtkWidget      *spacer_top;
+    GtkWidget      *spacer_bottom;
+    GtkWidget      *az_frame;
+    GtkWidget      *el_frame;
+    GtkWidget      *az_el_row;
+    GtkWidget      *target_frame;
+    GtkWidget      *conf_frame;
+    GtkWidget      *calib_frame;
+    GtkWidget      *preset_frame;
+    GtkWidget      *term_widget;
+    GtkWidget      *banner_widget;
 
     /* check that we have rot conf */
     if (!have_conf())
@@ -19868,33 +19829,77 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 
     /* create contents */
     table = gtk_grid_new();
-    gtk_grid_set_column_homogeneous(GTK_GRID(table), FALSE);
+    gtk_grid_set_column_homogeneous(GTK_GRID(table), TRUE);
     gtk_grid_set_row_homogeneous(GTK_GRID(table), FALSE);
-    gtk_grid_set_row_spacing(GTK_GRID(table), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(table), 10);
+    gtk_grid_set_column_spacing(GTK_GRID(table), 10);
     gtk_container_set_border_width(GTK_CONTAINER(table), 0);
-    gtk_grid_attach(GTK_GRID(table), create_az_widgets(rot_ctrl), 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_el_widgets(rot_ctrl), 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_target_widgets(rot_ctrl),
-                    0, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_conf_widgets(rot_ctrl),
-                    1, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_calibration_widgets(rot_ctrl),
-                    2, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), create_cal_widgets(rot_ctrl), 0, 2, 3, 1);
-    gtk_grid_attach(GTK_GRID(table),
-                    gp_term_view_get_widget(rot_ctrl->term_view),
-                    0, 3, 3, 1);
-    gtk_grid_attach(GTK_GRID(table), create_aoslos_banner_widgets(rot_ctrl),
-                    0, 4, 3, 1);
+
+    az_frame = create_az_widgets(rot_ctrl);
+    el_frame = create_el_widgets(rot_ctrl);
+    target_frame = create_target_widgets(rot_ctrl);
+    conf_frame = create_conf_widgets(rot_ctrl);
+    calib_frame = create_calibration_widgets(rot_ctrl);
+    preset_frame = create_cal_widgets(rot_ctrl);
+    term_widget = gp_term_view_get_widget(rot_ctrl->term_view);
+    banner_widget = create_aoslos_banner_widgets(rot_ctrl);
+
+    gtk_widget_set_hexpand(az_frame, TRUE);
+    gtk_widget_set_hexpand(el_frame, TRUE);
+    gtk_widget_set_hexpand(target_frame, TRUE);
+    gtk_widget_set_hexpand(conf_frame, TRUE);
+    gtk_widget_set_hexpand(calib_frame, TRUE);
+    gtk_widget_set_hexpand(preset_frame, TRUE);
+    gtk_widget_set_hexpand(term_widget, TRUE);
+    gtk_widget_set_hexpand(banner_widget, TRUE);
+
+    gtk_widget_set_vexpand(preset_frame, FALSE);
+    gtk_widget_set_valign(preset_frame, GTK_ALIGN_START);
+
+    az_el_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(az_el_row), 10);
+    gtk_grid_set_column_homogeneous(GTK_GRID(az_el_row), TRUE);
+    gtk_widget_set_hexpand(az_el_row, TRUE);
+    gtk_widget_set_vexpand(az_el_row, FALSE);
+    gtk_grid_attach(GTK_GRID(az_el_row), az_frame, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(az_el_row), el_frame, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), az_el_row, 0, 0, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), target_frame, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), conf_frame, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), calib_frame, 2, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), preset_frame, 0, 2, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), term_widget, 0, 3, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), banner_widget, 0, 4, 3, 1);
 
     plot_frame = create_plot_widget(rot_ctrl);
     gtk_widget_set_hexpand(plot_frame, TRUE);
     gtk_widget_set_vexpand(plot_frame, TRUE);
-    gtk_box_pack_start(GTK_BOX(rot_ctrl), plot_frame, TRUE, TRUE, 5);
+
+    main_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(main_grid), 10);
+    gtk_grid_set_row_spacing(GTK_GRID(main_grid), 10);
+    gtk_container_set_border_width(GTK_CONTAINER(main_grid), 0);
+    gtk_widget_set_hexpand(main_grid, TRUE);
+    gtk_widget_set_vexpand(main_grid, FALSE);
+    gtk_grid_attach(GTK_GRID(main_grid), plot_frame, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_grid), table, 1, 0, 1, 1);
+
     gtk_widget_set_hexpand(table, TRUE);
-    gtk_widget_set_vexpand(table, TRUE);
-    gtk_box_pack_start(GTK_BOX(rot_ctrl), table, TRUE, TRUE, 5);
+    gtk_widget_set_vexpand(table, FALSE);
+    gtk_widget_set_valign(table, GTK_ALIGN_FILL);
+
+    outer = gtk_grid_new();
+    gtk_widget_set_hexpand(outer, TRUE);
+    gtk_widget_set_vexpand(outer, TRUE);
+    spacer_top = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    spacer_bottom = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_vexpand(spacer_top, TRUE);
+    gtk_widget_set_vexpand(spacer_bottom, TRUE);
+    gtk_grid_attach(GTK_GRID(outer), spacer_top, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(outer), main_grid, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(outer), spacer_bottom, 0, 2, 1, 1);
+
+    gtk_box_pack_start(GTK_BOX(rot_ctrl), outer, TRUE, TRUE, 5);
     gtk_container_set_border_width(GTK_CONTAINER(rot_ctrl), 5);
 
     /* load initial rotator configuration */
@@ -19909,11 +19914,6 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
                                           rot_ctrl_timeout_cb,
                                           rot_ctrl);
     }
-
-    g_signal_connect(G_OBJECT(rot_ctrl),
-                     "size-allocate",
-                     G_CALLBACK(rotctrl_size_allocate_cb),
-                     rot_ctrl);
 
     return GTK_WIDGET(rot_ctrl);
 }

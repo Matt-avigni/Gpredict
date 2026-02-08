@@ -44,6 +44,117 @@
 
 extern GtkWidget *app;          /* in main.c */
 
+typedef struct
+{
+    GtkSatModule   *module;
+    const gchar    *width_key;
+    const gchar    *height_key;
+    const gchar    *pos_x_key;
+    const gchar    *pos_y_key;
+} WindowGeomInfo;
+
+static void apply_window_geometry(GtkWindow *window,
+                                  GtkSatModule *module,
+                                  const gchar *width_key,
+                                  const gchar *height_key,
+                                  const gchar *pos_x_key,
+                                  const gchar *pos_y_key)
+{
+    gint w = -1;
+    gint h = -1;
+
+    if (window == NULL || module == NULL || module->cfgdata == NULL)
+        return;
+
+    if (g_key_file_has_key(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                           width_key, NULL) &&
+        g_key_file_has_key(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                           height_key, NULL))
+    {
+        w = g_key_file_get_integer(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                                   width_key, NULL);
+        h = g_key_file_get_integer(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                                   height_key, NULL);
+        if (w > 0 && h > 0)
+            gtk_window_set_default_size(window, w, h);
+    }
+
+    if (sat_cfg_get_bool(SAT_CFG_BOOL_MOD_WIN_POS) &&
+        g_key_file_has_key(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                           pos_x_key, NULL) &&
+        g_key_file_has_key(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                           pos_y_key, NULL))
+    {
+        gtk_window_move(window,
+                        g_key_file_get_integer(module->cfgdata,
+                                               MOD_CFG_GLOBAL_SECTION,
+                                               pos_x_key, NULL),
+                        g_key_file_get_integer(module->cfgdata,
+                                               MOD_CFG_GLOBAL_SECTION,
+                                               pos_y_key, NULL));
+    }
+}
+
+static gboolean window_geom_config_cb(GtkWidget *widget,
+                                      GdkEventConfigure *event,
+                                      gpointer data)
+{
+    WindowGeomInfo *info = data;
+    GtkSatModule   *module;
+    gint            x, y, w, h;
+
+    if (info == NULL)
+        return FALSE;
+
+    module = info->module;
+    if (module == NULL || module->cfgdata == NULL)
+        return FALSE;
+
+    if (!gtk_widget_get_visible(widget))
+        return FALSE;
+
+#ifdef G_OS_WIN32
+    if (gdk_window_get_state(gtk_widget_get_window(widget)) &
+        GDK_WINDOW_STATE_MAXIMIZED)
+    {
+        return FALSE;
+    }
+#endif
+
+    gtk_window_get_position(GTK_WINDOW(widget), &x, &y);
+
+#if GTK_MINOR_VERSION < 22
+    w = gdk_screen_width();
+    h = gdk_screen_height();
+#else
+    {
+        GdkRectangle    work_area;
+        gdk_monitor_get_workarea(gdk_display_get_primary_monitor(gdk_display_get_default()),
+                                 &work_area);
+        w = work_area.width;
+        h = work_area.height;
+    }
+#endif
+
+    if (x < 0 || y < 0 || x + event->width > w || y + event->height > h)
+        return FALSE;
+
+    if (sat_cfg_get_bool(SAT_CFG_BOOL_MOD_WIN_POS))
+    {
+        g_key_file_set_integer(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                               info->pos_x_key, x);
+        g_key_file_set_integer(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                               info->pos_y_key, y);
+    }
+
+    g_key_file_set_integer(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                           info->width_key, event->width);
+    g_key_file_set_integer(module->cfgdata, MOD_CFG_GLOBAL_SECTION,
+                           info->height_key, event->height);
+
+    return FALSE;
+}
+
 /**
  * Configure module.
  *
@@ -829,6 +940,17 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
                      G_CALLBACK(window_delete), NULL);
     g_signal_connect(G_OBJECT(module->rigctrlwin), "destroy",
                      G_CALLBACK(destroy_rigctrl), module);
+    {
+        WindowGeomInfo *geom = g_new0(WindowGeomInfo, 1);
+        geom->module = module;
+        geom->width_key = MOD_CFG_RIG_WIN_WIDTH;
+        geom->height_key = MOD_CFG_RIG_WIN_HEIGHT;
+        geom->pos_x_key = MOD_CFG_RIG_WIN_POS_X;
+        geom->pos_y_key = MOD_CFG_RIG_WIN_POS_Y;
+        g_signal_connect_data(G_OBJECT(module->rigctrlwin), "configure_event",
+                              G_CALLBACK(window_geom_config_cb), geom,
+                              (GClosureNotify)g_free, 0);
+    }
 
     /* window icon */
     buff = icon_file_name("gpredict-oscilloscope.png");
@@ -836,25 +958,9 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
     g_free(buff);
 
     gtk_container_add(GTK_CONTAINER(module->rigctrlwin), module->rigctrl);
-
-    {
-        GtkRequisition min_req;
-        GtkRequisition nat_req;
-        GdkGeometry geom = {0};
-        gdouble aspect = 0.0;
-
-        gtk_widget_get_preferred_size(module->rigctrl, &min_req, &nat_req);
-        if (nat_req.width > 0 && nat_req.height > 0)
-        {
-            aspect = (gdouble) nat_req.width / (gdouble) nat_req.height;
-            geom.min_aspect = aspect;
-            geom.max_aspect = aspect;
-            gtk_window_set_geometry_hints(GTK_WINDOW(module->rigctrlwin),
-                                          module->rigctrl,
-                                          &geom,
-                                          GDK_HINT_ASPECT);
-        }
-    }
+    apply_window_geometry(GTK_WINDOW(module->rigctrlwin), module,
+                          MOD_CFG_RIG_WIN_WIDTH, MOD_CFG_RIG_WIN_HEIGHT,
+                          MOD_CFG_RIG_WIN_POS_X, MOD_CFG_RIG_WIN_POS_Y);
 
     gtk_widget_show_all(module->rigctrlwin);
 }
@@ -928,6 +1034,17 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
                      G_CALLBACK(window_delete), module);
     g_signal_connect(G_OBJECT(module->rotctrlwin), "destroy",
                      G_CALLBACK(destroy_rotctrl), module);
+    {
+        WindowGeomInfo *geom = g_new0(WindowGeomInfo, 1);
+        geom->module = module;
+        geom->width_key = MOD_CFG_ROT_WIN_WIDTH;
+        geom->height_key = MOD_CFG_ROT_WIN_HEIGHT;
+        geom->pos_x_key = MOD_CFG_ROT_WIN_POS_X;
+        geom->pos_y_key = MOD_CFG_ROT_WIN_POS_Y;
+        g_signal_connect_data(G_OBJECT(module->rotctrlwin), "configure_event",
+                              G_CALLBACK(window_geom_config_cb), geom,
+                              (GClosureNotify)g_free, 0);
+    }
 
     /* window icon */
     buff = icon_file_name("gpredict-antenna.png");
@@ -935,25 +1052,9 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
     g_free(buff);
 
     gtk_container_add(GTK_CONTAINER(module->rotctrlwin), module->rotctrl);
-
-    {
-        GtkRequisition min_req;
-        GtkRequisition nat_req;
-        GdkGeometry geom = {0};
-        gdouble aspect = 0.0;
-
-        gtk_widget_get_preferred_size(module->rotctrl, &min_req, &nat_req);
-        if (nat_req.width > 0 && nat_req.height > 0)
-        {
-            aspect = (gdouble) nat_req.width / (gdouble) nat_req.height;
-            geom.min_aspect = aspect;
-            geom.max_aspect = aspect;
-            gtk_window_set_geometry_hints(GTK_WINDOW(module->rotctrlwin),
-                                          module->rotctrl,
-                                          &geom,
-                                          GDK_HINT_ASPECT);
-        }
-    }
+    apply_window_geometry(GTK_WINDOW(module->rotctrlwin), module,
+                          MOD_CFG_ROT_WIN_WIDTH, MOD_CFG_ROT_WIN_HEIGHT,
+                          MOD_CFG_ROT_WIN_POS_X, MOD_CFG_ROT_WIN_POS_Y);
 
     gtk_widget_show_all(module->rotctrlwin);
 }
