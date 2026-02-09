@@ -811,6 +811,7 @@ static gint     rigctrl_trsp_popup_get_max_height(GtkWidget *anchor);
 static gint     rigctrl_trsp_tree_row_count(GtkWidget *tree);
 static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget,
                                           GType child_type);
+static GtkWidget *rigctrl_trsp_find_scrolled(GtkWidget *widget);
 static void     rigctrl_trsp_popup_set_ts(GtkWidget *widget, const gchar *key);
 static guint    rigctrl_trsp_popup_bump_seq(GtkWidget *widget);
 static guint    rigctrl_trsp_popup_get_seq(GtkWidget *widget);
@@ -4104,9 +4105,7 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
         g_object_set_data(G_OBJECT(combo), "rigctrl-popup-configured-seq",
                           GUINT_TO_POINTER(open_seq));
 
-        scrolled = popup_widget;
-        while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
-            scrolled = gtk_widget_get_parent(scrolled);
+        scrolled = rigctrl_trsp_find_scrolled(popup_widget);
 
         tree = rigctrl_trsp_find_child(popup_widget, GTK_TYPE_TREE_VIEW);
         if (GTK_IS_TREE_VIEW(tree))
@@ -4208,7 +4207,7 @@ static void rigctrl_trsp_combo_realize(GtkWidget *widget, gpointer data)
 
 static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
 {
-    GtkWidget *scrolled = widget;
+    GtkWidget *scrolled = NULL;
     GtkWidget *tree = NULL;
     GtkAdjustment *vadj;
     GtkTreePath *path;
@@ -4232,8 +4231,7 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
     if (combo != NULL)
         g_idle_add(rigctrl_configure_trsp_popup_idle, g_object_ref(combo));
 
-    while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
-        scrolled = gtk_widget_get_parent(scrolled);
+    scrolled = rigctrl_trsp_find_scrolled(widget);
 
     if (!GTK_IS_SCROLLED_WINDOW(scrolled))
         return;
@@ -4277,7 +4275,7 @@ static void rigctrl_trsp_popup_show(GtkWidget *widget, gpointer data)
 static void rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data)
 {
     GtkWidget *combo = GTK_IS_WIDGET(data) ? GTK_WIDGET(data) : NULL;
-    GtkWidget *scrolled = widget;
+    GtkWidget *scrolled = NULL;
 
     if (widget == NULL)
         return;
@@ -4288,8 +4286,7 @@ static void rigctrl_trsp_popup_hide(GtkWidget *widget, gpointer data)
         rigctrl_trsp_popup_set_ts(combo, "rigctrl-popup-last-hide");
     }
 
-    while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
-        scrolled = gtk_widget_get_parent(scrolled);
+    scrolled = rigctrl_trsp_find_scrolled(widget);
 
     if (GTK_IS_SCROLLED_WINDOW(scrolled))
     {
@@ -4400,6 +4397,19 @@ static GtkWidget *rigctrl_trsp_find_child(GtkWidget *widget, GType child_type)
 
     g_list_free(children);
     return child;
+}
+
+static GtkWidget *rigctrl_trsp_find_scrolled(GtkWidget *widget)
+{
+    GtkWidget *scrolled = widget;
+
+    while (scrolled != NULL && !GTK_IS_SCROLLED_WINDOW(scrolled))
+        scrolled = gtk_widget_get_parent(scrolled);
+
+    if (!GTK_IS_SCROLLED_WINDOW(scrolled))
+        scrolled = rigctrl_trsp_find_child(widget, GTK_TYPE_SCROLLED_WINDOW);
+
+    return scrolled;
 }
 
 static gint rigctld_parse_identifier_pid(const gchar *identifier)
