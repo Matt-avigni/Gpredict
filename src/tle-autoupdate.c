@@ -1,4 +1,11 @@
 /*
+ * Copyright (C) 2024-2026 Matteo Avigni
+ *
+ * This file is part of Gpredict and distributed under the
+ * GNU General Public License version 2 or later.
+ */
+
+/*
     Gpredict: Real-time satellite tracking and orbit prediction program
 
     Silent, asynchronous TLE autoupdate for module satellites.

@@ -38,7 +38,7 @@ LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
             VALUE "FileDescription", "Gpredict: Real-time satellite tracking and orbit prediction program"
             VALUE "FileVersion", VERSION_STRL
             VALUE "InternalName", "GPredict"
-            VALUE "LegalCopyright", "Copyright (C)  2001-2017  Alexandru Csete, OZ9AEC"
+            VALUE "LegalCopyright", "Copyright (C) 2001-2019 Alexandru Csete, OZ9AEC; Copyright (C) 2024-2026 Matteo Avigni"
             VALUE "ProductName", "GPredict"
             VALUE "ProductVersion", VERSION_STRS
         }

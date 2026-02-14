@@ -113,7 +113,8 @@ void about_dialog_create()
     gtk_about_dialog_set_version(GTK_ABOUT_DIALOG(dialog),
                                  GPREDICT_FULL_VERSION);
     gtk_about_dialog_set_copyright(GTK_ABOUT_DIALOG(dialog),
-                                   _("Copyright (C) 2001-2019 Alexandru Csete OZ9AEC and contributors"));
+                                   _("Copyright (C) 2001-2019 Alexandru Csete OZ9AEC and contributors\n"
+                                     "Copyright (C) 2024-2026 Matteo Avigni"));
     gtk_about_dialog_set_website(GTK_ABOUT_DIALOG(dialog),
                                  "http://gpredict.oz9aec.net/");
     gtk_about_dialog_set_license_type(GTK_ABOUT_DIALOG(dialog),

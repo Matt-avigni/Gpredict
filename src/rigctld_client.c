@@ -1,3 +1,10 @@
+/*
+ * Copyright (C) 2024-2026 Matteo Avigni
+ *
+ * This file is part of Gpredict and distributed under the
+ * GNU General Public License version 2 or later.
+ */
+
 #include "rigctld_client.h"
 
 #include <errno.h>

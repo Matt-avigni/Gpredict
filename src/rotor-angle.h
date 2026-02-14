@@ -1,3 +1,10 @@
+/*
+ * Copyright (C) 2024-2026 Matteo Avigni
+ *
+ * This file is part of Gpredict and distributed under the
+ * GNU General Public License version 2 or later.
+ */
+
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 #ifndef ROTOR_ANGLE_H
 #define ROTOR_ANGLE_H 1
