@@ -67,7 +67,7 @@ static void     systog_cb(GtkToggleButton * togglebutton, gpointer user_data);
 static void     reset_cb(GtkWidget * button, gpointer data);
 
 /** Create and initialise widgets for number formats tab. */
-GtkWidget      *sat_pref_formats_create()
+GtkWidget      *sat_pref_formats_create(void)
 {
     GtkWidget      *vbox, *tfbox;
     gchar          *text;
@@ -143,7 +143,7 @@ GtkWidget      *sat_pref_formats_create()
 }
 
 /** User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_formats_cancel()
+void sat_pref_formats_cancel(void)
 {
     /* restore imperial setting to it's original value */
     sat_cfg_set_bool(SAT_CFG_BOOL_USE_IMPERIAL, useimporg);
@@ -152,7 +152,7 @@ void sat_pref_formats_cancel()
 }
 
 /** User pressed OK. Any changes should be stored in config. */
-void sat_pref_formats_ok()
+void sat_pref_formats_ok(void)
 {
     g_source_remove(timer);
 

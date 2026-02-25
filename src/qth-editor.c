@@ -104,7 +104,7 @@ static void update_widgets(qth_t * qth)
  *
  * This function is usually called when the user clicks on the CLEAR button
  */
-static void clear_widgets()
+static void clear_widgets(void)
 {
     gtk_entry_set_text(GTK_ENTRY(name), "");
     gtk_entry_set_text(GTK_ENTRY(location), "");

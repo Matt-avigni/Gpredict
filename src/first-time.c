@@ -92,7 +92,7 @@ static void     first_time_check_step_08(guint * error);
  *
  * FIXME: Should only have one parameterized function for checking directories.
  */
-guint first_time_check_run()
+guint first_time_check_run(void)
 {
     guint           error = 0;
 

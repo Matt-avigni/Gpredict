@@ -80,7 +80,7 @@ static void     clean_log_dir(const gchar * dirname, glong age);
  * renamed, depending on the sat-cfg settings.
  * Finally, a new gpredict.log file is created and opened.
  */
-void sat_log_init()
+void sat_log_init(void)
 {
     gchar          *dirname, *filename, *confdir;
     gboolean        err = FALSE;
@@ -138,7 +138,7 @@ void sat_log_init()
 }
 
 /** Close message logger. */
-void sat_log_close()
+void sat_log_close(void)
 {
     if (initialised)
     {
@@ -250,7 +250,7 @@ static void manage_debug_message(sat_log_level_t debug_level,
 }
 
 /** Perform log rotation and other maintenance in log directory */
-static void log_rotate()
+static void log_rotate(void)
 {
     gint64          now;        /* current time */
     glong           age;        /* age for cleaning */

@@ -88,7 +88,7 @@ static void gtk_azel_plot_init(GtkAzelPlot * azel,
     azel->extratick = FALSE;
 }
 
-GType gtk_azel_plot_get_type()
+GType gtk_azel_plot_get_type(void)
 {
     static GType    gtk_azel_plot_type = 0;
 

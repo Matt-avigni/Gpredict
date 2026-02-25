@@ -282,7 +282,7 @@ gdouble gtk_freq_knob_get_value(GtkFreqKnob * knob)
     return knob->value;
 }
 
-GType gtk_freq_knob_get_type()
+GType gtk_freq_knob_get_type(void)
 {
     static GType    gtk_freq_knob_type = 0;
 

@@ -250,7 +250,7 @@ static void CloseWinSock2(void)
  * gpredict_gui package.
  *
  */
-static void gpredict_app_create()
+static void gpredict_app_create(void)
 {
     gchar          *title;
     gchar          *icon;
@@ -559,7 +559,7 @@ static gboolean tle_mon_task(gpointer data)
 }
 
 /* Stop TLE monitoring and any pending updates. */
-static void tle_mon_stop()
+static void tle_mon_stop(void)
 {
     gboolean        retcode;
 

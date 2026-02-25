@@ -94,7 +94,7 @@ static void     add_debug_message(const gchar * datetime,
  * the counters and set the text of the corresponding widgets
  * to zero.
  */
-static void clear_message_list()
+static void clear_message_list(void)
 {
     /* clear the meaase list */
     gtk_list_store_clear(GTK_LIST_STORE(model));
@@ -296,7 +296,7 @@ static void message_window_response(GtkWidget * widget, gint response,
 }
 
 /* create summary */
-static GtkWidget *create_message_summary()
+static GtkWidget *create_message_summary(void)
 {
     GtkWidget      *vbox;
     GtkWidget      *table;      /* table containing everything */
@@ -374,7 +374,7 @@ static GtkWidget *create_message_summary()
    only interested in a flat list. A GtkListStore can be cast to a GtkTreeModel
    without any problems.
 */
-static GtkTreeModel *create_list_model()
+static GtkTreeModel *create_list_model(void)
 {
     GtkListStore   *liststore;
 
@@ -411,7 +411,7 @@ static void message_window_destroy(GtkWidget * widget, gpointer data)
 }
 
 /* Create list view */
-static GtkWidget *create_message_list()
+static GtkWidget *create_message_list(void)
 {
     GtkWidget      *treeview;   /* high level treev iew widget */
     GtkWidget      *swin;       /* scrolled window containing the tree view */
@@ -456,7 +456,7 @@ static GtkWidget *create_message_list()
  * data structures. The function should be called when the main program
  * is initialised.
  */
-void sat_log_browser_open()
+void sat_log_browser_open(void)
 {
     GtkWidget      *hbox;
     gchar          *fname;

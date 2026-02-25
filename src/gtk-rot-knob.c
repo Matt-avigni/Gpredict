@@ -254,7 +254,7 @@ static gboolean on_button_scroll(GtkWidget * evtbox,
     return TRUE;
 }
 
-GType gtk_rot_knob_get_type()
+GType gtk_rot_knob_get_type(void)
 {
     static GType    gtk_rot_knob_type = 0;
 

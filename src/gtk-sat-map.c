@@ -114,7 +114,7 @@ static GooCanvasPoints *points1;
 static GooCanvasPoints *points2;
 
 
-GType gtk_sat_map_get_type()
+GType gtk_sat_map_get_type(void)
 {
     static GType    gtk_sat_map_type = 0;
 

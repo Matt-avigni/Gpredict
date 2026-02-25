@@ -236,7 +236,7 @@ static gint compare_func(GtkTreeModel * model, GtkTreeIter * a,
     return ret;
 }
 
-static gchar   *select_module()
+static gchar   *select_module(void)
 {
     GtkWidget      *dialog;     /* the dialog window */
     GtkWidget      *modlist;    /* the treeview widget */

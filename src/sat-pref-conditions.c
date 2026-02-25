@@ -38,13 +38,13 @@ static gboolean dirty = FALSE;  /* used to check whether any changes have occurr
 static gboolean reset = FALSE;
 
 
-void sat_pref_conditions_cancel()
+void sat_pref_conditions_cancel(void)
 {
     dirty = FALSE;
     reset = FALSE;
 }
 
-void sat_pref_conditions_ok()
+void sat_pref_conditions_ok(void)
 {
     if (dirty)
     {
@@ -142,7 +142,7 @@ static void create_reset_button(GtkBox * vbox)
     gtk_box_pack_end(vbox, butbox, FALSE, TRUE, 0);
 }
 
-GtkWidget      *sat_pref_conditions_create()
+GtkWidget      *sat_pref_conditions_create(void)
 {
     GtkWidget      *table;
     GtkWidget      *label;

@@ -103,7 +103,7 @@ static gboolean convert_qth_altitude(GtkTreeModel * model,
  * The other buttons are active only if a row is selected.
  *
  */
-GtkWidget      *sat_pref_qth_create()
+GtkWidget      *sat_pref_qth_create(void)
 {
     GtkWidget      *vbox;       /* vbox containing the list part and the details part */
     GtkWidget      *swin;
@@ -126,12 +126,12 @@ GtkWidget      *sat_pref_qth_create()
 }
 
 /** User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_qth_cancel()
+void sat_pref_qth_cancel(void)
 {
 }
 
 /** User pressed OK. Any changes should be stored in config. */
-void sat_pref_qth_ok()
+void sat_pref_qth_ok(void)
 {
     delete_location_files();
 
@@ -140,7 +140,7 @@ void sat_pref_qth_ok()
 }
 
 /** Create QTH list widgets. */
-static GtkWidget *create_qth_list()
+static GtkWidget *create_qth_list(void)
 {
     GtkTreeModel   *model;
     GtkCellRenderer *renderer;
@@ -285,7 +285,7 @@ static GtkWidget *create_qth_list()
  * The individual .qth files are read by the read_qth_file
  * function.
  */
-static GtkTreeModel *create_and_fill_model()
+static GtkTreeModel *create_and_fill_model(void)
 {
     GtkListStore   *liststore;  /* the list store data structure */
     GDir           *dir = NULL; /* directory handle */
@@ -876,7 +876,7 @@ static gboolean save_qth(GtkTreeModel * model, GtkTreePath * path,
  * This function is used to remove any existing .qth file
  * before storing the data from the QTH list.
  */
-static void delete_location_files()
+static void delete_location_files(void)
 {
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */

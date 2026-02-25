@@ -258,7 +258,7 @@ static GKeyFile *config = NULL;
  * The the configuration data in memory is already "loaded" the data will
  * be ereased first.
  */
-guint sat_cfg_load()
+guint sat_cfg_load(void)
 {
     gchar          *keyfile, *confdir;
     GError         *error = NULL;
@@ -352,7 +352,7 @@ guint sat_cfg_load()
  * This function saves the configuration data currently stored in
  * memory to the gpredict.cfg file.
  */
-guint sat_cfg_save()
+guint sat_cfg_save(void)
 {
     gchar          *keyfile;
     gchar          *confdir;
@@ -375,7 +375,7 @@ guint sat_cfg_save()
  * is called again. This function should only be called when the
  * program exits.
  */
-void sat_cfg_close()
+void sat_cfg_close(void)
 {
     if (config != NULL)
     {

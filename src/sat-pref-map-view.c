@@ -120,7 +120,7 @@ static gboolean shadow_changed(GtkRange * range, GtkScrollType scroll,
     return TRUE;
 }
 
-static void update_map_icon()
+static void update_map_icon(void)
 {
     gchar          *mapfile;
     GdkPixbuf      *obuf, *sbuf;

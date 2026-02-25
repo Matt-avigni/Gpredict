@@ -119,7 +119,7 @@ static void gtk_polar_view_init(GtkPolarView * polview,
     polview->resize = FALSE;
 }
 
-GType gtk_polar_view_get_type()
+GType gtk_polar_view_get_type(void)
 {
     static GType    gtk_polar_view_type = 0;
 

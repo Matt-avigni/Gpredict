@@ -120,7 +120,7 @@ static void rig_pref_editor_done(radio_conf_t *conf,
     }
 }
 
-static GtkTreeModel *create_and_fill_model()
+static GtkTreeModel *create_and_fill_model(void)
 {
     GtkListStore   *liststore;  /* the list store data structure */
     GtkTreeIter     item;       /* new item added to the list store */
@@ -641,7 +641,7 @@ static void row_activated_cb(GtkTreeView * tree_view,
 }
 
 /* Radio configuration list widget. */
-static void create_rig_list()
+static void create_rig_list(void)
 {
     GtkTreeModel   *model;
     GtkCellRenderer *renderer;
@@ -911,7 +911,7 @@ static GtkWidget *create_buttons(void)
 }
 
 /* Create and initialise widgets for the radios tab. */
-GtkWidget      *sat_pref_rig_create()
+GtkWidget      *sat_pref_rig_create(void)
 {
     GtkWidget      *vbox;       /* vbox containing the list part and the details part */
     GtkWidget      *swin;
@@ -932,7 +932,7 @@ GtkWidget      *sat_pref_rig_create()
 }
 
 /* User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_rig_cancel()
+void sat_pref_rig_cancel(void)
 {
 }
 
@@ -942,7 +942,7 @@ void sat_pref_rig_cancel()
  * First, all .grc files are deleted, whereafter the radio configurations in
  * the riglist are saved one by one.
  */
-void sat_pref_rig_ok()
+void sat_pref_rig_ok(void)
 {
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */

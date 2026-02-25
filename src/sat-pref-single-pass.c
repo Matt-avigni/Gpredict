@@ -44,14 +44,14 @@ static void     reset_cb(GtkWidget * button, gpointer data);
 
 
 /* User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_single_pass_cancel()
+void sat_pref_single_pass_cancel(void)
 {
     dirty = FALSE;
     reset = FALSE;
 }
 
 /* User pressed OK. Any changes should be stored in config. */
-void sat_pref_single_pass_ok()
+void sat_pref_single_pass_ok(void)
 {
     if (dirty)
     {
@@ -115,7 +115,7 @@ static void create_reset_button(GtkBox * vbox)
     gtk_box_pack_end(vbox, butbox, FALSE, TRUE, 0);
 }
 
-GtkWidget      *sat_pref_single_pass_create()
+GtkWidget      *sat_pref_single_pass_create(void)
 {
     GtkWidget      *table;
     GtkWidget      *label;

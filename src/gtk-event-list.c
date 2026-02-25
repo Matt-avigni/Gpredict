@@ -131,7 +131,7 @@ static void     row_activated_cb(GtkTreeView * tree_view,
 
 static GtkBoxClass *parent_class = NULL;
 
-GType gtk_event_list_get_type()
+GType gtk_event_list_get_type(void)
 {
     static GType    gtk_event_list_type = 0;
 

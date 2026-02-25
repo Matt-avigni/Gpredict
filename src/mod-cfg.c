@@ -884,7 +884,7 @@ static void edit_advanced_settings(GtkDialog * parent, GKeyFile * cfgdata)
  * This function creates a new module. The name of the module is
  * returned  and it should be freed when no longer needed.
  */
-gchar          *mod_cfg_new()
+gchar          *mod_cfg_new(void)
 {
     GtkWidget      *dialog;
     GKeyFile       *cfgdata;

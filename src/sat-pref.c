@@ -71,7 +71,7 @@ static void     sat_pref_dialog_destroy(GtkWidget *widget, gpointer user_data);
  * in a button box. Using something like the GtkIconView would have been better
  * but that seems to be rather useless when packed into a box.
  */
-void sat_pref_run()
+void sat_pref_run(void)
 {
     GtkWidget      *nbook;      /* notebook widget */
     GtkWidget      *hbox;       /* horizontal box */

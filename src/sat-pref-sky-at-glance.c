@@ -35,13 +35,13 @@ static GtkWidget *col6, *col7, *col8, *col9, *col10;
 static gboolean dirty = FALSE;  /* used to check whether any changes have occurred */
 static gboolean reset = FALSE;
 
-void sat_pref_sky_at_glance_cancel()
+void sat_pref_sky_at_glance_cancel(void)
 {
     dirty = FALSE;
     reset = FALSE;
 }
 
-void sat_pref_sky_at_glance_ok()
+void sat_pref_sky_at_glance_ok(void)
 {
     GdkRGBA         gdk_rgba;
     guint           rgb;
@@ -243,7 +243,7 @@ static void create_reset_button(GtkBox * vbox)
  * is NULL, sensible default values, eg. those from defaults.h should
  * be loaded.
  */
-GtkWidget      *sat_pref_sky_at_glance_create()
+GtkWidget      *sat_pref_sky_at_glance_create(void)
 {
     GtkWidget      *table;
     GtkWidget      *label;

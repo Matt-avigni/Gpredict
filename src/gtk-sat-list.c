@@ -221,7 +221,7 @@ static void     Calculate_RADec(sat_t * sat, qth_t * qth,
 static GtkVBoxClass *parent_class = NULL;
 
 
-GType gtk_sat_list_get_type()
+GType gtk_sat_list_get_type(void)
 {
     static GType    gtk_sat_list_type = 0;
 

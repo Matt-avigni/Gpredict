@@ -101,7 +101,7 @@ const gchar *authors[] = {
 
 extern GtkWidget *app;
 
-void about_dialog_create()
+void about_dialog_create(void)
 {
     GtkWidget      *dialog;
     GdkPixbuf      *icon;

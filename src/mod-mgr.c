@@ -300,7 +300,7 @@ gint mod_mgr_remove_module(GtkWidget * module)
  * a NULL-list, indication that the corresponding configuration key should be
  * removed.
  */
-void mod_mgr_save_state()
+void mod_mgr_save_state(void)
 {
     guint           num;
     guint           i;
@@ -524,7 +524,7 @@ gint mod_mgr_undock_module(GtkWidget * module)
     return retcode;
 }
 
-static void update_window_title()
+static void update_window_title(void)
 {
     gint            pgn, num;
     GtkWidget      *pg;
@@ -567,7 +567,7 @@ static void switch_page_cb(GtkNotebook * notebook,
     g_free(title);
 }
 
-void mod_mgr_reload_sats()
+void mod_mgr_reload_sats(void)
 {
     guint           num;
     guint           i;

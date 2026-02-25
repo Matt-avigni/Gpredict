@@ -64,12 +64,12 @@ static void select_age(void)
 }
 
 /* User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_debug_cancel()
+void sat_pref_debug_cancel(void)
 {
 }
 
 /* User pressed OK. Any changes should be stored in config. */
-void sat_pref_debug_ok()
+void sat_pref_debug_ok(void)
 {
     gint            num = gtk_combo_box_get_active(GTK_COMBO_BOX(age));
 
@@ -149,7 +149,7 @@ static void reset_cb(GtkWidget * button, gpointer data)
     dirty = FALSE;
 }
 
-GtkWidget      *sat_pref_debug_create()
+GtkWidget      *sat_pref_debug_create(void)
 {
     GtkWidget      *vbox;       /* vbox containing the list part and the details part */
     GtkWidget      *hbox;

@@ -37,7 +37,7 @@
  * The function returns a newly allocated gchar * which must be free when
  * it is no longer needed.
  */
-gchar          *get_data_dir()
+gchar          *get_data_dir(void)
 {
     gchar          *dir = NULL;
 
@@ -85,7 +85,7 @@ gchar          *data_file_name(const gchar * data)
  * The function returns a newly allocated gchar * which must be free when
  * it is no longer needed.
  */
-gchar          *get_maps_dir()
+gchar          *get_maps_dir(void)
 {
     gchar          *dir = NULL;
 
@@ -133,7 +133,7 @@ gchar          *map_file_name(const gchar * map)
  * The function returns a newly allocated gchar * which must be free when
  * it is no longer needed.
  */
-gchar          *get_logo_dir()
+gchar          *get_logo_dir(void)
 {
     gchar          *dir = NULL;
 
@@ -162,7 +162,7 @@ gchar          *get_logo_dir()
  * The function returns a newly allocated gchar * which must be free when
  * it is no longer needed.
  */
-gchar          *get_icon_dir()
+gchar          *get_icon_dir(void)
 {
     gchar          *dir = NULL;
 

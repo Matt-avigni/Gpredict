@@ -418,14 +418,14 @@ static void create_reset_button(GtkBox * vbox)
 }
 
 /* User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_tle_cancel()
+void sat_pref_tle_cancel(void)
 {
     dirty = FALSE;
     reset = FALSE;
 }
 
 /* User pressed OK. Any changes should be stored in config. */
-void sat_pref_tle_ok()
+void sat_pref_tle_ok(void)
 {
     if (dirty)
     {
@@ -503,7 +503,7 @@ void sat_pref_tle_ok()
     }
 }
 
-GtkWidget      *sat_pref_tle_create()
+GtkWidget      *sat_pref_tle_create(void)
 {
     GtkWidget      *vbox;
 

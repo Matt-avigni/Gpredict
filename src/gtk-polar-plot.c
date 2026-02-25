@@ -106,7 +106,7 @@ static void gtk_polar_plot_class_init(GtkPolarPlotClass * class,
     widget_class->destroy = gtk_polar_plot_destroy;
 }
 
-GType gtk_polar_plot_get_type()
+GType gtk_polar_plot_get_type(void)
 {
     static GType    gtk_polar_plot_type = 0;
 

@@ -45,7 +45,7 @@
  * is NULL, sensible default values, eg. those from defaults.h should
  * be loaded.
  */
-GtkWidget      *sat_pref_predict_create()
+GtkWidget      *sat_pref_predict_create(void)
 {
     GtkWidget      *nbook;
 
@@ -68,7 +68,7 @@ GtkWidget      *sat_pref_predict_create()
 }
 
 /** User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_predict_cancel()
+void sat_pref_predict_cancel(void)
 {
     sat_pref_conditions_cancel();
     sat_pref_multi_pass_cancel();
@@ -77,7 +77,7 @@ void sat_pref_predict_cancel()
 }
 
 /** User pressed OK. Any changes should be stored in config. */
-void sat_pref_predict_ok()
+void sat_pref_predict_ok(void)
 {
     sat_pref_conditions_ok();
     sat_pref_multi_pass_ok();

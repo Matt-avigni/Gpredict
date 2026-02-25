@@ -388,7 +388,7 @@ void trsp_update_files(gchar * input_file)
 }
 
 /** Update MODES files from network. */
-void modes_update_from_network()
+void modes_update_from_network(void)
 {
     gchar          *server;
     gchar          *proxy = NULL;

@@ -41,7 +41,7 @@
  * is NULL, sensible default values, eg. those from defaults.h should
  * be loaded.
  */
-GtkWidget      *sat_pref_general_create()
+GtkWidget      *sat_pref_general_create(void)
 {
     GtkWidget      *nbook;
 
@@ -64,7 +64,7 @@ GtkWidget      *sat_pref_general_create()
 }
 
 /** User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_general_cancel()
+void sat_pref_general_cancel(void)
 {
     sat_pref_formats_cancel();
     sat_pref_qth_cancel();
@@ -73,7 +73,7 @@ void sat_pref_general_cancel()
 }
 
 /** User pressed OK. Any changes should be stored in config. */
-void sat_pref_general_ok()
+void sat_pref_general_ok(void)
 {
     sat_pref_formats_ok();
     sat_pref_qth_ok();

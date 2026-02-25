@@ -680,7 +680,7 @@ void gtk_single_sat_update(GtkWidget * widget)
     }
 }
 
-GType gtk_single_sat_get_type()
+GType gtk_single_sat_get_type(void)
 {
     static GType    gtk_single_sat_type = 0;
 

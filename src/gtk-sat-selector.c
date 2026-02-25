@@ -107,7 +107,7 @@ static void gtk_sat_selector_init(GtkSatSelector * selector,
     selector->models = NULL;
 }
 
-GType gtk_sat_selector_get_type()
+GType gtk_sat_selector_get_type(void)
 {
     static GType    gtk_sat_selector_type = 0;
 

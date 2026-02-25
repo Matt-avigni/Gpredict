@@ -162,7 +162,7 @@ static void gtk_sky_glance_class_init(GtkSkyGlanceClass * class,
     parent_class = g_type_class_peek_parent(class);
 }
 
-GType gtk_sky_glance_get_type()
+GType gtk_sky_glance_get_type(void)
 {
     static GType    gtk_sky_glance_type = 0;
 

@@ -42,7 +42,7 @@
  * is NULL, sensible default values, eg. those from defaults.h should
  * be loaded.
  */
-GtkWidget      *sat_pref_interfaces_create()
+GtkWidget      *sat_pref_interfaces_create(void)
 {
     GtkWidget      *nbook;
 
@@ -59,14 +59,14 @@ GtkWidget      *sat_pref_interfaces_create()
 }
 
 /** User pressed cancel. Any changes to config must be cancelled. */
-void sat_pref_interfaces_cancel()
+void sat_pref_interfaces_cancel(void)
 {
     sat_pref_rig_cancel();
     sat_pref_rot_cancel();
 }
 
 /** User pressed OK. Any changes should be stored in config. */
-void sat_pref_interfaces_ok()
+void sat_pref_interfaces_ok(void)
 {
     sat_pref_rig_ok();
     sat_pref_rot_ok();
