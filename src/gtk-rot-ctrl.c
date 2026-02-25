@@ -170,6 +170,9 @@
 #define ROT_AUTOCAL_MOVE_INTERVAL_MS 500
 #define ROT_AUTOCAL_NO_MOTION_MS 4000
 #define ROT_AUTOCAL_NO_POS_MS 4000
+#define ROT_FREEZE_MIN_WAIT_MS 250
+#define ROT_FREEZE_MAX_WAIT_MS 1200
+#define ROT_FREEZE_POLL_SLICE_US 20000
 
 static const gdouble k_meas_quantum_deg = 1.0;
 static const gdouble k_meas_tol_deg = 1.5;
@@ -473,7 +476,7 @@ struct _GtkRotCtrl {
     GtkWidget      *SatSel, *AzSat, *ElSat, *SatCnt;
     GtkWidget      *aoslos_banner;
     GtkWidget      *DevSel, *LockBut, *MonitorCheckBox;
-    GtkWidget      *track, *cycle_spin, *thld_spin;
+    GtkWidget      *track, *freeze, *cycle_spin, *thld_spin;
     GtkWidget      *plot;
     GtkWidget      *axis_mode_combo;
     GtkWidget      *wrap_mode_combo;
@@ -4852,6 +4855,131 @@ static gboolean rotctrl_get_pos_valid(GtkRotCtrl *ctrl, gint64 *last_pos_us)
         *last_pos_us = last;
 
     return ok;
+}
+
+static gboolean rotctrl_last_known_user_position(GtkRotCtrl *ctrl,
+                                                 gdouble *az_out,
+                                                 gdouble *el_out,
+                                                 gint64 *sample_us_out)
+{
+    gboolean have = FALSE;
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+    gint64 sample_us = 0;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    g_mutex_lock(&ctrl->client.mutex);
+    if (ctrl->client.last_pos_sample_us > 0)
+    {
+        az = ctrl->client.last_pos_user_az;
+        el = ctrl->client.last_pos_user_el;
+        sample_us = ctrl->client.last_pos_sample_us;
+        have = TRUE;
+    }
+    else if (ctrl->client.last_pos_us > 0)
+    {
+        az = ctrl->client.azi_in;
+        el = ctrl->client.ele_in;
+        sample_us = ctrl->client.last_pos_us;
+        have = TRUE;
+    }
+    g_mutex_unlock(&ctrl->client.mutex);
+
+    if (have)
+    {
+        if (az_out)
+            *az_out = az;
+        if (el_out)
+            *el_out = el;
+        if (sample_us_out)
+            *sample_us_out = sample_us;
+    }
+    else if (sample_us_out)
+    {
+        *sample_us_out = 0;
+    }
+
+    return have;
+}
+
+static gboolean rotctrl_refresh_user_position(GtkRotCtrl *ctrl,
+                                              gint timeout_ms,
+                                              gdouble *az_out,
+                                              gdouble *el_out,
+                                              gboolean *fresh_out)
+{
+    gint64 baseline_sample_us = 0;
+    gint64 deadline_us = 0;
+    gdouble az = 0.0;
+    gdouble el = 0.0;
+    gint64 sample_us = 0;
+    gboolean have = FALSE;
+    gboolean fresh = FALSE;
+
+    if (fresh_out)
+        *fresh_out = FALSE;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    have = rotctrl_last_known_user_position(ctrl,
+                                            &az,
+                                            &el,
+                                            &baseline_sample_us);
+
+    if (!ctrl->client.running || !ctrl->engaged)
+    {
+        if (have)
+        {
+            if (az_out)
+                *az_out = az;
+            if (el_out)
+                *el_out = el;
+        }
+        return have;
+    }
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.pos_unknown = TRUE;
+    ctrl->client.last_pos_attempt_us = 0;
+    ctrl->client.pos_backoff_until_us = 0;
+    ctrl->client.pos_backoff_sec = 0.5;
+    g_mutex_unlock(&ctrl->client.mutex);
+
+    if (timeout_ms < ROT_FREEZE_MIN_WAIT_MS)
+        timeout_ms = ROT_FREEZE_MIN_WAIT_MS;
+    if (timeout_ms > ROT_FREEZE_MAX_WAIT_MS)
+        timeout_ms = ROT_FREEZE_MAX_WAIT_MS;
+
+    deadline_us = g_get_monotonic_time() + ((gint64)timeout_ms * 1000);
+    while (g_get_monotonic_time() < deadline_us)
+    {
+        have = rotctrl_last_known_user_position(ctrl, &az, &el, &sample_us);
+        if (have && sample_us > baseline_sample_us)
+        {
+            fresh = TRUE;
+            break;
+        }
+        g_usleep(ROT_FREEZE_POLL_SLICE_US);
+    }
+
+    if (!have)
+        have = rotctrl_last_known_user_position(ctrl, &az, &el, &sample_us);
+
+    if (have)
+    {
+        if (az_out)
+            *az_out = az;
+        if (el_out)
+            *el_out = el;
+    }
+
+    if (fresh_out)
+        *fresh_out = fresh;
+
+    return have;
 }
 
 static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
@@ -10030,6 +10158,83 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     }
 }
 
+static void freeze_clicked_cb(GtkButton *button, gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+    gdouble freeze_az = 0.0;
+    gdouble freeze_el = 0.0;
+    gboolean have_pos = FALSE;
+    gboolean fresh_pos = FALSE;
+    gint wait_ms = ROT_FREEZE_MIN_WAIT_MS;
+
+    (void)button;
+
+    if (ctrl == NULL || ctrl->ui_updating)
+        return;
+
+    if (ctrl->cal_hold_active)
+        rotctrl_set_cal_hold(ctrl, FALSE, "freeze");
+
+    if (ctrl->tracking && ctrl->track)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+
+    if (ctrl->engaged && ctrl->client.running)
+    {
+        g_mutex_lock(&ctrl->client.mutex);
+        ctrl->client.stop_pending = TRUE;
+        ctrl->client.new_trg = FALSE;
+        ctrl->client.force_pending = FALSE;
+        g_mutex_unlock(&ctrl->client.mutex);
+    }
+
+    wait_ms = MAX(ROT_FREEZE_MIN_WAIT_MS, rotctrl_poll_period_ms(ctrl) * 2);
+    have_pos = rotctrl_refresh_user_position(ctrl,
+                                             wait_ms,
+                                             &freeze_az,
+                                             &freeze_el,
+                                             &fresh_pos);
+
+    if (!have_pos)
+    {
+        ctrl->manual_sync_pending = TRUE;
+        ctrl->have_user_command = FALSE;
+        ctrl->setpoint_valid = FALSE;
+        ctrl->force_next_send = FALSE;
+        sat_log_log(SAT_LOG_LEVEL_WARN,
+                    "freeze: no known rotor position; sent stop only");
+        rot_term_log(ctrl, "gpredict:warn",
+                     "freeze: no known rotor position; sent stop only");
+        return;
+    }
+
+    if (ctrl->conf && ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        freeze_el = ctrl->conf->minel;
+
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), freeze_az);
+    gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), freeze_el);
+    ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
+    ctrl->manual_sync_pending = FALSE;
+    ctrl->have_user_command = TRUE;
+    ctrl->hold_position_on_engage = FALSE;
+    ctrl->park_requested = FALSE;
+    ctrl->setpoint_valid = FALSE;
+    ctrl->force_next_send = TRUE;
+
+    if (have_pos)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "freeze: hold at az=%.2f el=%.2f source=%s",
+                    freeze_az,
+                    freeze_el,
+                    fresh_pos ? "live" : "last_known");
+        rot_term_log(ctrl, "gpredict:state",
+                     "freeze: hold at az=%.2f el=%.2f source=%s",
+                     freeze_az,
+                     freeze_el,
+                     fresh_pos ? "live" : "last_known");
+    }
+}
+
 /**
  * Rotator controller timeout function
  *
@@ -13469,6 +13674,8 @@ static void rot_monitor_cb(GtkCheckButton * button, gpointer data)
     gtk_widget_set_sensitive(ctrl->AzSet, !ctrl->monitor);
     gtk_widget_set_sensitive(ctrl->ElSet, !ctrl->monitor);
     gtk_widget_set_sensitive(ctrl->track, !ctrl->monitor);
+    if (ctrl->freeze)
+        gtk_widget_set_sensitive(ctrl->freeze, !ctrl->monitor);
 }
 
 
@@ -18503,6 +18710,13 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     g_signal_connect(ctrl->track, "toggled", G_CALLBACK(track_toggle_cb),
                      ctrl);
 
+    ctrl->freeze = gtk_button_new_with_label(_("Freeze"));
+    gtk_widget_set_tooltip_text(ctrl->freeze,
+                                _("Stop tracking and hold the rotor at its current position"));
+    gtk_grid_attach(GTK_GRID(table), ctrl->freeze, 2, 1, 1, 1);
+    g_signal_connect(ctrl->freeze, "clicked", G_CALLBACK(freeze_clicked_cb),
+                     ctrl);
+
     /* Azimuth */
     label = gtk_label_new(_("Az:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
@@ -19674,6 +19888,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->max_el_spin = NULL;
     ctrl->az_endstop_spin = NULL;
     ctrl->preset_grid = NULL;
+    ctrl->freeze = NULL;
     ctrl->preset_count = 0;
 
     ctrl->tracking = FALSE;
