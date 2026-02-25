@@ -476,7 +476,7 @@ struct _GtkRotCtrl {
     GtkWidget      *SatSel, *AzSat, *ElSat, *SatCnt;
     GtkWidget      *aoslos_banner;
     GtkWidget      *DevSel, *LockBut, *MonitorCheckBox;
-    GtkWidget      *track, *freeze, *cycle_spin, *poll_spin, *thld_spin;
+    GtkWidget      *track, *freeze, *cycle_spin, *thld_spin;
     GtkWidget      *plot;
     GtkWidget      *axis_mode_combo;
     GtkWidget      *wrap_mode_combo;
@@ -499,6 +499,7 @@ struct _GtkRotCtrl {
     guint           delay, timerid;
     gdouble         threshold, t;
     gint            errcnt;
+    gboolean        cycle_perf_warned;
 
     gboolean        tracking, engaged, monitor, flipped;
     gboolean        engage_pending;
@@ -9883,6 +9884,7 @@ static GtkWidget *create_az_widgets(GtkRotCtrl * ctrl)
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
     gtk_grid_set_column_spacing(GTK_GRID(table), 5);
     gtk_grid_set_row_spacing(GTK_GRID(table), 5);
+    gtk_widget_set_halign(table, GTK_ALIGN_CENTER);
     gtk_container_add(GTK_CONTAINER(frame), table);
 
     ctrl->AzSet = gtk_rot_knob_new(0.0, 360.0, 180.0);
@@ -9924,6 +9926,7 @@ static GtkWidget *create_el_widgets(GtkRotCtrl * ctrl)
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
     gtk_grid_set_column_spacing(GTK_GRID(table), 5);
     gtk_grid_set_row_spacing(GTK_GRID(table), 5);
+    gtk_widget_set_halign(table, GTK_ALIGN_CENTER);
     gtk_container_add(GTK_CONTAINER(frame), table);
 
     ctrl->ElSet = gtk_rot_knob_new(0.0, 90.0, 45.0);
@@ -13015,31 +13018,30 @@ static void delay_changed_cb(GtkSpinButton * spin, gpointer data)
 
     ctrl->delay = (guint) gtk_spin_button_get_value(spin);
     if (ctrl->conf)
+    {
         ctrl->conf->cycle = ctrl->delay;
+        ctrl->conf->rotor_poll_period_ms = ctrl->delay;
+    }
+
+    if (ctrl->delay > 1000)
+    {
+        if (!ctrl->cycle_perf_warned)
+        {
+            rot_show_message(ctrl, GTK_MESSAGE_WARNING,
+                             _("Cycle delay warning"),
+                             _("Cycle delay above 1000 ms may cause poor tracking performance."));
+            ctrl->cycle_perf_warned = TRUE;
+        }
+    }
+    else
+    {
+        ctrl->cycle_perf_warned = FALSE;
+    }
 
     if (ctrl->timerid > 0)
         g_source_remove(ctrl->timerid);
 
     ctrl->timerid = g_timeout_add(ctrl->delay, rot_ctrl_timeout_cb, ctrl);
-}
-
-/**
- * Manage poll interval changes.
- *
- * \param spin Pointer to the spin button.
- * \param data Pointer to the GtkRotCtrl widget.
- *
- * This function is called when the user changes the get_position poll period.
- */
-static void poll_changed_cb(GtkSpinButton * spin, gpointer data)
-{
-    GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
-
-    if (ctrl == NULL || ctrl->ui_updating)
-        return;
-
-    (void)spin;
-    (void)rotor_apply_ui_settings(ctrl, FALSE);
 }
 
 /**
@@ -13095,31 +13097,20 @@ static gboolean rotctrl_parse_spin_value(GtkSpinButton *spin, gdouble *value)
 static gboolean rotor_apply_ui_settings(GtkRotCtrl *ctrl, gboolean strict)
 {
     GtkSpinButton *cycle_spin;
-    GtkSpinButton *poll_spin;
     GtkSpinButton *thld_spin;
     GtkAdjustment *adj;
     gdouble raw = 0.0;
     gdouble lower;
     gdouble upper;
     gdouble value;
-    guint delay_ms = 0;
-    gint poll_ms = ROTCTLD_DEFAULT_POLL_PERIOD_MS;
+    guint delay_ms;
     gdouble threshold_deg = 0.0;
 
     if (ctrl == NULL)
         return TRUE;
 
     cycle_spin = ctrl->cycle_spin ? GTK_SPIN_BUTTON(ctrl->cycle_spin) : NULL;
-    poll_spin = ctrl->poll_spin ? GTK_SPIN_BUTTON(ctrl->poll_spin) : NULL;
     thld_spin = ctrl->thld_spin ? GTK_SPIN_BUTTON(ctrl->thld_spin) : NULL;
-
-    if (cycle_spin)
-        delay_ms = (guint) llround(gtk_spin_button_get_value(cycle_spin));
-    else
-        delay_ms = ctrl->delay;
-
-    if (ctrl->conf && ctrl->conf->rotor_poll_period_ms > 0)
-        poll_ms = ctrl->conf->rotor_poll_period_ms;
 
     if (cycle_spin)
     {
@@ -13152,71 +13143,39 @@ static gboolean rotor_apply_ui_settings(GtkRotCtrl *ctrl, gboolean strict)
         value = gtk_spin_button_get_value(cycle_spin);
         delay_ms = (guint)llround(value);
     }
-
-    if (poll_spin)
+    else
     {
-        adj = gtk_spin_button_get_adjustment(poll_spin);
-        lower = gtk_adjustment_get_lower(adj);
-        upper = gtk_adjustment_get_upper(adj);
-
-        if (strict)
-        {
-            if (!rotctrl_parse_spin_value(poll_spin, &raw))
-            {
-                rot_show_message(ctrl, GTK_MESSAGE_ERROR,
-                                 _("Invalid poll interval"),
-                                 _("Poll interval must be a valid number."));
-                return FALSE;
-            }
-            if (raw < lower || raw > upper)
-            {
-                gchar *msg = g_strdup_printf(_("Poll interval must be between %.0f and %.0f ms."),
-                                             lower, upper);
-                rot_show_message(ctrl, GTK_MESSAGE_ERROR,
-                                 _("Invalid poll interval"), msg);
-                g_free(msg);
-                return FALSE;
-            }
-            gtk_spin_button_set_value(poll_spin, raw);
-        }
-
-        gtk_spin_button_update(poll_spin);
-        value = gtk_spin_button_get_value(poll_spin);
-        poll_ms = (gint)llround(value);
-    }
-
-    if (poll_ms < 100)
-        poll_ms = 100;
-
-    if ((guint)poll_ms > delay_ms)
-    {
-        gchar *msg = g_strdup_printf(_("Poll interval (%d ms) cannot be larger than cycle delay (%u ms)."),
-                                     poll_ms, delay_ms);
-        rot_show_message(ctrl, GTK_MESSAGE_ERROR,
-                         _("Invalid poll interval"), msg);
-        g_free(msg);
-        return FALSE;
+        delay_ms = ctrl->delay;
     }
 
     if (cycle_spin)
     {
         ctrl->delay = delay_ms;
         if (ctrl->conf)
+        {
             ctrl->conf->cycle = ctrl->delay;
+            ctrl->conf->rotor_poll_period_ms = ctrl->delay;
+        }
+
+        if (ctrl->delay > 1000)
+        {
+            if (!ctrl->cycle_perf_warned)
+            {
+                rot_show_message(ctrl, GTK_MESSAGE_WARNING,
+                                 _("Cycle delay warning"),
+                                 _("Cycle delay above 1000 ms may cause poor tracking performance."));
+                ctrl->cycle_perf_warned = TRUE;
+            }
+        }
+        else
+        {
+            ctrl->cycle_perf_warned = FALSE;
+        }
 
         if (ctrl->timerid > 0)
             g_source_remove(ctrl->timerid);
 
         ctrl->timerid = g_timeout_add(ctrl->delay, rot_ctrl_timeout_cb, ctrl);
-    }
-
-    if (ctrl->conf)
-        ctrl->conf->rotor_poll_period_ms = poll_ms;
-
-    if (poll_spin)
-    {
-        /* Keep UI in sync with backend minimum clamp. */
-        gtk_spin_button_set_value(poll_spin, poll_ms);
     }
 
     if (thld_spin)
@@ -13256,11 +13215,11 @@ static gboolean rotor_apply_ui_settings(GtkRotCtrl *ctrl, gboolean strict)
     if (strict && cycle_spin && thld_spin)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "Applied rotor settings: cycle_ms=%u poll_ms=%d threshold_deg=%.2f",
-                    ctrl->delay, poll_ms, ctrl->threshold);
+                    "Applied rotor settings: cycle_ms=%u threshold_deg=%.2f",
+                    ctrl->delay, ctrl->threshold);
         rot_term_log(ctrl, "gpredict:rx",
-                     "applied rotor settings: cycle_ms=%u poll_ms=%d threshold_deg=%.2f",
-                     ctrl->delay, poll_ms, ctrl->threshold);
+                     "applied rotor settings: cycle_ms=%u threshold_deg=%.2f",
+                     ctrl->delay, ctrl->threshold);
     }
 
     return TRUE;
@@ -13659,14 +13618,15 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
         if (ctrl->conf->aztype == ROT_AZ_TYPE_480)
             ctrl->conf->aztype = ROT_AZ_TYPE_360;
 
+        if (ctrl->conf->cycle < 100)
+            ctrl->conf->cycle = 100;
+        ctrl->conf->rotor_poll_period_ms = ctrl->conf->cycle;
+
         was_updating = ctrl->ui_updating;
         rotctrl_ui_begin_update(ctrl, "rot_selected");
 
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->cycle_spin),
                                   ctrl->conf->cycle);
-        if (ctrl->poll_spin)
-            gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->poll_spin),
-                                      ctrl->conf->rotor_poll_period_ms);
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->thld_spin),
                                   ctrl->conf->threshold);
 
@@ -18970,7 +18930,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(main_table), label, 0, 2, 1, 1);
 
-    ctrl->cycle_spin = gtk_spin_button_new_with_range(10, 10000, 10);
+    ctrl->cycle_spin = gtk_spin_button_new_with_range(100, 10000, 10);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->cycle_spin), 0);
     gtk_widget_set_tooltip_text(ctrl->cycle_spin,
                                 _("This parameter controls the delay between "
@@ -18986,28 +18946,6 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     label = gtk_label_new(_("msec"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(main_table), label, 2, 2, 1, 1);
-
-    /* get_position poll period */
-    label = gtk_label_new(_("Poll:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 3, 2, 1, 1);
-
-    ctrl->poll_spin = gtk_spin_button_new_with_range(100, 10000, 10);
-    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->poll_spin), 0);
-    gtk_widget_set_tooltip_text(ctrl->poll_spin,
-                                _("This parameter controls how often Gpredict "
-                                  "polls rotctld for position (get_position)."));
-    g_signal_connect(ctrl->poll_spin, "value-changed",
-                     G_CALLBACK(poll_changed_cb), ctrl);
-    g_signal_connect(ctrl->poll_spin, "focus-out-event",
-                     G_CALLBACK(rotctrl_settings_focus_out_cb), ctrl);
-    g_signal_connect(ctrl->poll_spin, "activate",
-                     G_CALLBACK(rotctrl_settings_activate_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->poll_spin, 4, 2, 1, 1);
-
-    label = gtk_label_new(_("msec"));
-    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 5, 2, 1, 1);
 
     /* Tolerance */
     label = gtk_label_new(_("Threshold:"));
@@ -19041,7 +18979,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     GtkWidget *status = gtk_label_new(_("DISENGAGED"));
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), status, 1, 4, 5, 1);
+    gtk_grid_attach(GTK_GRID(main_table), status, 1, 4, 3, 1);
 
     /* store pointer on the controller object for later updates */
     g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
@@ -20083,6 +20021,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->timerid = 0;
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
     ctrl->errcnt = 0;
+    ctrl->cycle_perf_warned = FALSE;
     ctrl->conf = NULL;
     ctrl->term_view = gp_term_view_new(_("Follow tail"), TRUE, FALSE);
     ctrl->log_toggle = NULL;
@@ -20482,13 +20421,13 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     gtk_widget_set_vexpand(az_el_row, FALSE);
     gtk_grid_attach(GTK_GRID(az_el_row), az_frame, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(az_el_row), el_frame, 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), az_el_row, 0, 0, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), az_el_row, 0, 0, 3, 1);
     gtk_grid_attach(GTK_GRID(table), target_frame, 0, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), conf_frame, 1, 1, 2, 1);
-    gtk_grid_attach(GTK_GRID(table), calib_frame, 3, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(table), preset_frame, 0, 2, 4, 1);
-    gtk_grid_attach(GTK_GRID(table), term_widget, 0, 3, 4, 1);
-    gtk_grid_attach(GTK_GRID(table), banner_widget, 0, 4, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), conf_frame, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), calib_frame, 2, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), preset_frame, 0, 2, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), term_widget, 0, 3, 3, 1);
+    gtk_grid_attach(GTK_GRID(table), banner_widget, 0, 4, 3, 1);
 
     plot_frame = create_plot_widget(rot_ctrl);
     gtk_widget_set_hexpand(plot_frame, TRUE);
