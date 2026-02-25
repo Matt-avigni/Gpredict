@@ -6774,6 +6774,7 @@ static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
     ctrl->have_user_command = TRUE;
+    ctrl->force_next_send = TRUE;
     ctrl->hold_position_on_engage = FALSE;
     return FALSE;
 }
@@ -9426,6 +9427,9 @@ static gpointer rotctld_client_thread(gpointer data)
 
                 if (!feedback_disabled)
                 {
+                    gint64 ref_cmd_us = 0;
+                    gboolean recent_cmd = FALSE;
+                    gboolean monitor_discrepancy = FALSE;
                     gboolean have_last_cmd =
                         last_cmd_backend_valid || (last_cmd_ok_us > 0);
                     gdouble cmd_az =
@@ -9436,7 +9440,20 @@ static gpointer rotctld_client_thread(gpointer data)
                     const gchar *disc_reason = NULL;
                     gdouble err_deg = 0.0;
 
-                    if (pos_res == ROTCTLD_POS_OK && have_last_cmd)
+                    if (last_set_attempt_us > ref_cmd_us)
+                        ref_cmd_us = last_set_attempt_us;
+                    if (last_cmd_ok_us > ref_cmd_us)
+                        ref_cmd_us = last_cmd_ok_us;
+                    if (ref_cmd_us > 0 && now_us >= ref_cmd_us &&
+                        (now_us - ref_cmd_us) <=
+                            ((gint64)ROT_CMD_MAX_SILENCE_MS * 1000))
+                    {
+                        recent_cmd = TRUE;
+                    }
+                    monitor_discrepancy = desired_tracking || recent_cmd;
+
+                    if (monitor_discrepancy &&
+                        pos_res == ROTCTLD_POS_OK && have_last_cmd)
                     {
                         gdouble az_err = fabs(shortest_az_delta(cur_az, cmd_az));
                         gdouble el_err = fabs(cur_el - cmd_el);
@@ -9491,16 +9508,16 @@ static gpointer rotctld_client_thread(gpointer data)
                                         wrong_way++;
                                 }
                             }
-                            if ((now_us - last_err_time) >=
-                                ((gint64)ROT_CMD_STUCK_TIMEOUT_MS * 1000))
-                            {
-                                discrepancy_hit = TRUE;
-                                disc_reason = "stuck";
-                            }
-                            else if (wrong_way >= 3)
+                            if (wrong_way >= 3)
                             {
                                 discrepancy_hit = TRUE;
                                 disc_reason = "wrong_way";
+                            }
+                            else if ((now_us - last_err_time) >=
+                                     ((gint64)ROT_CMD_STUCK_TIMEOUT_MS * 1000))
+                            {
+                                discrepancy_hit = TRUE;
+                                disc_reason = "stuck";
                             }
                         }
 
@@ -9516,29 +9533,42 @@ static gpointer rotctld_client_thread(gpointer data)
                         ctrl->client.last_err_to_cmd = 0.0;
                         ctrl->client.last_err_time_us = 0;
                         ctrl->client.wrong_way_count = 0;
+                        if (!monitor_discrepancy)
+                        {
+                            ctrl->client.discrepancy_streak = 0;
+                            ctrl->client.discrepancy_pending = FALSE;
+                        }
                         g_mutex_unlock(&ctrl->client.mutex);
                     }
 
                     if (discrepancy_hit)
                     {
                         guint streak = 0;
+                        gboolean should_log = FALSE;
                         g_mutex_lock(&ctrl->client.mutex);
                         if (ctrl->client.discrepancy_streak < G_MAXUINT)
                             ctrl->client.discrepancy_streak++;
                         ctrl->client.discrepancy_pending = TRUE;
                         streak = ctrl->client.discrepancy_streak;
+                        should_log =
+                            (streak >= ROT_CMD_DISCREPANCY_STRIKES) &&
+                            (streak == ROT_CMD_DISCREPANCY_STRIKES ||
+                             (streak % ROT_CMD_DISCREPANCY_STRIKES) == 0);
                         g_mutex_unlock(&ctrl->client.mutex);
 
-                        sat_log_log(SAT_LOG_LEVEL_WARN,
-                                    "rot discrepancy: reason=%s streak=%u err=%.2f",
-                                    disc_reason ? disc_reason : "unknown",
-                                    streak,
-                                    err_deg);
-                        rot_term_log(ctrl, "gpredict:warn",
-                                     "rot discrepancy: reason=%s streak=%u err=%.2f",
-                                     disc_reason ? disc_reason : "unknown",
-                                     streak,
-                                     err_deg);
+                        if (should_log)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_WARN,
+                                        "rot discrepancy: reason=%s streak=%u err=%.2f",
+                                        disc_reason ? disc_reason : "unknown",
+                                        streak,
+                                        err_deg);
+                            rot_term_log(ctrl, "gpredict:warn",
+                                         "rot discrepancy: reason=%s streak=%u err=%.2f",
+                                         disc_reason ? disc_reason : "unknown",
+                                         streak,
+                                         err_deg);
+                        }
 
                     }
                     else
@@ -12204,7 +12234,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         delta_az_phys = rot_ang_dist_deg(meas_az360, raw_cmd_az);
         delta_el_phys = fabs(raw_cmd_el - meas_el);
 
-        force_send = force_send || (!ctrl->tracking && manual_override);
         if (!ctrl->tracking && last_cmd_us == 0 && ctrl->have_user_command)
             force_send = TRUE;
 
