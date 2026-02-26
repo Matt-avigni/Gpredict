@@ -12776,26 +12776,26 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     ? rot_target_invalid_reason_name(decision_out.range_reason)
                     : "none";
 
-            rot_term_log(ctrl, "gpredict:tx",
-                         "rot_cmd_gate: mode=%s desired_user=(%.2f,%.2f) setpoint_user=(%.2f,%.2f) "
-                         "last_cmd_user=(%.2f,%.2f) desired_backend=(%.2f,%.2f) setpoint_backend=(%.2f,%.2f) "
-                         "in_flight=%d stale_hold=%d pos_fresh=%d last_good_age_ms=%lld "
-                         "delta_user=(%.2f,%.2f) delta_backend=(%.2f,%.2f) action=%s reason=%s range=%s",
-                         mode_name,
-                         desired_user_az_log, desired_user_el_log,
-                         setpoint_user_az, setpoint_user_el,
-                         last_cmd_user_az_log, last_cmd_user_el_log,
-                         desired_backend_az, desired_backend_el,
-                         setpoint_backend_az, setpoint_backend_el,
-                         ctrl->setpoint_valid ? 1 : 0,
-                         ctrl->stale_hold_active ? 1 : 0,
-                         pos_fresh ? 1 : 0,
-                         (long long)pos_age_ms,
-                         delta_user_az, delta_user_el,
-                         delta_backend_az, delta_backend_el,
-                         action,
-                         rot_cmd_reason_name(reason),
-                         range_reason);
+            rot_term_log_verbose(ctrl, "gpredict:tx",
+                                 "rot_cmd_gate: mode=%s desired_user=(%.2f,%.2f) setpoint_user=(%.2f,%.2f) "
+                                 "last_cmd_user=(%.2f,%.2f) desired_backend=(%.2f,%.2f) setpoint_backend=(%.2f,%.2f) "
+                                 "in_flight=%d stale_hold=%d pos_fresh=%d last_good_age_ms=%lld "
+                                 "delta_user=(%.2f,%.2f) delta_backend=(%.2f,%.2f) action=%s reason=%s range=%s",
+                                 mode_name,
+                                 desired_user_az_log, desired_user_el_log,
+                                 setpoint_user_az, setpoint_user_el,
+                                 last_cmd_user_az_log, last_cmd_user_el_log,
+                                 desired_backend_az, desired_backend_el,
+                                 setpoint_backend_az, setpoint_backend_el,
+                                 ctrl->setpoint_valid ? 1 : 0,
+                                 ctrl->stale_hold_active ? 1 : 0,
+                                 pos_fresh ? 1 : 0,
+                                 (long long)pos_age_ms,
+                                 delta_user_az, delta_user_el,
+                                 delta_backend_az, delta_backend_el,
+                                 action,
+                                 rot_cmd_reason_name(reason),
+                                 range_reason);
         }
 
         if (have_target)
