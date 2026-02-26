@@ -809,6 +809,9 @@ static gdouble  rotctrl_normalize_az_to_limits(gdouble az,
 static gdouble  rotctrl_normalize_backend_az(gdouble az,
                                              gdouble backend_min_az,
                                              gdouble backend_max_az);
+static void     rotctrl_prefer_user_backend_span(const GtkRotCtrl *ctrl,
+                                                 gdouble *backend_min,
+                                                 gdouble *backend_max);
 static gint     rotctrl_poll_period_ms(const GtkRotCtrl *ctrl);
 static gint     rotctrl_stale_warn_ms(const GtkRotCtrl *ctrl);
 static gint     rotctrl_stale_degraded_ms(const GtkRotCtrl *ctrl);
@@ -4535,6 +4538,17 @@ static gdouble rotctrl_normalize_az_to_limits(gdouble az,
     return az;
 }
 
+static gdouble rotctrl_clamp_user_az_interval(const GtkRotCtrl *ctrl,
+                                              gdouble az)
+{
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return az;
+
+    return rotctrl_normalize_az_to_limits(az,
+                                          ctrl->conf->minaz,
+                                          ctrl->conf->maxaz);
+}
+
 static void G_GNUC_UNUSED normalize_and_clamp_target(const SpanConfig *span,
                                                      gdouble az_deg,
                                                      gdouble el_deg,
@@ -7506,6 +7520,8 @@ static void format_rotctld_setpos(GtkRotCtrl *ctrl,
         az = rotctrl_normalize_backend_az(az, 0.0, 360.0);
     }
 
+    az = rotctrl_clamp_user_az_interval(ctrl, az);
+
     if (az_out)
         *az_out = az;
     if (el_out)
@@ -7726,6 +7742,8 @@ static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
         send_el = CLAMP(send_el, el_min, el_max);
         send_az = rotctrl_normalize_backend_az(send_az, 0.0, 360.0);
     }
+
+    send_az = rotctrl_clamp_user_az_interval(ctrl, send_az);
 
     format_rotctld_setpos(ctrl, send_az, send_el,
                           &send_az, &send_el,
@@ -12145,6 +12163,31 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         az_abs_cmd = az_target_to_nearest_abs(ctrl->az_abs_cur,
                                                               cmdaz, backend_span_mode);
                     }
+                }
+            }
+        }
+
+        {
+            gdouble cmdaz_user = rotctrl_clamp_user_az_interval(ctrl, cmdaz);
+
+            if (fabs(cmdaz_user - cmdaz) > 1e-6)
+            {
+                az_clamped = TRUE;
+                cmdaz = cmdaz_user;
+
+                if (backend_span_extended)
+                {
+                    az_abs_cmd = cmdaz;
+                }
+                else if (rotpos_valid)
+                {
+                    az_abs_cmd = az_target_to_nearest_abs(ctrl->az_abs_cur,
+                                                          cmdaz,
+                                                          backend_span_mode);
+                }
+                else
+                {
+                    az_abs_cmd = cmdaz;
                 }
             }
         }
@@ -19997,6 +20040,61 @@ static void rotctld_selftest(GtkRotCtrl *ctrl)
         g_snprintf(expected, sizeof(expected), "P 180.00 %.2f\n", expect_el);
         if (g_strcmp0(cmd, expected) != 0)
             ok = FALSE;
+    }
+
+    {
+        gboolean prev_valid = FALSE;
+        gdouble prev_az_min = 0.0;
+        gdouble prev_az_max = 0.0;
+        gdouble prev_el_min = 0.0;
+        gdouble prev_el_max = 0.0;
+        gdouble conf_prev_minaz = 0.0;
+        gdouble conf_prev_maxaz = 360.0;
+        rot_az_type_t conf_prev_type = ROT_AZ_TYPE_360;
+        gboolean conf_restore = (ctrl->conf != NULL);
+
+        if (conf_restore)
+        {
+            conf_prev_minaz = ctrl->conf->minaz;
+            conf_prev_maxaz = ctrl->conf->maxaz;
+            conf_prev_type = ctrl->conf->aztype;
+            ctrl->conf->minaz = 0.0;
+            ctrl->conf->maxaz = 360.0;
+            ctrl->conf->aztype = ROT_AZ_TYPE_360;
+        }
+
+        g_mutex_lock(&ctrl->client.mutex);
+        prev_valid = ctrl->client.limits_valid;
+        prev_az_min = ctrl->client.az_min;
+        prev_az_max = ctrl->client.az_max;
+        prev_el_min = ctrl->client.el_min;
+        prev_el_max = ctrl->client.el_max;
+        ctrl->client.limits_valid = TRUE;
+        ctrl->client.az_min = -180.0;
+        ctrl->client.az_max = 180.0;
+        ctrl->client.el_min = ROTCTRL_DEFAULT_MIN_EL;
+        ctrl->client.el_max = ROTCTRL_DEFAULT_MAX_EL;
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        format_rotctld_setpos(ctrl, 350.0, 20.0, NULL, NULL, cmd, sizeof(cmd));
+
+        if (g_strcmp0(cmd, "P 350.00 20.00\n") != 0)
+            ok = FALSE;
+
+        g_mutex_lock(&ctrl->client.mutex);
+        ctrl->client.limits_valid = prev_valid;
+        ctrl->client.az_min = prev_az_min;
+        ctrl->client.az_max = prev_az_max;
+        ctrl->client.el_min = prev_el_min;
+        ctrl->client.el_max = prev_el_max;
+        g_mutex_unlock(&ctrl->client.mutex);
+
+        if (conf_restore)
+        {
+            ctrl->conf->minaz = conf_prev_minaz;
+            ctrl->conf->maxaz = conf_prev_maxaz;
+            ctrl->conf->aztype = conf_prev_type;
+        }
     }
 
     sat_log_log(ok ? SAT_LOG_LEVEL_INFO : SAT_LOG_LEVEL_WARN,
