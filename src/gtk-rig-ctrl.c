@@ -1556,7 +1556,7 @@ static const gchar *rig_rprt_error_string(gint code)
     }
 }
 
-static gboolean rig_parse_rprt_code(const gchar *reply, gint *code_out)
+static gboolean G_GNUC_UNUSED rig_parse_rprt_code(const gchar *reply, gint *code_out)
 {
     const gchar *start = reply;
     gchar *endp = NULL;

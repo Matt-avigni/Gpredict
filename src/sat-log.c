@@ -266,7 +266,7 @@ static void log_rotate(void)
     dirname = g_strconcat(confdir, G_DIR_SEPARATOR_S, "logs", NULL);
 
     fname1 = g_strconcat(dirname, G_DIR_SEPARATOR_S, "gpredict.log", NULL);
-    fname2 = g_strdup_printf("%s%sgpredict-%ld.log",
+    fname2 = g_strdup_printf("%s%sgpredict-%" G_GINT64_FORMAT ".log",
                              dirname, G_DIR_SEPARATOR_S, now);
 
     if (age > 0)

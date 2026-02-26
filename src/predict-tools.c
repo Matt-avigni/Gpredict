@@ -710,6 +710,7 @@ static pass_t  *get_pass_engine(sat_t * sat_in, qth_t * qth, gdouble start,
         }
     }
 
+    (void)iter;
     return pass;
 }
 

@@ -53,6 +53,12 @@ typedef struct
     const gchar    *pos_y_key;
 } WindowGeomInfo;
 
+static void window_geom_info_free(gpointer data, GClosure *closure)
+{
+    (void)closure;
+    g_free(data);
+}
+
 static void apply_window_geometry(GtkWindow *window,
                                   GtkSatModule *module,
                                   const gchar *width_key,
@@ -949,7 +955,7 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
         geom->pos_y_key = MOD_CFG_RIG_WIN_POS_Y;
         g_signal_connect_data(G_OBJECT(module->rigctrlwin), "configure_event",
                               G_CALLBACK(window_geom_config_cb), geom,
-                              (GClosureNotify)g_free, 0);
+                              window_geom_info_free, 0);
     }
 
     /* window icon */
@@ -1043,7 +1049,7 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
         geom->pos_y_key = MOD_CFG_ROT_WIN_POS_Y;
         g_signal_connect_data(G_OBJECT(module->rotctrlwin), "configure_event",
                               G_CALLBACK(window_geom_config_cb), geom,
-                              (GClosureNotify)g_free, 0);
+                              window_geom_info_free, 0);
     }
 
     /* window icon */

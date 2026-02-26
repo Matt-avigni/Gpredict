@@ -153,6 +153,7 @@
 #define ROT_PRESET_COUNT_KEY "count"
 #define ROT_PRESET_RESPONSE_DELETE 1001
 #define ROT_PRESET_BUTTON_HEIGHT 44
+#define ROTCTRL_PANEL_SPACING 12
 #define ROT_AZ_ENDSTOP_PENALTY 1000.0
 #define ROT_BELOW_HORIZON_MARGIN_DEG 0.5
 #define ROT_AUTOCAL_TIMEOUT_US (45 * G_USEC_PER_SEC)
@@ -3481,9 +3482,9 @@ static gboolean rot_plan_get_cmd_at_time(const rot_plan_t *plan, gdouble t,
     return TRUE;
 }
 
-static gboolean rot_get_command(GtkRotCtrl *ctrl, gboolean plan_active,
-                                gdouble setaz, gdouble setel, gdouble t,
-                                gdouble *cmdaz, gdouble *cmdel)
+static gboolean G_GNUC_UNUSED rot_get_command(GtkRotCtrl *ctrl, gboolean plan_active,
+                                              gdouble setaz, gdouble setel, gdouble t,
+                                              gdouble *cmdaz, gdouble *cmdel)
 {
     gboolean from_plan = FALSE;
     gdouble az = setaz;
@@ -3927,7 +3928,7 @@ static gdouble rotctrl_wrap_user_az(const rotor_conf_t *conf, gdouble az)
     return normalize_az_0_360(az);
 }
 
-static gdouble az_wrap_diff(gdouble a, gdouble b, rot_az_type_t type)
+static gdouble G_GNUC_UNUSED az_wrap_diff(gdouble a, gdouble b, rot_az_type_t type)
 {
     gdouble span = 360.0;
     gdouble da = a;
@@ -4534,12 +4535,12 @@ static gdouble rotctrl_normalize_az_to_limits(gdouble az,
     return az;
 }
 
-static void normalize_and_clamp_target(const SpanConfig *span,
-                                       gdouble az_deg,
-                                       gdouble el_deg,
-                                       gdouble current_az,
-                                       gboolean have_current,
-                                       AzElMapResult *out)
+static void G_GNUC_UNUSED normalize_and_clamp_target(const SpanConfig *span,
+                                                     gdouble az_deg,
+                                                     gdouble el_deg,
+                                                     gdouble current_az,
+                                                     gboolean have_current,
+                                                     AzElMapResult *out)
 {
     if (out != NULL)
         memset(out, 0, sizeof(*out));
@@ -5321,6 +5322,41 @@ typedef struct {
     gboolean safe;
 } RotLanePick;
 
+static void rotctrl_prefer_user_backend_span(const GtkRotCtrl *ctrl,
+                                             gdouble *backend_min,
+                                             gdouble *backend_max)
+{
+    const gdouble eps = 1e-6;
+    gdouble user_min = 0.0;
+    gdouble user_max = 0.0;
+
+    if (ctrl == NULL || backend_min == NULL || backend_max == NULL)
+        return;
+
+    if (!ctrl->user_limits.valid ||
+        ctrl->user_limits.wrap_mode != ROT_TARGET_WRAP_360)
+        return;
+
+    user_min = ctrl->user_limits.az_min;
+    user_max = ctrl->user_limits.az_max;
+
+    if (user_min > user_max)
+        return;
+
+    /* If backend exposes an extended superset (e.g. -180..450), keep lane
+     * selection inside the configured user span to avoid equivalent negative
+     * commands for a 0..360 rotor.
+     */
+    if (*backend_min <= user_min + eps &&
+        *backend_max >= user_max - eps &&
+        (*backend_min < user_min - eps ||
+         *backend_max > user_max + eps))
+    {
+        *backend_min = user_min;
+        *backend_max = user_max;
+    }
+}
+
 static gdouble rotctrl_choose_backend_lane(GtkRotCtrl *ctrl,
                                            gdouble az360,
                                            gdouble ref_backend,
@@ -5348,8 +5384,6 @@ static gdouble rotctrl_choose_backend_lane(GtkRotCtrl *ctrl,
     gboolean switched = FALSE;
     const gchar *switch_reason = NULL;
 
-    (void)ctrl;
-
     if (out_used_margin)
         *out_used_margin = FALSE;
     if (out_switched)
@@ -5363,6 +5397,8 @@ static gdouble rotctrl_choose_backend_lane(GtkRotCtrl *ctrl,
         min_az = max_az;
         max_az = tmp;
     }
+
+    rotctrl_prefer_user_backend_span(ctrl, &min_az, &max_az);
 
     if (endstop_margin_deg < 0.0)
         endstop_margin_deg = 0.0;
@@ -5558,6 +5594,8 @@ static gboolean rotctrl_choose_seam_crossing_lane(const GtkRotCtrl *ctrl,
     if (ctrl == NULL || ctrl->conf == NULL)
         return FALSE;
 
+    rotctrl_prefer_user_backend_span(ctrl, &backend_min, &backend_max);
+
     rotctrl_wrap_span_bounds(ctrl->conf, &wrap_min, &wrap_max);
     span = wrap_max - wrap_min;
     if (span <= 0.0)
@@ -5600,7 +5638,8 @@ static gboolean rotctrl_choose_seam_crossing_lane(const GtkRotCtrl *ctrl,
     return TRUE;
 }
 
-static gboolean rotctrl_pick_wrap_candidate(gdouble target_az360,
+static gboolean rotctrl_pick_wrap_candidate(const GtkRotCtrl *ctrl,
+                                            gdouble target_az360,
                                             gdouble ref_backend,
                                             gdouble backend_min,
                                             gdouble backend_max,
@@ -5610,8 +5649,8 @@ static gboolean rotctrl_pick_wrap_candidate(gdouble target_az360,
                                             gint *chosen_k_out)
 {
     gdouble az_norm = gp_norm360(target_az360);
-    gint k_min = (gint)floor((backend_min - az_norm) / 360.0) - 1;
-    gint k_max = (gint)ceil((backend_max - az_norm) / 360.0) + 1;
+    gint k_min = 0;
+    gint k_max = -1;
     gdouble best = 0.0;
     gdouble best_diff = 0.0;
     gint best_k = 0;
@@ -5620,6 +5659,10 @@ static gboolean rotctrl_pick_wrap_candidate(gdouble target_az360,
     gdouble cand_b = NAN;
     gdouble diff_a = 0.0;
     gdouble diff_b = 0.0;
+
+    rotctrl_prefer_user_backend_span(ctrl, &backend_min, &backend_max);
+    k_min = (gint)floor((backend_min - az_norm) / 360.0) - 1;
+    k_max = (gint)ceil((backend_max - az_norm) / 360.0) + 1;
 
     for (gint k = k_min; k <= k_max; k++)
     {
@@ -5899,15 +5942,39 @@ static gint rotctrl_stale_ms(const GtkRotCtrl *ctrl)
     return rotctrl_stale_degraded_ms(ctrl);
 }
 
+static gint rotctrl_stale_warn_floor_ms(const GtkRotCtrl *ctrl)
+{
+    gint poll_ms = rotctrl_poll_period_ms(ctrl);
+    gint floor_ms = poll_ms * 2;
+
+    if (floor_ms < 500)
+        floor_ms = 500;
+
+    return floor_ms;
+}
+
+static gint rotctrl_stale_degraded_floor_ms(const GtkRotCtrl *ctrl)
+{
+    gint poll_ms = rotctrl_poll_period_ms(ctrl);
+    gint floor_ms = poll_ms * 3;
+    gint warn_floor_ms = rotctrl_stale_warn_floor_ms(ctrl);
+
+    if (floor_ms < warn_floor_ms)
+        floor_ms = warn_floor_ms;
+
+    return floor_ms;
+}
+
 static gint rotctrl_stale_warn_ms(const GtkRotCtrl *ctrl)
 {
     gint val = ROT_CMD_POS_FRESH_MS;
+    gint floor_ms = rotctrl_stale_warn_floor_ms(ctrl);
 
     if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_warn_ms > 0)
         val = ctrl->conf->rotor_stale_warn_ms;
 
-    if (val < 500)
-        val = 500;
+    if (val < floor_ms)
+        val = floor_ms;
 
     return val;
 }
@@ -5915,6 +5982,7 @@ static gint rotctrl_stale_warn_ms(const GtkRotCtrl *ctrl)
 static gint rotctrl_stale_degraded_ms(const GtkRotCtrl *ctrl)
 {
     gint val = ROTCTLD_DEFAULT_STALE_MS;
+    gint floor_ms = rotctrl_stale_degraded_floor_ms(ctrl);
 
     if (ctrl && ctrl->conf && ctrl->conf->rotor_stale_degraded_ms > 0)
         val = ctrl->conf->rotor_stale_degraded_ms;
@@ -5923,6 +5991,8 @@ static gint rotctrl_stale_degraded_ms(const GtkRotCtrl *ctrl)
 
     if (val < rotctrl_stale_warn_ms(ctrl))
         val = rotctrl_stale_warn_ms(ctrl);
+    if (val < floor_ms)
+        val = floor_ms;
 
     return val;
 }
@@ -6348,9 +6418,9 @@ static gboolean rotctrl_use_rotctld_caps(GtkRotCtrl *ctrl,
     return TRUE;
 }
 
-static gdouble rotctrl_az_distance(const rot_target_caps_t *caps,
-                                   gdouble a,
-                                   gdouble b)
+static gdouble G_GNUC_UNUSED rotctrl_az_distance(const rot_target_caps_t *caps,
+                                                 gdouble a,
+                                                 gdouble b)
 {
     if (caps)
     {
@@ -10211,12 +10281,33 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
     if (ctrl->tracking && ctrl->track)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
 
+    /* Latch freeze regardless of UI signal delivery order. */
+    ctrl->tracking = FALSE;
+    ctrl->tracking_active = FALSE;
+    ctrl->target_state = ROT_TARGET_STATE_IDLE;
+    ctrl->target_state_since_us = 0;
+    ctrl->target_valid_since_us = 0;
+    ctrl->target_invalid_since_us = 0;
+    rot_plan_reset(&ctrl->trajectory_plan);
+    set_flipped_pass(ctrl);
+    rotctrl_tracking_policy_reset_reason(ctrl, "freeze");
+    ctrl->pretrack_target_valid = FALSE;
+    ctrl->pretrack_aos_time = 0.0;
+    ctrl->pretrack_wait_log_us = 0;
+    ctrl->pretrack_wrap_valid = FALSE;
+    ctrl->pretrack_wrap_user_az = 0.0;
+    ctrl->pretrack_wrap_raw_az = 0.0;
+    ctrl->pretrack_wrap_k = 0;
+
     if (ctrl->engaged && ctrl->client.running)
     {
         g_mutex_lock(&ctrl->client.mutex);
         ctrl->client.stop_pending = TRUE;
         ctrl->client.new_trg = FALSE;
         ctrl->client.force_pending = FALSE;
+        ctrl->client.desired_valid = FALSE;
+        ctrl->client.desired_allow = FALSE;
+        ctrl->client.desired_tracking = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
     }
 
@@ -10231,12 +10322,15 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
     {
         ctrl->manual_sync_pending = TRUE;
         ctrl->have_user_command = FALSE;
+        ctrl->hold_position_on_engage = TRUE;
+        ctrl->hold_position_log_emitted = FALSE;
+        ctrl->park_requested = FALSE;
         ctrl->setpoint_valid = FALSE;
         ctrl->force_next_send = FALSE;
         sat_log_log(SAT_LOG_LEVEL_WARN,
-                    "freeze: no known rotor position; sent stop only");
+                    "freeze: no known rotor position; stop latched");
         rot_term_log(ctrl, "gpredict:warn",
-                     "freeze: no known rotor position; sent stop only");
+                     "freeze: no known rotor position; stop latched");
         return;
     }
 
@@ -10247,21 +10341,22 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), freeze_el);
     ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
     ctrl->manual_sync_pending = FALSE;
-    ctrl->have_user_command = TRUE;
-    ctrl->hold_position_on_engage = FALSE;
+    ctrl->have_user_command = FALSE;
+    ctrl->hold_position_on_engage = TRUE;
+    ctrl->hold_position_log_emitted = FALSE;
     ctrl->park_requested = FALSE;
     ctrl->setpoint_valid = FALSE;
-    ctrl->force_next_send = TRUE;
+    ctrl->force_next_send = FALSE;
 
     if (have_pos)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "freeze: hold at az=%.2f el=%.2f source=%s",
+                    "freeze: stop latched at az=%.2f el=%.2f source=%s",
                     freeze_az,
                     freeze_el,
                     fresh_pos ? "live" : "last_known");
         rot_term_log(ctrl, "gpredict:state",
-                     "freeze: hold at az=%.2f el=%.2f source=%s",
+                     "freeze: stop latched at az=%.2f el=%.2f source=%s",
                      freeze_az,
                      freeze_el,
                      fresh_pos ? "live" : "last_known");
@@ -12362,7 +12457,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 {
                     if (!ctrl->wrap_acquire_active)
                     {
-                        if (rotctrl_pick_wrap_candidate(desired_raw_az,
+                        if (rotctrl_pick_wrap_candidate(ctrl,
+                                                        desired_raw_az,
                                                         ref_backend,
                                                         backend_az_min,
                                                         backend_az_max,
@@ -13027,6 +13123,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         rotctrl_queue_draw_plots(ctrl);
     }
 
+    (void)cmd_rejected;
+    (void)have_last_cmd_phys;
     return TRUE;
 }
 /**
@@ -14288,7 +14386,7 @@ static gchar *rotctld_merge_config_timeout(const gchar *existing,
     return g_string_free(out, FALSE);
 }
 
-static gchar *rotctld_merge_config(const gchar *existing)
+static gchar *G_GNUC_UNUSED rotctld_merge_config(const gchar *existing)
 {
     return rotctld_merge_config_timeout(existing, 1200, FALSE);
 }
@@ -14438,7 +14536,7 @@ static gboolean rotctld_spawn_process(GtkRotCtrl *ctrl, gchar **argv)
     return TRUE;
 }
 
-static gboolean rotctld_should_autodetect(const rotor_conf_t *conf)
+static gboolean G_GNUC_UNUSED rotctld_should_autodetect(const rotor_conf_t *conf)
 {
     const gchar *env_device = g_getenv("GPREDICT_ROT_SERIAL");
     const gchar *env_cmd = g_getenv("GPREDICT_ROTCTLD_CMD");
@@ -14563,7 +14661,7 @@ static gboolean rotctld_autodetect_is_cu(const gchar *candidate)
     return ok;
 }
 
-static gchar *rotctld_autodetect_tty_equivalent(const gchar *candidate)
+static gchar *G_GNUC_UNUSED rotctld_autodetect_tty_equivalent(const gchar *candidate)
 {
 #ifdef __APPLE__
     gchar *base = NULL;
@@ -19097,7 +19195,7 @@ static GtkWidget *create_calibration_widgets(GtkRotCtrl *ctrl)
  *
  * Park at the configured station rest position (user space).
  */
-static void
+static void G_GNUC_UNUSED
 rot_park_zenith_cb(GtkButton *button, gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
@@ -19781,9 +19879,8 @@ static GtkWidget *create_plot_widget(GtkRotCtrl * ctrl)
     gtk_container_add(GTK_CONTAINER(overlay), ctrl->plot);
 
     detach_button = gtk_button_new_with_label(_("Detach"));
-    gtk_widget_set_halign(detach_button, GTK_ALIGN_START);
+    gtk_widget_set_halign(detach_button, GTK_ALIGN_END);
     gtk_widget_set_valign(detach_button, GTK_ALIGN_START);
-    gtk_widget_set_margin_start(detach_button, 6);
     gtk_widget_set_margin_top(detach_button, 6);
     gtk_widget_set_margin_end(detach_button, 6);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), detach_button);
@@ -20416,10 +20513,10 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 
     /* create contents */
     table = gtk_grid_new();
-    gtk_grid_set_column_homogeneous(GTK_GRID(table), TRUE);
+    gtk_grid_set_column_homogeneous(GTK_GRID(table), FALSE);
     gtk_grid_set_row_homogeneous(GTK_GRID(table), FALSE);
-    gtk_grid_set_row_spacing(GTK_GRID(table), 10);
-    gtk_grid_set_column_spacing(GTK_GRID(table), 10);
+    gtk_grid_set_row_spacing(GTK_GRID(table), ROTCTRL_PANEL_SPACING);
+    gtk_grid_set_column_spacing(GTK_GRID(table), ROTCTRL_PANEL_SPACING);
     gtk_container_set_border_width(GTK_CONTAINER(table), 0);
 
     az_frame = create_az_widgets(rot_ctrl);
@@ -20435,7 +20532,10 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     gtk_widget_set_hexpand(el_frame, TRUE);
     gtk_widget_set_hexpand(target_frame, TRUE);
     gtk_widget_set_hexpand(conf_frame, TRUE);
-    gtk_widget_set_hexpand(calib_frame, TRUE);
+    gtk_widget_set_hexpand(calib_frame, FALSE);
+    gtk_widget_set_halign(calib_frame, GTK_ALIGN_START);
+    gtk_widget_set_vexpand(calib_frame, TRUE);
+    gtk_widget_set_valign(calib_frame, GTK_ALIGN_FILL);
     gtk_widget_set_hexpand(preset_frame, TRUE);
     gtk_widget_set_hexpand(term_widget, TRUE);
     gtk_widget_set_hexpand(banner_widget, TRUE);
@@ -20444,7 +20544,7 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     gtk_widget_set_valign(preset_frame, GTK_ALIGN_START);
 
     az_el_row = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(az_el_row), 10);
+    gtk_grid_set_column_spacing(GTK_GRID(az_el_row), ROTCTRL_PANEL_SPACING);
     gtk_grid_set_column_homogeneous(GTK_GRID(az_el_row), TRUE);
     gtk_widget_set_hexpand(az_el_row, TRUE);
     gtk_widget_set_vexpand(az_el_row, FALSE);

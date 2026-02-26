@@ -47,7 +47,7 @@
  * Read the system clock and return the current Julian day.
  */
 gdouble
-get_current_daynum ()
+get_current_daynum(void)
 {
     struct tm utc;
     GDateTime *now;

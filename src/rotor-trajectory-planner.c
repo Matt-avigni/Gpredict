@@ -238,6 +238,8 @@ static gboolean build_for_strategy(const rot_plan_input_t *in,
         prev_el = el_cmd;
     }
 
+    (void)prev_az;
+    (void)prev_el;
     out->strategy = strategy;
     out->trackable_pct = (in->samples->len > 0)
                          ? (100.0 * trackable / (gdouble)in->samples->len)

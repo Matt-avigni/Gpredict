@@ -71,7 +71,7 @@ static GOptionEntry entries[] = {
      "Clean the transponder data in user's configuration directory", NULL},
     {"fullscreen", 0, 0, G_OPTION_ARG_NONE, &fullscreen,
      "Start gpredict in fullscreen mode.", NULL},
-    {NULL}
+    {NULL, 0, 0, 0, NULL, NULL, NULL}
 };
 
 const gchar    *dummy = N_("just to have a pot");
