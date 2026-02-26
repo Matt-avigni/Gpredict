@@ -63,6 +63,12 @@ typedef struct {
     GtkWidget *maxel;
     GtkWidget *minel_label;
     GtkWidget *maxel_label;
+    GtkWidget *el_overtravel_enable;
+    GtkWidget *el_overtravel_revealer;
+    GtkWidget *el_min_deg;
+    GtkWidget *el_max_deg;
+    GtkWidget *el_min_deg_label;
+    GtkWidget *el_max_deg_label;
     GtkWidget *axismode;
     GtkWidget *disable_pos_feedback;
     gboolean device_scan_in_progress;
@@ -81,7 +87,9 @@ typedef struct {
 } RotPrefDialogState;
 
 static void update_el_limits_sensitivity(RotPrefUi *ui);
+static void update_el_overtravel_visibility(RotPrefUi *ui, gboolean az_el);
 static void axismode_changed_cb(GtkComboBox *box, gpointer data);
+static void el_overtravel_toggled_cb(GtkToggleButton *button, gpointer data);
 static void name_changed(GtkWidget *widget, gpointer data);
 static gboolean rot_pref_form_is_valid(RotPrefUi *ui);
 static void rot_pref_update_ok_button(RotPrefUi *ui);
@@ -966,6 +974,16 @@ static void update_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), conf->maxaz);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), conf->minel);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), conf->maxel);
+    if (ui->el_overtravel_enable)
+        gtk_toggle_button_set_active(
+            GTK_TOGGLE_BUTTON(ui->el_overtravel_enable),
+            conf->el_overtravel_enable);
+    if (ui->el_min_deg)
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->el_min_deg),
+                                  conf->el_min_deg);
+    if (ui->el_max_deg)
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->el_max_deg),
+                                  conf->el_max_deg);
     rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), conf->axis_mode,
                               G_CALLBACK(axismode_changed_cb));
     update_el_limits_sensitivity(ui);
@@ -1007,6 +1025,13 @@ static void clear_widgets(RotPrefUi *ui)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minel), -5);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxel), 185);
+    if (ui->el_overtravel_enable)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->el_overtravel_enable),
+                                     FALSE);
+    if (ui->el_min_deg)
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->el_min_deg), 0.0);
+    if (ui->el_max_deg)
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->el_max_deg), 180.0);
     rot_pref_combo_set_active(GTK_COMBO_BOX(ui->axismode), ROT_AXIS_MODE_AZ_EL,
                               G_CALLBACK(axismode_changed_cb));
     update_el_limits_sensitivity(ui);
@@ -1112,6 +1137,34 @@ static void device_combo_changed_cb(GtkComboBox *box, gpointer data)
     rot_pref_update_device_ui_state(ui);
 }
 
+static void update_el_overtravel_visibility(RotPrefUi *ui, gboolean az_el)
+{
+    gboolean enabled = FALSE;
+
+    if (ui == NULL)
+        return;
+
+    if (ui->el_overtravel_enable)
+        enabled = gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(ui->el_overtravel_enable));
+
+    if (ui->el_overtravel_enable)
+        gtk_widget_set_sensitive(ui->el_overtravel_enable, az_el);
+
+    if (ui->el_overtravel_revealer)
+        gtk_revealer_set_reveal_child(GTK_REVEALER(ui->el_overtravel_revealer),
+                                      (enabled && az_el));
+
+    if (ui->el_min_deg)
+        gtk_widget_set_sensitive(ui->el_min_deg, enabled && az_el);
+    if (ui->el_max_deg)
+        gtk_widget_set_sensitive(ui->el_max_deg, enabled && az_el);
+    if (ui->el_min_deg_label)
+        gtk_widget_set_sensitive(ui->el_min_deg_label, enabled && az_el);
+    if (ui->el_max_deg_label)
+        gtk_widget_set_sensitive(ui->el_max_deg_label, enabled && az_el);
+}
+
 static void update_el_limits_sensitivity(RotPrefUi *ui)
 {
     gboolean az_el = TRUE;
@@ -1131,6 +1184,25 @@ static void update_el_limits_sensitivity(RotPrefUi *ui)
         gtk_widget_set_sensitive(ui->minel_label, az_el);
     if (ui->maxel_label)
         gtk_widget_set_sensitive(ui->maxel_label, az_el);
+
+    update_el_overtravel_visibility(ui, az_el);
+}
+
+static void el_overtravel_toggled_cb(GtkToggleButton *button, gpointer data)
+{
+    RotPrefUi *ui = data;
+    gboolean az_el = TRUE;
+
+    (void)button;
+
+    if (ui == NULL)
+        return;
+
+    if (ui->axismode)
+        az_el = (gtk_combo_box_get_active(GTK_COMBO_BOX(ui->axismode)) ==
+                 ROT_AXIS_MODE_AZ_EL);
+
+    update_el_overtravel_visibility(ui, az_el);
 }
 
 static void axismode_changed_cb(GtkComboBox *box, gpointer data)
@@ -1179,6 +1251,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     GtkWidget      *label;
     GtkWidget      *test_button;
     GtkWidget      *device_manual_row;
+    GtkWidget      *overtravel_grid;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -1458,9 +1531,55 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     g_signal_connect(ui->maxel, "value-changed",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
+    ui->el_overtravel_enable =
+        gtk_check_button_new_with_label(_("Enable elevation overtravel (advanced)"));
+    gtk_widget_set_tooltip_text(ui->el_overtravel_enable,
+                                _("Use a custom elevation clamp range for outgoing commands."));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->el_overtravel_enable), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->el_overtravel_enable, 0, 17, 4, 1);
+    g_signal_connect(ui->el_overtravel_enable, "toggled",
+                     G_CALLBACK(el_overtravel_toggled_cb), ui);
+    g_signal_connect(ui->el_overtravel_enable, "toggled",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+
+    overtravel_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(overtravel_grid), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(overtravel_grid), 5);
+
+    ui->el_min_deg_label = gtk_label_new(_(" Min elevation (deg)"));
+    g_object_set(ui->el_min_deg_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(overtravel_grid), ui->el_min_deg_label, 0, 0, 1, 1);
+
+    ui->el_min_deg = gtk_spin_button_new_with_range(-90, 450, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->el_min_deg), 0.0);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->el_min_deg), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->el_min_deg), FALSE);
+    gtk_grid_attach(GTK_GRID(overtravel_grid), ui->el_min_deg, 1, 0, 1, 1);
+    g_signal_connect(ui->el_min_deg, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+
+    ui->el_max_deg_label = gtk_label_new(_(" Max elevation (deg)"));
+    g_object_set(ui->el_max_deg_label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(overtravel_grid), ui->el_max_deg_label, 2, 0, 1, 1);
+
+    ui->el_max_deg = gtk_spin_button_new_with_range(-90, 450, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->el_max_deg), 180.0);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(ui->el_max_deg), TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(ui->el_max_deg), FALSE);
+    gtk_grid_attach(GTK_GRID(overtravel_grid), ui->el_max_deg, 3, 0, 1, 1);
+    g_signal_connect(ui->el_max_deg, "value-changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+
+    ui->el_overtravel_revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(ui->el_overtravel_revealer),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_container_add(GTK_CONTAINER(ui->el_overtravel_revealer), overtravel_grid);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(ui->el_overtravel_revealer), FALSE);
+    gtk_grid_attach(GTK_GRID(table), ui->el_overtravel_revealer, 0, 18, 4, 1);
+
     gtk_grid_attach(GTK_GRID(table),
                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
-                    0, 17, 4, 1);
+                    0, 19, 4, 1);
 
     ui->disable_pos_feedback =
         gtk_check_button_new_with_label(_("Disable position feedback checks (no encoder)"));
@@ -1468,7 +1587,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
                                 _("Allow sending commands even when no position feedback is available. "
                                   "Disables position discrepancy disconnect logic."));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback), FALSE);
-    gtk_grid_attach(GTK_GRID(table), ui->disable_pos_feedback, 0, 18, 4, 1);
+    gtk_grid_attach(GTK_GRID(table), ui->disable_pos_feedback, 0, 20, 4, 1);
     g_signal_connect(ui->disable_pos_feedback, "toggled",
                      G_CALLBACK(rot_pref_on_field_changed), ui);
 
@@ -1492,6 +1611,10 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
 /* Called when the user clicks the OK button */
 static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
 {
+    gboolean el_overtravel_enable = FALSE;
+    gdouble el_min_deg = 0.0;
+    gdouble el_max_deg = 180.0;
+
     if (ui == NULL || conf == NULL)
         return FALSE;
 
@@ -1573,6 +1696,26 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
     conf->maxaz = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->maxaz));
     conf->minel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->minel));
     conf->maxel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->maxel));
+
+    if (ui->el_overtravel_enable)
+        el_overtravel_enable = gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(ui->el_overtravel_enable));
+    if (ui->el_min_deg)
+        el_min_deg = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->el_min_deg));
+    if (ui->el_max_deg)
+        el_max_deg = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->el_max_deg));
+
+    if (el_overtravel_enable && !(el_min_deg < el_max_deg))
+    {
+        rot_pref_show_dialog(ui,
+                             GTK_MESSAGE_ERROR,
+                             _("Invalid elevation overtravel limits"),
+                             _("Min elevation (deg) must be less than Max elevation (deg)."));
+        return FALSE;
+    }
+    conf->el_overtravel_enable = el_overtravel_enable;
+    conf->el_min_deg = el_min_deg;
+    conf->el_max_deg = el_max_deg;
 
     /* az stop position */
 

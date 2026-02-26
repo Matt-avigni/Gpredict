@@ -57,6 +57,9 @@ typedef enum {
     ROT_LIST_COL_STALE_DEBOUNCE, /*!< Stale debounce count. */
     ROT_LIST_COL_ANGLE_EPSILON, /*!< Angle epsilon in degrees. */
     ROT_LIST_COL_ELEV_FLOOR,   /*!< Elevation floor in degrees. */
+    ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, /*!< Enable custom elevation overtravel clamp. */
+    ROT_LIST_COL_EL_MIN_DEG,   /*!< Overtravel minimum elevation in degrees. */
+    ROT_LIST_COL_EL_MAX_DEG,   /*!< Overtravel maximum elevation in degrees. */
     ROT_LIST_COL_HAMLIB_MODEL, /*!< Hamlib model ID. */
     ROT_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rotor_list_col_t;

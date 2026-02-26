@@ -151,11 +151,19 @@ rot_cmd_map_status_t rot_cmd_map(const rotor_conf_t *conf,
 
     gdouble az_min = 0.0;
     gdouble az_max = 360.0;
+    gdouble el_min = conf->minel;
+    gdouble el_max = conf->maxel;
     rot_cmd_get_abs_az_limits(conf, &az_min, &az_max);
+
+    if (conf->el_overtravel_enable && conf->el_min_deg < conf->el_max_deg)
+    {
+        el_min = conf->el_min_deg;
+        el_max = conf->el_max_deg;
+    }
 
     gdouble az_abs = rot_cmd_normalize_abs(conf, az);
     gdouble az_clamped_abs = rot_cmd_clamp_az_abs(az_abs, az_min, az_max);
-    gdouble el_clamped = CLAMP(el, conf->minel, conf->maxel);
+    gdouble el_clamped = CLAMP(el, el_min, el_max);
 
     out->mapped_az = rot_cmd_az_to_conf(conf, az_abs);
     out->mapped_el = el;

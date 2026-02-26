@@ -52,6 +52,9 @@
 #define KEY_MAXAZ       "MaxAz"
 #define KEY_MINEL       "MinEl"
 #define KEY_MAXEL       "MaxEl"
+#define KEY_EL_OVERTRAVEL_ENABLE "rotor.el_overtravel_enable"
+#define KEY_EL_MIN_DEG "rotor.el_min_deg"
+#define KEY_EL_MAX_DEG "rotor.el_max_deg"
 #define KEY_AZSTOPPOS   "AzStopPos"
 #define KEY_THLD        "Threshold"
 #define KEY_POLL_PERIOD_MS "PollPeriodMs"
@@ -100,6 +103,9 @@
 #define DEFAULT_DISABLE_POS_FEEDBACK FALSE
 #define DEFAULT_MIN_EL -5.0
 #define DEFAULT_MAX_EL 185.0
+#define DEFAULT_EL_OVERTRAVEL_ENABLE FALSE
+#define DEFAULT_EL_MIN_DEG 0.0
+#define DEFAULT_EL_MAX_DEG 180.0
 
 /* Hamlib rotator model IDs from hamlib/rotlist.h. */
 #define ROT_HAMLIB_MODEL_GS232B    ROT_MODEL_GS232B
@@ -634,6 +640,59 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
         conf->maxel = DEFAULT_MAX_EL;
     }
 
+    conf->el_overtravel_enable = DEFAULT_EL_OVERTRAVEL_ENABLE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_EL_OVERTRAVEL_ENABLE, NULL))
+    {
+        conf->el_overtravel_enable =
+            g_key_file_get_boolean(cfg, GROUP, KEY_EL_OVERTRAVEL_ENABLE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: rotor.el_overtravel_enable not defined for %s. Assuming false."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->el_overtravel_enable = DEFAULT_EL_OVERTRAVEL_ENABLE;
+        }
+    }
+
+    conf->el_min_deg = DEFAULT_EL_MIN_DEG;
+    if (g_key_file_has_key(cfg, GROUP, KEY_EL_MIN_DEG, NULL))
+    {
+        conf->el_min_deg = g_key_file_get_double(cfg, GROUP, KEY_EL_MIN_DEG, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: rotor.el_min_deg not defined for %s. Assuming %.0f\302\260."),
+                        __func__, conf->name, DEFAULT_EL_MIN_DEG);
+            g_clear_error(&error);
+            conf->el_min_deg = DEFAULT_EL_MIN_DEG;
+        }
+    }
+
+    conf->el_max_deg = DEFAULT_EL_MAX_DEG;
+    if (g_key_file_has_key(cfg, GROUP, KEY_EL_MAX_DEG, NULL))
+    {
+        conf->el_max_deg = g_key_file_get_double(cfg, GROUP, KEY_EL_MAX_DEG, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: rotor.el_max_deg not defined for %s. Assuming %.0f\302\260."),
+                        __func__, conf->name, DEFAULT_EL_MAX_DEG);
+            g_clear_error(&error);
+            conf->el_max_deg = DEFAULT_EL_MAX_DEG;
+        }
+    }
+
+    if (!(conf->el_min_deg < conf->el_max_deg))
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: Invalid elevation overtravel range for %s. Using defaults."),
+                    __func__, conf->name);
+        conf->el_overtravel_enable = DEFAULT_EL_OVERTRAVEL_ENABLE;
+        conf->el_min_deg = DEFAULT_EL_MIN_DEG;
+        conf->el_max_deg = DEFAULT_EL_MAX_DEG;
+    }
+
     conf->azstoppos = g_key_file_get_double(cfg, GROUP, KEY_AZSTOPPOS, &error);
     if (error != NULL)
     {
@@ -877,6 +936,10 @@ void rotor_conf_save(rotor_conf_t * conf)
     g_key_file_set_double(cfg, GROUP, KEY_MAXAZ, conf->maxaz);
     g_key_file_set_double(cfg, GROUP, KEY_MINEL, conf->minel);
     g_key_file_set_double(cfg, GROUP, KEY_MAXEL, conf->maxel);
+    g_key_file_set_boolean(cfg, GROUP, KEY_EL_OVERTRAVEL_ENABLE,
+                           conf->el_overtravel_enable);
+    g_key_file_set_double(cfg, GROUP, KEY_EL_MIN_DEG, conf->el_min_deg);
+    g_key_file_set_double(cfg, GROUP, KEY_EL_MAX_DEG, conf->el_max_deg);
     g_key_file_set_double(cfg, GROUP, KEY_AZSTOPPOS, conf->azstoppos);
     g_key_file_set_integer(cfg, GROUP, KEY_AXIS_MODE, conf->axis_mode);
     g_key_file_set_boolean(cfg, GROUP, KEY_USE_OFFSET, conf->use_offset);

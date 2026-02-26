@@ -71,6 +71,9 @@ typedef struct {
     gdouble         maxaz;      /*!< Upper azimuth limit */
     gdouble         minel;      /*!< Lower elevation limit */
     gdouble         maxel;      /*!< Upper elevation limit */
+    gboolean        el_overtravel_enable; /*!< Enable custom elevation clamp for command output */
+    gdouble         el_min_deg; /*!< Custom overtravel minimum elevation (degrees) */
+    gdouble         el_max_deg; /*!< Custom overtravel maximum elevation (degrees) */
     gdouble         azstoppos;  /*!< absolute position of rotation stops; normally = minaz */
     gdouble         threshold;  /*!< Angle difference that triggers new motion command */
     gint            rotor_poll_period_ms; /*!< Poll interval for rotctld get_position */

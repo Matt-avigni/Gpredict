@@ -140,8 +140,14 @@ int gp_hamlib_rot_set_azel(double az_sky, double el_sky, const rotor_conf_t *con
 
     // clamp elevation according to conf / caps
     double el_mech = el_sky;
-    if (el_mech < conf->minel) el_mech = conf->minel;
-    if (el_mech > conf->maxel) el_mech = conf->maxel;
+    double el_min = conf->minel;
+    double el_max = conf->maxel;
+    if (conf->el_overtravel_enable && conf->el_min_deg < conf->el_max_deg) {
+        el_min = conf->el_min_deg;
+        el_max = conf->el_max_deg;
+    }
+    if (el_mech < el_min) el_mech = el_min;
+    if (el_mech > el_max) el_mech = el_max;
 
     ret = rot_set_position(rot, az_mech, el_mech);
     if (ret != RIG_OK) {

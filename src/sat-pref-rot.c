@@ -76,6 +76,9 @@ static void rot_pref_store_set(GtkListStore *store,
                        ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf->rotor_stale_debounce_count,
                        ROT_LIST_COL_ANGLE_EPSILON, conf->rotor_angle_epsilon_deg,
                        ROT_LIST_COL_ELEV_FLOOR, conf->rotor_elev_floor_deg,
+                       ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, conf->el_overtravel_enable,
+                       ROT_LIST_COL_EL_MIN_DEG, conf->el_min_deg,
+                       ROT_LIST_COL_EL_MAX_DEG, conf->el_max_deg,
                        ROT_LIST_COL_HAMLIB_MODEL, conf->hamlib_model,
                        -1);
 }
@@ -143,6 +146,9 @@ static void add_cb(GtkWidget * button, gpointer data)
         .maxaz = 360,
         .minel = -5,
         .maxel = 185,
+        .el_overtravel_enable = FALSE,
+        .el_min_deg = 0.0,
+        .el_max_deg = 180.0,
         .aztype = ROT_AZ_TYPE_360,
         .azstoppos = 0,
         .axis_mode = ROT_AXIS_MODE_AZ_EL,
@@ -237,6 +243,9 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .maxaz = 360,
         .minel = -5,
         .maxel = 185,
+        .el_overtravel_enable = FALSE,
+        .el_min_deg = 0.0,
+        .el_max_deg = 180.0,
         .aztype = ROT_AZ_TYPE_360,
         .azstoppos = 0,
         .axis_mode = ROT_AXIS_MODE_AZ_EL,
@@ -274,6 +283,9 @@ static void edit_cb(GtkWidget * button, gpointer data)
                        ROT_LIST_COL_MAXAZ, &conf->maxaz,
                        ROT_LIST_COL_MINEL, &conf->minel,
                        ROT_LIST_COL_MAXEL, &conf->maxel,
+                       ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, &conf->el_overtravel_enable,
+                       ROT_LIST_COL_EL_MIN_DEG, &conf->el_min_deg,
+                       ROT_LIST_COL_EL_MAX_DEG, &conf->el_max_deg,
                        ROT_LIST_COL_AZTYPE, &conf->aztype,
                        ROT_LIST_COL_AZSTOPPOS, &conf->azstoppos,
                        ROT_LIST_COL_AXIS_MODE, &conf->axis_mode,
@@ -391,6 +403,9 @@ static GtkTreeModel *create_and_fill_model(void)
                                    G_TYPE_INT,          // Stale debounce
                                    G_TYPE_DOUBLE,       // Angle epsilon
                                    G_TYPE_DOUBLE,       // Elevation floor
+                                   G_TYPE_BOOLEAN,      // Elevation overtravel enable
+                                   G_TYPE_DOUBLE,       // Elevation overtravel min
+                                   G_TYPE_DOUBLE,       // Elevation overtravel max
                                    G_TYPE_INT           // Hamlib model
         );
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
@@ -428,6 +443,9 @@ static GtkTreeModel *create_and_fill_model(void)
                                        ROT_LIST_COL_MAXAZ, conf.maxaz,
                                        ROT_LIST_COL_MINEL, conf.minel,
                                        ROT_LIST_COL_MAXEL, conf.maxel,
+                                       ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, conf.el_overtravel_enable,
+                                       ROT_LIST_COL_EL_MIN_DEG, conf.el_min_deg,
+                                       ROT_LIST_COL_EL_MAX_DEG, conf.el_max_deg,
                                        ROT_LIST_COL_AZTYPE, conf.aztype,
                                        ROT_LIST_COL_AZSTOPPOS, conf.azstoppos,
                                        ROT_LIST_COL_AXIS_MODE, conf.axis_mode,
@@ -742,6 +760,9 @@ void sat_pref_rot_ok(void)
         .maxaz = 360,
         .minel = -5,
         .maxel = 185,
+        .el_overtravel_enable = FALSE,
+        .el_min_deg = 0.0,
+        .el_max_deg = 180.0,
         .aztype = ROT_AZ_TYPE_360,
         .azstoppos = 0,
         .axis_mode = ROT_AXIS_MODE_AZ_EL,
@@ -814,6 +835,10 @@ void sat_pref_rot_ok(void)
                                ROT_LIST_COL_MAXAZ, &conf.maxaz,
                                ROT_LIST_COL_MINEL, &conf.minel,
                                ROT_LIST_COL_MAXEL, &conf.maxel,
+                               ROT_LIST_COL_EL_OVERTRAVEL_ENABLE,
+                               &conf.el_overtravel_enable,
+                               ROT_LIST_COL_EL_MIN_DEG, &conf.el_min_deg,
+                               ROT_LIST_COL_EL_MAX_DEG, &conf.el_max_deg,
                                ROT_LIST_COL_AZTYPE, &conf.aztype,
                                ROT_LIST_COL_AZSTOPPOS, &conf.azstoppos,
                                ROT_LIST_COL_AXIS_MODE, &conf.axis_mode,
