@@ -13267,7 +13267,33 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (status_label)
         {
             const gchar *status_text = NULL;
+            const gdouble status_eps = rotctrl_angle_epsilon(ctrl);
             gboolean has_error = error || (ctrl->errcnt > 0);
+            gdouble status_target_az = az_abs_cmd;
+            gdouble status_target_el = cmdel;
+            gboolean status_moving = FALSE;
+
+            if (ctrl->setpoint_valid)
+            {
+                status_target_az = setpoint_backend_az;
+                status_target_el = setpoint_backend_el;
+            }
+
+            if (rotpos_valid)
+            {
+                gdouble status_az_err = backend_span_extended
+                                        ? fabs(status_target_az - ctrl->az_abs_cur)
+                                        : fabs(shortest_az_delta(status_target_az,
+                                                                 ctrl->az_abs_cur));
+                gdouble status_el_err = fabs(status_target_el - rotel_backend);
+
+                if (ctrl->conf &&
+                    ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+                    status_el_err = 0.0;
+
+                status_moving = (status_az_err > status_eps ||
+                                 status_el_err > status_eps);
+            }
 
             if (!ctrl->engaged)
                 status_text = _("DISENGAGED");
@@ -13285,10 +13311,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED)
                 status_text = _("MOVING");
-            else if (rotpos_valid &&
-                     (fabs(shortest_az_delta(az_abs_cmd, ctrl->az_abs_cur)) >
-                          rotctrl_angle_epsilon(ctrl) ||
-                      fabs(cmdel - rotel_backend) > rotctrl_angle_epsilon(ctrl)))
+            else if (status_moving)
                 status_text = _("MOVING");
             else if (ctrl->engaged &&
                      !ctrl->tracking &&
