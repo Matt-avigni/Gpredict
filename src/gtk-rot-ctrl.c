@@ -10878,27 +10878,45 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 target_az360 = az_pred;
                 target_el = el_pred;
 
-                if (ctrl->pretrack_aos_time > 0.0)
                 {
-                    gdouble aos_in = (ctrl->pretrack_aos_time - ctrl->t) * secday;
-                    if (aos_in < 0.0)
-                        aos_in = 0.0;
+                    gboolean pretrack_done = FALSE;
+                    const gchar *done_reason = NULL;
 
-                    if (now_us - ctrl->pretrack_wait_log_us >= ROT_PRETRACK_RECALC_US)
+                    /* Handover to normal tracking as soon as the live
+                     * satellite elevation is in-range. This prevents
+                     * PRETRACK from sticking when AOS time is unknown or
+                     * when hysteresis keeps below_horizon latched.
+                     */
+                    if (live_valid && live_el >= elev_floor)
                     {
-                        sat_log_log(SAT_LOG_LEVEL_INFO,
-                                    "pretrack waiting: now_el=%.2f next_aos_in=%.1f",
-                                    live_valid ? live_el : 0.0,
-                                    aos_in);
-                        ctrl->pretrack_wait_log_us = now_us;
+                        pretrack_done = TRUE;
+                        done_reason = "elev";
+                    }
+                    else if (ctrl->pretrack_aos_time > 0.0 &&
+                             ctrl->t >= ctrl->pretrack_aos_time)
+                    {
+                        pretrack_done = TRUE;
+                        done_reason = "aos";
                     }
 
-                    if (ctrl->t >= ctrl->pretrack_aos_time ||
-                        (live_valid &&
-                         live_el >= elev_floor + ROT_PRETRACK_HYSTERESIS_DEG))
+                    if (ctrl->pretrack_aos_time > 0.0)
                     {
-                        const gchar *done_reason =
-                            (ctrl->t >= ctrl->pretrack_aos_time) ? "aos" : "elev";
+                        gdouble aos_in = (ctrl->pretrack_aos_time - ctrl->t) * secday;
+                        if (aos_in < 0.0)
+                            aos_in = 0.0;
+
+                        if (now_us - ctrl->pretrack_wait_log_us >= ROT_PRETRACK_RECALC_US)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack waiting: now_el=%.2f next_aos_in=%.1f",
+                                        live_valid ? live_el : 0.0,
+                                        aos_in);
+                            ctrl->pretrack_wait_log_us = now_us;
+                        }
+                    }
+
+                    if (pretrack_done)
+                    {
                         pretrack_active = FALSE;
                         ctrl->pretrack_target_valid = FALSE;
                         ctrl->pretrack_aos_time = 0.0;
@@ -10909,7 +10927,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         below_horizon = FALSE;
                         sat_log_log(SAT_LOG_LEVEL_INFO,
                                     "pretrack complete: reason=%s now_el=%.2f",
-                                    done_reason,
+                                    done_reason ? done_reason : "handover",
                                     live_valid ? live_el : 0.0);
                     }
                 }
