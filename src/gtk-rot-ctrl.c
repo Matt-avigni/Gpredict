@@ -10490,6 +10490,7 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
 
     if (!have_pos)
     {
+        ctrl->manual_edit_until_us = 0;
         ctrl->manual_sync_pending = TRUE;
         ctrl->have_user_command = FALSE;
         ctrl->hold_position_on_engage = TRUE;
@@ -10509,7 +10510,8 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
 
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), freeze_az);
     gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), freeze_el);
-    ctrl->manual_edit_until_us = g_get_monotonic_time() + 1000000;
+    /* Freeze is not a manual move request; keep hold engaged after STOP. */
+    ctrl->manual_edit_until_us = 0;
     ctrl->manual_sync_pending = FALSE;
     ctrl->have_user_command = FALSE;
     ctrl->hold_position_on_engage = TRUE;
