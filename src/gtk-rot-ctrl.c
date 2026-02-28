@@ -19467,6 +19467,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     GtkWidget      *cycle_row;
     GtkWidget      *threshold_row;
     GtkWidget      *status_row;
+    GtkWidget      *engage_panel;
+    GtkWidget      *status_panel;
     GtkWidget      *status_box;
     GtkWidget      *status_led;
     GtkWidget      *logging_row;
@@ -19566,9 +19568,14 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
                      ctrl);
     gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
-    gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_FILL);
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->LockBut, 1, 0, 1, 1);
+    engage_panel = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(engage_panel), GTK_SHADOW_ETCHED_IN);
+    gtk_widget_set_halign(engage_panel, GTK_ALIGN_CENTER);
+    gtk_widget_set_size_request(engage_panel, 172, -1);
+    gtk_container_add(GTK_CONTAINER(engage_panel), ctrl->LockBut);
+    gtk_grid_attach(GTK_GRID(main_table), engage_panel, 1, 0, 1, 1);
 
     /* Monitor checkbox */
     ctrl->MonitorCheckBox = gtk_check_button_new_with_label(_("Monitor"));
@@ -19665,21 +19672,16 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(main_table), threshold_row, 0, 2, 1, 1);
 
     /* Status line */
-    status_row = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(status_row), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(status_row), 5);
+    status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(status_row, TRUE);
     gtk_widget_set_halign(status_row, GTK_ALIGN_CENTER);
 
-    label = gtk_label_new(_("Status:"));
-    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    gtk_grid_attach(GTK_GRID(status_row), label, 0, 0, 1, 1);
-
     status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(status_box, GTK_ALIGN_START);
-    /* Keep status text anchored where it was before adding the LED. */
-    gtk_widget_set_margin_start(status_box, -6);
+    gtk_widget_set_halign(status_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(status_box, 3);
+    gtk_widget_set_margin_bottom(status_box, 3);
+    gtk_widget_set_margin_start(status_box, 8);
+    gtk_widget_set_margin_end(status_box, 8);
 
     status_led = status_indicator_new();
     gtk_box_pack_start(GTK_BOX(status_box), status_led, FALSE, FALSE, 0);
@@ -19693,7 +19695,12 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_halign(status, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(status_box), status, FALSE, FALSE, 0);
 
-    gtk_grid_attach(GTK_GRID(status_row), status_box, 1, 0, 1, 1);
+    status_panel = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(status_panel), GTK_SHADOW_ETCHED_IN);
+    gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
+    gtk_widget_set_size_request(status_panel, 172, -1);
+    gtk_container_add(GTK_CONTAINER(status_panel), status_box);
+    gtk_box_pack_start(GTK_BOX(status_row), status_panel, FALSE, FALSE, 0);
     gtk_grid_attach(GTK_GRID(main_table), status_row, 1, 1, 1, 1);
 
     /* store pointer on the controller object for later updates */
