@@ -19435,6 +19435,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     GtkWidget      *monitor_row;
     GtkWidget      *status;
     GtkWidget      *verbose_check;
+    GtkSizeGroup   *left_label_group;
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */
     gchar          *dirname;    /* directory name */
@@ -19446,15 +19447,18 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_container_set_border_width(GTK_CONTAINER(main_table), 5);
     gtk_grid_set_column_spacing(GTK_GRID(main_table), 5);
     gtk_grid_set_row_spacing(GTK_GRID(main_table), 5);
+    left_label_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
 
     device_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(device_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(device_row), 5);
     gtk_widget_set_hexpand(device_row, TRUE);
+    gtk_widget_set_margin_end(device_row, ROTCTRL_PANEL_SPACING);
 
     label = gtk_label_new(_("Device:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_size_group_add_widget(left_label_group, label);
     gtk_grid_attach(GTK_GRID(device_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel = gtk_combo_box_text_new();
@@ -19555,10 +19559,12 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(cycle_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(cycle_row), 5);
     gtk_widget_set_hexpand(cycle_row, TRUE);
+    gtk_widget_set_margin_end(cycle_row, ROTCTRL_PANEL_SPACING);
 
     label = gtk_label_new(_("Cycle:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_size_group_add_widget(left_label_group, label);
     gtk_grid_attach(GTK_GRID(cycle_row), label, 0, 0, 1, 1);
 
     ctrl->cycle_spin = gtk_spin_button_new_with_range(100, 10000, 10);
@@ -19587,10 +19593,12 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(threshold_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(threshold_row), 5);
     gtk_widget_set_hexpand(threshold_row, TRUE);
+    gtk_widget_set_margin_end(threshold_row, ROTCTRL_PANEL_SPACING);
 
     label = gtk_label_new(_("Threshold:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_size_group_add_widget(left_label_group, label);
     gtk_grid_attach(GTK_GRID(threshold_row), label, 0, 0, 1, 1);
 
     ctrl->thld_spin = gtk_spin_button_new_with_range(0.01, 50.0, 0.01);
@@ -19630,7 +19638,6 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_halign(status_box, GTK_ALIGN_START);
-    gtk_widget_set_hexpand(status_box, TRUE);
 
     status_led_placeholder = gtk_label_new("");
     gtk_widget_set_size_request(status_led_placeholder, 10, 10);
@@ -19641,9 +19648,10 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
         gtk_label_new(rotor_ui_status_to_string(ROTOR_UI_STATUS_DISENGAGED));
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_label_set_ellipsize(GTK_LABEL(status), PANGO_ELLIPSIZE_END);
-    gtk_widget_set_hexpand(status, TRUE);
-    gtk_widget_set_halign(status, GTK_ALIGN_FILL);
-    gtk_box_pack_start(GTK_BOX(status_box), status, TRUE, TRUE, 0);
+    gtk_label_set_width_chars(GTK_LABEL(status), 12);
+    gtk_label_set_max_width_chars(GTK_LABEL(status), 20);
+    gtk_widget_set_halign(status, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(status_box), status, FALSE, FALSE, 0);
 
     gtk_grid_attach(GTK_GRID(status_row), status_box, 1, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(main_table), status_row, 1, 1, 1, 1);
@@ -19691,6 +19699,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(monitor_row), label, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(monitor_row), ctrl->MonitorCheckBox, 1, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(main_table), monitor_row, 2, 2, 1, 1);
+    g_object_unref(left_label_group);
 
     ctrl->settings_window = gtk_widget_get_toplevel(GTK_WIDGET(main_table));
 
@@ -21155,8 +21164,10 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 
     gtk_widget_set_hexpand(az_frame, TRUE);
     gtk_widget_set_hexpand(el_frame, TRUE);
-    gtk_widget_set_hexpand(target_frame, TRUE);
+    gtk_widget_set_hexpand(target_frame, FALSE);
+    gtk_widget_set_halign(target_frame, GTK_ALIGN_START);
     gtk_widget_set_hexpand(conf_frame, TRUE);
+    gtk_widget_set_halign(conf_frame, GTK_ALIGN_FILL);
     gtk_widget_set_hexpand(calib_frame, FALSE);
     gtk_widget_set_halign(calib_frame, GTK_ALIGN_START);
     gtk_widget_set_vexpand(calib_frame, TRUE);
