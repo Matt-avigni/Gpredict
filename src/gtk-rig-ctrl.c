@@ -4326,8 +4326,11 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
         gint list_min = 0;
         gint list_nat = 0;
         gint rows = 0;
+#ifndef __APPLE__
         gboolean needs_scroll = FALSE;
+#endif
         gint popup_width = -1;
+        gint popup_height = -1;
         guint open_seq = 0;
         guint configured_seq = 0;
 
@@ -4354,10 +4357,12 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
             if (list_nat <= 0 && list_min > 0)
                 list_nat = list_min;
             rows = rigctrl_trsp_tree_row_count(tree);
+#ifndef __APPLE__
             if (list_nat > 0)
                 needs_scroll = (list_nat > max_height);
             else
                 needs_scroll = (rows > RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD);
+#endif
         }
         if (GTK_IS_SCROLLED_WINDOW(scrolled))
         {
@@ -4381,6 +4386,29 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
             gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(scrolled),
                                                       FALSE);
 #endif
+#ifdef __APPLE__
+            if (rows > 0)
+            {
+                gint row_height = 24;
+                gint visible_rows = MIN(rows, 12);
+
+                if (list_nat > 0)
+                    row_height = list_nat / MAX(rows, 1);
+                else if (list_min > 0)
+                    row_height = list_min / MAX(rows, 1);
+
+                if (row_height < 18 || row_height > 64)
+                    row_height = 24;
+
+                popup_height = row_height * visible_rows + 2;
+                if (popup_height > max_height)
+                    popup_height = max_height;
+            }
+            if (popup_height > 0)
+                gtk_widget_set_size_request(scrolled, -1, popup_height);
+            else
+                gtk_widget_set_size_request(scrolled, -1, max_height);
+#else
             gtk_scrolled_window_set_propagate_natural_height(
                 GTK_SCROLLED_WINDOW(scrolled), !needs_scroll);
 #if GTK_CHECK_VERSION(3, 22, 0)
@@ -4391,7 +4419,14 @@ static gboolean rigctrl_configure_trsp_popup_idle(gpointer data)
                     GTK_SCROLLED_WINDOW(scrolled), popup_width);
 #endif
             gtk_widget_set_size_request(scrolled, -1, -1);
+#endif
         }
+#ifdef __APPLE__
+        if (popup_width > 0 || popup_height > 0)
+            gtk_widget_set_size_request(popup_widget,
+                                        popup_width > 0 ? popup_width : -1,
+                                        popup_height > 0 ? popup_height : -1);
+#endif
 
         if (GTK_IS_TREE_VIEW(tree))
         {
@@ -6437,6 +6472,7 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
 
 static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 {
+    const gint      action_panel_width = 240;
     GtkWidget      *frame, *table, *label;
     GtkWidget      *downlink_row, *uplink_row, *cycle_row;
     GtkWidget      *engage_panel, *status_panel;
@@ -6558,7 +6594,7 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
     engage_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(engage_panel, GTK_ALIGN_CENTER);
-    gtk_widget_set_size_request(engage_panel, 172, -1);
+    gtk_widget_set_size_request(engage_panel, action_panel_width, -1);
     gtk_box_pack_start(GTK_BOX(engage_panel), ctrl->LockBut, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(table), engage_panel, 1, 0, 1, 1);
 
@@ -6594,10 +6630,10 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), cycle_row, 0, 2, 1, 1);
 
     /* status */
-    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(status_box, GTK_ALIGN_CENTER);
-    gtk_widget_set_margin_top(status_box, 3);
-    gtk_widget_set_margin_bottom(status_box, 3);
+    gtk_widget_set_margin_top(status_box, 5);
+    gtk_widget_set_margin_bottom(status_box, 5);
     gtk_widget_set_margin_start(status_box, 8);
     gtk_widget_set_margin_end(status_box, 8);
     status_led = status_indicator_new();
@@ -6607,10 +6643,19 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     g_object_set(ctrl->status_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_label_set_ellipsize(GTK_LABEL(ctrl->status_label), PANGO_ELLIPSIZE_END);
     gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_START);
+    {
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs,
+                               pango_attr_scale_new(1.30));
+        pango_attr_list_insert(attrs,
+                               pango_attr_weight_new(PANGO_WEIGHT_MEDIUM));
+        gtk_label_set_attributes(GTK_LABEL(ctrl->status_label), attrs);
+        pango_attr_list_unref(attrs);
+    }
     gtk_box_pack_start(GTK_BOX(status_box), ctrl->status_label, FALSE, FALSE, 0);
     status_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
-    gtk_widget_set_size_request(status_panel, 172, -1);
+    gtk_widget_set_size_request(status_panel, action_panel_width, 42);
     gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(table), status_panel, 1, 1, 1, 1);
     g_object_set_data(G_OBJECT(ctrl), "rig-status-indicator", status_led);

@@ -19476,6 +19476,7 @@ static GtkWidget *create_aoslos_banner_widgets(GtkRotCtrl *ctrl)
 
 static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 {
+    const gint      action_panel_width = 240;
     GtkWidget      *frame, *main_table, *label;
     GtkWidget      *device_row;
     GtkWidget      *cycle_row;
@@ -19586,7 +19587,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
     engage_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(engage_panel, GTK_ALIGN_CENTER);
-    gtk_widget_set_size_request(engage_panel, 172, -1);
+    gtk_widget_set_size_request(engage_panel, action_panel_width, -1);
     gtk_box_pack_start(GTK_BOX(engage_panel), ctrl->LockBut, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(main_table), engage_panel, 1, 0, 1, 1);
     rotctrl_reset_lock_button_visual(ctrl);
@@ -19686,10 +19687,10 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(main_table), threshold_row, 0, 2, 1, 1);
 
     /* Status line */
-    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(status_box, GTK_ALIGN_CENTER);
-    gtk_widget_set_margin_top(status_box, 3);
-    gtk_widget_set_margin_bottom(status_box, 3);
+    gtk_widget_set_margin_top(status_box, 5);
+    gtk_widget_set_margin_bottom(status_box, 5);
     gtk_widget_set_margin_start(status_box, 8);
     gtk_widget_set_margin_end(status_box, 8);
 
@@ -19701,11 +19702,20 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_label_set_ellipsize(GTK_LABEL(status), PANGO_ELLIPSIZE_END);
     gtk_widget_set_halign(status, GTK_ALIGN_START);
+    {
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs,
+                               pango_attr_scale_new(1.30));
+        pango_attr_list_insert(attrs,
+                               pango_attr_weight_new(PANGO_WEIGHT_MEDIUM));
+        gtk_label_set_attributes(GTK_LABEL(status), attrs);
+        pango_attr_list_unref(attrs);
+    }
     gtk_box_pack_start(GTK_BOX(status_box), status, FALSE, FALSE, 0);
 
     status_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
-    gtk_widget_set_size_request(status_panel, 172, -1);
+    gtk_widget_set_size_request(status_panel, action_panel_width, 42);
     gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(main_table), status_panel, 1, 1, 1, 1);
 

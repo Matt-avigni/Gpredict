@@ -9,7 +9,7 @@
 
 #include "status_indicator.h"
 
-#define STATUS_INDICATOR_SIZE 14
+#define STATUS_INDICATOR_SIZE 18
 #define STATUS_INDICATOR_TICK_MS 50
 
 typedef struct {
