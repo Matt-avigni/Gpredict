@@ -19480,7 +19480,6 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     GtkWidget      *device_row;
     GtkWidget      *cycle_row;
     GtkWidget      *threshold_row;
-    GtkWidget      *status_row;
     GtkWidget      *engage_panel;
     GtkWidget      *status_panel;
     GtkWidget      *status_box;
@@ -19687,10 +19686,6 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(main_table), threshold_row, 0, 2, 1, 1);
 
     /* Status line */
-    status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_hexpand(status_row, TRUE);
-    gtk_widget_set_halign(status_row, GTK_ALIGN_CENTER);
-
     status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_halign(status_box, GTK_ALIGN_CENTER);
     gtk_widget_set_margin_top(status_box, 3);
@@ -19714,8 +19709,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
     gtk_widget_set_size_request(status_panel, 172, -1);
     gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(status_row), status_panel, FALSE, FALSE, 0);
-    gtk_grid_attach(GTK_GRID(main_table), status_row, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), status_panel, 1, 1, 1, 1);
 
     /* store pointer on the controller object for later updates */
     g_object_set_data(G_OBJECT(ctrl), "rot-status-indicator", status_led);
