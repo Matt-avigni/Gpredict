@@ -16,6 +16,7 @@
 #include "predict-tools.h"
 #include "radio-conf.h"
 #include "payload-profile.h"
+#include "ui-status.h"
 #include "sgpsdp/sgp4sdp4.h"
 #include "trsp-conf.h"
 
@@ -232,6 +233,11 @@ struct _gtk_rig_ctrl {
     gchar          *secondary_rig_id;   /*!< Selected secondary rig ID */
     GtkWidget      *status_label;       /*!< Command/status indicator */
     gboolean        cmd_error;          /*!< Last command status */
+    RadioUiStatus   ui_status;          /*!< Operator-facing status */
+    gboolean        ui_hard_error;      /*!< Latched startup/configuration failure */
+    gchar           ui_hard_error_reason[128];
+    gchar           ui_status_detail[160];
+    RigUiCommandWindow ui_cmd_window;   /*!< Last command outcomes */
 };
 
 struct _GtkRigCtrlClass {

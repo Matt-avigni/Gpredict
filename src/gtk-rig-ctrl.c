@@ -88,6 +88,7 @@ typedef int socklen_t;
 #include "sat-pref-rig-editor.h"
 #include "trsp-conf.h"
 #include "ui-popup-quarantine.h"
+#include "ui-status.h"
 
 #ifndef G_SUBPROCESS_FLAGS_STDIN_DEV_NULL
 #ifdef G_SUBPROCESS_FLAGS_STDIN_INHERIT
@@ -413,6 +414,10 @@ static const gchar *rig_strategy_name(rig_strategy_t strategy)
     }
 }
 
+static void rigctrl_clear_ui_hard_error(GtkRigCtrl *ctrl);
+static void rigctrl_queue_ui_status_refresh(GtkRigCtrl *ctrl,
+                                            const gchar *reason);
+
 static void rig_session_set_state(GtkRigCtrl *ctrl, RigSession *session,
                                   rig_session_state_t state,
                                   const gchar *reason_fmt, ...)
@@ -450,6 +455,12 @@ static void rig_session_set_state(GtkRigCtrl *ctrl, RigSession *session,
     session->state = state;
     g_free(session->state_reason);
     session->state_reason = reason;
+
+    if (state == RIG_SESSION_READY)
+        rigctrl_clear_ui_hard_error(ctrl);
+    if (ctrl != NULL)
+        rigctrl_queue_ui_status_refresh(ctrl,
+                                        reason ? reason : "session state");
 }
 
 static void rig_session_apply_caps(RigSession *session, const RigCaps *caps)
@@ -780,8 +791,11 @@ static void     rig_error_dialog_response(GtkDialog *dialog, gint response_id,
 static void     rigctrl_show_log(GtkRigCtrl *ctrl);
 static void     rigctrl_schedule_status(GtkRigCtrl *ctrl,
                                         const gchar *text,
-                                        gboolean is_error);
+                                        gboolean is_error,
+                                        RigUiCommandOutcome outcome);
 static gboolean rigctrl_on_main_thread(const GtkRigCtrl *ctrl);
+static void     rigctrl_queue_ui_status_refresh(GtkRigCtrl *ctrl,
+                                                const gchar *reason);
 static const gchar *rigctrl_conn_state_name(rigctrl_conn_state_t state);
 static void     rigctrl_set_conn_state(GtkRigCtrl *ctrl,
                                        gboolean secondary,
@@ -855,7 +869,7 @@ static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
 static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                                            const gchar *role);
 static void     rigctrl_reset_error_gates(GtkRigCtrl *ctrl);
-static void     rigctrl_fail_engage(GtkRigCtrl *ctrl);
+static void     rigctrl_fail_engage(GtkRigCtrl *ctrl, const gchar *reason);
 static void     rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl);
 static gboolean rigctrl_resize_idle(gpointer data);
 static void     rigctrl_schedule_resize(GtkRigCtrl *ctrl);
@@ -2071,6 +2085,7 @@ typedef struct {
     GtkRigCtrl *ctrl;
     gchar      *text;
     gboolean    is_error;
+    RigUiCommandOutcome outcome;
 } RigStatusInfo;
 
 typedef struct {
@@ -2078,22 +2093,217 @@ typedef struct {
     gboolean secondary;
 } RigctrlCloseSocketInfo;
 
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *reason;
+} RigUiStatusRefreshInfo;
+
+static gboolean rig_session_state_is_engaging(const RigSession *session)
+{
+    if (session == NULL)
+        return FALSE;
+
+    switch (session->state)
+    {
+    case RIG_SESSION_STARTING_RIGCTLD:
+    case RIG_SESSION_CONNECTING:
+    case RIG_SESSION_PROBING:
+    case RIG_SESSION_CONFIGURING:
+    case RIG_SESSION_RECONNECTING:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static gboolean rig_session_state_is_degraded(const RigSession *session)
+{
+    if (session == NULL)
+        return FALSE;
+
+    return (session->state == RIG_SESSION_DEGRADED);
+}
+
+static void rigctrl_set_status_detail(GtkRigCtrl *ctrl, const gchar *detail)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (detail == NULL || *detail == '\0')
+    {
+        ctrl->ui_status_detail[0] = '\0';
+        return;
+    }
+
+    g_strlcpy(ctrl->ui_status_detail, detail, sizeof(ctrl->ui_status_detail));
+}
+
+static void rigctrl_set_ui_hard_error(GtkRigCtrl *ctrl, const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->ui_hard_error = TRUE;
+    if (reason == NULL || *reason == '\0')
+        ctrl->ui_hard_error_reason[0] = '\0';
+    else
+        g_strlcpy(ctrl->ui_hard_error_reason, reason,
+                  sizeof(ctrl->ui_hard_error_reason));
+}
+
+static void rigctrl_clear_ui_hard_error(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->ui_hard_error = FALSE;
+    ctrl->ui_hard_error_reason[0] = '\0';
+}
+
+static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
+{
+    RigUiCommandWindowStats stats = { 0 };
+    RigStateSnapshot snap = { 0 };
+    RadioUiStatus new_status;
+    gboolean needs_secondary = FALSE;
+    gboolean primary_disconnected;
+    gboolean secondary_disconnected = FALSE;
+    const gchar *detail = NULL;
+    gint64 now_us = g_get_monotonic_time();
+    const gchar *why = (reason != NULL) ? reason : "update";
+
+    if (ctrl == NULL)
+        return;
+
+    rig_ui_command_window_get_stats(&ctrl->ui_cmd_window,
+                                    now_us,
+                                    RIG_UI_ACTIVE_WINDOW_MS,
+                                    &stats);
+
+    needs_secondary = (ctrl->conf2 != NULL);
+    primary_disconnected = (ctrl->conn_state == RIGCTRL_CONN_DISCONNECTED ||
+                            ctrl->conn_state == RIGCTRL_CONN_DISCONNECTING);
+    if (needs_secondary)
+    {
+        secondary_disconnected =
+            (ctrl->conn_state2 == RIGCTRL_CONN_DISCONNECTED ||
+             ctrl->conn_state2 == RIGCTRL_CONN_DISCONNECTING);
+    }
+
+    snap.control_active = (ctrl->engaged || ctrl->engage_pending || ctrl->ui_hard_error);
+    snap.engaging = (ctrl->engage_pending ||
+                     ctrl->opening ||
+                     ctrl->opening2 ||
+                     ctrl->conn_state == RIGCTRL_CONN_CONNECTING ||
+                     (needs_secondary &&
+                      ctrl->conn_state2 == RIGCTRL_CONN_CONNECTING) ||
+                     rig_session_state_is_engaging(ctrl->rig_session) ||
+                     rig_session_state_is_engaging(ctrl->rig_session2));
+    snap.hard_error = ctrl->ui_hard_error;
+    snap.link_lost = (snap.control_active &&
+                      !snap.engaging &&
+                      !snap.hard_error &&
+                      (primary_disconnected || secondary_disconnected));
+    snap.degraded = (snap.control_active &&
+                     (ctrl->verify_degraded_down ||
+                      ctrl->verify_degraded_up ||
+                      rig_session_state_is_degraded(ctrl->rig_session) ||
+                      rig_session_state_is_degraded(ctrl->rig_session2)));
+    snap.active_flow = stats.active;
+    snap.consecutive_link_failures = stats.consecutive_link_failures;
+    snap.link_fail_count_in_window = stats.link_fail_count;
+    snap.total_fail_count_in_window = stats.total_fail_count;
+    snap.ok_count_in_window = stats.ok_count;
+
+    new_status = radio_compute_ui_status(&snap);
+
+    if (new_status != ctrl->ui_status)
+    {
+        if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "rig ui status: %s -> %s (reason=%s, window: ok=%u reject=%u linkfail=%u consec_linkfail=%u active=%d)",
+                         radio_ui_status_to_string(ctrl->ui_status),
+                         radio_ui_status_to_string(new_status),
+                         why,
+                         stats.ok_count,
+                         stats.reject_count,
+                         stats.link_fail_count,
+                         stats.consecutive_link_failures,
+                         stats.active ? 1 : 0);
+        }
+        ctrl->ui_status = new_status;
+    }
+
+    if (ctrl->status_label != NULL)
+    {
+        gtk_label_set_text(GTK_LABEL(ctrl->status_label),
+                           radio_ui_status_to_string(ctrl->ui_status));
+
+        if (ctrl->ui_hard_error && ctrl->ui_hard_error_reason[0] != '\0')
+            detail = ctrl->ui_hard_error_reason;
+        else if (ctrl->ui_status_detail[0] != '\0')
+            detail = ctrl->ui_status_detail;
+
+        gtk_widget_set_tooltip_text(ctrl->status_label, detail);
+    }
+}
+
+static gboolean rigctrl_refresh_ui_status_idle(gpointer data)
+{
+    RigUiStatusRefreshInfo *info = data;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    rigctrl_refresh_ui_status(info->ctrl, info->reason);
+    if (info->ctrl != NULL)
+        g_object_unref(info->ctrl);
+    g_free(info->reason);
+    g_free(info);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_queue_ui_status_refresh(GtkRigCtrl *ctrl,
+                                            const gchar *reason)
+{
+    RigUiStatusRefreshInfo *info;
+
+    if (ctrl == NULL)
+        return;
+
+    if (rigctrl_on_main_thread(ctrl))
+    {
+        rigctrl_refresh_ui_status(ctrl, reason);
+        return;
+    }
+
+    info = g_new0(RigUiStatusRefreshInfo, 1);
+    info->ctrl = g_object_ref(ctrl);
+    info->reason = g_strdup(reason);
+    g_idle_add(rigctrl_refresh_ui_status_idle, info);
+}
+
 static gboolean rig_status_idle(gpointer data)
 {
     RigStatusInfo *info = data;
     GtkRigCtrl *ctrl;
-    const gchar *label_text;
+    gint64 now_us;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
     ctrl = info->ctrl;
-    if (ctrl != NULL && ctrl->status_label != NULL)
+    if (ctrl != NULL)
     {
-        label_text = info->text ? info->text :
-            (info->is_error ? _("Error") : _("OK"));
-        gtk_label_set_text(GTK_LABEL(ctrl->status_label), label_text);
         ctrl->cmd_error = info->is_error;
+        if (info->is_error)
+            rigctrl_set_status_detail(ctrl, info->text);
+        else
+            rigctrl_set_status_detail(ctrl, NULL);
+        now_us = g_get_monotonic_time();
+        rig_ui_command_window_record(&ctrl->ui_cmd_window, info->outcome, now_us);
+        rigctrl_refresh_ui_status(ctrl, "command outcome");
     }
 
     g_free(info->text);
@@ -2103,20 +2313,19 @@ static gboolean rig_status_idle(gpointer data)
 
 static void rigctrl_schedule_status(GtkRigCtrl *ctrl,
                                     const gchar *text,
-                                    gboolean is_error)
+                                    gboolean is_error,
+                                    RigUiCommandOutcome outcome)
 {
     RigStatusInfo *info;
 
-    if (ctrl == NULL || ctrl->status_label == NULL)
-        return;
-
-    if (!is_error && !ctrl->cmd_error)
+    if (ctrl == NULL)
         return;
 
     info = g_new0(RigStatusInfo, 1);
     info->ctrl = ctrl;
     info->text = g_strdup(text);
     info->is_error = is_error;
+    info->outcome = outcome;
     g_idle_add(rig_status_idle, info);
 }
 
@@ -2240,6 +2449,8 @@ static void rigctrl_set_conn_state(GtkRigCtrl *ctrl,
         rigctrl_update_freq_display(ctrl);
     else
         g_idle_add(rigctrl_update_freq_display_idle, ctrl);
+
+    rigctrl_queue_ui_status_refresh(ctrl, reason);
 }
 
 static void G_GNUC_UNUSED rig_show_conn_error(GtkRigCtrl *ctrl,
@@ -2643,6 +2854,11 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->secondary_rig_id = NULL;
     ctrl->status_label = NULL;
     ctrl->cmd_error = FALSE;
+    ctrl->ui_status = RADIO_UI_STATUS_DISENGAGED;
+    ctrl->ui_hard_error = FALSE;
+    ctrl->ui_hard_error_reason[0] = '\0';
+    ctrl->ui_status_detail[0] = '\0';
+    rig_ui_command_window_init(&ctrl->ui_cmd_window);
     g_mutex_init(&(ctrl->busy));
     g_mutex_init(&ctrl->freq_cache_lock);
     ctrl->engaged = FALSE;
@@ -4567,6 +4783,7 @@ void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
     }
 
     rigctrl_update_freq_display(ctrl);
+    rigctrl_refresh_ui_status(ctrl, "module update");
 
     g_mutex_unlock(&ctrl->rig_ctrl_updatelock);
 }
@@ -5584,6 +5801,12 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         ctrl->engage_pending = FALSE;
         rigctrl_cancel_open_task(ctrl);
         rigctrl_reset_doppler_smoothing(ctrl);
+        if (!ctrl->ui_hard_error)
+        {
+            rigctrl_clear_ui_hard_error(ctrl);
+            rigctrl_set_status_detail(ctrl, NULL);
+            rig_ui_command_window_init(&ctrl->ui_cmd_window);
+        }
         rig_term_log(ctrl, "gpredict", "disengage");
 
         /* Notify worker thread about the new configuration/state */
@@ -5607,6 +5830,9 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
 
         /* User-initiated engage: clear error gating for a fresh attempt. */
         rigctrl_reset_error_gates(ctrl);
+        rigctrl_clear_ui_hard_error(ctrl);
+        rigctrl_set_status_detail(ctrl, NULL);
+        rig_ui_command_window_init(&ctrl->ui_cmd_window);
         ctrl->engage_pending = TRUE;
 
         if (ctrl->conf == NULL)
@@ -5620,20 +5846,20 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
                 _("No radio configuration is selected. See log for details."));
             rig_term_log(ctrl, "gpredict:err",
                          "no radio config selected; open Interfaces -> Radios");
-            rigctrl_fail_engage(ctrl);
+            rigctrl_fail_engage(ctrl, "no radio configuration selected");
             return;
         }
 
         if (!rigctrl_validate_mode(ctrl, ctrl->conf, _("receiver")))
         {
-            rigctrl_fail_engage(ctrl);
+            rigctrl_fail_engage(ctrl, "receiver mode validation failed");
             return;
         }
 
         if (ctrl->conf2 != NULL &&
             !rigctrl_validate_mode(ctrl, ctrl->conf2, _("uplink")))
         {
-            rigctrl_fail_engage(ctrl);
+            rigctrl_fail_engage(ctrl, "uplink mode validation failed");
             return;
         }
 
@@ -5663,6 +5889,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     ctrl->conf2 = NULL;
 
     rigctrl_update_freq_display(ctrl);
+    rigctrl_queue_ui_status_refresh(ctrl, "engage toggled");
 }
 
 static void rigctrl_combo_set_ellipsize(GtkComboBox *combo)
@@ -6296,11 +6523,12 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
 
-    ctrl->status_label = gtk_label_new(_("OK"));
+    ctrl->status_label = gtk_label_new("DISENGAGED");
     g_object_set(ctrl->status_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_hexpand(ctrl->status_label, TRUE);
     gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), ctrl->status_label, 1, 4, 2, 1);
+    rigctrl_refresh_ui_status(ctrl, "widget init");
 
     frame = gtk_frame_new(_("Settings"));
     gtk_widget_set_hexpand(frame, TRUE);
@@ -6431,7 +6659,8 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                          trim_cmd ? trim_cmd : "(null)");
             rigctrl_schedule_status(ctrl,
                                     _("Rig control timeout (rigctld did not reply)"),
-                                    TRUE);
+                                    TRUE,
+                                    RIG_UI_CMD_LINK_FAIL);
         }
         else
         {
@@ -6439,7 +6668,10 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                          "rigctld request failed (%s) cmd=%s",
                          strerror(err),
                          trim_cmd ? trim_cmd : "(null)");
-            rigctrl_schedule_status(ctrl, _("Command failed"), TRUE);
+            rigctrl_schedule_status(ctrl,
+                                    _("Command failed"),
+                                    TRUE,
+                                    RIG_UI_CMD_LINK_FAIL);
         }
 
         g_free(trim_cmd);
@@ -6457,7 +6689,10 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
                      "rigctld closed connection cmd=%s",
                      trim_cmd ? g_strchomp(trim_cmd) : "(null)");
         g_free(trim_cmd);
-        rigctrl_schedule_status(ctrl, _("Rigctld closed connection"), TRUE);
+        rigctrl_schedule_status(ctrl,
+                                _("Rigctld closed connection"),
+                                TRUE,
+                                RIG_UI_CMD_LINK_FAIL);
         rigctrl_handle_socket_error(ctrl, sock, "recv");
         rigctld_io_lock_release();
         return FALSE;
@@ -6508,14 +6743,20 @@ static gboolean _send_rigctld_command(GtkRigCtrl * ctrl, gint sock,
 
         g_snprintf(status_msg, sizeof(status_msg),
                    _("Command rejected (RPRT %d)"), rprt);
-        rigctrl_schedule_status(ctrl, status_msg, TRUE);
+        rigctrl_schedule_status(ctrl,
+                                status_msg,
+                                TRUE,
+                                RIG_UI_CMD_COMMAND_REJECT);
 
         g_free(trim_cmd);
         g_free(trim_reply);
     }
 
-    if (saw_rprt && !rprt_error)
-        rigctrl_schedule_status(ctrl, _("OK"), FALSE);
+    if (!rprt_error)
+        rigctrl_schedule_status(ctrl,
+                                saw_rprt ? _("OK") : NULL,
+                                FALSE,
+                                RIG_UI_CMD_OK);
 
     rigctld_io_lock_release();
     return ok && !rprt_error;
@@ -12280,14 +12521,19 @@ static void schedule_rig_disengage(GtkRigCtrl *ctrl)
     g_idle_add(rig_disengage_idle, ctrl);
 }
 
-static void rigctrl_fail_engage(GtkRigCtrl *ctrl)
+static void rigctrl_fail_engage(GtkRigCtrl *ctrl, const gchar *reason)
 {
+    const gchar *detail = (reason != NULL) ? reason : "rig engage failed";
+
     if (ctrl == NULL || !ctrl->engage_pending)
         return;
 
     ctrl->engage_pending = FALSE;
     ctrl->engaged = FALSE;
+    rigctrl_set_ui_hard_error(ctrl, detail);
+    rigctrl_set_status_detail(ctrl, detail);
     schedule_rig_disengage(ctrl);
+    rigctrl_queue_ui_status_refresh(ctrl, detail);
 }
 
 static void rigctrl_cancel_open_task(GtkRigCtrl *ctrl)
@@ -12620,10 +12866,13 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s: missing primary rig configuration"), __func__);
+        rigctrl_set_ui_hard_error(ctrl, "missing primary rig configuration");
+        rigctrl_set_status_detail(ctrl, "missing primary rig configuration");
         rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                "missing config");
         ctrl->opening = FALSE;
         ctrl->opening2 = FALSE;
+        rigctrl_queue_ui_status_refresh(ctrl, "missing primary rig configuration");
         return FALSE;
     }
 
@@ -12680,7 +12929,7 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                     schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
                     ctrl->rx_conn_error_reported = TRUE;
                 }
-                rigctrl_fail_engage(ctrl);
+                rigctrl_fail_engage(ctrl, "receiver open/probe failed");
                 rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                        "open failed");
                 ctrl->opening = FALSE;
@@ -12720,7 +12969,7 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                     schedule_rig_conn_error(ctrl, ctrl->conf, _("receiver"));
                     ctrl->rx_conn_error_reported = TRUE;
                 }
-                rigctrl_fail_engage(ctrl);
+                rigctrl_fail_engage(ctrl, "receiver session probe failed");
                 rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                        "open failed");
                 ctrl->opening = FALSE;
@@ -12824,7 +13073,7 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
 
     if (ctrl->sock < 0)
     {
-        rigctrl_fail_engage(ctrl);
+        rigctrl_fail_engage(ctrl, "uplink open/probe failed");
         rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                "open failed");
         ctrl->opening = FALSE;
@@ -12949,6 +13198,9 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                      vfo_name(tx_vfo));
     }
 
+    rigctrl_clear_ui_hard_error(ctrl);
+    rigctrl_set_status_detail(ctrl, NULL);
+    rigctrl_queue_ui_status_refresh(ctrl, "open complete");
     return TRUE;
 }
 

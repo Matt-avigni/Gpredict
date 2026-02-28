@@ -30,6 +30,7 @@ gpredict_SOURCES = \
     rot-angle.c rot-angle.h \
     rot_math.c rot_math.h \
     ui-popup-quarantine.c ui-popup-quarantine.h \
+    ui-status.c ui-status.h \
     rotor_calibration.c rotor_calibration.h \
     tle-autoupdate.c tle-autoupdate.h \
 	nxjson/nxjson.c nxjson/nxjson.h \
@@ -155,11 +156,11 @@ gpredict_LDADD = @PACKAGE_LIBS@
 check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
     azel-mapping-test safety-window-test hamlib-mock-test \
-    payload-profile-test
+    payload-profile-test ui-status-test
 TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
     azel-mapping-test safety-window-test hamlib-mock-test \
-    payload-profile-test
+    payload-profile-test ui-status-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -216,3 +217,9 @@ payload_profile_test_SOURCES = \
     payload-profile.c \
     payload-profile.h
 payload_profile_test_LDADD = @PACKAGE_LIBS@
+
+ui_status_test_SOURCES = \
+    ui-status-test.c \
+    ui-status.c \
+    ui-status.h
+ui_status_test_LDADD = @PACKAGE_LIBS@

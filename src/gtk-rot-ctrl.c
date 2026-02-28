@@ -93,6 +93,7 @@
 #include "tracking_policy.h"
 #include "safety_window.h"
 #include "ui-popup-quarantine.h"
+#include "ui-status.h"
 #include "rotctld_mgr.h"
 #include "rotctld-parse.h"
 #include "rotctld_client.h"
@@ -512,6 +513,10 @@ struct _GtkRotCtrl {
     gboolean        hold_position_log_emitted;
     gboolean        have_user_command;
     rot_comm_status_t comm_status;
+    RotorUiStatus   ui_status;
+    gboolean        ui_hard_error;
+    gchar           ui_hard_error_reason[128];
+    gchar           ui_status_detail[160];
     guint           ok_streak;
     guint           bad_streak;
     guint           timeout_streak;
@@ -764,6 +769,14 @@ static void     rotctrl_set_target_pos_on_plots(GtkRotCtrl *ctrl,
 static void     rotctrl_set_ctrl_pos_on_plots(GtkRotCtrl *ctrl,
                                               gdouble az, gdouble el);
 static void     rotctrl_queue_draw_plots(GtkRotCtrl *ctrl);
+static void     rotctrl_set_ui_hard_error(GtkRotCtrl *ctrl,
+                                          const gchar *reason);
+static void     rotctrl_clear_ui_hard_error(GtkRotCtrl *ctrl);
+static void     rotctrl_set_ui_status_detail(GtkRotCtrl *ctrl,
+                                             const gchar *detail);
+static void     rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
+                                        const RotorStateSnapshot *snap,
+                                        const gchar *reason);
 static gboolean rotctrl_target_display_valid(const sat_t *sat);
 static void     rotctrl_update_detached_labels(GtkRotCtrl *ctrl);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
@@ -2018,6 +2031,84 @@ static void rot_term_log_rx(GtkRotCtrl *ctrl, const gchar *cmd,
     g_free(trim_reply);
 }
 
+static void rotctrl_set_ui_status_detail(GtkRotCtrl *ctrl, const gchar *detail)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (detail == NULL || *detail == '\0')
+    {
+        ctrl->ui_status_detail[0] = '\0';
+        return;
+    }
+
+    g_strlcpy(ctrl->ui_status_detail, detail, sizeof(ctrl->ui_status_detail));
+}
+
+static void rotctrl_set_ui_hard_error(GtkRotCtrl *ctrl, const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->ui_hard_error = TRUE;
+    if (reason == NULL || *reason == '\0')
+        ctrl->ui_hard_error_reason[0] = '\0';
+    else
+        g_strlcpy(ctrl->ui_hard_error_reason, reason,
+                  sizeof(ctrl->ui_hard_error_reason));
+}
+
+static void rotctrl_clear_ui_hard_error(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->ui_hard_error = FALSE;
+    ctrl->ui_hard_error_reason[0] = '\0';
+}
+
+static void rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
+                                    const RotorStateSnapshot *snap,
+                                    const gchar *reason)
+{
+    RotorUiStatus next;
+    const gchar *detail = NULL;
+    const gchar *why = (reason != NULL) ? reason : "update";
+    GtkWidget *status_label;
+
+    if (ctrl == NULL || snap == NULL)
+        return;
+
+    next = rotor_compute_ui_status(snap);
+
+    if (next != ctrl->ui_status)
+    {
+        if (ctrl->verbose_logging)
+        {
+            rot_term_log(ctrl, "gpredict:state",
+                         "rotor ui status: %s -> %s (reason=%s)",
+                         rotor_ui_status_to_string(ctrl->ui_status),
+                         rotor_ui_status_to_string(next),
+                         why);
+        }
+        ctrl->ui_status = next;
+    }
+
+    status_label = g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
+    if (status_label == NULL)
+        return;
+
+    gtk_label_set_text(GTK_LABEL(status_label),
+                       rotor_ui_status_to_string(ctrl->ui_status));
+
+    if (ctrl->ui_hard_error && ctrl->ui_hard_error_reason[0] != '\0')
+        detail = ctrl->ui_hard_error_reason;
+    else if (ctrl->ui_status_detail[0] != '\0')
+        detail = ctrl->ui_status_detail;
+
+    gtk_widget_set_tooltip_text(status_label, detail);
+}
+
 static const gchar *rot_session_state_name(rot_session_state_t state)
 {
     switch (state)
@@ -2414,6 +2505,8 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
         }
     }
 
+    rotctrl_clear_ui_hard_error(ctrl);
+    rotctrl_set_ui_status_detail(ctrl, NULL);
     rot_session_set_state(ctrl, ROT_SESSION_READY, "ready", FALSE);
 }
 
@@ -13256,9 +13349,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             sat_log_log(SAT_LOG_LEVEL_WARN,
                         _("%s: MAX_ERROR_COUNT (%d) reached. Keeping tracking alive, link down."),
                         __func__, MAX_ERROR_COUNT);
-
-            if (status_label)
-                gtk_label_set_text(GTK_LABEL(status_label), _("LINK DOWN"));
+            rotctrl_set_ui_status_detail(ctrl, "LINK DOWN");
         }
 
         rotctrl_update_session_state(ctrl, pos_recent, pos_unknown,
@@ -13274,6 +13365,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             gdouble status_target_az = az_abs_cmd;
             gdouble status_target_el = cmdel;
             gboolean status_moving = FALSE;
+            gboolean standby_state = FALSE;
+            RotorStateSnapshot snap = { 0 };
 
             if (ctrl->setpoint_valid)
             {
@@ -13319,11 +13412,34 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                      !ctrl->tracking &&
                      !ctrl->setpoint_valid &&
                      !ctrl->park_requested)
+            {
                 status_text = _("STANDBY");
+                standby_state = TRUE;
+            }
             else
                 status_text = _("ON TARGET");
 
-            gtk_label_set_text(GTK_LABEL(status_label), status_text);
+            rotctrl_set_ui_status_detail(ctrl, status_text);
+
+            snap.control_active = (ctrl->engaged || ctrl->engage_pending ||
+                                   ctrl->ui_hard_error);
+            snap.engaging = (ctrl->engage_pending ||
+                             ctrl->session_state == ROT_SESSION_CONNECTING ||
+                             ctrl->session_state == ROT_SESSION_ENGAGING);
+            snap.hard_error = ctrl->ui_hard_error;
+            snap.link_lost = (comm_status == ROT_COMM_LINK_LOST);
+            snap.degraded = ((comm_status == ROT_COMM_DEGRADED) ||
+                             (ctrl->session_state == ROT_SESSION_DEGRADED) ||
+                             has_error);
+            snap.moving = ((ctrl->tracking &&
+                            (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
+                             ctrl->target_state ==
+                             ROT_TARGET_STATE_TRACKING_DEGRADED)) ||
+                           status_moving);
+            snap.on_target = (ctrl->engaged &&
+                              !snap.moving &&
+                              !standby_state);
+            rotctrl_apply_ui_status(ctrl, &snap, "poll");
 
             char cmdaz_str[32];
             char cmdel_str[32];
@@ -13358,6 +13474,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         if (status_label)
         {
             const gchar *status_text = NULL;
+            RotorStateSnapshot snap = { 0 };
 
             rotctrl_update_session_state(ctrl, FALSE, FALSE, FALSE, FALSE,
                                          0, 0);
@@ -13371,7 +13488,20 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             else
                 status_text = _("DISENGAGED");
 
-            gtk_label_set_text(GTK_LABEL(status_label), status_text);
+            rotctrl_set_ui_status_detail(ctrl, status_text);
+
+            snap.control_active = (ctrl->engaged || ctrl->engage_pending ||
+                                   ctrl->ui_hard_error);
+            snap.engaging = (ctrl->engage_pending ||
+                             ctrl->session_state == ROT_SESSION_CONNECTING ||
+                             ctrl->session_state == ROT_SESSION_ENGAGING);
+            snap.hard_error = ctrl->ui_hard_error;
+            snap.link_lost = (ctrl->engaged &&
+                              ctrl->comm_status == ROT_COMM_LINK_LOST);
+            snap.degraded = (ctrl->session_state == ROT_SESSION_DEGRADED);
+            snap.moving = FALSE;
+            snap.on_target = FALSE;
+            rotctrl_apply_ui_status(ctrl, &snap, "poll no-client");
         }
     }
 
@@ -16062,8 +16192,6 @@ static void rotctld_probe_cancel(GtkRotCtrl *ctrl)
 
 static void rotctld_finish_engage(GtkRotCtrl *ctrl)
 {
-    GtkWidget *status_label =
-        g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
     guint64 generation = 0;
 
     if (ctrl == NULL)
@@ -16212,11 +16340,16 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
         {
             if (!thread_matches)
             {
+                RotorStateSnapshot snap = { 0 };
                 rotctld_request_thread_stop(ctrl, TRUE);
                 rot_session_set_state(ctrl, ROT_SESSION_CONNECTING,
                                       "waiting for previous session", FALSE);
-                if (status_label)
-                    gtk_label_set_text(GTK_LABEL(status_label), _("ENGAGING"));
+                rotctrl_set_ui_status_detail(ctrl, "ENGAGING");
+                snap.control_active = TRUE;
+                snap.engaging = TRUE;
+                snap.hard_error = ctrl->ui_hard_error;
+                rotctrl_apply_ui_status(ctrl, &snap,
+                                        "waiting for previous session");
                 return;
             }
 
@@ -16228,8 +16361,14 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
             ctrl->engaged = TRUE;
             rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
                                   "thread reuse", FALSE);
-            if (status_label)
-                gtk_label_set_text(GTK_LABEL(status_label), _("ENGAGING"));
+            {
+                RotorStateSnapshot snap = { 0 };
+                rotctrl_set_ui_status_detail(ctrl, "ENGAGING");
+                snap.control_active = TRUE;
+                snap.engaging = TRUE;
+                snap.hard_error = ctrl->ui_hard_error;
+                rotctrl_apply_ui_status(ctrl, &snap, "thread reuse");
+            }
             return;
         }
     }
@@ -16248,8 +16387,14 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->engaged = TRUE;
     rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
                           "thread started", FALSE);
-    if (status_label)
-        gtk_label_set_text(GTK_LABEL(status_label), _("ENGAGING"));
+    {
+        RotorStateSnapshot snap = { 0 };
+        rotctrl_set_ui_status_detail(ctrl, "ENGAGING");
+        snap.control_active = TRUE;
+        snap.engaging = TRUE;
+        snap.hard_error = ctrl->ui_hard_error;
+        rotctrl_apply_ui_status(ctrl, &snap, "thread started");
+    }
     rot_term_log(ctrl, "gpredict:rx",
                  "rotctld engage started %s:%d",
                  ctrl->conf ? ctrl->conf->host : "(null)",
@@ -16258,9 +16403,6 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
 
 static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
 {
-    GtkWidget *status_label =
-        g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
-
     if (ctrl == NULL)
         return;
 
@@ -16291,8 +16433,14 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
                           "engage failed", FALSE);
     gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
-    if (status_label)
-        gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+    rotctrl_set_ui_hard_error(ctrl, "rotctld engage failed");
+    rotctrl_set_ui_status_detail(ctrl, "ERROR: rotctld");
+    {
+        RotorStateSnapshot snap = { 0 };
+        snap.control_active = TRUE;
+        snap.hard_error = TRUE;
+        rotctrl_apply_ui_status(ctrl, &snap, "engage failed");
+    }
     if (!error_reported)
         rot_show_no_rotor_dialog(ctrl);
 }
@@ -18613,7 +18761,6 @@ static void rot_show_message(GtkRotCtrl *ctrl,
 static gboolean rot_wrong_daemon_idle(gpointer data)
 {
     RotWrongDaemonInfo *info = data;
-    GtkWidget *status_label;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
@@ -18625,10 +18772,12 @@ static gboolean rot_wrong_daemon_idle(gpointer data)
 
     if (info->ctrl)
     {
-        status_label =
-            g_object_get_data(G_OBJECT(info->ctrl), "rot-status-label");
-        if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+        RotorStateSnapshot snap = { 0 };
+        rotctrl_set_ui_hard_error(info->ctrl, "port in use by non-rotctld");
+        rotctrl_set_ui_status_detail(info->ctrl, "ERROR: rotctld");
+        snap.control_active = TRUE;
+        snap.hard_error = TRUE;
+        rotctrl_apply_ui_status(info->ctrl, &snap, "wrong daemon");
     }
 
     g_free(info->host);
@@ -18669,7 +18818,6 @@ static void rot_show_cmd_reject_error(GtkRotCtrl *ctrl, const gchar *reason)
 static gboolean rot_cmd_reject_idle(gpointer data)
 {
     RotCmdRejectInfo *info = data;
-    GtkWidget *status_label;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
@@ -18677,9 +18825,15 @@ static gboolean rot_cmd_reject_idle(gpointer data)
     if (info->ctrl)
         rot_show_cmd_reject_error(info->ctrl, info->reason);
 
-    status_label = g_object_get_data(G_OBJECT(info->ctrl), "rot-status-label");
-    if (status_label)
-        gtk_label_set_text(GTK_LABEL(status_label), _("ERROR: rotctld"));
+    if (info->ctrl)
+    {
+        RotorStateSnapshot snap = { 0 };
+        rotctrl_set_ui_hard_error(info->ctrl, "rotctld command rejected");
+        rotctrl_set_ui_status_detail(info->ctrl, "ERROR: rotctld");
+        snap.control_active = TRUE;
+        snap.hard_error = TRUE;
+        rotctrl_apply_ui_status(info->ctrl, &snap, "command rejected");
+    }
 
     g_free(info->reason);
     g_free(info);
@@ -18887,8 +19041,6 @@ static void rot_verbose_cb(GtkToggleButton *button, gpointer data)
 static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 {
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
-    GtkWidget      *status_label =
-        g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
 
     if (ctrl == NULL || ctrl->ui_updating)
         return;
@@ -18927,14 +19079,17 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         reason = "user disengage";
         rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
                               reason, will_send_quit);
+        rotctrl_clear_ui_hard_error(ctrl);
+        rotctrl_set_ui_status_detail(ctrl, NULL);
 
         if (!ctrl->client.running && ctrl->client.thread == NULL)
         {
             /* client thread is not running; nothing to do */
+            RotorStateSnapshot snap = { 0 };
             if (ctrl->rotctld_mgr)
                 rotctld_process_stop_async(ctrl, "user_disengage");
-            if (status_label)
-                gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
+            snap.control_active = FALSE;
+            rotctrl_apply_ui_status(ctrl, &snap, "user disengage");
             return;
         }
 
@@ -18946,8 +19101,11 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             ctrl->client.socket = -1;
             ctrl->client.thread_generation = 0;
         }
-        if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), _("DISENGAGED"));
+        {
+            RotorStateSnapshot snap = { 0 };
+            snap.control_active = FALSE;
+            rotctrl_apply_ui_status(ctrl, &snap, "user disengage");
+        }
         ctrl->hold_position_on_engage = FALSE;
         ctrl->hold_position_log_emitted = FALSE;
     }
@@ -18968,13 +19126,22 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         {
             gchar *conf_err = NULL;
             if (!rot_conf_validate(ctrl->conf, &conf_err)) {
+                RotorStateSnapshot snap = { 0 };
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: Controller does not have a valid configuration: %s"),
                             __func__, conf_err ? conf_err : "unknown error");
                 rot_show_conf_error(ctrl, conf_err);
-                g_free(conf_err);
                 gtk_toggle_button_set_active(button, FALSE);
                 ctrl->engaged = FALSE;
+                rotctrl_set_ui_hard_error(ctrl,
+                                          conf_err ? conf_err :
+                                          "invalid rotor configuration");
+                rotctrl_set_ui_status_detail(ctrl, "ERROR: rotctld");
+                snap.control_active = TRUE;
+                snap.hard_error = TRUE;
+                rotctrl_apply_ui_status(ctrl, &snap,
+                                        "config validation failed");
+                g_free(conf_err);
                 return;
             }
         }
@@ -18998,11 +19165,21 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->hold_position_on_engage = TRUE;
         ctrl->hold_position_log_emitted = FALSE;
         ctrl->have_user_command = FALSE;
+        rotctrl_clear_ui_hard_error(ctrl);
+        rotctrl_set_ui_status_detail(ctrl, NULL);
 
         {
             ctrl->engage_pending = TRUE;
             rot_session_set_state(ctrl, ROT_SESSION_CONNECTING,
                                   "engage requested", FALSE);
+            {
+                RotorStateSnapshot snap = { 0 };
+                rotctrl_set_ui_status_detail(ctrl, "ENGAGING");
+                snap.control_active = TRUE;
+                snap.engaging = TRUE;
+                snap.hard_error = ctrl->ui_hard_error;
+                rotctrl_apply_ui_status(ctrl, &snap, "engage requested");
+            }
             rotctld_probe_cancel(ctrl);
             g_mutex_lock(&ctrl->client.mutex);
             ctrl->engage_generation++;
@@ -19044,7 +19221,14 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             }
             if (ensure == ROTCTLD_ENSURE_PENDING)
             {
+                RotorStateSnapshot snap = { 0 };
                 gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
+                rotctrl_set_ui_status_detail(ctrl, "ENGAGING");
+                snap.control_active = TRUE;
+                snap.engaging = TRUE;
+                snap.hard_error = ctrl->ui_hard_error;
+                rotctrl_apply_ui_status(ctrl, &snap,
+                                        "rotctld ensure pending");
                 return;
             }
         }
@@ -19394,12 +19578,18 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(main_table), label, 0, 4, 1, 1);
 
-    GtkWidget *status = gtk_label_new(_("DISENGAGED"));
+    GtkWidget *status =
+        gtk_label_new(rotor_ui_status_to_string(ROTOR_UI_STATUS_DISENGAGED));
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(main_table), status, 1, 4, 3, 1);
 
     /* store pointer on the controller object for later updates */
     g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
+    {
+        RotorStateSnapshot snap = { 0 };
+        snap.control_active = FALSE;
+        rotctrl_apply_ui_status(ctrl, &snap, "widget init");
+    }
 
     /* Verbose logging */
     label = gtk_label_new(_("Logging:"));
@@ -20485,6 +20675,10 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->engage_generation = 0;
     ctrl->session_state = ROT_SESSION_DISCONNECTED;
     ctrl->comm_status = ROT_COMM_DISENGAGED;
+    ctrl->ui_status = ROTOR_UI_STATUS_DISENGAGED;
+    ctrl->ui_hard_error = FALSE;
+    ctrl->ui_hard_error_reason[0] = '\0';
+    ctrl->ui_status_detail[0] = '\0';
     ctrl->ok_streak = 0;
     ctrl->bad_streak = 0;
     ctrl->timeout_streak = 0;
