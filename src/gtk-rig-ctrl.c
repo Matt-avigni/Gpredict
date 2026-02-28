@@ -6437,17 +6437,40 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
 
 static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 {
-    GtkWidget      *frame, *table, *label, *status_box, *status_led;
+    GtkWidget      *frame, *table, *label;
+    GtkWidget      *downlink_row, *uplink_row, *cycle_row;
+    GtkWidget      *engage_panel, *status_panel;
+    GtkWidget      *status_box, *status_led;
+    GtkWidget      *logging_row;
+    GtkSizeGroup   *left_label_group;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
     gtk_grid_set_column_spacing(GTK_GRID(table), 8);
     gtk_grid_set_row_spacing(GTK_GRID(table), 8);
+    left_label_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+
+    downlink_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(downlink_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(downlink_row), 5);
+    gtk_widget_set_hexpand(downlink_row, TRUE);
+
+    uplink_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(uplink_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(uplink_row), 5);
+    gtk_widget_set_hexpand(uplink_row, TRUE);
+
+    cycle_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(cycle_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(cycle_row), 5);
+    gtk_widget_set_hexpand(cycle_row, TRUE);
 
     /* Primary device */
     label = gtk_label_new(_("Downlink device"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 0, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_size_group_add_widget(left_label_group, label);
+    gtk_grid_attach(GTK_GRID(downlink_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ctrl->DevSel,
@@ -6458,8 +6481,10 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 
     /* Secondary device */
     label = gtk_label_new(_("Uplink device"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 1, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_size_group_add_widget(left_label_group, label);
+    gtk_grid_attach(GTK_GRID(uplink_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel2 = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ctrl->DevSel2,
@@ -6474,14 +6499,16 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                     GTK_COMBO_BOX(ctrl->DevSel));
     gtk_widget_set_hexpand(ctrl->DevSel, TRUE);
     gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_FILL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->DevSel, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(downlink_row), ctrl->DevSel, 1, 0, 1, 1);
     g_signal_connect(ctrl->DevSel2, "changed",
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
     gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
                                     GTK_COMBO_BOX(ctrl->DevSel2));
     gtk_widget_set_hexpand(ctrl->DevSel2, TRUE);
     gtk_widget_set_halign(ctrl->DevSel2, GTK_ALIGN_FILL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->DevSel2, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(uplink_row), ctrl->DevSel2, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), downlink_row, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), uplink_row, 0, 1, 1, 1);
 
     /* Logs toggle */
     ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Show log"));
@@ -6491,12 +6518,20 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(rig_logs_toggle_cb), ctrl);
     if (ctrl->term_view != NULL)
         gp_term_view_set_visible(ctrl->term_view, FALSE);
-    gtk_grid_attach(GTK_GRID(table), ctrl->log_toggle, 2, 1, 1, 1);
+    gtk_widget_set_halign(ctrl->log_toggle, GTK_ALIGN_START);
+    gtk_widget_set_valign(ctrl->log_toggle, GTK_ALIGN_CENTER);
+    gtk_grid_attach(GTK_GRID(table), ctrl->log_toggle, 2, 0, 1, 1);
 
     /* Verbose rig logging toggle */
+    logging_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(logging_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(logging_row), 5);
+    gtk_widget_set_halign(logging_row, GTK_ALIGN_START);
+
     label = gtk_label_new(_("Logging:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 2, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(logging_row), label, 0, 0, 1, 1);
 
     ctrl->log_verbose_toggle =
         gtk_check_button_new_with_label(_("Verbose"));
@@ -6504,9 +6539,10 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                 _("Enable detailed rig logging summaries"));
     g_signal_connect(ctrl->log_verbose_toggle, "toggled",
                      G_CALLBACK(rig_verbose_toggle_cb), ctrl);
-    gtk_widget_set_hexpand(ctrl->log_verbose_toggle, TRUE);
-    gtk_widget_set_halign(ctrl->log_verbose_toggle, GTK_ALIGN_FILL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->log_verbose_toggle, 1, 2, 1, 1);
+    gtk_widget_set_halign(ctrl->log_verbose_toggle, GTK_ALIGN_START);
+    gtk_widget_set_valign(ctrl->log_verbose_toggle, GTK_ALIGN_CENTER);
+    gtk_grid_attach(GTK_GRID(logging_row), ctrl->log_verbose_toggle, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), logging_row, 2, 1, 1, 1);
 
     rigctrl_sync_log_toggles(ctrl);
 
@@ -6516,12 +6552,22 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                 _("Engage the selected radio device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rig_engaged_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(table), ctrl->LockBut, 2, 0, 1, 1);
+    gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
+    gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
+    engage_panel = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(engage_panel), GTK_SHADOW_ETCHED_IN);
+    gtk_widget_set_halign(engage_panel, GTK_ALIGN_CENTER);
+    gtk_widget_set_size_request(engage_panel, 172, -1);
+    gtk_container_add(GTK_CONTAINER(engage_panel), ctrl->LockBut);
+    gtk_grid_attach(GTK_GRID(table), engage_panel, 1, 0, 1, 1);
 
     /* cycle period */
     label = gtk_label_new(_("Cycle:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 3, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_size_group_add_widget(left_label_group, label);
+    gtk_grid_attach(GTK_GRID(cycle_row), label, 0, 0, 1, 1);
 
     ctrl->cycle_spin = gtk_spin_button_new_with_range(10, 10000, 10);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->cycle_spin), 0);
@@ -6535,34 +6581,40 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     g_signal_connect(ctrl->cycle_spin, "activate",
                      G_CALLBACK(rigctrl_cycle_activate_cb), ctrl);
     gtk_widget_set_hexpand(ctrl->cycle_spin, TRUE);
-    gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_FILL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->cycle_spin, 1, 3, 1, 1);
+    gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_START);
+    gtk_entry_set_width_chars(GTK_ENTRY(ctrl->cycle_spin), 5);
+    gtk_widget_set_size_request(ctrl->cycle_spin, 125, -1);
+    gtk_grid_attach(GTK_GRID(cycle_row), ctrl->cycle_spin, 1, 0, 1, 1);
 
     label = gtk_label_new(_("msec"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 2, 3, 1, 1);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(cycle_row), label, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), cycle_row, 0, 2, 1, 1);
 
     /* status */
-    label = gtk_label_new(_("Status:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
-
     status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(status_box, GTK_ALIGN_START);
-    gtk_widget_set_hexpand(status_box, TRUE);
-    /* Keep status text anchored where it was before adding the LED. */
-    gtk_widget_set_margin_start(status_box, -20);
+    gtk_widget_set_halign(status_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(status_box, 3);
+    gtk_widget_set_margin_bottom(status_box, 3);
+    gtk_widget_set_margin_start(status_box, 8);
+    gtk_widget_set_margin_end(status_box, 8);
     status_led = status_indicator_new();
     gtk_box_pack_start(GTK_BOX(status_box), status_led, FALSE, FALSE, 0);
 
     ctrl->status_label = gtk_label_new("DISENGAGED");
     g_object_set(ctrl->status_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_label_set_ellipsize(GTK_LABEL(ctrl->status_label), PANGO_ELLIPSIZE_END);
-    gtk_widget_set_hexpand(ctrl->status_label, TRUE);
-    gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_FILL);
-    gtk_box_pack_start(GTK_BOX(status_box), ctrl->status_label, TRUE, TRUE, 0);
-    gtk_grid_attach(GTK_GRID(table), status_box, 1, 4, 2, 1);
+    gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(status_box), ctrl->status_label, FALSE, FALSE, 0);
+    status_panel = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(status_panel), GTK_SHADOW_ETCHED_IN);
+    gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
+    gtk_widget_set_size_request(status_panel, 172, -1);
+    gtk_container_add(GTK_CONTAINER(status_panel), status_box);
+    gtk_grid_attach(GTK_GRID(table), status_panel, 1, 1, 1, 1);
     g_object_set_data(G_OBJECT(ctrl), "rig-status-indicator", status_led);
+    g_object_unref(left_label_group);
     rigctrl_refresh_ui_status(ctrl, "widget init");
 
     frame = gtk_frame_new(_("Settings"));
