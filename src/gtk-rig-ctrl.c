@@ -6555,11 +6555,10 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
     gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_FILL);
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
-    engage_panel = gtk_frame_new(NULL);
-    gtk_frame_set_shadow_type(GTK_FRAME(engage_panel), GTK_SHADOW_ETCHED_IN);
+    engage_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(engage_panel, GTK_ALIGN_CENTER);
     gtk_widget_set_size_request(engage_panel, 172, -1);
-    gtk_container_add(GTK_CONTAINER(engage_panel), ctrl->LockBut);
+    gtk_box_pack_start(GTK_BOX(engage_panel), ctrl->LockBut, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(table), engage_panel, 1, 0, 1, 1);
 
     /* cycle period */
@@ -6607,11 +6606,10 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_label_set_ellipsize(GTK_LABEL(ctrl->status_label), PANGO_ELLIPSIZE_END);
     gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(status_box), ctrl->status_label, FALSE, FALSE, 0);
-    status_panel = gtk_frame_new(NULL);
-    gtk_frame_set_shadow_type(GTK_FRAME(status_panel), GTK_SHADOW_ETCHED_IN);
+    status_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
     gtk_widget_set_size_request(status_panel, 172, -1);
-    gtk_container_add(GTK_CONTAINER(status_panel), status_box);
+    gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(table), status_panel, 1, 1, 1, 1);
     g_object_set_data(G_OBJECT(ctrl), "rig-status-indicator", status_led);
     g_object_unref(left_label_group);

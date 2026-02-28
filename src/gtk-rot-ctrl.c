@@ -19585,11 +19585,10 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
     gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_FILL);
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
-    engage_panel = gtk_frame_new(NULL);
-    gtk_frame_set_shadow_type(GTK_FRAME(engage_panel), GTK_SHADOW_ETCHED_IN);
+    engage_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(engage_panel, GTK_ALIGN_CENTER);
     gtk_widget_set_size_request(engage_panel, 172, -1);
-    gtk_container_add(GTK_CONTAINER(engage_panel), ctrl->LockBut);
+    gtk_box_pack_start(GTK_BOX(engage_panel), ctrl->LockBut, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(main_table), engage_panel, 1, 0, 1, 1);
     rotctrl_reset_lock_button_visual(ctrl);
 
@@ -19711,11 +19710,10 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_halign(status, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(status_box), status, FALSE, FALSE, 0);
 
-    status_panel = gtk_frame_new(NULL);
-    gtk_frame_set_shadow_type(GTK_FRAME(status_panel), GTK_SHADOW_ETCHED_IN);
+    status_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(status_panel, GTK_ALIGN_CENTER);
     gtk_widget_set_size_request(status_panel, 172, -1);
-    gtk_container_add(GTK_CONTAINER(status_panel), status_box);
+    gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(status_row), status_panel, FALSE, FALSE, 0);
     gtk_grid_attach(GTK_GRID(main_table), status_row, 1, 1, 1, 1);
 
