@@ -19374,7 +19374,10 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), label, 0, 1, 1, 1);
 
     ctrl->AzSat = gtk_label_new(buff);
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    g_object_set(ctrl->AzSat, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_label_set_width_chars(GTK_LABEL(ctrl->AzSat), 8);
+    gtk_label_set_max_width_chars(GTK_LABEL(ctrl->AzSat), 8);
+    gtk_label_set_single_line_mode(GTK_LABEL(ctrl->AzSat), TRUE);
     gtk_grid_attach(GTK_GRID(table), ctrl->AzSat, 1, 1, 1, 1);
 
     /* Elevation */
@@ -19383,7 +19386,10 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(table), label, 0, 2, 1, 1);
 
     ctrl->ElSat = gtk_label_new(buff);
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    g_object_set(ctrl->ElSat, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_label_set_width_chars(GTK_LABEL(ctrl->ElSat), 8);
+    gtk_label_set_max_width_chars(GTK_LABEL(ctrl->ElSat), 8);
+    gtk_label_set_single_line_mode(GTK_LABEL(ctrl->ElSat), TRUE);
     gtk_grid_attach(GTK_GRID(table), ctrl->ElSat, 1, 2, 1, 1);
 
     /* count down */
@@ -19391,7 +19397,10 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 3, 1, 1);
     ctrl->SatCnt = gtk_label_new("00:00:00");
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
+    g_object_set(ctrl->SatCnt, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_label_set_width_chars(GTK_LABEL(ctrl->SatCnt), 8);
+    gtk_label_set_max_width_chars(GTK_LABEL(ctrl->SatCnt), 8);
+    gtk_label_set_single_line_mode(GTK_LABEL(ctrl->SatCnt), TRUE);
     gtk_grid_attach(GTK_GRID(table), ctrl->SatCnt, 1, 3, 1, 1);
 
     frame = gtk_frame_new(_("Target"));
