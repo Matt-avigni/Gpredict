@@ -5954,7 +5954,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(table), 8);
     gtk_grid_set_row_spacing(GTK_GRID(table), 8);
 
-    label = gtk_label_new(_("Target preset"));
+    label = gtk_label_new(_("Target preset:"));
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 0, 1, 1);
 
@@ -5985,7 +5985,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_size_group_add_widget(combo_group, ctrl->SatSel);
 
     /* Service/payload preset selector, apply, and lock buttons */
-    trsp_label = gtk_label_new(_("Payload preset"));
+    trsp_label = gtk_label_new(_("Payload preset:"));
     g_object_set(trsp_label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), trsp_label, 0, 1, 1, 1);
 
@@ -6463,10 +6463,11 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     cycle_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(cycle_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(cycle_row), 5);
-    gtk_widget_set_hexpand(cycle_row, TRUE);
+    gtk_widget_set_hexpand(cycle_row, FALSE);
+    gtk_widget_set_halign(cycle_row, GTK_ALIGN_START);
 
     /* Primary device */
-    label = gtk_label_new(_("Downlink device"));
+    label = gtk_label_new(_("Downlink device:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_halign(label, GTK_ALIGN_START);
     gtk_size_group_add_widget(left_label_group, label);
@@ -6480,7 +6481,7 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                                   " for uplink"));
 
     /* Secondary device */
-    label = gtk_label_new(_("Uplink device"));
+    label = gtk_label_new(_("Uplink device:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_halign(label, GTK_ALIGN_START);
     gtk_size_group_add_widget(left_label_group, label);
@@ -6579,7 +6580,7 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(rigctrl_cycle_focus_out_cb), ctrl);
     g_signal_connect(ctrl->cycle_spin, "activate",
                      G_CALLBACK(rigctrl_cycle_activate_cb), ctrl);
-    gtk_widget_set_hexpand(ctrl->cycle_spin, TRUE);
+    gtk_widget_set_hexpand(ctrl->cycle_spin, FALSE);
     gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_START);
     gtk_entry_set_width_chars(GTK_ENTRY(ctrl->cycle_spin), 5);
     gtk_widget_set_size_request(ctrl->cycle_spin, 125, -1);
@@ -6588,6 +6589,7 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     label = gtk_label_new(_("msec"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(label, 4);
     gtk_grid_attach(GTK_GRID(cycle_row), label, 2, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(table), cycle_row, 0, 2, 1, 1);
 
