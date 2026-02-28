@@ -19700,8 +19700,6 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
         gtk_label_new(rotor_ui_status_to_string(ROTOR_UI_STATUS_DISENGAGED));
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_label_set_ellipsize(GTK_LABEL(status), PANGO_ELLIPSIZE_END);
-    gtk_label_set_width_chars(GTK_LABEL(status), 12);
-    gtk_label_set_max_width_chars(GTK_LABEL(status), 20);
     gtk_widget_set_halign(status, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(status_box), status, FALSE, FALSE, 0);
 
