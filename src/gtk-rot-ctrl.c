@@ -19425,6 +19425,16 @@ static GtkWidget *create_aoslos_banner_widgets(GtkRotCtrl *ctrl)
 static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 {
     GtkWidget      *frame, *main_table, *label;
+    GtkWidget      *device_row;
+    GtkWidget      *cycle_row;
+    GtkWidget      *threshold_row;
+    GtkWidget      *status_row;
+    GtkWidget      *status_box;
+    GtkWidget      *status_led_placeholder;
+    GtkWidget      *logging_row;
+    GtkWidget      *monitor_row;
+    GtkWidget      *status;
+    GtkWidget      *verbose_check;
     GDir           *dir = NULL; /* directory handle */
     GError         *error = NULL;       /* error flag and info */
     gchar          *dirname;    /* directory name */
@@ -19437,13 +19447,21 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(main_table), 5);
     gtk_grid_set_row_spacing(GTK_GRID(main_table), 5);
 
+    device_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(device_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(device_row), 5);
+    gtk_widget_set_hexpand(device_row, TRUE);
+
     label = gtk_label_new(_("Device:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 0, 0, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(device_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ctrl->DevSel,
                                 _("Select antenna rotator device"));
+    gtk_widget_set_hexpand(ctrl->DevSel, TRUE);
+    gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_FILL);
 
     /* open configuration directory */
     dirname = get_hwconf_dir();
@@ -19497,7 +19515,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                      ctrl);
     gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
                                     GTK_COMBO_BOX(ctrl->DevSel));
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->DevSel, 1, 0, 2, 1);
+    gtk_grid_attach(GTK_GRID(device_row), ctrl->DevSel, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), device_row, 0, 0, 1, 1);
 
     /* Engage button */
     ctrl->LockBut = gtk_toggle_button_new_with_label(_("Engage"));
@@ -19505,7 +19524,9 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                 _("Engage the selected rotor device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
                      ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->LockBut, 3, 0, 1, 1);
+    gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_START);
+    gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->LockBut, 1, 0, 1, 1);
 
     /* Monitor checkbox */
     ctrl->MonitorCheckBox = gtk_check_button_new_with_label(_("Monitor"));
@@ -19514,7 +19535,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "position commands"));
     g_signal_connect(ctrl->MonitorCheckBox, "toggled",
                      G_CALLBACK(rot_monitor_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->MonitorCheckBox, 1, 1, 1, 1);
+    gtk_widget_set_halign(ctrl->MonitorCheckBox, GTK_ALIGN_START);
+    gtk_widget_set_valign(ctrl->MonitorCheckBox, GTK_ALIGN_CENTER);
 
     /* Logs toggle */
     ctrl->log_toggle = gtk_toggle_button_new_with_label(_("Show log"));
@@ -19524,34 +19546,52 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                      G_CALLBACK(rot_logs_toggle_cb), ctrl);
     if (ctrl->term_view != NULL)
         gp_term_view_set_visible(ctrl->term_view, FALSE);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->log_toggle, 3, 1, 1, 1);
+    gtk_widget_set_halign(ctrl->log_toggle, GTK_ALIGN_START);
+    gtk_widget_set_valign(ctrl->log_toggle, GTK_ALIGN_CENTER);
+    gtk_grid_attach(GTK_GRID(main_table), ctrl->log_toggle, 2, 0, 1, 1);
 
     /* cycle period */
+    cycle_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(cycle_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(cycle_row), 5);
+    gtk_widget_set_hexpand(cycle_row, TRUE);
+
     label = gtk_label_new(_("Cycle:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 0, 2, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(cycle_row), label, 0, 0, 1, 1);
 
     ctrl->cycle_spin = gtk_spin_button_new_with_range(100, 10000, 10);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->cycle_spin), 0);
     gtk_widget_set_tooltip_text(ctrl->cycle_spin,
                                 _("This parameter controls the delay between "
                                   "commands sent to the rotator."));
+    gtk_widget_set_hexpand(ctrl->cycle_spin, TRUE);
+    gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_FILL);
     g_signal_connect(ctrl->cycle_spin, "value-changed",
                      G_CALLBACK(delay_changed_cb), ctrl);
     g_signal_connect(ctrl->cycle_spin, "focus-out-event",
                      G_CALLBACK(rotctrl_settings_focus_out_cb), ctrl);
     g_signal_connect(ctrl->cycle_spin, "activate",
                      G_CALLBACK(rotctrl_settings_activate_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->cycle_spin, 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(cycle_row), ctrl->cycle_spin, 1, 0, 1, 1);
 
     label = gtk_label_new(_("msec"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 2, 2, 1, 1);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(cycle_row), label, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), cycle_row, 0, 1, 1, 1);
 
     /* Tolerance */
+    threshold_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(threshold_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(threshold_row), 5);
+    gtk_widget_set_hexpand(threshold_row, TRUE);
+
     label = gtk_label_new(_("Threshold:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 0, 3, 1, 1);
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(threshold_row), label, 0, 0, 1, 1);
 
     ctrl->thld_spin = gtk_spin_button_new_with_range(0.01, 50.0, 0.01);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ctrl->thld_spin), 2);
@@ -19561,27 +19601,52 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "If the difference between the target and "
                                   "rotator values is smaller than the "
                                   "threshold, no new commands are sent"));
+    gtk_widget_set_hexpand(ctrl->thld_spin, TRUE);
+    gtk_widget_set_halign(ctrl->thld_spin, GTK_ALIGN_FILL);
     g_signal_connect(ctrl->thld_spin, "value-changed",
                      G_CALLBACK(threshold_changed_cb), ctrl);
     g_signal_connect(ctrl->thld_spin, "focus-out-event",
                      G_CALLBACK(rotctrl_settings_focus_out_cb), ctrl);
     g_signal_connect(ctrl->thld_spin, "activate",
                      G_CALLBACK(rotctrl_settings_activate_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), ctrl->thld_spin, 1, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(threshold_row), ctrl->thld_spin, 1, 0, 1, 1);
 
     label = gtk_label_new(_("deg"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 2, 3, 1, 1);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(threshold_row), label, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), threshold_row, 0, 2, 1, 1);
 
     /* Status line */
-    label = gtk_label_new(_("Status:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 0, 4, 1, 1);
+    status_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(status_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(status_row), 5);
+    gtk_widget_set_halign(status_row, GTK_ALIGN_START);
 
-    GtkWidget *status =
+    label = gtk_label_new(_("Status:"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(status_row), label, 0, 0, 1, 1);
+
+    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_halign(status_box, GTK_ALIGN_START);
+    gtk_widget_set_hexpand(status_box, TRUE);
+
+    status_led_placeholder = gtk_label_new("");
+    gtk_widget_set_size_request(status_led_placeholder, 10, 10);
+    gtk_box_pack_start(GTK_BOX(status_box), status_led_placeholder,
+                       FALSE, FALSE, 0);
+
+    status =
         gtk_label_new(rotor_ui_status_to_string(ROTOR_UI_STATUS_DISENGAGED));
     g_object_set(status, "xalign", 0.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), status, 1, 4, 3, 1);
+    gtk_label_set_ellipsize(GTK_LABEL(status), PANGO_ELLIPSIZE_END);
+    gtk_widget_set_hexpand(status, TRUE);
+    gtk_widget_set_halign(status, GTK_ALIGN_FILL);
+    gtk_box_pack_start(GTK_BOX(status_box), status, TRUE, TRUE, 0);
+
+    gtk_grid_attach(GTK_GRID(status_row), status_box, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), status_row, 1, 1, 1, 1);
 
     /* store pointer on the controller object for later updates */
     g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
@@ -19592,11 +19657,17 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     }
 
     /* Verbose logging */
-    label = gtk_label_new(_("Logging:"));
-    g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
-    gtk_grid_attach(GTK_GRID(main_table), label, 0, 5, 1, 1);
+    logging_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(logging_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(logging_row), 5);
+    gtk_widget_set_halign(logging_row, GTK_ALIGN_START);
 
-    GtkWidget *verbose_check = gtk_check_button_new_with_label(_("Verbose"));
+    label = gtk_label_new(_("Logging:"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(logging_row), label, 0, 0, 1, 1);
+
+    verbose_check = gtk_check_button_new_with_label(_("Verbose"));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(verbose_check),
                                  ctrl->verbose_logging);
     gtk_widget_set_tooltip_text(verbose_check,
@@ -19604,7 +19675,22 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "diagnostic logging in the terminal."));
     g_signal_connect(verbose_check, "toggled",
                      G_CALLBACK(rot_verbose_cb), ctrl);
-    gtk_grid_attach(GTK_GRID(main_table), verbose_check, 1, 5, 1, 1);
+    gtk_widget_set_halign(verbose_check, GTK_ALIGN_START);
+    gtk_widget_set_valign(verbose_check, GTK_ALIGN_CENTER);
+    gtk_grid_attach(GTK_GRID(logging_row), verbose_check, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), logging_row, 2, 1, 1, 1);
+
+    monitor_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(monitor_row), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(monitor_row), 5);
+    gtk_widget_set_halign(monitor_row, GTK_ALIGN_START);
+
+    label = gtk_label_new(_("Monitor:"));
+    g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(monitor_row), label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(monitor_row), ctrl->MonitorCheckBox, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(main_table), monitor_row, 2, 2, 1, 1);
 
     ctrl->settings_window = gtk_widget_get_toplevel(GTK_WIDGET(main_table));
 
