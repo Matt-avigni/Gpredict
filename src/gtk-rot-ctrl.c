@@ -19445,15 +19445,14 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     main_table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(main_table), 5);
-    gtk_grid_set_column_spacing(GTK_GRID(main_table), 5);
+    gtk_grid_set_column_spacing(GTK_GRID(main_table), ROTCTRL_PANEL_SPACING);
     gtk_grid_set_row_spacing(GTK_GRID(main_table), 5);
     left_label_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
 
     device_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(device_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(device_row), 5);
-    gtk_widget_set_hexpand(device_row, TRUE);
-    gtk_widget_set_margin_end(device_row, ROTCTRL_PANEL_SPACING);
+    gtk_widget_set_halign(device_row, GTK_ALIGN_START);
 
     label = gtk_label_new(_("Device:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
@@ -19464,8 +19463,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     ctrl->DevSel = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ctrl->DevSel,
                                 _("Select antenna rotator device"));
-    gtk_widget_set_hexpand(ctrl->DevSel, TRUE);
-    gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_FILL);
+    gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_START);
+    gtk_widget_set_size_request(ctrl->DevSel, 220, -1);
 
     /* open configuration directory */
     dirname = get_hwconf_dir();
@@ -19558,8 +19557,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     cycle_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(cycle_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(cycle_row), 5);
-    gtk_widget_set_hexpand(cycle_row, TRUE);
-    gtk_widget_set_margin_end(cycle_row, ROTCTRL_PANEL_SPACING);
+    gtk_widget_set_halign(cycle_row, GTK_ALIGN_START);
 
     label = gtk_label_new(_("Cycle:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
@@ -19572,8 +19570,9 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_tooltip_text(ctrl->cycle_spin,
                                 _("This parameter controls the delay between "
                                   "commands sent to the rotator."));
-    gtk_widget_set_hexpand(ctrl->cycle_spin, TRUE);
-    gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_FILL);
+    gtk_widget_set_halign(ctrl->cycle_spin, GTK_ALIGN_START);
+    gtk_entry_set_width_chars(GTK_ENTRY(ctrl->cycle_spin), 5);
+    gtk_widget_set_size_request(ctrl->cycle_spin, 125, -1);
     g_signal_connect(ctrl->cycle_spin, "value-changed",
                      G_CALLBACK(delay_changed_cb), ctrl);
     g_signal_connect(ctrl->cycle_spin, "focus-out-event",
@@ -19592,8 +19591,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     threshold_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(threshold_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(threshold_row), 5);
-    gtk_widget_set_hexpand(threshold_row, TRUE);
-    gtk_widget_set_margin_end(threshold_row, ROTCTRL_PANEL_SPACING);
+    gtk_widget_set_halign(threshold_row, GTK_ALIGN_START);
 
     label = gtk_label_new(_("Threshold:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
@@ -19609,8 +19607,9 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                   "If the difference between the target and "
                                   "rotator values is smaller than the "
                                   "threshold, no new commands are sent"));
-    gtk_widget_set_hexpand(ctrl->thld_spin, TRUE);
-    gtk_widget_set_halign(ctrl->thld_spin, GTK_ALIGN_FILL);
+    gtk_widget_set_halign(ctrl->thld_spin, GTK_ALIGN_START);
+    gtk_entry_set_width_chars(GTK_ENTRY(ctrl->thld_spin), 5);
+    gtk_widget_set_size_request(ctrl->thld_spin, 125, -1);
     g_signal_connect(ctrl->thld_spin, "value-changed",
                      G_CALLBACK(threshold_changed_cb), ctrl);
     g_signal_connect(ctrl->thld_spin, "focus-out-event",
