@@ -19527,6 +19527,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                 _("Engage the selected rotor device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
                      ctrl);
+    gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
     gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_START);
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->LockBut, 1, 0, 1, 1);
@@ -19549,6 +19550,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                      G_CALLBACK(rot_logs_toggle_cb), ctrl);
     if (ctrl->term_view != NULL)
         gp_term_view_set_visible(ctrl->term_view, FALSE);
+    gtk_widget_set_hexpand(ctrl->log_toggle, TRUE);
     gtk_widget_set_halign(ctrl->log_toggle, GTK_ALIGN_START);
     gtk_widget_set_valign(ctrl->log_toggle, GTK_ALIGN_CENTER);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->log_toggle, 2, 0, 1, 1);
@@ -19628,6 +19630,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     status_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(status_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(status_row), 5);
+    gtk_widget_set_hexpand(status_row, TRUE);
     gtk_widget_set_halign(status_row, GTK_ALIGN_START);
 
     label = gtk_label_new(_("Status:"));
@@ -19667,6 +19670,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     logging_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(logging_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(logging_row), 5);
+    gtk_widget_set_hexpand(logging_row, TRUE);
     gtk_widget_set_halign(logging_row, GTK_ALIGN_START);
 
     label = gtk_label_new(_("Logging:"));
@@ -19690,6 +19694,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     monitor_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(monitor_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(monitor_row), 5);
+    gtk_widget_set_hexpand(monitor_row, TRUE);
     gtk_widget_set_halign(monitor_row, GTK_ALIGN_START);
 
     label = gtk_label_new(_("Monitor:"));
