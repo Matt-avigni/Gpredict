@@ -19331,7 +19331,7 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
     gtk_grid_set_column_homogeneous(GTK_GRID(table), FALSE);
     gtk_grid_set_column_spacing(GTK_GRID(table), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(table), 8);
 
     /* sat selector */
     ctrl->SatSel = gtk_combo_box_text_new();
@@ -19370,7 +19370,7 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
 
     values_grid = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(values_grid), 5);
-    gtk_grid_set_row_spacing(GTK_GRID(values_grid), 6);
+    gtk_grid_set_row_spacing(GTK_GRID(values_grid), 8);
     gtk_widget_set_halign(values_grid, GTK_ALIGN_START);
     gtk_widget_set_valign(values_grid, GTK_ALIGN_START);
     gtk_grid_attach(GTK_GRID(table), values_grid, 0, 1, 2, 3);
@@ -19462,7 +19462,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     main_table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(main_table), 5);
     gtk_grid_set_column_spacing(GTK_GRID(main_table), ROTCTRL_PANEL_SPACING);
-    gtk_grid_set_row_spacing(GTK_GRID(main_table), 5);
+    gtk_grid_set_row_spacing(GTK_GRID(main_table), 8);
     left_label_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
 
     device_row = gtk_grid_new();
