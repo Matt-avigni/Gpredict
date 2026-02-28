@@ -30,6 +30,7 @@ gpredict_SOURCES = \
     rot-angle.c rot-angle.h \
     rot_math.c rot_math.h \
     ui-popup-quarantine.c ui-popup-quarantine.h \
+    status_indicator.c status_indicator.h \
     ui-status.c ui-status.h \
     rotor_calibration.c rotor_calibration.h \
     tle-autoupdate.c tle-autoupdate.h \

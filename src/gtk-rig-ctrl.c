@@ -86,6 +86,7 @@ typedef int socklen_t;
 #include "sat-log.h"
 #include "sat-cfg.h"
 #include "sat-pref-rig-editor.h"
+#include "status_indicator.h"
 #include "trsp-conf.h"
 #include "ui-popup-quarantine.h"
 #include "ui-status.h"
@@ -2165,12 +2166,16 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
     RigUiCommandWindowStats stats = { 0 };
     RigStateSnapshot snap = { 0 };
     RadioUiStatus new_status;
+    UiSeverity new_severity;
+    UiSeverity prev_severity;
+    StatusIndicatorPulseMode pulse_mode;
     gboolean needs_secondary = FALSE;
     gboolean primary_disconnected;
     gboolean secondary_disconnected = FALSE;
     const gchar *detail = NULL;
     gint64 now_us = g_get_monotonic_time();
     const gchar *why = (reason != NULL) ? reason : "update";
+    GtkWidget *status_indicator = NULL;
 
     if (ctrl == NULL)
         return;
@@ -2239,6 +2244,25 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
     {
         gtk_label_set_text(GTK_LABEL(ctrl->status_label),
                            radio_ui_status_to_string(ctrl->ui_status));
+
+        status_indicator =
+            g_object_get_data(G_OBJECT(ctrl), "rig-status-indicator");
+        if (status_indicator != NULL)
+        {
+            prev_severity = status_indicator_get_severity(status_indicator);
+            new_severity = radio_ui_status_to_severity(ctrl->ui_status);
+            pulse_mode = radio_ui_status_to_pulse_mode(ctrl->ui_status);
+            if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE) &&
+                prev_severity != new_severity)
+            {
+                rig_term_log(ctrl, "gpredict",
+                             "status indicator: severity %s -> %s",
+                             ui_severity_to_string(prev_severity),
+                             ui_severity_to_string(new_severity));
+            }
+            status_indicator_set_severity(status_indicator, new_severity);
+            status_indicator_set_pulse_mode(status_indicator, pulse_mode);
+        }
 
         if (ctrl->ui_hard_error && ctrl->ui_hard_error_reason[0] != '\0')
             detail = ctrl->ui_hard_error_reason;
@@ -6413,7 +6437,7 @@ static void rigctrl_rebuild_device_selectors(GtkRigCtrl *ctrl,
 
 static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 {
-    GtkWidget      *frame, *table, *label;
+    GtkWidget      *frame, *table, *label, *status_box, *status_led;
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -6523,11 +6547,22 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     g_object_set(label, "xalign", 1.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(table), label, 0, 4, 1, 1);
 
+    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_halign(status_box, GTK_ALIGN_START);
+    gtk_widget_set_hexpand(status_box, TRUE);
+    /* Keep status text anchored where it was before adding the LED. */
+    gtk_widget_set_margin_start(status_box, -20);
+    status_led = status_indicator_new();
+    gtk_box_pack_start(GTK_BOX(status_box), status_led, FALSE, FALSE, 0);
+
     ctrl->status_label = gtk_label_new("DISENGAGED");
     g_object_set(ctrl->status_label, "xalign", 0.0f, "yalign", 0.5f, NULL);
+    gtk_label_set_ellipsize(GTK_LABEL(ctrl->status_label), PANGO_ELLIPSIZE_END);
     gtk_widget_set_hexpand(ctrl->status_label, TRUE);
     gtk_widget_set_halign(ctrl->status_label, GTK_ALIGN_FILL);
-    gtk_grid_attach(GTK_GRID(table), ctrl->status_label, 1, 4, 2, 1);
+    gtk_box_pack_start(GTK_BOX(status_box), ctrl->status_label, TRUE, TRUE, 0);
+    gtk_grid_attach(GTK_GRID(table), status_box, 1, 4, 2, 1);
+    g_object_set_data(G_OBJECT(ctrl), "rig-status-indicator", status_led);
     rigctrl_refresh_ui_status(ctrl, "widget init");
 
     frame = gtk_frame_new(_("Settings"));

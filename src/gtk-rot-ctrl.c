@@ -92,6 +92,7 @@
 #include "azel_mapping.h"
 #include "tracking_policy.h"
 #include "safety_window.h"
+#include "status_indicator.h"
 #include "ui-popup-quarantine.h"
 #include "ui-status.h"
 #include "rotctld_mgr.h"
@@ -2072,9 +2073,13 @@ static void rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
                                     const gchar *reason)
 {
     RotorUiStatus next;
+    UiSeverity next_severity;
+    UiSeverity prev_severity;
+    StatusIndicatorPulseMode pulse_mode;
     const gchar *detail = NULL;
     const gchar *why = (reason != NULL) ? reason : "update";
     GtkWidget *status_label;
+    GtkWidget *status_indicator;
 
     if (ctrl == NULL || snap == NULL)
         return;
@@ -2100,6 +2105,23 @@ static void rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
 
     gtk_label_set_text(GTK_LABEL(status_label),
                        rotor_ui_status_to_string(ctrl->ui_status));
+
+    status_indicator = g_object_get_data(G_OBJECT(ctrl), "rot-status-indicator");
+    if (status_indicator != NULL)
+    {
+        prev_severity = status_indicator_get_severity(status_indicator);
+        next_severity = rotor_ui_status_to_severity(ctrl->ui_status);
+        pulse_mode = rotor_ui_status_to_pulse_mode(ctrl->ui_status);
+        if (ctrl->verbose_logging && prev_severity != next_severity)
+        {
+            rot_term_log(ctrl, "gpredict:state",
+                         "status indicator: severity %s -> %s",
+                         ui_severity_to_string(prev_severity),
+                         ui_severity_to_string(next_severity));
+        }
+        status_indicator_set_severity(status_indicator, next_severity);
+        status_indicator_set_pulse_mode(status_indicator, pulse_mode);
+    }
 
     if (ctrl->ui_hard_error && ctrl->ui_hard_error_reason[0] != '\0')
         detail = ctrl->ui_hard_error_reason;
@@ -19446,7 +19468,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     GtkWidget      *threshold_row;
     GtkWidget      *status_row;
     GtkWidget      *status_box;
-    GtkWidget      *status_led_placeholder;
+    GtkWidget      *status_led;
     GtkWidget      *logging_row;
     GtkWidget      *monitor_row;
     GtkWidget      *status;
@@ -19654,13 +19676,13 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_halign(label, GTK_ALIGN_START);
     gtk_grid_attach(GTK_GRID(status_row), label, 0, 0, 1, 1);
 
-    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_halign(status_box, GTK_ALIGN_START);
+    /* Keep status text anchored where it was before adding the LED. */
+    gtk_widget_set_margin_start(status_box, -6);
 
-    status_led_placeholder = gtk_label_new("");
-    gtk_widget_set_size_request(status_led_placeholder, 10, 10);
-    gtk_box_pack_start(GTK_BOX(status_box), status_led_placeholder,
-                       FALSE, FALSE, 0);
+    status_led = status_indicator_new();
+    gtk_box_pack_start(GTK_BOX(status_box), status_led, FALSE, FALSE, 0);
 
     status =
         gtk_label_new(rotor_ui_status_to_string(ROTOR_UI_STATUS_DISENGAGED));
@@ -19675,6 +19697,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(main_table), status_row, 1, 1, 1, 1);
 
     /* store pointer on the controller object for later updates */
+    g_object_set_data(G_OBJECT(ctrl), "rot-status-indicator", status_led);
     g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
     {
         RotorStateSnapshot snap = { 0 };
