@@ -19052,6 +19052,19 @@ static void rot_verbose_cb(GtkToggleButton *button, gpointer data)
                  ctrl->verbose_logging ? "enabled" : "disabled");
 }
 
+static void rotctrl_reset_lock_button_visual(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->LockBut == NULL)
+        return;
+
+    gtk_toggle_button_set_inconsistent(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+    gtk_widget_unset_state_flags(ctrl->LockBut,
+                                 GTK_STATE_FLAG_ACTIVE |
+                                 GTK_STATE_FLAG_PRELIGHT |
+                                 GTK_STATE_FLAG_FOCUSED |
+                                 GTK_STATE_FLAG_SELECTED);
+}
+
 /**
  * Rotor locked.
  *
@@ -19130,6 +19143,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         }
         ctrl->hold_position_on_engage = FALSE;
         ctrl->hold_position_log_emitted = FALSE;
+        rotctrl_reset_lock_button_visual(ctrl);
     }
     else
     {
@@ -19567,6 +19581,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
                                 _("Engage the selected rotor device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
                      ctrl);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
     gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
     gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_FILL);
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
@@ -19576,6 +19591,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_widget_set_size_request(engage_panel, 172, -1);
     gtk_container_add(GTK_CONTAINER(engage_panel), ctrl->LockBut);
     gtk_grid_attach(GTK_GRID(main_table), engage_panel, 1, 0, 1, 1);
+    rotctrl_reset_lock_button_visual(ctrl);
 
     /* Monitor checkbox */
     ctrl->MonitorCheckBox = gtk_check_button_new_with_label(_("Monitor"));
@@ -21091,6 +21107,15 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     {
         gp_term_view_free(ctrl->term_view);
         ctrl->term_view = NULL;
+    }
+    if (ctrl->LockBut != NULL)
+    {
+        g_signal_handlers_block_by_func(ctrl->LockBut,
+                                        (gpointer)rot_locked_cb, ctrl);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+        g_signal_handlers_unblock_by_func(ctrl->LockBut,
+                                          (gpointer)rot_locked_cb, ctrl);
+        rotctrl_reset_lock_button_visual(ctrl);
     }
     ctrl->log_toggle = NULL;
     if (ctrl->resize_idle_id != 0)
