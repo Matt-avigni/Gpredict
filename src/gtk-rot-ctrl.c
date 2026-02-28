@@ -19537,7 +19537,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
                      ctrl);
     gtk_widget_set_hexpand(ctrl->LockBut, TRUE);
-    gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_START);
+    gtk_widget_set_halign(ctrl->LockBut, GTK_ALIGN_CENTER);
     gtk_widget_set_valign(ctrl->LockBut, GTK_ALIGN_CENTER);
     gtk_grid_attach(GTK_GRID(main_table), ctrl->LockBut, 1, 0, 1, 1);
 
@@ -19640,7 +19640,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_set_column_spacing(GTK_GRID(status_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(status_row), 5);
     gtk_widget_set_hexpand(status_row, TRUE);
-    gtk_widget_set_halign(status_row, GTK_ALIGN_START);
+    gtk_widget_set_halign(status_row, GTK_ALIGN_CENTER);
 
     label = gtk_label_new(_("Status:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
