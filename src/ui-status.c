@@ -30,6 +30,8 @@ const char *rotor_ui_status_to_string(RotorUiStatus s)
         return "STANDBY";
     case ROTOR_UI_STATUS_MOVING:
         return "MOVING";
+    case ROTOR_UI_STATUS_PRETRACK:
+        return "PRETRACK";
     case ROTOR_UI_STATUS_ON_TARGET:
         return "ON TARGET";
     case ROTOR_UI_STATUS_DEGRADED:
@@ -83,6 +85,8 @@ RotorUiStatus rotor_compute_ui_status(const RotorStateSnapshot *s)
         return ROTOR_UI_STATUS_DEGRADED;
     if (s->moving)
         return ROTOR_UI_STATUS_MOVING;
+    if (s->pretracking)
+        return ROTOR_UI_STATUS_PRETRACK;
     if (s->on_target)
         return ROTOR_UI_STATUS_ON_TARGET;
 

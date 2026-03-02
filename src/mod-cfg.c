@@ -37,6 +37,7 @@
 #include "sat-cfg.h"
 #include "sat-log.h"
 #include "sat-pref-modules.h"
+#include "ui-popup-quarantine.h"
 
 
 extern GtkWidget *app;
@@ -628,6 +629,7 @@ static GtkWidget *mod_cfg_editor_create(const gchar * modname,
                                          "_Cancel", GTK_RESPONSE_CANCEL,
                                          "_OK", GTK_RESPONSE_OK, NULL);
     g_free(strbuf);
+    gp_ui_quarantine_install(dialog);
 
     gtk_container_set_border_width(GTK_CONTAINER(dialog), 5);
 
@@ -670,6 +672,7 @@ static GtkWidget *mod_cfg_editor_create(const gchar * modname,
 
     /* ground station selector */
     locw = create_loc_selector(cfgdata);
+    gp_ui_quarantine_register_combo(dialog, GTK_COMBO_BOX(locw));
     gtk_widget_set_tooltip_text(locw,
                                 _("Select a ground station for this module."));
 

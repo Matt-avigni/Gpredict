@@ -18,6 +18,7 @@ typedef enum {
     ROTOR_UI_STATUS_ENGAGING,
     ROTOR_UI_STATUS_STANDBY,
     ROTOR_UI_STATUS_MOVING,
+    ROTOR_UI_STATUS_PRETRACK,
     ROTOR_UI_STATUS_ON_TARGET,
     ROTOR_UI_STATUS_DEGRADED,
     ROTOR_UI_STATUS_LINK_LOST,
@@ -47,6 +48,7 @@ typedef struct {
     gboolean link_lost;
     gboolean degraded;
     gboolean moving;
+    gboolean pretracking;
     gboolean on_target;
 } RotorStateSnapshot;
 

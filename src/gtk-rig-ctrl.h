@@ -180,6 +180,10 @@ struct _gtk_rig_ctrl {
     gint            reconnect_backoff_ms2;  /*!< Exponential backoff for reconnect (secondary). */
     gint64          reconnect_next_us;      /*!< Next reconnect time (monotonic us, primary). */
     gint64          reconnect_next_us2;     /*!< Next reconnect time (monotonic us, secondary). */
+    guint           reconnect_attempts;     /*!< Reconnect attempts in current engage cycle (primary). */
+    guint           reconnect_attempts2;    /*!< Reconnect attempts in current engage cycle (secondary). */
+    gboolean        link_lost_latched;      /*!< Latch primary link-lost status until user re-engages. */
+    gboolean        link_lost_latched2;     /*!< Latch secondary link-lost status until user re-engages. */
     gboolean        rx_conn_error_reported; /*!< Avoid repeated connect error popups (primary). */
     gboolean        tx_conn_error_reported; /*!< Avoid repeated connect error popups (secondary). */
     gboolean        edit_primary;           /*!< Suppress reconnect while editing primary config. */

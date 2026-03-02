@@ -16,10 +16,6 @@
 typedef struct {
     GtkWidget *toplevel;
     GdkWindow *window;
-    gint64 last_popup_popdown_us;
-    gint64 quarantine_until_us;
-    gboolean swallowed_press;
-    gboolean swallowed_release;
     GtkComboBox *pending_combo;
     gboolean pending_press_swallowed;
     gboolean filter_installed;
@@ -105,12 +101,6 @@ gboolean gp_ui_combo_popup_shown(GtkComboBox *combo)
     return shown_tracked;
 }
 
-static void gp_ui_quarantine_reset_swallow(GpUiQuarantine *state)
-{
-    state->swallowed_press = FALSE;
-    state->swallowed_release = FALSE;
-}
-
 static void gp_ui_quarantine_set_pending_combo(GpUiQuarantine *state,
                                                GtkComboBox *combo)
 {
@@ -182,7 +172,6 @@ static GdkFilterReturn gp_ui_quarantine_filter(GdkXEvent *xevent,
 {
     GpUiQuarantine *state = data;
     GdkEventButton *button_event;
-    gint64 now_us;
 
     (void)xevent;
 
@@ -223,26 +212,6 @@ static GdkFilterReturn gp_ui_quarantine_filter(GdkXEvent *xevent,
         }
     }
 
-    now_us = g_get_monotonic_time();
-    if (now_us >= state->quarantine_until_us)
-        return GDK_FILTER_CONTINUE;
-
-    if (event->type == GDK_BUTTON_PRESS && !state->swallowed_press)
-    {
-        state->swallowed_press = TRUE;
-        GP_UI_LOG("%s: swallow press remaining=%lld us\n", __func__,
-                  (long long)(state->quarantine_until_us - now_us));
-        return GDK_FILTER_REMOVE;
-    }
-
-    if (event->type == GDK_BUTTON_RELEASE && !state->swallowed_release)
-    {
-        state->swallowed_release = TRUE;
-        GP_UI_LOG("%s: swallow release remaining=%lld us\n", __func__,
-                  (long long)(state->quarantine_until_us - now_us));
-        return GDK_FILTER_REMOVE;
-    }
-
     return GDK_FILTER_CONTINUE;
 }
 
@@ -251,7 +220,6 @@ static void gp_ui_quarantine_update_combo_state(GpUiQuarantine *state,
                                                 gboolean shown)
 {
     gboolean prev_shown;
-    gint64 now_us;
 
     if (state == NULL || combo == NULL)
         return;
@@ -262,13 +230,8 @@ static void gp_ui_quarantine_update_combo_state(GpUiQuarantine *state,
 
     if (prev_shown && !shown)
     {
-        now_us = g_get_monotonic_time();
-        state->last_popup_popdown_us = now_us;
-        state->quarantine_until_us = now_us + 250000;
-        gp_ui_quarantine_reset_swallow(state);
         gp_ui_quarantine_set_pending_combo(state, combo);
-        GP_UI_LOG("%s: popdown quarantine until=%lld us\n", __func__,
-                  (long long)state->quarantine_until_us);
+        GP_UI_LOG("%s: popdown pending combo=%p\n", __func__, (void *)combo);
     }
     else if (shown && combo == state->pending_combo)
     {

@@ -147,6 +147,7 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTLD_IC905_FALLBACK_TIMEOUT_MS 12000
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
 #define RIGCTRL_RECONNECT_BACKOFF_MAX_MS 10000
+#define RIGCTRL_RECONNECT_MAX_ATTEMPTS 2
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
 #define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
 #define RIGCTRL_RESPONSE_SHOW_LOG 1003
@@ -867,8 +868,13 @@ static gboolean rigctrl_validate_mode(GtkRigCtrl *ctrl,
                                       const radio_conf_t *conf,
                                       const gchar *role);
 static void     rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
+static void     rigctrl_reset_link_lost_latch(GtkRigCtrl *ctrl);
 static void     rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                                            const gchar *role);
+static void     rigctrl_latch_link_lost(GtkRigCtrl *ctrl,
+                                        gboolean secondary,
+                                        const gchar *role,
+                                        guint attempts);
 static void     rigctrl_reset_error_gates(GtkRigCtrl *ctrl);
 static void     rigctrl_fail_engage(GtkRigCtrl *ctrl, const gchar *reason);
 static void     rigctrl_force_toplevel_resize(GtkRigCtrl *ctrl);
@@ -2195,7 +2201,11 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
              ctrl->conn_state2 == RIGCTRL_CONN_DISCONNECTING);
     }
 
-    snap.control_active = (ctrl->engaged || ctrl->engage_pending || ctrl->ui_hard_error);
+    snap.control_active = (ctrl->engaged ||
+                           ctrl->engage_pending ||
+                           ctrl->ui_hard_error ||
+                           ctrl->link_lost_latched ||
+                           ctrl->link_lost_latched2);
     snap.engaging = (ctrl->engage_pending ||
                      ctrl->opening ||
                      ctrl->opening2 ||
@@ -2208,7 +2218,10 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
     snap.link_lost = (snap.control_active &&
                       !snap.engaging &&
                       !snap.hard_error &&
-                      (primary_disconnected || secondary_disconnected));
+                      (ctrl->link_lost_latched ||
+                       ctrl->link_lost_latched2 ||
+                       primary_disconnected ||
+                       secondary_disconnected));
     snap.degraded = (snap.control_active &&
                      (ctrl->verify_degraded_down ||
                       ctrl->verify_degraded_up ||
@@ -2516,6 +2529,52 @@ static void rigctrl_cancel_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
     }
 }
 
+typedef struct {
+    GtkRigCtrl *ctrl;
+    gchar      *primary;
+    gchar      *secondary;
+} RigLinkLostInfo;
+
+static gboolean rig_link_lost_error_idle(gpointer data)
+{
+    RigLinkLostInfo *info = data;
+
+    if (info == NULL)
+        return G_SOURCE_REMOVE;
+
+    if (info->ctrl != NULL && !info->ctrl->destroying)
+    {
+        rig_show_error_dialog(info->ctrl,
+                              info->primary ? info->primary : _("Radio link lost"),
+                              info->secondary ? info->secondary : _("See log for details."));
+    }
+
+    g_free(info->primary);
+    g_free(info->secondary);
+    g_free(info);
+    return G_SOURCE_REMOVE;
+}
+
+static void rigctrl_schedule_link_lost_popup(GtkRigCtrl *ctrl,
+                                             const gchar *role,
+                                             guint attempts)
+{
+    RigLinkLostInfo *info;
+    const gchar *label = (role != NULL) ? role : _("radio");
+
+    if (ctrl == NULL)
+        return;
+
+    info = g_new0(RigLinkLostInfo, 1);
+    info->ctrl = ctrl;
+    info->primary = g_strdup(_("Radio link lost"));
+    info->secondary = g_strdup_printf(
+        _("The %s link failed after %u reconnect attempt(s). "
+          "Check power, cable, and rigctld, then press Engage to retry."),
+        label, attempts);
+    g_idle_add(rig_link_lost_error_idle, info);
+}
+
 static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
 {
     if (ctrl == NULL)
@@ -2526,6 +2585,7 @@ static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
         rigctrl_cancel_reconnect(ctrl, TRUE);
         ctrl->reconnect_backoff_ms2 = 0;
         ctrl->reconnect_next_us2 = 0;
+        ctrl->reconnect_attempts2 = 0;
         ctrl->tx_conn_error_reported = FALSE;
     }
     else
@@ -2533,8 +2593,86 @@ static void rigctrl_reset_reconnect(GtkRigCtrl *ctrl, gboolean secondary)
         rigctrl_cancel_reconnect(ctrl, FALSE);
         ctrl->reconnect_backoff_ms = 0;
         ctrl->reconnect_next_us = 0;
+        ctrl->reconnect_attempts = 0;
         ctrl->rx_conn_error_reported = FALSE;
     }
+}
+
+static void rigctrl_reset_link_lost_latch(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->link_lost_latched = FALSE;
+    ctrl->link_lost_latched2 = FALSE;
+}
+
+static void rigctrl_latch_link_lost(GtkRigCtrl *ctrl,
+                                    gboolean secondary,
+                                    const gchar *role,
+                                    guint attempts)
+{
+    gboolean *latched_ptr;
+    RigSession *session;
+    gchar detail[sizeof(ctrl->ui_status_detail)] = { 0 };
+    const gchar *label = (role != NULL) ? role : _("radio");
+    gboolean shared_secondary = FALSE;
+
+    if (ctrl == NULL || ctrl->destroying)
+        return;
+
+    latched_ptr = secondary ? &ctrl->link_lost_latched2 : &ctrl->link_lost_latched;
+    if (*latched_ptr)
+        return;
+    *latched_ptr = TRUE;
+
+    session = secondary ? ctrl->rig_session2 : ctrl->rig_session;
+    if (session != NULL)
+    {
+        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                              "reconnect failed after %u attempt(s)", attempts);
+    }
+
+    g_snprintf(detail, sizeof(detail),
+               _("%s link lost after %u reconnect attempt(s)"),
+               label, attempts);
+    rigctrl_set_status_detail(ctrl, detail);
+
+    rig_term_log(ctrl, "gpredict:err", "%s", detail);
+    sat_log_log(SAT_LOG_LEVEL_ERROR, "%s", detail);
+
+    rigctrl_cancel_reconnect(ctrl, secondary);
+    rigctrl_cancel_open_task(ctrl);
+    if (secondary)
+        ctrl->opening2 = FALSE;
+    else
+        ctrl->opening = FALSE;
+
+    if (!secondary && ctrl->conf2 == NULL &&
+        is_full_duplex_main_sub_configured(ctrl->conf))
+    {
+        shared_secondary = TRUE;
+        ctrl->link_lost_latched2 = TRUE;
+        if (ctrl->rig_session2 != NULL)
+        {
+            rig_session_set_state(ctrl, ctrl->rig_session2, RIG_SESSION_DEGRADED,
+                                  "shared link lost");
+        }
+    }
+
+    rigctrl_set_conn_state(ctrl, secondary, RIGCTRL_CONN_DISCONNECTED,
+                           "retry limit reached");
+    if (shared_secondary)
+    {
+        rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_DISCONNECTED,
+                               "shared retry limit reached");
+    }
+
+    rigctrl_schedule_link_lost_popup(ctrl, label, attempts);
+    rigctrl_queue_ui_status_refresh(ctrl, "link lost latched");
+
+    if (ctrl->engaged || ctrl->engage_pending)
+        schedule_rig_disengage(ctrl);
 }
 
 static void rigctrl_reset_error_gates(GtkRigCtrl *ctrl)
@@ -2545,6 +2683,7 @@ static void rigctrl_reset_error_gates(GtkRigCtrl *ctrl)
     /* Reset retry/error gating only when the user engages again. */
     rigctrl_reset_reconnect(ctrl, FALSE);
     rigctrl_reset_reconnect(ctrl, TRUE);
+    rigctrl_reset_link_lost_latch(ctrl);
 
     if (ctrl->autostart_error_reported != NULL)
         g_hash_table_remove_all(ctrl->autostart_error_reported);
@@ -2580,6 +2719,10 @@ static gboolean rigctrl_reconnect_cb(gpointer data)
 
         if (!ctrl->destroying && ctrl->engaged)
         {
+            if ((secondary && ctrl->link_lost_latched2) ||
+                (!secondary && ctrl->link_lost_latched))
+                goto done;
+
             rigctrl_request_open(ctrl, "reconnect timer");
 
             if (secondary)
@@ -2596,6 +2739,7 @@ static gboolean rigctrl_reconnect_cb(gpointer data)
         }
     }
 
+done:
     if (ctrl != NULL)
         g_object_unref(ctrl);
     if (info != NULL)
@@ -2615,6 +2759,8 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
     gint   *backoff_ptr;
     gint64 *next_ptr;
     guint  *source_ptr;
+    guint  *attempts_ptr;
+    guint   attempt = 0;
 
     if (ctrl == NULL)
         return;
@@ -2630,6 +2776,9 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
         return;
     if (secondary && ctrl->conf2 == NULL)
         return;
+    if ((secondary && ctrl->link_lost_latched2) ||
+        (!secondary && ctrl->link_lost_latched))
+        return;
 
     backoff_ptr = secondary ? &ctrl->reconnect_backoff_ms2
                             : &ctrl->reconnect_backoff_ms;
@@ -2637,9 +2786,20 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
                          : &ctrl->reconnect_next_us;
     source_ptr = secondary ? &ctrl->reconnect_source_id2
                            : &ctrl->reconnect_source_id;
+    attempts_ptr = secondary ? &ctrl->reconnect_attempts2
+                             : &ctrl->reconnect_attempts;
 
     if (*source_ptr != 0)
         return;
+
+    if (*attempts_ptr >= RIGCTRL_RECONNECT_MAX_ATTEMPTS)
+    {
+        rigctrl_latch_link_lost(ctrl, secondary, role, *attempts_ptr);
+        return;
+    }
+
+    (*attempts_ptr)++;
+    attempt = *attempts_ptr;
 
     if (*backoff_ptr <= 0)
         backoff = RIGCTRL_RECONNECT_BACKOFF_MIN_MS;
@@ -2651,17 +2811,22 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
     *next_ptr = now_us + ((gint64) backoff * 1000);
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: scheduling %s reconnect in %d ms"),
-                __func__, role ? role : _("rig"), backoff);
+                _("%s: scheduling %s reconnect attempt %u/%u in %d ms"),
+                __func__, role ? role : _("rig"),
+                attempt, (guint)RIGCTRL_RECONNECT_MAX_ATTEMPTS, backoff);
     rig_term_log(ctrl, "gpredict",
-                 "reconnect %s in %d ms",
-                 role ? role : "rig", backoff);
+                 "reconnect %s attempt %u/%u in %d ms",
+                 role ? role : "rig",
+                 attempt, (guint)RIGCTRL_RECONNECT_MAX_ATTEMPTS, backoff);
 
     {
         RigSession *session = secondary ? ctrl->rig_session2 : ctrl->rig_session;
 
         rig_session_set_state(ctrl, session, RIG_SESSION_RECONNECTING,
-                              "backoff %d ms", backoff);
+                              "backoff %d ms attempt %u/%u",
+                              backoff,
+                              attempt,
+                              (guint)RIGCTRL_RECONNECT_MAX_ATTEMPTS);
     }
 
     {
@@ -2841,6 +3006,10 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->reconnect_backoff_ms2 = 0;
     ctrl->reconnect_next_us = 0;
     ctrl->reconnect_next_us2 = 0;
+    ctrl->reconnect_attempts = 0;
+    ctrl->reconnect_attempts2 = 0;
+    ctrl->link_lost_latched = FALSE;
+    ctrl->link_lost_latched2 = FALSE;
     ctrl->rx_conn_error_reported = FALSE;
     ctrl->tx_conn_error_reported = FALSE;
     ctrl->edit_primary = FALSE;
@@ -5863,7 +6032,16 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         if (!ctrl->ui_hard_error)
         {
             rigctrl_clear_ui_hard_error(ctrl);
-            rigctrl_set_status_detail(ctrl, NULL);
+            if (ctrl->link_lost_latched || ctrl->link_lost_latched2)
+            {
+                rigctrl_set_status_detail(
+                    ctrl,
+                    _("Radio link lost. Check radio and press Engage to retry."));
+            }
+            else
+            {
+                rigctrl_set_status_detail(ctrl, NULL);
+            }
             rig_ui_command_window_init(&ctrl->ui_cmd_window);
         }
         rig_term_log(ctrl, "gpredict", "disengage");
@@ -11853,6 +12031,12 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
         g_idle_add(rigctrl_close_socket_idle, info);
     }
 
+    rigctrl_cancel_open_task(ctrl);
+    if (secondary)
+        ctrl->opening2 = FALSE;
+    else
+        ctrl->opening = FALSE;
+
     rigctrl_schedule_reconnect(ctrl, secondary, role);
 }
 
@@ -12769,6 +12953,8 @@ static void rigctrl_start_open_task(GtkRigCtrl *ctrl)
 {
     if (ctrl == NULL || ctrl->destroying || !ctrl->engaged)
         return;
+    if (ctrl->link_lost_latched || ctrl->link_lost_latched2)
+        return;
 
     if (ctrl->open_task != NULL)
         return;
@@ -12787,6 +12973,8 @@ static void rigctrl_request_open(GtkRigCtrl *ctrl, const gchar *reason)
     gboolean schedule = FALSE;
 
     if (ctrl == NULL || ctrl->destroying || !ctrl->engaged)
+        return;
+    if (ctrl->link_lost_latched || ctrl->link_lost_latched2)
         return;
 
     /* Opening/state guards keep reconnect attempts from re-entering open(). */

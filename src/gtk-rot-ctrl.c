@@ -509,6 +509,7 @@ struct _GtkRotCtrl {
     guint64         engage_generation;
     rot_session_state_t session_state;
     gboolean        tracking_active;
+    gdouble         tracking_session_los;
     gboolean        force_next_send;
     gboolean        hold_position_on_engage;
     gboolean        hold_position_log_emitted;
@@ -778,6 +779,8 @@ static void     rotctrl_set_ui_status_detail(GtkRotCtrl *ctrl,
 static void     rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
                                         const RotorStateSnapshot *snap,
                                         const gchar *reason);
+static void     rotctrl_finish_tracking_pass_over(GtkRotCtrl *ctrl,
+                                                  const gchar *reason);
 static gboolean rotctrl_target_display_valid(const sat_t *sat);
 static void     rotctrl_update_detached_labels(GtkRotCtrl *ctrl);
 static void rot_session_set_state(GtkRotCtrl *ctrl,
@@ -6135,6 +6138,11 @@ static gint rotctrl_stale_warn_floor_ms(const GtkRotCtrl *ctrl)
 {
     gint poll_ms = rotctrl_poll_period_ms(ctrl);
     gint floor_ms = poll_ms * 2;
+    gint timeout_floor_ms = ROT_CMD_POS_TIMEOUT_MS + poll_ms;
+
+    /* Budget one slow get_position round-trip before warning. */
+    if (floor_ms < timeout_floor_ms)
+        floor_ms = timeout_floor_ms;
 
     if (floor_ms < 500)
         floor_ms = 500;
@@ -6147,6 +6155,11 @@ static gint rotctrl_stale_degraded_floor_ms(const GtkRotCtrl *ctrl)
     gint poll_ms = rotctrl_poll_period_ms(ctrl);
     gint floor_ms = poll_ms * 3;
     gint warn_floor_ms = rotctrl_stale_warn_floor_ms(ctrl);
+    gint timeout_floor_ms = ROT_CMD_POS_TIMEOUT_MS + (poll_ms * 2);
+
+    /* Require sustained misses beyond normal poll+timeout jitter. */
+    if (floor_ms < timeout_floor_ms)
+        floor_ms = timeout_floor_ms;
 
     if (floor_ms < warn_floor_ms)
         floor_ms = warn_floor_ms;
@@ -10097,6 +10110,78 @@ static void update_aoslos_banner(GtkRotCtrl *ctrl, gdouble t)
     g_free(buff);
 }
 
+static void rotctrl_finish_tracking_pass_over(GtkRotCtrl *ctrl,
+                                              const gchar *reason)
+{
+    const gchar *why = (reason && *reason) ? reason : "pass over";
+    RotorStateSnapshot snap = { 0 };
+    gboolean locked = FALSE;
+
+    if (ctrl == NULL || !ctrl->tracking)
+        return;
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "tracking complete: %s; waiting for user input",
+                why);
+    rot_term_log(ctrl, "gpredict:state",
+                 "tracking complete: %s; waiting for user input",
+                 why);
+
+    if (ctrl->track != NULL)
+    {
+        rotctrl_ui_begin_update(ctrl, "pass_over_track_off");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+        rotctrl_ui_end_update(ctrl, "pass_over_track_off");
+    }
+
+    if (ctrl->LockBut != NULL)
+        locked = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut));
+    if (ctrl->MonitorCheckBox != NULL)
+        gtk_widget_set_sensitive(ctrl->MonitorCheckBox, !locked);
+    if (ctrl->AzSet != NULL)
+        gtk_widget_set_sensitive(ctrl->AzSet, TRUE);
+    if (ctrl->ElSet != NULL)
+        gtk_widget_set_sensitive(ctrl->ElSet, TRUE);
+
+    ctrl->tracking = FALSE;
+    ctrl->tracking_active = FALSE;
+    ctrl->tracking_session_los = 0.0;
+    ctrl->target_state = ROT_TARGET_STATE_IDLE;
+    ctrl->target_state_since_us = 0;
+    ctrl->target_valid_since_us = 0;
+    ctrl->target_invalid_since_us = 0;
+    ctrl->setpoint_valid = FALSE;
+    ctrl->last_target_update_us = 0;
+    ctrl->last_send_us = 0;
+    ctrl->above_eps_count = 0;
+    ctrl->motion_err_valid = FALSE;
+    ctrl->motion_stall_count = 0;
+    rot_plan_reset(&ctrl->trajectory_plan);
+    set_flipped_pass(ctrl);
+
+    ctrl->have_user_command = FALSE;
+    ctrl->hold_position_on_engage = TRUE;
+    ctrl->hold_position_log_emitted = FALSE;
+    ctrl->force_next_send = FALSE;
+    ctrl->park_requested = FALSE;
+    ctrl->stale_hold_active = FALSE;
+    ctrl->pretrack_target_valid = FALSE;
+    ctrl->pretrack_last_update_us = 0;
+    ctrl->pretrack_aos_time = 0.0;
+    ctrl->pretrack_wait_log_us = 0;
+    ctrl->pretrack_wrap_valid = FALSE;
+    ctrl->pretrack_wrap_user_az = 0.0;
+    ctrl->pretrack_wrap_raw_az = 0.0;
+    ctrl->pretrack_wrap_k = 0;
+    rotctrl_tracking_policy_reset_reason(ctrl, "pass_over");
+
+    snap.control_active = ctrl->engaged || ctrl->engage_pending || ctrl->ui_hard_error;
+    snap.engaging = ctrl->engage_pending;
+    snap.hard_error = ctrl->ui_hard_error;
+    rotctrl_set_ui_status_detail(ctrl, "STANDBY");
+    rotctrl_apply_ui_status(ctrl, &snap, "pass over");
+}
+
 /*
  * Update rotator control state.
  * 
@@ -10138,6 +10223,14 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
         update_aoslos_banner(ctrl, t);
         rotctrl_update_detached_labels(ctrl);
 
+        if (ctrl->tracking &&
+            ctrl->tracking_session_los > 0.0 &&
+            isfinite(ctrl->tracking_session_los) &&
+            t >= ctrl->tracking_session_los)
+        {
+            rotctrl_finish_tracking_pass_over(ctrl, "pass LOS reached");
+        }
+
         /*if the current pass is too far away */
         if ((ctrl->pass != NULL))
             if (qth_small_dist(ctrl->qth, ctrl->pass->qth_comp) > 1.0)
@@ -10175,6 +10268,10 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                 else if ((ctrl->target->aos - ctrl->pass->aos) >
                          (ctrl->delay / secday / 1000 / 4.0))
                 {
+                    if (ctrl->tracking)
+                        rotctrl_finish_tracking_pass_over(ctrl,
+                                                          "pass ended (rollover)");
+
                     /* the target is expected to appear in a new pass 
                        sufficiently later after the current pass says */
 
@@ -10197,6 +10294,10 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                    horizon so look for a new pass */
                 if (ctrl->target->el < 0.0)
                 {
+                    if (ctrl->tracking)
+                        rotctrl_finish_tracking_pass_over(ctrl,
+                                                          "satellite below horizon");
+
                     rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
@@ -10388,6 +10489,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         rot_plan_reset(&ctrl->trajectory_plan);
         set_flipped_pass(ctrl);
         ctrl->tracking_active = FALSE;
+        ctrl->tracking_session_los = 0.0;
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
         ctrl->target_state_since_us = 0;
         ctrl->target_valid_since_us = 0;
@@ -10464,6 +10566,10 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
             ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, ctrl->t);
         else
             ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
+        ctrl->tracking_session_los =
+            (ctrl->pass != NULL && isfinite(ctrl->pass->los))
+                ? ctrl->pass->los
+                : 0.0;
 
         rot_plan_reset(&ctrl->trajectory_plan);
         rotctrl_tracking_policy_reset_reason(ctrl, "track_on");
@@ -10528,6 +10634,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
             rot_show_plan_error(ctrl, ctrl->trajectory_plan.reason);
             gtk_toggle_button_set_active(button, FALSE);
             ctrl->tracking = FALSE;
+            ctrl->tracking_session_los = 0.0;
             set_flipped_pass(ctrl);
             rotctrl_tracking_policy_reset_reason(ctrl, "track_off_no_session");
             return;
@@ -10541,6 +10648,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     }
     else if (ctrl->tracking) {
         rot_plan_reset(&ctrl->trajectory_plan);
+        ctrl->tracking_session_los = 0.0;
         set_flipped_pass(ctrl);
         rotctrl_tracking_policy_reset_reason(ctrl, "track_off");
     }
@@ -10569,6 +10677,7 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
     /* Latch freeze regardless of UI signal delivery order. */
     ctrl->tracking = FALSE;
     ctrl->tracking_active = FALSE;
+    ctrl->tracking_session_los = 0.0;
     ctrl->target_state = ROT_TARGET_STATE_IDLE;
     ctrl->target_state_since_us = 0;
     ctrl->target_valid_since_us = 0;
@@ -10766,6 +10875,15 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     if (!session_ready)
         plan_active = FALSE;
 
+    if (ctrl->tracking &&
+        ctrl->tracking_session_los > 0.0 &&
+        isfinite(ctrl->tracking_session_los) &&
+        ctrl->t >= ctrl->tracking_session_los)
+    {
+        rotctrl_finish_tracking_pass_over(ctrl, "pass LOS reached");
+        return TRUE;
+    }
+
     if (ctrl->client.thread != NULL)
     {
         gboolean thread_done = FALSE;
@@ -10844,6 +10962,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 ctrl->pretrack_target_valid ? ROT_PRETRACK_HYSTERESIS_DEG : 0.0;
             below_horizon = live_valid &&
                             (live_el < (elev_floor + horizon_margin));
+        }
+        if (below_horizon &&
+            ctrl->pass != NULL &&
+            isfinite(ctrl->pass->los) &&
+            ctrl->t >= ctrl->pass->los)
+        {
+            rotctrl_finish_tracking_pass_over(ctrl, "LOS reached");
+            return TRUE;
         }
         pretrack_active = FALSE;
         hold_below = FALSE;
@@ -12508,10 +12634,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (ctrl->tracking)
         {
-            if (pretrack_active && ctrl->pretrack_target_valid)
+            /* Keep the controller marker in the same transformed/display
+             * domain used for setpoint and command generation. This avoids
+             * azimuth drift on flipped/inverted trajectories.
+             */
+            if (pred_valid)
             {
-                cmdaz_plot = azel_normalize_az_0_360(ctrl->pretrack_target_az);
-                cmdel_plot = ctrl->pretrack_target_el;
+                cmdaz_plot = azel_normalize_az_0_360(display_az360);
+                cmdel_plot = display_el;
             }
             else if (live_valid)
             {
@@ -13384,9 +13514,13 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             const gchar *status_text = NULL;
             const gdouble status_eps = rotctrl_angle_epsilon(ctrl);
             gboolean has_error = error || (ctrl->errcnt > 0);
+            gboolean stale_only_degraded = FALSE;
+            gboolean degraded_for_ui = FALSE;
+            gboolean assume_standby_no_user_cmd = FALSE;
             gdouble status_target_az = az_abs_cmd;
             gdouble status_target_el = cmdel;
             gboolean status_moving = FALSE;
+            gboolean pretrack_hold = FALSE;
             gboolean standby_state = FALSE;
             RotorStateSnapshot snap = { 0 };
 
@@ -13403,31 +13537,75 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                         : fabs(shortest_az_delta(status_target_az,
                                                                  ctrl->az_abs_cur));
                 gdouble status_el_err = fabs(status_target_el - rotel_backend);
+                gdouble status_eps_exit = status_eps;
+                gdouble status_eps_enter = status_eps_exit * 1.35;
 
                 if (ctrl->conf &&
                     ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
                     status_el_err = 0.0;
 
-                status_moving = (status_az_err > status_eps ||
-                                 status_el_err > status_eps);
+                if (ctrl->threshold > 0.0 && status_eps_exit < ctrl->threshold)
+                    status_eps_exit = ctrl->threshold;
+                if (status_eps_enter < (status_eps_exit + 0.2))
+                    status_eps_enter = status_eps_exit + 0.2;
+
+                if (ctrl->ui_status == ROTOR_UI_STATUS_MOVING)
+                    status_moving = (status_az_err > status_eps_exit ||
+                                     status_el_err > status_eps_exit);
+                else
+                    status_moving = (status_az_err > status_eps_enter ||
+                                     status_el_err > status_eps_enter);
             }
+
+            stale_only_degraded = (ctrl->session_state == ROT_SESSION_DEGRADED &&
+                                   ctrl->pos_stale_hyst_active &&
+                                   (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
+                                    !ctrl->stale_hold_active) &&
+                                   comm_status != ROT_COMM_DEGRADED &&
+                                   !has_error &&
+                                   !ctrl->ui_hard_error);
+            degraded_for_ui = ((comm_status == ROT_COMM_DEGRADED) ||
+                               ((ctrl->session_state == ROT_SESSION_DEGRADED) &&
+                                !stale_only_degraded) ||
+                               has_error);
+
+            assume_standby_no_user_cmd =
+                (ctrl->engaged &&
+                 !ctrl->tracking &&
+                 !ctrl->park_requested &&
+                 !ctrl->have_user_command &&
+                 !ctrl->cal_active &&
+                 !ctrl->cal_hold_active);
+            if (assume_standby_no_user_cmd)
+                status_moving = FALSE;
+
+            pretrack_hold = (ctrl->tracking &&
+                             ctrl->target_state == ROT_TARGET_STATE_PRETRACK &&
+                             !status_moving);
 
             if (!ctrl->engaged)
                 status_text = _("DISENGAGED");
             else if (comm_status == ROT_COMM_LINK_LOST || has_error)
                 status_text = _("LINK LOST");
-            else if (comm_status == ROT_COMM_DEGRADED)
+            else if (degraded_for_ui)
                 status_text = _("DEGRADED FEEDBACK");
             else if (ctrl->session_state == ROT_SESSION_CONNECTING)
                 status_text = _("CONNECTING");
             else if (ctrl->session_state == ROT_SESSION_ENGAGING)
                 status_text = _("ENGAGING");
+            else if (pretrack_hold)
+                status_text = _("PRETRACK");
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_PRETRACK)
                 status_text = _("MOVING");
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED)
                 status_text = _("MOVING");
+            else if (assume_standby_no_user_cmd)
+            {
+                status_text = _("STANDBY");
+                standby_state = TRUE;
+            }
             else if (status_moving)
                 status_text = _("MOVING");
             else if (ctrl->engaged &&
@@ -13450,16 +13628,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                              ctrl->session_state == ROT_SESSION_ENGAGING);
             snap.hard_error = ctrl->ui_hard_error;
             snap.link_lost = (comm_status == ROT_COMM_LINK_LOST);
-            snap.degraded = ((comm_status == ROT_COMM_DEGRADED) ||
-                             (ctrl->session_state == ROT_SESSION_DEGRADED) ||
-                             has_error);
-            snap.moving = ((ctrl->tracking &&
-                            (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
-                             ctrl->target_state ==
-                             ROT_TARGET_STATE_TRACKING_DEGRADED)) ||
-                           status_moving);
+            snap.degraded = degraded_for_ui;
+            snap.moving = (!assume_standby_no_user_cmd &&
+                           !pretrack_hold &&
+                           ((ctrl->tracking &&
+                             (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
+                              ctrl->target_state ==
+                              ROT_TARGET_STATE_TRACKING_DEGRADED)) ||
+                            status_moving));
+            snap.pretracking = pretrack_hold;
             snap.on_target = (ctrl->engaged &&
                               !snap.moving &&
+                              !snap.pretracking &&
                               !standby_state);
             rotctrl_apply_ui_status(ctrl, &snap, "poll");
 
@@ -19091,6 +19271,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->engaged = FALSE;
         ctrl->engage_pending = FALSE;
         ctrl->tracking_active = FALSE;
+        ctrl->tracking_session_los = 0.0;
         ctrl->have_user_command = FALSE;
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
         ctrl->target_state_since_us = 0;
@@ -20765,6 +20946,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
 
     ctrl->tracking = FALSE;
     ctrl->tracking_active = FALSE;
+    ctrl->tracking_session_los = 0.0;
     ctrl->have_user_command = FALSE;
     ctrl->target_state = ROT_TARGET_STATE_IDLE;
     ctrl->target_state_since_us = 0;

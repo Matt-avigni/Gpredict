@@ -182,33 +182,39 @@ static void run_rotor_tests(void)
     snap.moving = TRUE;
     expect_rotor(snap, ROTOR_UI_STATUS_MOVING, "rotor moving");
 
-    /* d) on target => ON TARGET */
+    /* d) pretrack hold => PRETRACK */
     snap.moving = FALSE;
+    snap.pretracking = TRUE;
+    expect_rotor(snap, ROTOR_UI_STATUS_PRETRACK, "rotor pretrack hold");
+
+    /* e) on target => ON TARGET */
+    snap.pretracking = FALSE;
     snap.on_target = TRUE;
     expect_rotor(snap, ROTOR_UI_STATUS_ON_TARGET, "rotor on target");
 
-    /* e) degraded => DEGRADED */
+    /* f) degraded => DEGRADED */
     snap.on_target = FALSE;
     snap.degraded = TRUE;
     expect_rotor(snap, ROTOR_UI_STATUS_DEGRADED, "rotor degraded");
 
-    /* f) link lost => LINK LOST */
+    /* g) link lost => LINK LOST */
     snap.degraded = FALSE;
     snap.link_lost = TRUE;
     expect_rotor(snap, ROTOR_UI_STATUS_LINK_LOST, "rotor link lost");
 
-    /* g) daemon/config failure => ERROR */
+    /* h) daemon/config failure => ERROR */
     snap.link_lost = FALSE;
     snap.hard_error = TRUE;
     expect_rotor(snap, ROTOR_UI_STATUS_ERROR, "rotor hard error");
 
-    /* h) engaged but idle => STANDBY */
+    /* i) engaged but idle => STANDBY */
     snap.hard_error = FALSE;
     snap.control_active = TRUE;
     snap.engaging = FALSE;
     snap.degraded = FALSE;
     snap.link_lost = FALSE;
     snap.moving = FALSE;
+    snap.pretracking = FALSE;
     snap.on_target = FALSE;
     expect_rotor(snap, ROTOR_UI_STATUS_STANDBY, "rotor standby");
 }
@@ -218,6 +224,9 @@ int main(void)
     expect_true(g_strcmp0(rotor_ui_status_to_string(ROTOR_UI_STATUS_ON_TARGET),
                           "ON TARGET") == 0,
                 "rotor status string ON TARGET");
+    expect_true(g_strcmp0(rotor_ui_status_to_string(ROTOR_UI_STATUS_PRETRACK),
+                          "PRETRACK") == 0,
+                "rotor status string PRETRACK");
     expect_true(g_strcmp0(radio_ui_status_to_string(RADIO_UI_STATUS_STABLE),
                           "STABLE") == 0,
                 "radio status string STABLE");

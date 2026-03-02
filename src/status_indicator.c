@@ -278,6 +278,8 @@ UiSeverity rotor_ui_status_to_severity(RotorUiStatus status)
     switch (status)
     {
     case ROTOR_UI_STATUS_ENGAGING:
+    case ROTOR_UI_STATUS_STANDBY:
+    case ROTOR_UI_STATUS_PRETRACK:
     case ROTOR_UI_STATUS_MOVING:
         return UI_SEVERITY_BLUE;
     case ROTOR_UI_STATUS_ON_TARGET:
@@ -288,7 +290,6 @@ UiSeverity rotor_ui_status_to_severity(RotorUiStatus status)
     case ROTOR_UI_STATUS_ERROR:
         return UI_SEVERITY_RED;
     case ROTOR_UI_STATUS_DISENGAGED:
-    case ROTOR_UI_STATUS_STANDBY:
     default:
         return UI_SEVERITY_GREY;
     }
@@ -299,6 +300,7 @@ UiSeverity radio_ui_status_to_severity(RadioUiStatus status)
     switch (status)
     {
     case RADIO_UI_STATUS_ENGAGING:
+    case RADIO_UI_STATUS_STANDBY:
         return UI_SEVERITY_BLUE;
     case RADIO_UI_STATUS_STABLE:
         return UI_SEVERITY_GREEN;
@@ -308,7 +310,6 @@ UiSeverity radio_ui_status_to_severity(RadioUiStatus status)
     case RADIO_UI_STATUS_ERROR:
         return UI_SEVERITY_RED;
     case RADIO_UI_STATUS_DISENGAGED:
-    case RADIO_UI_STATUS_STANDBY:
     default:
         return UI_SEVERITY_GREY;
     }
@@ -322,6 +323,8 @@ StatusIndicatorPulseMode rotor_ui_status_to_pulse_mode(RotorUiStatus status)
         return STATUS_INDICATOR_PULSE_SLOW;
     case ROTOR_UI_STATUS_MOVING:
         return STATUS_INDICATOR_PULSE_FAST;
+    case ROTOR_UI_STATUS_PRETRACK:
+        return STATUS_INDICATOR_PULSE_NONE;
     case ROTOR_UI_STATUS_LINK_LOST:
         return STATUS_INDICATOR_PULSE_SLOW;
     default:

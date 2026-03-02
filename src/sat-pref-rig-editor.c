@@ -141,7 +141,10 @@ static void update_rigctld_model_sensitivity(RigPrefUi *ui, gboolean enabled)
     if (ui == NULL)
         return;
 
-    allow_edit = enabled && !radio_model_has_preset(ui);
+    (void)enabled;
+
+    /* Keep manual model editable for "Other" even if autostart is disabled. */
+    allow_edit = !radio_model_has_preset(ui);
 
     if (ui->rigctld_model != NULL)
         gtk_widget_set_sensitive(ui->rigctld_model, allow_edit);

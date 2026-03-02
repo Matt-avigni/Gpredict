@@ -1369,7 +1369,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     /* Baud */
     label = gtk_label_new(_("Baud"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
 
     ui->baud = gtk_spin_button_new_with_range(300, 921600, 100);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->baud),
@@ -1383,7 +1383,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     /* Device */
     label = gtk_label_new(_("Device"));
     g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(table), label, 0, 6, 1, 1);
+    gtk_grid_attach(GTK_GRID(table), label, 0, 7, 1, 1);
 
     ui->device_combo = gtk_combo_box_text_new();
     gtk_widget_set_tooltip_text(ui->device_combo,

@@ -32,6 +32,7 @@
 #include "sat-pref-interfaces.h"
 #include "sat-pref-modules.h"
 #include "sat-pref-predict.h"
+#include "ui-popup-quarantine.h"
 
 /** Columns in the icon list */
 enum {
@@ -56,6 +57,7 @@ static void     sat_pref_dialog_response(GtkDialog *dialog,
                                          gint response,
                                          gpointer user_data);
 static void     sat_pref_dialog_destroy(GtkWidget *widget, gpointer user_data);
+static void     sat_pref_register_combos(GtkWidget *widget, gpointer data);
 
 /**
  * Create and run preferences dialog.
@@ -172,6 +174,10 @@ void sat_pref_run(void)
     gtk_box_set_spacing(GTK_BOX
                         (gtk_dialog_get_content_area(GTK_DIALOG(window))), 10);
 
+    gp_ui_quarantine_install(window);
+    sat_pref_register_combos(gtk_dialog_get_content_area(GTK_DIALOG(window)),
+                             window);
+
     gtk_button_clicked(GTK_BUTTON(genbut));
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "sat-pref dialog created");
@@ -237,4 +243,21 @@ static void sat_pref_dialog_destroy(GtkWidget *widget, gpointer user_data)
     sat_log_log(SAT_LOG_LEVEL_DEBUG, "sat-pref dialog destroyed");
     if (widget == window)
         window = NULL;
+}
+
+static void sat_pref_register_combos(GtkWidget *widget, gpointer data)
+{
+    GtkWidget *toplevel = GTK_WIDGET(data);
+
+    if (widget == NULL || toplevel == NULL)
+        return;
+
+    if (GTK_IS_COMBO_BOX(widget))
+        gp_ui_quarantine_register_combo(toplevel, GTK_COMBO_BOX(widget));
+
+    if (GTK_IS_CONTAINER(widget))
+    {
+        gtk_container_foreach(GTK_CONTAINER(widget),
+                              sat_pref_register_combos, data);
+    }
 }
