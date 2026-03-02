@@ -161,6 +161,10 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTRL_DOPPLER_LOG_INTERVAL_US 2000000
 #define RIGCTRL_PROBE_LOG_INTERVAL_US 5000000
 #define RIGCTRL_VERIFY_LOG_INTERVAL_US 5000000
+#define RIGCTRL_TARGET_MAX_AZ_DEG 720.0
+#define RIGCTRL_TARGET_MAX_EL_DEG 180.0
+#define RIGCTRL_TARGET_MAX_RANGE_KM 1000000.0
+#define RIGCTRL_TARGET_MAX_RANGE_RATE_KM_S 1000.0
 
 #ifdef RIGCTRL_TRSP_POPUP_DEBUG
 #define RIGCTRL_TRSP_POPUP_LOG(...) \
@@ -3152,12 +3156,53 @@ static void update_count_down(GtkRigCtrl * ctrl, gdouble t)
 {
     gchar          *buff;
 
+    if (ctrl == NULL || ctrl->SatCnt == NULL || ctrl->target == NULL ||
+        !isfinite(t) ||
+        !isfinite(ctrl->target->az) ||
+        !isfinite(ctrl->target->el) ||
+        !isfinite(ctrl->target->aos) ||
+        !isfinite(ctrl->target->los) ||
+        !isfinite(ctrl->target->range) ||
+        !isfinite(ctrl->target->range_rate))
+    {
+        gtk_label_set_markup(GTK_LABEL(ctrl->SatCnt),
+                             "<span size='xx-large'><b>--</b></span>");
+        return;
+    }
+
     buff = predict_format_aoslos_countdown(ctrl->target, t, TRUE, TRUE);
     if (buff == NULL)
         buff = g_strdup("<span size='xx-large'><b>--</b></span>");
 
     gtk_label_set_markup(GTK_LABEL(ctrl->SatCnt), buff);
     g_free(buff);
+}
+
+static gboolean rigctrl_target_display_valid(const sat_t *sat)
+{
+    if (sat == NULL)
+        return FALSE;
+
+    if (!isfinite(sat->az) || !isfinite(sat->el) ||
+        !isfinite(sat->aos) || !isfinite(sat->los) ||
+        !isfinite(sat->range) || !isfinite(sat->range_rate))
+    {
+        return FALSE;
+    }
+
+    if (fabs(sat->az) > RIGCTRL_TARGET_MAX_AZ_DEG ||
+        fabs(sat->el) > RIGCTRL_TARGET_MAX_EL_DEG)
+    {
+        return FALSE;
+    }
+
+    if (sat->range < 0.0 || sat->range > RIGCTRL_TARGET_MAX_RANGE_KM)
+        return FALSE;
+
+    if (fabs(sat->range_rate) > RIGCTRL_TARGET_MAX_RANGE_RATE_KM_S)
+        return FALSE;
+
+    return TRUE;
 }
 
 static void rigctrl_set_user_base_freq(GtkRigCtrl *ctrl,
@@ -3447,8 +3492,17 @@ static void rigctrl_update_doppler(GtkRigCtrl *ctrl)
     gint64 dd = 0;
     gint64 du = 0;
 
-    if (ctrl == NULL || ctrl->target == NULL)
+    if (ctrl == NULL || !rigctrl_target_display_valid(ctrl->target))
+    {
+        if (ctrl != NULL)
+        {
+            rigctrl_set_cached_doppler(ctrl, TRUE, 0);
+            rigctrl_set_cached_doppler(ctrl, FALSE, 0);
+            ctrl->doppler_down_hz = 0;
+            ctrl->doppler_up_hz = 0;
+        }
         return;
+    }
 
     menu_rx_hz = (ctrl->menu_rx_hz > 0) ?
                      ctrl->menu_rx_hz :
@@ -4952,7 +5006,7 @@ void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
 
     g_mutex_lock(&ctrl->rig_ctrl_updatelock);
 
-    if (ctrl->target)
+    if (rigctrl_target_display_valid(ctrl->target) && isfinite(t))
     {
         buff = g_strdup_printf(AZEL_FMTSTR, ctrl->target->az);
         gtk_label_set_text(GTK_LABEL(ctrl->SatAz), buff);
@@ -5008,6 +5062,41 @@ void gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t)
             /* we don't have any current pass; store the current one */
             ctrl->pass = get_next_pass(ctrl->target, ctrl->qth, 3.0);
         }
+    }
+    else
+    {
+        if (ctrl->target != NULL &&
+            rigctrl_log_throttled(ctrl, &ctrl->last_invalid_log_us,
+                                  RIGCTRL_DOPPLER_LOG_INTERVAL_US))
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "rig target telemetry invalid: az=%.3f el=%.3f range=%.3f rate=%.3f",
+                        ctrl->target->az,
+                        ctrl->target->el,
+                        ctrl->target->range,
+                        ctrl->target->range_rate);
+        }
+
+        gtk_label_set_text(GTK_LABEL(ctrl->SatAz), " --- ");
+        gtk_label_set_text(GTK_LABEL(ctrl->SatEl), " --- ");
+        if (sat_cfg_get_bool(SAT_CFG_BOOL_USE_IMPERIAL))
+        {
+            gtk_label_set_text(GTK_LABEL(ctrl->SatRng), "--- mi");
+            gtk_label_set_text(GTK_LABEL(ctrl->SatRngRate), "--- mi/s");
+        }
+        else
+        {
+            gtk_label_set_text(GTK_LABEL(ctrl->SatRng), "--- km");
+            gtk_label_set_text(GTK_LABEL(ctrl->SatRngRate), "--- km/s");
+        }
+        update_count_down(ctrl, t);
+        rigctrl_update_doppler(ctrl);
+        buff = g_strdup_printf("%" G_GINT64_FORMAT " Hz", ctrl->doppler_down_hz);
+        gtk_label_set_text(GTK_LABEL(ctrl->SatDopDown), buff);
+        g_free(buff);
+        buff = g_strdup_printf("%" G_GINT64_FORMAT " Hz", ctrl->doppler_up_hz);
+        gtk_label_set_text(GTK_LABEL(ctrl->SatDopUp), buff);
+        g_free(buff);
     }
 
     rigctrl_update_freq_display(ctrl);

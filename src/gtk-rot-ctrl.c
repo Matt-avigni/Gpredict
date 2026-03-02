@@ -144,7 +144,9 @@
 #define ROT_CMD_DISCREPANCY_STRIKES 3
 #define ROT_STALE_ENTER_MS 7000
 #define ROT_STALE_EXIT_MS 2500
+#define ROT_STALE_DEGRADED_CONFIRM_POLLS 2
 #define ROT_STALE_READY_CONFIRM_POLLS 2
+#define ROT_UI_DEGRADED_CLEAR_POLLS 4
 #define ROT_TRACK_LEAD_SEC 0.3
 #define ROT_AZ_OOB_PENALTY 10000.0
 
@@ -516,6 +518,8 @@ struct _GtkRotCtrl {
     gboolean        have_user_command;
     rot_comm_status_t comm_status;
     RotorUiStatus   ui_status;
+    gboolean        ui_degraded_latched;
+    guint           ui_degraded_clear_hits;
     gboolean        ui_hard_error;
     gchar           ui_hard_error_reason[128];
     gchar           ui_status_detail[160];
@@ -914,6 +918,9 @@ static gboolean rotctld_io_recent(GtkRotCtrl *ctrl, gint64 window_us);
 static gboolean rotctld_stop_requested(GtkRotCtrl *ctrl);
 static void     rotctld_request_thread_stop(GtkRotCtrl *ctrl,
                                             gboolean send_quit);
+static gboolean rotctld_collect_client_thread(GtkRotCtrl *ctrl,
+                                              gboolean allow_block,
+                                              const gchar *context);
 static void     rotctld_sleep_us(GtkRotCtrl *ctrl, gint64 usec);
 static void     rotctld_finish_engage(GtkRotCtrl *ctrl);
 static gint     rotctld_mgr_pid(const RotctldMgr *mgr);
@@ -2186,6 +2193,8 @@ static void rot_session_set_state(GtkRotCtrl *ctrl,
     {
         ctrl->hold_position_on_engage = TRUE;
         ctrl->hold_position_log_emitted = FALSE;
+        ctrl->ui_degraded_latched = FALSE;
+        ctrl->ui_degraded_clear_hits = 0;
         ctrl->ok_streak = 0;
         ctrl->bad_streak = 0;
         ctrl->timeout_streak = 0;
@@ -2238,6 +2247,8 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     {
         if (!ctrl->engage_pending)
             rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED, "idle", FALSE);
+        ctrl->ui_degraded_latched = FALSE;
+        ctrl->ui_degraded_clear_hits = 0;
         ctrl->pos_stale_hits = 0;
         ctrl->pos_stale_hyst_active = FALSE;
         ctrl->pos_stale_ready_hits = 0;
@@ -2262,18 +2273,29 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     if (stale_suppressed)
     {
         ctrl->pos_stale_hyst_active = FALSE;
+        ctrl->pos_stale_hits = 0;
         ctrl->pos_stale_ready_hits = 0;
     }
     else if (!ctrl->pos_stale_hyst_active)
     {
         if (stale_enter)
         {
-            ctrl->pos_stale_hyst_active = TRUE;
-            ctrl->pos_stale_ready_hits = 0;
+            if (ctrl->pos_stale_hits < G_MAXUINT)
+                ctrl->pos_stale_hits++;
+            if (ctrl->pos_stale_hits >= ROT_STALE_DEGRADED_CONFIRM_POLLS)
+            {
+                ctrl->pos_stale_hyst_active = TRUE;
+                ctrl->pos_stale_ready_hits = 0;
+            }
+        }
+        else
+        {
+            ctrl->pos_stale_hits = 0;
         }
     }
     else
     {
+        ctrl->pos_stale_hits = ROT_STALE_DEGRADED_CONFIRM_POLLS;
         if (stale_exit)
         {
             if (ctrl->pos_stale_ready_hits < G_MAXUINT)
@@ -2281,6 +2303,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
             if (ctrl->pos_stale_ready_hits >= ROT_STALE_READY_CONFIRM_POLLS)
             {
                 ctrl->pos_stale_hyst_active = FALSE;
+                ctrl->pos_stale_hits = 0;
                 ctrl->pos_stale_ready_hits = 0;
             }
         }
@@ -2293,11 +2316,13 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
 
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 "rotor stale eval poll=%dms age=%lldms stale_ms=%d "
-                "enter=%d exit=%d active=%d ready_hits=%u/%u state=%s",
+                "enter=%d hits=%u/%u exit=%d active=%d ready_hits=%u/%u state=%s",
                 rotctrl_poll_period_ms(ctrl),
                 (long long)pos_age_ms,
                 stale_ms,
                 stale_enter ? 1 : 0,
+                ctrl->pos_stale_hits,
+                ROT_STALE_DEGRADED_CONFIRM_POLLS,
                 stale_exit ? 1 : 0,
                 stale_active ? 1 : 0,
                 ctrl->pos_stale_ready_hits,
@@ -2950,6 +2975,50 @@ static void rotctld_request_thread_stop(GtkRotCtrl *ctrl, gboolean send_quit)
 
     if (!thread_running && ctrl->client.client != NULL)
         rotctld_client_close(ctrl->client.client);
+}
+
+static gboolean rotctld_collect_client_thread(GtkRotCtrl *ctrl,
+                                              gboolean allow_block,
+                                              const gchar *context)
+{
+    GThread *thread = NULL;
+
+    if (ctrl == NULL)
+        return TRUE;
+
+    thread = ctrl->client.thread;
+    if (thread == NULL)
+        return TRUE;
+
+#if GLIB_CHECK_VERSION(2, 32, 0)
+    if (!allow_block)
+    {
+        gboolean thread_done = FALSE;
+        gboolean running = FALSE;
+
+        g_mutex_lock(&ctrl->client.mutex);
+        thread_done = ctrl->client.thread_done;
+        running = ctrl->client.running;
+        g_mutex_unlock(&ctrl->client.mutex);
+        if (!thread_done || running)
+            return FALSE;
+        g_thread_unref(thread);
+    }
+    else
+#endif
+    {
+        g_thread_join(thread);
+    }
+
+    ctrl->client.thread = NULL;
+    ctrl->client.socket = -1;
+    ctrl->client.thread_generation = 0;
+    ctrl->client.running = FALSE;
+    if (context && *context)
+        rot_term_log_verbose(ctrl, "gpredict:rx",
+                             "rotctld client thread joined (%s)",
+                             context);
+    return TRUE;
 }
 
 static void rotctld_sleep_us(GtkRotCtrl *ctrl, gint64 usec)
@@ -10894,19 +10963,15 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (thread_done)
         {
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "rotctld client thread joined");
-            rot_term_log_verbose(ctrl, "gpredict:rx",
-                                 "rotctld client thread joined");
-            g_thread_join(ctrl->client.thread);
-            ctrl->client.thread = NULL;
-            ctrl->client.socket = -1;
-            ctrl->client.thread_generation = 0;
-            ctrl->client.running = FALSE;
-            if (ctrl->engage_pending)
+            if (rotctld_collect_client_thread(ctrl, FALSE, "poll"))
             {
-                rotctld_finish_engage(ctrl);
-                return TRUE;
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            "rotctld client thread joined");
+                if (ctrl->engage_pending)
+                {
+                    rotctld_finish_engage(ctrl);
+                    return TRUE;
+                }
             }
         }
     }
@@ -13515,7 +13580,10 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             const gdouble status_eps = rotctrl_angle_epsilon(ctrl);
             gboolean has_error = error || (ctrl->errcnt > 0);
             gboolean stale_only_degraded = FALSE;
+            gboolean degraded_raw = FALSE;
             gboolean degraded_for_ui = FALSE;
+            gboolean stuck_feedback = FALSE;
+            gboolean degraded_clear_ok = FALSE;
             gboolean assume_standby_no_user_cmd = FALSE;
             gdouble status_target_az = az_abs_cmd;
             gdouble status_target_el = cmdel;
@@ -13523,6 +13591,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             gboolean pretrack_hold = FALSE;
             gboolean standby_state = FALSE;
             RotorStateSnapshot snap = { 0 };
+            guint discrepancy_streak = 0;
+            gboolean discrepancy_pending = FALSE;
 
             if (ctrl->setpoint_valid)
             {
@@ -13557,17 +13627,64 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                      status_el_err > status_eps_enter);
             }
 
+            g_mutex_lock(&ctrl->client.mutex);
+            discrepancy_streak = ctrl->client.discrepancy_streak;
+            discrepancy_pending = ctrl->client.discrepancy_pending;
+            g_mutex_unlock(&ctrl->client.mutex);
+            stuck_feedback = (discrepancy_pending &&
+                              discrepancy_streak >= ROT_CMD_DISCREPANCY_STRIKES);
+
             stale_only_degraded = (ctrl->session_state == ROT_SESSION_DEGRADED &&
                                    ctrl->pos_stale_hyst_active &&
-                                   (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
-                                    !ctrl->stale_hold_active) &&
+                                   !ctrl->tracking &&
+                                   !ctrl->stale_hold_active &&
+                                   !stuck_feedback &&
                                    comm_status != ROT_COMM_DEGRADED &&
                                    !has_error &&
                                    !ctrl->ui_hard_error);
-            degraded_for_ui = ((comm_status == ROT_COMM_DEGRADED) ||
-                               ((ctrl->session_state == ROT_SESSION_DEGRADED) &&
-                                !stale_only_degraded) ||
-                               has_error);
+            degraded_raw = ((comm_status == ROT_COMM_DEGRADED) ||
+                            ((ctrl->session_state == ROT_SESSION_DEGRADED) &&
+                             !stale_only_degraded) ||
+                            has_error);
+            if (degraded_raw)
+            {
+                ctrl->ui_degraded_latched = TRUE;
+                ctrl->ui_degraded_clear_hits = 0;
+            }
+            else if (ctrl->ui_degraded_latched)
+            {
+                degraded_clear_ok = (ctrl->engaged &&
+                                     ctrl->session_state == ROT_SESSION_READY &&
+                                     comm_status == ROT_COMM_STANDBY &&
+                                     !ctrl->pos_stale_hyst_active &&
+                                     !ctrl->stale_hold_active &&
+                                     !stuck_feedback &&
+                                     pos_fresh &&
+                                     !has_error &&
+                                     !ctrl->ui_hard_error);
+                if (degraded_clear_ok)
+                {
+                    if (ctrl->ui_degraded_clear_hits < G_MAXUINT)
+                        ctrl->ui_degraded_clear_hits++;
+                    if (ctrl->ui_degraded_clear_hits >=
+                        ROT_UI_DEGRADED_CLEAR_POLLS)
+                    {
+                        ctrl->ui_degraded_latched = FALSE;
+                        ctrl->ui_degraded_clear_hits = 0;
+                    }
+                }
+                else
+                {
+                    ctrl->ui_degraded_clear_hits = 0;
+                }
+            }
+
+            degraded_for_ui = degraded_raw || ctrl->ui_degraded_latched;
+            if (stuck_feedback)
+            {
+                degraded_for_ui = TRUE;
+                status_moving = FALSE;
+            }
 
             assume_standby_no_user_cmd =
                 (ctrl->engaged &&
@@ -13601,6 +13718,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED)
                 status_text = _("MOVING");
+            else if (ctrl->tracking && !pos_fresh)
+                status_text = _("MOVING");
             else if (assume_standby_no_user_cmd)
             {
                 status_text = _("STANDBY");
@@ -13629,18 +13748,21 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             snap.hard_error = ctrl->ui_hard_error;
             snap.link_lost = (comm_status == ROT_COMM_LINK_LOST);
             snap.degraded = degraded_for_ui;
-            snap.moving = (!assume_standby_no_user_cmd &&
+            snap.moving = (!degraded_for_ui &&
+                           !assume_standby_no_user_cmd &&
                            !pretrack_hold &&
                            ((ctrl->tracking &&
                              (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
                               ctrl->target_state ==
-                              ROT_TARGET_STATE_TRACKING_DEGRADED)) ||
+                              ROT_TARGET_STATE_TRACKING_DEGRADED ||
+                              !pos_fresh)) ||
                             status_moving));
             snap.pretracking = pretrack_hold;
             snap.on_target = (ctrl->engaged &&
                               !snap.moving &&
                               !snap.pretracking &&
-                              !standby_state);
+                              !standby_state &&
+                              (!ctrl->tracking || pos_fresh));
             rotctrl_apply_ui_status(ctrl, &snap, "poll");
 
             char cmdaz_str[32];
@@ -16532,10 +16654,8 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
 
         if (thread_done)
         {
-            g_thread_join(ctrl->client.thread);
-            ctrl->client.thread = NULL;
-            ctrl->client.socket = -1;
-            ctrl->client.thread_generation = 0;
+            if (!rotctld_collect_client_thread(ctrl, FALSE, "engage"))
+                return;
         }
 
         if (ctrl->client.thread != NULL)
@@ -17371,10 +17491,9 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                 return ROTCTLD_AUTODETECT_STEP_CONTINUE;
             }
 
-            g_thread_join(ctrl->client.thread);
-            ctrl->client.thread = NULL;
-            ctrl->client.socket = -1;
-            ctrl->client.thread_generation = 0;
+            if (!rotctld_collect_client_thread(ctrl, FALSE,
+                                               "autodetect_start_child"))
+                return ROTCTLD_AUTODETECT_STEP_CONTINUE;
         }
 
         if (ctrl->client.running || ctrl->client.socket != -1)
@@ -19312,10 +19431,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         rotctld_request_thread_stop(ctrl, will_send_quit);
         if (ctrl->client.thread)
         {
-            g_thread_join(ctrl->client.thread);
-            ctrl->client.thread = NULL;
-            ctrl->client.socket = -1;
-            ctrl->client.thread_generation = 0;
+            (void)rotctld_collect_client_thread(ctrl, FALSE, "disengage");
         }
         {
             RotorStateSnapshot snap = { 0 };
@@ -21019,6 +21135,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->session_state = ROT_SESSION_DISCONNECTED;
     ctrl->comm_status = ROT_COMM_DISENGAGED;
     ctrl->ui_status = ROTOR_UI_STATUS_DISENGAGED;
+    ctrl->ui_degraded_latched = FALSE;
+    ctrl->ui_degraded_clear_hits = 0;
     ctrl->ui_hard_error = FALSE;
     ctrl->ui_hard_error_reason[0] = '\0';
     ctrl->ui_status_detail[0] = '\0';
@@ -21268,9 +21386,7 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     {
         /* Signal the thread to stop, then wait for it */
         rotctld_request_thread_stop(ctrl, TRUE);
-        g_thread_join(ctrl->client.thread);
-        ctrl->client.thread = NULL;
-        ctrl->client.socket = -1;
+        (void)rotctld_collect_client_thread(ctrl, TRUE, "destroy");
     }
     if (ctrl->client.rxbuf != NULL)
     {
