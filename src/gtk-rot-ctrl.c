@@ -1146,6 +1146,9 @@ static void wrap_mode_changed_cb(GtkComboBox *box, gpointer data);
 static void rot_limits_changed_cb(GtkSpinButton *spin, gpointer data);
 static void az_endstop_changed_cb(GtkSpinButton *spin, gpointer data);
 static void sat_selected_cb(GtkComboBox *satsel, gpointer data);
+static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
+                                            gint index,
+                                            const gchar *source);
 
 /* Park position helper.
  *
@@ -10417,6 +10420,7 @@ void gtk_rot_ctrl_select_sat(GtkRotCtrl * ctrl, gint catnum)
                                           GTK_COMBO_BOX(ctrl->SatSel),
                                           i,
                                           G_CALLBACK(sat_selected_cb));
+            (void)rotctrl_apply_sat_selection(ctrl, i, "programmatic");
             break;
         }
     }
@@ -19646,6 +19650,106 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
  * 
  * This function is called when the user selects a new satellite.
  */
+static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
+                                            gint index,
+                                            const gchar *source)
+{
+    sat_t *selected = NULL;
+    gdouble target_plot_az = -10.0;
+    gdouble target_plot_el = -10.0;
+
+    if (ctrl == NULL)
+        return FALSE;
+
+    selected = SAT(g_slist_nth_data(ctrl->sats, index));
+    if (selected == NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    _("%s:%s: Invalid satellite selection: %d"),
+                    __FILE__, __func__, index);
+
+        ctrl->target = NULL;
+        if (ctrl->pass != NULL)
+        {
+            free_pass(ctrl->pass);
+            ctrl->pass = NULL;
+        }
+        rotctrl_set_pass_on_plots(ctrl, NULL);
+        rotctrl_set_target_pos_on_plots(ctrl, -10.0, -10.0);
+        rotctrl_queue_draw_plots(ctrl);
+        return FALSE;
+    }
+
+    ctrl->target = selected;
+    rot_plan_reset(&ctrl->trajectory_plan);
+    rotctrl_tracking_policy_reset_reason(ctrl, "target_change");
+    ctrl->pretrack_target_valid = FALSE;
+    ctrl->pretrack_last_update_us = 0;
+    ctrl->pretrack_aos_time = 0.0;
+    ctrl->pretrack_wait_log_us = 0;
+    ctrl->pretrack_wrap_valid = FALSE;
+    ctrl->pretrack_wrap_user_az = 0.0;
+    ctrl->pretrack_wrap_raw_az = 0.0;
+    ctrl->pretrack_wrap_k = 0;
+    ctrl->seam_valid = FALSE;
+    ctrl->seam_crossing_active = FALSE;
+    ctrl->seam_crossing_sent = FALSE;
+    ctrl->seam_crossing_lane_valid = FALSE;
+    ctrl->seam_crossing_lane_k = 0;
+    ctrl->seam_crossing_target_az360 = 0.0;
+    ctrl->seam_crossing_since_us = 0;
+    ctrl->wrap_acquire_active = FALSE;
+    ctrl->wrap_acquire_sent = FALSE;
+    ctrl->wrap_acquire_target_backend = 0.0;
+    ctrl->wrap_acquire_target_az360 = 0.0;
+    ctrl->wrap_acquire_target_k = 0;
+    ctrl->wrap_acquire_since_us = 0;
+    ctrl->wrap_acquire_last_log_us = 0;
+    ctrl->pending_lane_valid = FALSE;
+    ctrl->pending_lane_since_us = 0;
+    ctrl->locked_lane_valid = FALSE;
+    ctrl->last_target_valid = FALSE;
+
+    if (ctrl->pass != NULL)
+    {
+        free_pass(ctrl->pass);
+        ctrl->pass = NULL;
+    }
+
+    if (ctrl->target->el > 0.0)
+        ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, ctrl->t);
+    else
+        ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
+
+    set_flipped_pass(ctrl);
+    rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
+
+    if (isfinite(ctrl->target->az) && isfinite(ctrl->target->el) &&
+        ctrl->target->el >= 0.0)
+    {
+        target_plot_az = ctrl->target->az;
+        target_plot_el = ctrl->target->el;
+    }
+    rotctrl_set_target_pos_on_plots(ctrl, target_plot_az, target_plot_el);
+    update_count_down(ctrl, ctrl->t);
+    update_aoslos_banner(ctrl, ctrl->t);
+    rotctrl_update_detached_labels(ctrl);
+    rotctrl_queue_draw_plots(ctrl);
+
+    sat_log_log(SAT_LOG_LEVEL_INFO,
+                "target selection applied source=%s sat=%s catnr=%d",
+                source ? source : "unknown",
+                ctrl->target->nickname ? ctrl->target->nickname : "(none)",
+                ctrl->target->tle.catnr);
+    rot_term_log_verbose(ctrl, "gpredict:state",
+                         "target selection applied source=%s sat=%s catnr=%d",
+                         source ? source : "unknown",
+                         ctrl->target->nickname ? ctrl->target->nickname : "(none)",
+                         ctrl->target->tle.catnr);
+
+    return TRUE;
+}
+
 static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
 {
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(data);
@@ -19655,66 +19759,7 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
         return;
 
     i = gtk_combo_box_get_active(satsel);
-    if (i >= 0)
-    {
-        ctrl->target = SAT(g_slist_nth_data(ctrl->sats, i));
-        rot_plan_reset(&ctrl->trajectory_plan);
-        rotctrl_tracking_policy_reset_reason(ctrl, "target_change");
-        ctrl->pretrack_target_valid = FALSE;
-        ctrl->pretrack_last_update_us = 0;
-        ctrl->pretrack_aos_time = 0.0;
-        ctrl->pretrack_wait_log_us = 0;
-        ctrl->pretrack_wrap_valid = FALSE;
-        ctrl->pretrack_wrap_user_az = 0.0;
-        ctrl->pretrack_wrap_raw_az = 0.0;
-        ctrl->pretrack_wrap_k = 0;
-        ctrl->seam_valid = FALSE;
-        ctrl->seam_crossing_active = FALSE;
-        ctrl->seam_crossing_sent = FALSE;
-        ctrl->seam_crossing_lane_valid = FALSE;
-        ctrl->seam_crossing_lane_k = 0;
-        ctrl->seam_crossing_target_az360 = 0.0;
-        ctrl->seam_crossing_since_us = 0;
-        ctrl->wrap_acquire_active = FALSE;
-        ctrl->wrap_acquire_sent = FALSE;
-        ctrl->wrap_acquire_target_backend = 0.0;
-        ctrl->wrap_acquire_target_az360 = 0.0;
-        ctrl->wrap_acquire_target_k = 0;
-        ctrl->wrap_acquire_since_us = 0;
-        ctrl->wrap_acquire_last_log_us = 0;
-        ctrl->pending_lane_valid = FALSE;
-        ctrl->pending_lane_since_us = 0;
-        ctrl->locked_lane_valid = FALSE;
-        ctrl->last_target_valid = FALSE;
-
-        /* update next pass */
-        if (ctrl->pass != NULL)
-            free_pass(ctrl->pass);
-
-        if (ctrl->target->el > 0.0)
-            ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, ctrl->t);
-        else
-            ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
-
-        set_flipped_pass(ctrl);
-    }
-    else
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    _("%s:%s: Invalid satellite selection: %d"),
-                    __FILE__, __func__, i);
-
-        /* clear pass just in case... */
-        if (ctrl->pass != NULL)
-        {
-            free_pass(ctrl->pass);
-            ctrl->pass = NULL;
-        }
-    }
-
-    /* in either case, we set the new pass (even if NULL) on the polar plot */
-    if (ctrl->plot != NULL)
-        rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
+    (void)rotctrl_apply_sat_selection(ctrl, i, "combo");
 }
 
 /* Create target widgets */
