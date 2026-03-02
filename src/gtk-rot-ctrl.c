@@ -124,6 +124,7 @@
 #define ROT_PRETRACK_SEARCH_STEP_SEC 2.0
 #define ROT_PRETRACK_REFINE_SEC 0.5
 #define ROT_PRETRACK_HYSTERESIS_DEG 0.5
+#define ROT_PRETRACK_LIVE_FALLBACK_MARGIN_DEG 2.0
 #define ROT_TRACK_LOOKAHEAD_SEC 2.0
 #define ROT_CMD_MIN_AZ_DEG 0.8
 #define ROT_CMD_MIN_EL_DEG 0.5
@@ -144,8 +145,8 @@
 #define ROT_CMD_DISCREPANCY_STRIKES 3
 #define ROT_STALE_ENTER_MS 7000
 #define ROT_STALE_EXIT_MS 2500
-#define ROT_STALE_DEGRADED_CONFIRM_POLLS 2
-#define ROT_STALE_READY_CONFIRM_POLLS 2
+#define ROT_STALE_DEGRADED_CONFIRM_POLLS 3
+#define ROT_STALE_READY_CONFIRM_POLLS 4
 #define ROT_UI_DEGRADED_CLEAR_POLLS 4
 #define ROT_TRACK_LEAD_SEC 0.3
 #define ROT_AZ_OOB_PENALTY 10000.0
@@ -11060,6 +11061,42 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                                   &aos_az360,
                                                   &aos_el);
 
+                if (!aos_found &&
+                    ctrl->pass != NULL &&
+                    isfinite(ctrl->pass->aos) &&
+                    ctrl->pass->aos >= ctrl->t)
+                {
+                    gdouble pass_aos = ctrl->pass->aos;
+                    gdouble pass_lead = pass_aos +
+                                        (ROT_PRETRACK_AOS_OFFSET_SEC / secday);
+
+                    if (!rotctrl_predict_at(ctrl, pass_lead, &aos_az360, &aos_el))
+                        rotctrl_predict_at(ctrl, pass_aos, &aos_az360, &aos_el);
+
+                    if (isfinite(aos_az360) && isfinite(aos_el))
+                    {
+                        aos_time = pass_aos;
+                        aos_found = TRUE;
+                        if (ctrl->verbose_logging)
+                        {
+                            gchar aos_buf[64] = { 0 };
+                            const gchar *aos_str = "unknown";
+
+                            rotctrl_format_utc_jd(pass_aos,
+                                                  aos_buf,
+                                                  sizeof(aos_buf));
+                            if (aos_buf[0] != '\0')
+                                aos_str = aos_buf;
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack aos(pass)=%s az=%.2f el=%.2f lead=%.1fs",
+                                        aos_str,
+                                        aos_az360,
+                                        aos_el,
+                                        ROT_PRETRACK_AOS_OFFSET_SEC);
+                        }
+                    }
+                }
+
                 if (aos_found)
                 {
                     gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
@@ -11103,11 +11140,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                             ctrl->conf->maxel);
 
                     if (rotctrl_find_pretrack_cmd(ctrl,
-                                                  ctrl->t,
-                                                  elev_floor,
-                                                  &plan_az,
-                                                  &plan_el,
-                                                  &plan_t))
+                                                       ctrl->t,
+                                                       elev_floor,
+                                                       &plan_az,
+                                                       &plan_el,
+                                                       &plan_t))
                     {
                         ctrl->pretrack_target_az = plan_az;
                         ctrl->pretrack_target_el = plan_el;
@@ -11124,7 +11161,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                         plan_el);
                         }
                     }
-                    else if (live_valid)
+                    else if (live_valid &&
+                             live_el >= (elev_floor -
+                                         ROT_PRETRACK_LIVE_FALLBACK_MARGIN_DEG))
                     {
                         ctrl->pretrack_target_az = live_az360;
                         ctrl->pretrack_target_el = pretrack_el;
@@ -11959,24 +11998,39 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->pos_stale_active = FALSE;
             if (rotpos_valid)
             {
+                gboolean seeded_from_meas = FALSE;
+
                 g_mutex_lock(&ctrl->client.mutex);
-                ctrl->client.last_cmd_backend_az = meas_backend_az;
-                ctrl->client.last_cmd_backend_el = meas_backend_el;
-                ctrl->client.last_cmd_backend_valid = TRUE;
-                g_mutex_unlock(&ctrl->client.mutex);
-                last_cmd_backend = meas_backend_az;
-                have_last_cmd_backend = TRUE;
-                if (!ctrl->locked_lane_valid)
+                if (!ctrl->client.last_cmd_backend_valid)
                 {
-                    gdouble meas_norm = gp_norm360(meas_backend_az);
-                    ctrl->locked_lane_k =
-                        (gint)lrint((meas_backend_az - meas_norm) / 360.0);
-                    ctrl->locked_lane_valid = TRUE;
+                    ctrl->client.last_cmd_backend_az = meas_backend_az;
+                    ctrl->client.last_cmd_backend_el = meas_backend_el;
+                    ctrl->client.last_cmd_backend_valid = TRUE;
+                    seeded_from_meas = TRUE;
                 }
-                sat_log_log(SAT_LOG_LEVEL_INFO,
-                            "rot stale: recovered; seeding refs from measured az=%.2f el=%.2f",
-                            meas_backend_az,
-                            meas_backend_el);
+                g_mutex_unlock(&ctrl->client.mutex);
+
+                if (seeded_from_meas)
+                {
+                    last_cmd_backend = meas_backend_az;
+                    have_last_cmd_backend = TRUE;
+                    if (!ctrl->locked_lane_valid)
+                    {
+                        gdouble meas_norm = gp_norm360(meas_backend_az);
+                        ctrl->locked_lane_k =
+                            (gint)lrint((meas_backend_az - meas_norm) / 360.0);
+                        ctrl->locked_lane_valid = TRUE;
+                    }
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "rot stale: recovered; seeding refs from measured az=%.2f el=%.2f",
+                                meas_backend_az,
+                                meas_backend_el);
+                }
+                else
+                {
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "rot stale: recovered; keeping command reference");
+                }
             }
             else
             {
@@ -12536,8 +12590,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 {
                     gchar aos_buf[64] = { 0 };
                     const gchar *aos_str = "unknown";
+                    gboolean have_aos = (ctrl->pretrack_aos_time > 0.0);
 
-                    if (ctrl->pretrack_aos_time > 0.0)
+                    if (have_aos)
                     {
                         rotctrl_format_utc_jd(ctrl->pretrack_aos_time,
                                               aos_buf,
@@ -12545,18 +12600,30 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                         if (aos_buf[0] != '\0')
                             aos_str = aos_buf;
                     }
-                    sat_log_log(SAT_LOG_LEVEL_INFO,
-                                "pretrack target=AOS %s az=%.2f el=%.2f lead=%.1fs cmd=%.2f",
-                                aos_str,
-                                az_pred, el_pred,
-                                ROT_PRETRACK_AOS_OFFSET_SEC,
-                                cmdaz);
-                    rot_term_log_verbose(ctrl, "gpredict:state",
-                                         "pretrack target=AOS %s az=%.2f el=%.2f lead=%.1fs cmd=%.2f",
-                                         aos_str,
-                                         az_pred, el_pred,
-                                         ROT_PRETRACK_AOS_OFFSET_SEC,
-                                         cmdaz);
+                    if (have_aos)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    "pretrack target=AOS %s az=%.2f el=%.2f lead=%.1fs cmd=%.2f",
+                                    aos_str,
+                                    az_pred, el_pred,
+                                    ROT_PRETRACK_AOS_OFFSET_SEC,
+                                    cmdaz);
+                        rot_term_log_verbose(ctrl, "gpredict:state",
+                                             "pretrack target=AOS %s az=%.2f el=%.2f lead=%.1fs cmd=%.2f",
+                                             aos_str,
+                                             az_pred, el_pred,
+                                             ROT_PRETRACK_AOS_OFFSET_SEC,
+                                             cmdaz);
+                    }
+                    else
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    "pretrack target=FALLBACK az=%.2f el=%.2f cmd=%.2f",
+                                    az_pred, el_pred, cmdaz);
+                        rot_term_log_verbose(ctrl, "gpredict:state",
+                                             "pretrack target=FALLBACK az=%.2f el=%.2f cmd=%.2f",
+                                             az_pred, el_pred, cmdaz);
+                    }
                 }
                 else if (desired_state == ROT_TARGET_STATE_HOLD)
                 {
