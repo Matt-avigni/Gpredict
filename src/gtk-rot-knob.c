@@ -103,24 +103,7 @@ static void button_clicked_cb(GtkWidget * button, gpointer data)
     gdouble         delta =
         GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "delta")) / 100.0;
 
-    if ((delta > 0.0) && ((knob->value + delta) <= knob->max + .005))
-    {
-        knob->value += delta;
-        if (knob->value > knob->max)
-        {
-            knob->value = knob->max;
-        }
-    }
-    else if ((delta < 0.0) && ((knob->value + delta) >= knob->min - .005))
-    {
-        knob->value += delta;
-        if (knob->value < knob->min)
-        {
-            knob->value = knob->min;
-        }
-    }
-
-    gtk_rot_knob_update(knob);
+    gtk_rot_knob_set_value(knob, knob->value + delta);
 }
 
 /*

@@ -501,6 +501,8 @@ struct _GtkRotCtrl {
     sat_t          *target;
     pass_t         *pass;
     qth_t          *qth;
+    GtkSatModule   *module;
+    GHashTable     *module_sats;
 
     guint           delay, timerid;
     gdouble         threshold, t;
@@ -768,6 +770,7 @@ static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_capture_log_closed_height(GtkRotCtrl *ctrl);
 static void rotctrl_restore_log_height(GtkRotCtrl *ctrl);
+static void rotctrl_free_sat_list_entry(gpointer data, gpointer user_data);
 static void     rotctrl_set_pass_on_plots(GtkRotCtrl *ctrl, pass_t *pass);
 static void     rotctrl_set_rotor_pos_on_plots(GtkRotCtrl *ctrl,
                                                gdouble az, gdouble el);
@@ -779,6 +782,8 @@ static void     rotctrl_queue_draw_plots(GtkRotCtrl *ctrl);
 static void     rotctrl_set_ui_hard_error(GtkRotCtrl *ctrl,
                                           const gchar *reason);
 static void     rotctrl_clear_ui_hard_error(GtkRotCtrl *ctrl);
+static gboolean rotctrl_sync_sat_copy_from_module(GtkRotCtrl *ctrl,
+                                                  sat_t *dst);
 static void     rotctrl_set_ui_status_detail(GtkRotCtrl *ctrl,
                                              const gchar *detail);
 static void     rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
@@ -1481,6 +1486,68 @@ static gboolean rotctrl_target_display_valid(const sat_t *sat)
 
     if (fabs(sat->az) > 720.0 || fabs(sat->el) > 180.0)
         return FALSE;
+
+    return TRUE;
+}
+
+static gboolean rotctrl_sync_sat_copy_from_module(GtkRotCtrl *ctrl,
+                                                  sat_t *dst)
+{
+    sat_t *src = NULL;
+    gint catnr = 0;
+
+    if (ctrl == NULL || dst == NULL || ctrl->module_sats == NULL)
+        return FALSE;
+
+    catnr = dst->tle.catnr;
+    src = SAT(g_hash_table_lookup(ctrl->module_sats, &catnr));
+    if (src == NULL)
+        return FALSE;
+
+    if (g_strcmp0(dst->name, src->name) != 0)
+    {
+        g_free(dst->name);
+        dst->name = src->name ? g_strdup(src->name) : NULL;
+    }
+    if (g_strcmp0(dst->nickname, src->nickname) != 0)
+    {
+        g_free(dst->nickname);
+        dst->nickname = src->nickname ? g_strdup(src->nickname) : NULL;
+    }
+    if (g_strcmp0(dst->website, src->website) != 0)
+    {
+        g_free(dst->website);
+        dst->website = src->website ? g_strdup(src->website) : NULL;
+    }
+
+    dst->tle = src->tle;
+    dst->flags = src->flags;
+    dst->sgps = src->sgps;
+    dst->dps = src->dps;
+    dst->deep_arg = src->deep_arg;
+    dst->jul_epoch = src->jul_epoch;
+    dst->jul_utc = src->jul_utc;
+    dst->tsince = src->tsince;
+    dst->pos = src->pos;
+    dst->vel = src->vel;
+    dst->aos = src->aos;
+    dst->los = src->los;
+    dst->az = src->az;
+    dst->el = src->el;
+    dst->range = src->range;
+    dst->range_rate = src->range_rate;
+    dst->ra = src->ra;
+    dst->dec = src->dec;
+    dst->ssplat = src->ssplat;
+    dst->ssplon = src->ssplon;
+    dst->alt = src->alt;
+    dst->velo = src->velo;
+    dst->ma = src->ma;
+    dst->footprint = src->footprint;
+    dst->phase = src->phase;
+    dst->meanmo = src->meanmo;
+    dst->orbit = src->orbit;
+    dst->otype = src->otype;
 
     return TRUE;
 }
@@ -3378,7 +3445,15 @@ static gboolean rotctld_socket_rw(GtkRotCtrl *ctrl, gint sock,
 
 static gint sat_name_compare(sat_t * a, sat_t * b)
 {
-    return (gpredict_strcmp(a->nickname, b->nickname));
+    const gchar *an = "";
+    const gchar *bn = "";
+
+    if (a != NULL)
+        an = (a->nickname != NULL) ? a->nickname : (a->name ? a->name : "");
+    if (b != NULL)
+        bn = (b->nickname != NULL) ? b->nickname : (b->name ? b->name : "");
+
+    return gpredict_strcmp(an, bn);
 }
 
 static gint rot_name_compare(const gchar * a, const gchar * b)
@@ -10273,6 +10348,10 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
 
     if (ctrl->target)
     {
+        if (!rotctrl_sync_sat_copy_from_module(ctrl, ctrl->target) &&
+            ctrl->qth != NULL)
+            predict_calc(ctrl->target, ctrl->qth, t);
+
         target_valid = rotctrl_target_display_valid(ctrl->target);
         if (!target_valid)
         {
@@ -19681,6 +19760,7 @@ static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
     }
 
     ctrl->target = selected;
+    (void)rotctrl_sync_sat_copy_from_module(ctrl, ctrl->target);
     rot_plan_reset(&ctrl->trajectory_plan);
     rotctrl_tracking_policy_reset_reason(ctrl, "target_change");
     ctrl->pretrack_target_valid = FALSE;
@@ -19759,7 +19839,15 @@ static void sat_selected_cb(GtkComboBox * satsel, gpointer data)
         return;
 
     i = gtk_combo_box_get_active(satsel);
-    (void)rotctrl_apply_sat_selection(ctrl, i, "combo");
+    if (!rotctrl_apply_sat_selection(ctrl, i, "combo"))
+        return;
+
+    if (ctrl->module != NULL &&
+        ctrl->target != NULL &&
+        ctrl->module->target != ctrl->target->tle.catnr)
+    {
+        gtk_sat_module_select_sat(ctrl->module, ctrl->target->tle.catnr);
+    }
 }
 
 /* Create target widgets */
@@ -19784,10 +19872,17 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
 
     for (i = 0; i < n; i++)
     {
+        const gchar    *sat_name = _("Unknown");
         sat = SAT(g_slist_nth_data(ctrl->sats, i));
         if (sat)
+        {
+            if (sat->nickname != NULL && *sat->nickname != '\0')
+                sat_name = sat->nickname;
+            else if (sat->name != NULL && *sat->name != '\0')
+                sat_name = sat->name;
             gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ctrl->SatSel),
-                                           sat->nickname);
+                                           sat_name);
+        }
     }
     gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->SatSel), 0);
     gtk_widget_set_tooltip_text(ctrl->SatSel, _("Select target object"));
@@ -20944,15 +21039,30 @@ static GtkWidget *create_plot_widget(GtkRotCtrl * ctrl)
 }
 
 /** Copy satellite from hash table to singly linked list. */
+static void rotctrl_free_sat_list_entry(gpointer data, gpointer user_data)
+{
+    (void)user_data;
+    gtk_sat_data_free_sat(SAT(data));
+}
+
 static void store_sats(gpointer key, gpointer value, gpointer user_data)
 {
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(user_data);
     sat_t          *sat = SAT(value);
+    sat_t          *sat_copy = NULL;
 
     (void)key;                  /* avoid unused variable warning */
 
-    ctrl->sats = g_slist_insert_sorted(ctrl->sats, sat,
-                                       (GCompareFunc) sat_name_compare);
+    if (ctrl == NULL || sat == NULL)
+        return;
+
+    sat_copy = g_new0(sat_t, 1);
+    gtk_sat_data_copy_sat(sat, sat_copy, ctrl->qth);
+    if (sat_copy->nickname == NULL && sat_copy->name != NULL)
+        sat_copy->nickname = g_strdup(sat_copy->name);
+
+    ctrl->sats = g_slist_insert_sorted(ctrl->sats, sat_copy,
+                                       (GCompareFunc)sat_name_compare);
 }
 
 /** Check that we have at least one .rot file */
@@ -21159,6 +21269,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->target = NULL;
     ctrl->pass = NULL;
     ctrl->qth = NULL;
+    ctrl->module = NULL;
+    ctrl->module_sats = NULL;
     ctrl->plot = NULL;
     ctrl->detached_plots = NULL;
     ctrl->axis_mode_combo = NULL;
@@ -21536,6 +21648,16 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
 
     rot_plan_reset(&ctrl->trajectory_plan);
 
+    if (ctrl->sats != NULL)
+    {
+        g_slist_foreach(ctrl->sats, rotctrl_free_sat_list_entry, NULL);
+        g_slist_free(ctrl->sats);
+        ctrl->sats = NULL;
+        ctrl->target = NULL;
+    }
+    ctrl->module = NULL;
+    ctrl->module_sats = NULL;
+
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }
 
@@ -21604,6 +21726,11 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 
     gp_ui_quarantine_install(gtk_widget_get_toplevel(GTK_WIDGET(rot_ctrl)));
 
+    /* store QTH */
+    rot_ctrl->qth = module->qth;
+    rot_ctrl->module = module;
+    rot_ctrl->module_sats = module->satellites;
+
     /* store satellites */
     g_hash_table_foreach(module->satellites, store_sats, rot_ctrl);
 
@@ -21611,9 +21738,6 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
 
     /* store current time (don't know if real or simulated) */
     rot_ctrl->t = module->tmgCdnum;
-
-    /* store QTH */
-    rot_ctrl->qth = module->qth;
 
     /* get next pass for target satellite */
     if (rot_ctrl->target)
