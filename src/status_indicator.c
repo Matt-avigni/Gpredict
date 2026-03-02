@@ -279,9 +279,9 @@ UiSeverity rotor_ui_status_to_severity(RotorUiStatus status)
     {
     case ROTOR_UI_STATUS_ENGAGING:
     case ROTOR_UI_STATUS_STANDBY:
-    case ROTOR_UI_STATUS_PRETRACK:
     case ROTOR_UI_STATUS_MOVING:
         return UI_SEVERITY_BLUE;
+    case ROTOR_UI_STATUS_PRETRACK:
     case ROTOR_UI_STATUS_ON_TARGET:
         return UI_SEVERITY_GREEN;
     case ROTOR_UI_STATUS_DEGRADED:

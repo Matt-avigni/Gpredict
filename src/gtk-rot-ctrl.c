@@ -9516,6 +9516,10 @@ static gpointer rotctld_client_thread(gpointer data)
             gboolean pos_rprt_io = FALSE;
             gboolean backend_disengage = FALSE;
             gboolean desync_detected = FALSE;
+            gdouble sample_step_az = 0.0;
+            gdouble sample_step_el = 0.0;
+            gint64 sample_step_dt_us = 0;
+            gboolean sample_step_valid = FALSE;
             gchar pos_reply[256];
 
             g_mutex_lock(&ctrl->client.mutex);
@@ -9631,6 +9635,10 @@ static gpointer rotctld_client_thread(gpointer data)
                     gdouble mech_el = cur_el;
                     gdouble user_az = 0.0;
                     gdouble user_el = 0.0;
+                    gdouble prev_user_az = 0.0;
+                    gdouble prev_user_el = 0.0;
+                    gint64 prev_sample_us = 0;
+                    gint64 pos_now_us = 0;
 
                     rotctrl_map_mech_to_user(ctrl,
                                              mech_az,
@@ -9639,7 +9647,13 @@ static gpointer rotctld_client_thread(gpointer data)
                                              &user_el);
 
                     g_mutex_lock(&ctrl->client.mutex);
-                    gint64 pos_now_us = g_get_monotonic_time();
+                    if (ctrl->client.last_pos_sample_us > 0)
+                    {
+                        prev_sample_us = ctrl->client.last_pos_sample_us;
+                        prev_user_az = ctrl->client.last_pos_user_az;
+                        prev_user_el = ctrl->client.last_pos_user_el;
+                    }
+                    pos_now_us = g_get_monotonic_time();
                     ctrl->client.azi_mech_in = mech_az;
                     ctrl->client.ele_mech_in = mech_el;
                     ctrl->client.azi_in = user_az;
@@ -9657,6 +9671,13 @@ static gpointer rotctld_client_thread(gpointer data)
                     ctrl->client.last_pos_us = pos_now_us;
                     ctrl->client.last_pos_error[0] = '\0';
                     g_mutex_unlock(&ctrl->client.mutex);
+                    if (prev_sample_us > 0 && pos_now_us > prev_sample_us)
+                    {
+                        sample_step_dt_us = pos_now_us - prev_sample_us;
+                        sample_step_az = rot_ang_dist_deg(user_az, prev_user_az);
+                        sample_step_el = fabs(user_el - prev_user_el);
+                        sample_step_valid = TRUE;
+                    }
                     rotctld_note_io_ok(ctrl);
                     rotctld_backend_ioerr_reset(ctrl);
                     g_mutex_lock(&ctrl->client.mutex);
@@ -9931,12 +9952,21 @@ static gpointer rotctld_client_thread(gpointer data)
                             (ctrl->threshold > 0.0) ? ctrl->threshold : 0.10;
                         gdouble accept =
                             MAX(aim_deadband * 2.0, 0.5);
+                        gdouble move_eps =
+                            MAX(aim_deadband * 0.25, 0.15);
                         gdouble eps = rotctrl_angle_epsilon(ctrl);
                         gboolean within_eps =
                             (az_err <= eps && el_err <= eps);
                         gboolean below_min_step =
                             (az_err <= ROT_CMD_MIN_AZ_DEG &&
                              el_err <= ROT_CMD_MIN_EL_DEG);
+                        gboolean sample_advancing =
+                            (sample_step_valid &&
+                             sample_step_dt_us > 0 &&
+                             sample_step_dt_us <=
+                                 ((gint64)ROT_CMD_MAX_SILENCE_MS * 1000) &&
+                             (sample_step_az >= move_eps ||
+                              sample_step_el >= move_eps));
                         gint64 grace_until = 0;
                         gdouble last_err = 0.0;
                         gint64 last_err_time = 0;
@@ -9974,8 +10004,15 @@ static gpointer rotctld_client_thread(gpointer data)
                                 }
                                 else if (err_deg >= (last_err + 0.1))
                                 {
-                                    if (wrong_way < G_MAXUINT)
+                                    if (sample_advancing)
+                                    {
+                                        last_err_time = now_us;
+                                        wrong_way = 0;
+                                    }
+                                    else if (wrong_way < G_MAXUINT)
+                                    {
                                         wrong_way++;
+                                    }
                                 }
                             }
                             if (wrong_way >= 3)
@@ -13868,8 +13905,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             else if (ctrl->tracking &&
                      ctrl->target_state == ROT_TARGET_STATE_TRACKING_DEGRADED)
                 status_text = _("MOVING");
-            else if (ctrl->tracking && !pos_fresh)
-                status_text = _("MOVING");
             else if (assume_standby_no_user_cmd)
             {
                 status_text = _("STANDBY");
@@ -13904,15 +13939,13 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                            ((ctrl->tracking &&
                              (ctrl->target_state == ROT_TARGET_STATE_PRETRACK ||
                               ctrl->target_state ==
-                              ROT_TARGET_STATE_TRACKING_DEGRADED ||
-                              !pos_fresh)) ||
+                              ROT_TARGET_STATE_TRACKING_DEGRADED)) ||
                             status_moving));
             snap.pretracking = pretrack_hold;
             snap.on_target = (ctrl->engaged &&
                               !snap.moving &&
                               !snap.pretracking &&
-                              !standby_state &&
-                              (!ctrl->tracking || pos_fresh));
+                              !standby_state);
             rotctrl_apply_ui_status(ctrl, &snap, "poll");
 
             char cmdaz_str[32];
