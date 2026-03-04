@@ -150,6 +150,10 @@
 #define ROT_STALE_DEGRADED_CONFIRM_POLLS 1
 #define ROT_STALE_READY_CONFIRM_POLLS 2
 #define ROT_UI_DEGRADED_CLEAR_POLLS 4
+#define ROT_COMM_DEGRADED_FAIL_POLLS 4
+#define ROT_COMM_LINK_LOST_EXTRA_FAIL_POLLS 4
+#define ROT_COMM_LINK_LOST_FAIL_POLLS \
+    (ROT_COMM_DEGRADED_FAIL_POLLS + ROT_COMM_LINK_LOST_EXTRA_FAIL_POLLS)
 #define ROT_TRACK_LEAD_SEC 0.3
 #define ROT_AZ_OOB_PENALTY 10000.0
 
@@ -1368,6 +1372,33 @@ static gboolean rotctrl_link_lost_popup_cb(gpointer data)
                      GTK_MESSAGE_ERROR,
                      _("Rotor link lost"),
                      _("Lost rotor feedback. Check rotor model, serial device, baud rate, and power. Re-engage to retry."));
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean rotctrl_link_lost_disengage_cb(gpointer data)
+{
+    GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
+
+    if (ctrl == NULL)
+        return G_SOURCE_REMOVE;
+
+    sat_log_log(SAT_LOG_LEVEL_WARN,
+                "rotor link lost: disengaging tracking and rotor");
+    rot_term_log(ctrl, "gpredict:err",
+                 "rotor link lost: disengaging tracking and rotor");
+
+    if (ctrl->track != NULL &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->track)))
+    {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+    }
+
+    if (ctrl->LockBut != NULL &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
+    {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+    }
+
     return G_SOURCE_REMOVE;
 }
 
@@ -9934,32 +9965,47 @@ static gpointer rotctld_client_thread(gpointer data)
                                              info.bytes == 0 &&
                                              pos_reply[0] == '\0');
                     gboolean poll_bad = (!poll_ok && !poll_timeout);
+                    gboolean poll_stuck = FALSE;
+                    gboolean poll_fail = FALSE;
+                    guint discrepancy_streak = 0;
+                    gboolean discrepancy_pending = FALSE;
                     rot_comm_status_t prev_status;
                     rot_comm_status_t new_status;
                     gboolean enter_link_lost = FALSE;
+                    guint fail_streak = 0;
 
                     g_mutex_lock(&ctrl->client.mutex);
                     prev_status = ctrl->comm_status;
-                    if (poll_ok)
+                    discrepancy_streak = ctrl->client.discrepancy_streak;
+                    discrepancy_pending = ctrl->client.discrepancy_pending;
+                    poll_stuck = (ctrl->tracking &&
+                                  discrepancy_pending &&
+                                  discrepancy_streak >=
+                                      ROT_CMD_DISCREPANCY_STRIKES);
+                    poll_fail = (!poll_ok) || poll_stuck;
+
+                    if (!poll_fail)
                     {
                         if (ctrl->ok_streak < G_MAXUINT)
                             ctrl->ok_streak++;
                         ctrl->bad_streak = 0;
                         ctrl->timeout_streak = 0;
                     }
-                    else if (poll_timeout)
-                    {
-                        if (ctrl->timeout_streak < G_MAXUINT)
-                            ctrl->timeout_streak++;
-                        ctrl->ok_streak = 0;
-                        ctrl->bad_streak = 0;
-                    }
-                    else if (poll_bad)
+                    else
                     {
                         if (ctrl->bad_streak < G_MAXUINT)
                             ctrl->bad_streak++;
                         ctrl->ok_streak = 0;
-                        ctrl->timeout_streak = 0;
+
+                        if (poll_timeout)
+                        {
+                            if (ctrl->timeout_streak < G_MAXUINT)
+                                ctrl->timeout_streak++;
+                        }
+                        else
+                        {
+                            ctrl->timeout_streak = 0;
+                        }
                     }
 
                     new_status = prev_status;
@@ -9967,11 +10013,11 @@ static gpointer rotctld_client_thread(gpointer data)
                     {
                         new_status = ROT_COMM_DISENGAGED;
                     }
-                    else if (ctrl->timeout_streak >= 5)
+                    else if (ctrl->bad_streak >= ROT_COMM_LINK_LOST_FAIL_POLLS)
                     {
                         new_status = ROT_COMM_LINK_LOST;
                     }
-                    else if (ctrl->bad_streak >= 3 || ctrl->timeout_streak >= 3)
+                    else if (ctrl->bad_streak >= ROT_COMM_DEGRADED_FAIL_POLLS)
                     {
                         new_status = ROT_COMM_DEGRADED;
                     }
@@ -9985,17 +10031,33 @@ static gpointer rotctld_client_thread(gpointer data)
                     }
 
                     ctrl->comm_status = new_status;
+                    fail_streak = ctrl->bad_streak;
                     enter_link_lost = (prev_status != ROT_COMM_LINK_LOST &&
                                        new_status == ROT_COMM_LINK_LOST);
                     g_mutex_unlock(&ctrl->client.mutex);
 
                     if (enter_link_lost)
                     {
+                        const gchar *cause = poll_stuck ? "no motion" :
+                                             (poll_timeout ? "timeout" :
+                                              (poll_bad ? "invalid poll reply"
+                                                        : "no feedback"));
+
+                        rot_term_log(ctrl, "gpredict:err",
+                                     "rotor link lost after %u failed poll(s) "
+                                     "(degraded after %u); cause=%s",
+                                     fail_streak,
+                                     ROT_COMM_DEGRADED_FAIL_POLLS,
+                                     cause);
                         ctrl->hold_position_on_engage = TRUE;
                         ctrl->hold_position_log_emitted = FALSE;
                         rotctld_request_thread_stop(ctrl, TRUE);
                         g_idle_add_full(G_PRIORITY_DEFAULT,
                                         rotctrl_link_lost_popup_cb,
+                                        g_object_ref(ctrl),
+                                        g_object_unref);
+                        g_idle_add_full(G_PRIORITY_DEFAULT,
+                                        rotctrl_link_lost_disengage_cb,
                                         g_object_ref(ctrl),
                                         g_object_unref);
                     }
@@ -19686,6 +19748,10 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->tracking_active = FALSE;
         ctrl->tracking_session_los = 0.0;
         ctrl->have_user_command = FALSE;
+        ctrl->ok_streak = 0;
+        ctrl->bad_streak = 0;
+        ctrl->timeout_streak = 0;
+        ctrl->comm_status = ROT_COMM_DISENGAGED;
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
         ctrl->target_state_since_us = 0;
         ctrl->target_valid_since_us = 0;
