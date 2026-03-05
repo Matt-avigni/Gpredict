@@ -75,6 +75,25 @@ static void gtk_sat_module_free_sat(gpointer sat)
     gtk_sat_data_free_sat(SAT(sat));
 }
 
+static void gtk_sat_module_update_next_pass_events(sat_t *sat,
+                                                   qth_t *qth,
+                                                   gdouble start,
+                                                   gdouble maxdt)
+{
+    if (sat == NULL || qth == NULL)
+        return;
+
+    if (!has_aos(sat, qth))
+    {
+        sat->aos = 0.0;
+        sat->los = 0.0;
+        return;
+    }
+
+    sat->aos = find_aos(sat, qth, start, maxdt);
+    sat->los = find_los(sat, qth, start, maxdt);
+}
+
 static void update_autotrack(GtkSatModule * module)
 {
     GList          *satlist = NULL;
@@ -656,19 +675,9 @@ static void gtk_sat_module_update_sat(gpointer key, gpointer val,
     /* get current time (real or simulated */
     daynum = module->tmgCdnum;
 
-    /* update events if the event counter has been reset
-       and the other requirements are fulfilled */
-    if ((GTK_SAT_MODULE(module)->event_count == 0) &&
-        has_aos(sat, module->qth))
-    {
-        /* Note that has_aos may return TRUE for geostationary sats
-           whose orbit deviate from a true-geostat orbit, however,
-           find_aos and find_los will not go beyond the time limit
-           we specify (in those cases they return 0.0 for AOS/LOS times.
-           We use SAT_CFG_INT_PRED_LOOK_AHEAD for upper time limit */
-        sat->aos = find_aos(sat, module->qth, daynum, maxdt);
-        sat->los = find_los(sat, module->qth, daynum, maxdt);
-    }
+    /* update events if the event counter has been reset */
+    if (GTK_SAT_MODULE(module)->event_count == 0)
+        gtk_sat_module_update_next_pass_events(sat, module->qth, daynum, maxdt);
     /*
        Update AOS and LOS for this satellite if it was known and is before
        the current time.
@@ -705,11 +714,11 @@ static void gtk_sat_module_update_sat(gpointer key, gpointer val,
        practical matter the above code handles time reversing acceptably
        for most circumstances.
      */
-    if (sat->aos > 0 && sat->aos < daynum)
-        sat->aos = find_aos(sat, module->qth, daynum, maxdt);
-
-    if (sat->los > 0 && sat->los < daynum)
-        sat->los = find_los(sat, module->qth, daynum, maxdt);
+    if ((sat->aos > 0.0 && sat->aos < daynum) ||
+        (sat->los > 0.0 && sat->los < daynum))
+    {
+        gtk_sat_module_update_next_pass_events(sat, module->qth, daynum, maxdt);
+    }
 
     predict_calc(sat, module->qth, daynum);
 }

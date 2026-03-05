@@ -546,6 +546,11 @@ void tle_update_from_network(gboolean silent,
 
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "gpredict/curl");
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10);
+        /* Avoid long UI stalls on slow/stuck transfers. */
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 #endif
 
         /* get files */

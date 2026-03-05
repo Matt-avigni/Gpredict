@@ -24,6 +24,8 @@ GType      gtk_rot_ctrl_get_type   (void) G_GNUC_CONST;
 GtkWidget *gtk_rot_ctrl_new        (GtkSatModule *module);
 void       gtk_rot_ctrl_update     (GtkRotCtrl *ctrl, gdouble t);
 void       gtk_rot_ctrl_select_sat (GtkRotCtrl *ctrl, gint catnum);
+void       gtk_rot_ctrl_request_close(GtkRotCtrl *ctrl);
+gboolean   gtk_rot_ctrl_can_destroy(GtkRotCtrl *ctrl);
 
 G_END_DECLS
 

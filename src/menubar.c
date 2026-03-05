@@ -569,9 +569,11 @@ static void menubar_tle_net_cb(GtkWidget * widget, gpointer data)
     GtkWidget      *progress;
     GtkWidget      *label1, *label2;
     GtkWidget      *box;
+    gint64          tle_before = 0, tle_after = 0;
 
     (void)widget;
     (void)data;
+    tle_before = sat_cfg_get_int(SAT_CFG_INT_TLE_LAST_UPDATE);
 
     /* create new dialog with progress indicator */
     dialog = gtk_dialog_new_with_buttons(_("TLE Update"),
@@ -635,8 +637,9 @@ static void menubar_tle_net_cb(GtkWidget * widget, gpointer data)
     gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT,
                                       TRUE);
 
-    /* reload satellites */
-    mod_mgr_reload_sats();
+    tle_after = sat_cfg_get_int(SAT_CFG_INT_TLE_LAST_UPDATE);
+    if (tle_after != tle_before)
+        mod_mgr_reload_sats();
 }
 
 /* Update TLE from local files */
@@ -651,9 +654,11 @@ static void menubar_tle_local_cb(GtkWidget * widget, gpointer data)
     GtkWidget      *box;
     gint            response;   /* dialog response */
     gboolean        doupdate = FALSE;
+    gint64          tle_before = 0, tle_after = 0;
 
     (void)widget;
     (void)data;
+    tle_before = sat_cfg_get_int(SAT_CFG_INT_TLE_LAST_UPDATE);
 
     /* get last used directory */
     dir = sat_cfg_get_str(SAT_CFG_STR_TLE_FILE_DIR);
@@ -780,8 +785,9 @@ static void menubar_tle_local_cb(GtkWidget * widget, gpointer data)
     if (dir)
         g_free(dir);
 
-    /* reload satellites */
-    mod_mgr_reload_sats();
+    tle_after = sat_cfg_get_int(SAT_CFG_INT_TLE_LAST_UPDATE);
+    if (tle_after != tle_before)
+        mod_mgr_reload_sats();
 }
 
 static void menubar_help_cb(GtkWidget * widget, gpointer data)

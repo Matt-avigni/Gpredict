@@ -53,6 +53,13 @@ typedef struct
     const gchar    *pos_y_key;
 } WindowGeomInfo;
 
+typedef struct
+{
+    GtkWidget      *window;
+    GtkSatModule   *module;
+    guint           source_id;
+} RotCtrlCloseState;
+
 static void window_geom_info_free(gpointer data, GClosure *closure)
 {
     (void)closure;
@@ -788,6 +795,93 @@ static gint window_delete(GtkWidget * widget, GdkEvent * event, gpointer data)
     return FALSE;
 }
 
+static void rotctrl_close_state_free(gpointer data)
+{
+    RotCtrlCloseState *state = data;
+
+    if (state == NULL)
+        return;
+
+    if (state->source_id != 0)
+    {
+        g_source_remove(state->source_id);
+        state->source_id = 0;
+    }
+
+    if (state->window != NULL)
+        g_object_unref(state->window);
+
+    g_free(state);
+}
+
+static gboolean rotctrl_window_close_poll_cb(gpointer data)
+{
+    RotCtrlCloseState *state = data;
+
+    if (state == NULL || state->window == NULL ||
+        !GTK_IS_WIDGET(state->window) ||
+        state->module == NULL || !IS_GTK_SAT_MODULE(state->module))
+    {
+        if (state != NULL)
+            state->source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    if (state->module->rotctrl == NULL ||
+        !GTK_IS_ROT_CTRL(state->module->rotctrl))
+    {
+        state->source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    gtk_rot_ctrl_request_close(GTK_ROT_CTRL(state->module->rotctrl));
+
+    if (gtk_rot_ctrl_can_destroy(GTK_ROT_CTRL(state->module->rotctrl)))
+    {
+        state->source_id = 0;
+        gtk_widget_destroy(state->window);
+        return G_SOURCE_REMOVE;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+static gint rotctrl_window_delete(GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+    GtkSatModule *module = GTK_SAT_MODULE(data);
+    RotCtrlCloseState *state = NULL;
+
+    (void)event;
+
+    if (module == NULL || module->rotctrl == NULL ||
+        !GTK_IS_ROT_CTRL(module->rotctrl))
+    {
+        return FALSE;
+    }
+
+    gtk_rot_ctrl_request_close(GTK_ROT_CTRL(module->rotctrl));
+    if (gtk_rot_ctrl_can_destroy(GTK_ROT_CTRL(module->rotctrl)))
+        return FALSE;
+
+    state = g_object_get_data(G_OBJECT(widget), "rotctrl-close-state");
+    if (state == NULL)
+    {
+        state = g_new0(RotCtrlCloseState, 1);
+        state->window = g_object_ref(widget);
+        state->module = module;
+        g_object_set_data_full(G_OBJECT(widget), "rotctrl-close-state",
+                               state, rotctrl_close_state_free);
+    }
+
+    if (state->source_id == 0)
+    {
+        state->source_id = g_timeout_add(50, rotctrl_window_close_poll_cb, state);
+    }
+
+    /* Keep window alive while async close completes. */
+    return TRUE;
+}
+
 /**
  * Destroy sky at glance window.
  *
@@ -1037,7 +1131,7 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
     gtk_window_set_title(GTK_WINDOW(module->rotctrlwin), buff);
     g_free(buff);
     g_signal_connect(G_OBJECT(module->rotctrlwin), "delete_event",
-                     G_CALLBACK(window_delete), module);
+                     G_CALLBACK(rotctrl_window_delete), module);
     g_signal_connect(G_OBJECT(module->rotctrlwin), "destroy",
                      G_CALLBACK(destroy_rotctrl), module);
     {

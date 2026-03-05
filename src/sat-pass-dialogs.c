@@ -276,6 +276,7 @@ void show_pass(const gchar * satname, qth_t * qth, pass_t * pass,
     gchar          *title;
     guint           flags;
     guint           i, num;
+    guint           first_idx = 0;
     pass_detail_t  *detail;
     gchar          *buff;
     gint            retcode;
@@ -340,9 +341,21 @@ void show_pass(const gchar * satname, qth_t * qth, pass_t * pass,
     /* add rows to list store */
     num = g_slist_length(pass->details);
 
-    for (i = 0; i < num; i++)
+    /* Skip leading horizon-boundary samples (El <= 0). */
+    while ((first_idx + 1) < num)
+    {
+        detail = PASS_DETAIL(g_slist_nth_data(pass->details, first_idx));
+        if ((detail != NULL) && (detail->el <= 0.0))
+            first_idx++;
+        else
+            break;
+    }
+
+    for (i = first_idx; i < num; i++)
     {
         detail = PASS_DETAIL(g_slist_nth_data(pass->details, i));
+        if (detail == NULL)
+            continue;
 
         gtk_list_store_append(liststore, &item);
         gtk_list_store_set(liststore, &item,

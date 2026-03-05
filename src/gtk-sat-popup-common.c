@@ -25,6 +25,38 @@
 #include "predict-tools.h"
 #include "sat-cfg.h"
 #include "sat-pass-dialogs.h"
+#include "time-tools.h"
+
+static GSList *get_passes_no_min_el(sat_t *sat, qth_t *qth, gdouble start,
+                                    gdouble maxdt, guint num)
+{
+    GSList         *passes = NULL;
+    pass_t         *pass = NULL;
+    gdouble         t;
+    guint           i;
+
+    if (sat == NULL || qth == NULL)
+        return NULL;
+
+    if (num == 0)
+        num = 100;
+
+    t = start;
+    for (i = 0; i < num; i++)
+    {
+        pass = get_pass_no_min_el(sat, qth, t, maxdt);
+        if (pass == NULL)
+            break;
+
+        passes = g_slist_prepend(passes, pass);
+        t = pass->los + 0.014;
+
+        if ((maxdt > 0.0) && (t >= (start + maxdt)))
+            break;
+    }
+
+    return g_slist_reverse(passes);
+}
 
 
 void add_pass_menu_items(GtkWidget * menu, sat_t * sat, qth_t * qth,
@@ -119,20 +151,17 @@ void show_next_pass_dialog(sat_t * sat, qth_t * qth, gdouble tstamp,
 {
     GtkWidget      *dialog;
     pass_t         *pass;
+    gdouble         start;
+    gint            look_ahead;
 
     /* check whether sat actually has AOS */
     if (has_aos(sat, qth))
     {
-        if (sat_cfg_get_bool(SAT_CFG_BOOL_PRED_USE_REAL_T0))
-        {
-            pass = get_next_pass(sat, qth,
-                                 sat_cfg_get_int(SAT_CFG_INT_PRED_LOOK_AHEAD));
-        }
-        else
-        {
-            pass = get_pass(sat, qth, tstamp,
-                            sat_cfg_get_int(SAT_CFG_INT_PRED_LOOK_AHEAD));
-        }
+        look_ahead = sat_cfg_get_int(SAT_CFG_INT_PRED_LOOK_AHEAD);
+        start = sat_cfg_get_bool(SAT_CFG_BOOL_PRED_USE_REAL_T0)
+            ? get_current_daynum()
+            : tstamp;
+        pass = get_pass_no_min_el(sat, qth, start, look_ahead);
 
         if (pass != NULL)
         {
@@ -183,26 +212,19 @@ void show_future_passes_dialog(sat_t * sat, qth_t * qth, gdouble tstamp,
 {
     GSList         *passes = NULL;
     GtkWidget      *dialog;
+    gdouble         start;
+    gint            look_ahead;
+    gint            num_pass;
 
     /* check wheather sat actially has AOS */
     if (has_aos(sat, qth))
     {
-
-        if (sat_cfg_get_bool(SAT_CFG_BOOL_PRED_USE_REAL_T0))
-        {
-            passes = get_next_passes(sat, qth,
-                                     sat_cfg_get_int
-                                     (SAT_CFG_INT_PRED_LOOK_AHEAD),
-                                     sat_cfg_get_int
-                                     (SAT_CFG_INT_PRED_NUM_PASS));
-        }
-        else
-        {
-            passes = get_passes(sat, qth, tstamp,
-                                sat_cfg_get_int(SAT_CFG_INT_PRED_LOOK_AHEAD),
-                                sat_cfg_get_int(SAT_CFG_INT_PRED_NUM_PASS));
-
-        }
+        look_ahead = sat_cfg_get_int(SAT_CFG_INT_PRED_LOOK_AHEAD);
+        num_pass = sat_cfg_get_int(SAT_CFG_INT_PRED_NUM_PASS);
+        start = sat_cfg_get_bool(SAT_CFG_BOOL_PRED_USE_REAL_T0)
+            ? get_current_daynum()
+            : tstamp;
+        passes = get_passes_no_min_el(sat, qth, start, look_ahead, num_pass);
 
 
         if (passes != NULL)

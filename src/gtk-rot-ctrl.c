@@ -33,21 +33,19 @@
 #endif
 
 /* NETWORK */
-#ifndef WIN32
-#ifdef _WIN32
-  #include <winsock2.h>   /* htons(), etc. */
-  #include <ws2tcpip.h>
-#else
-  #include <arpa/inet.h>  /* htons(), etc. */
+#ifdef G_OS_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #endif
-
+#include <winsock2.h>           /* htons(), etc. */
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
 #include <arpa/inet.h>          /* htons() */
 #include <netdb.h>              /* gethostbyname() */
 #include <netinet/in.h>         /* struct sockaddr_in */
 #include <sys/socket.h>         /* socket(), connect(), send() */
-#else
-#include <winsock2.h>
-#include <windows.h>
+#include <unistd.h>
 #endif
 
 #include <errno.h>
@@ -10574,7 +10572,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                 rot_plan_reset(&ctrl->trajectory_plan);
                 free_pass(ctrl->pass);
                 ctrl->pass = NULL;
-                ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
+                ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, t, 3.0);
                 if (ctrl->pass)
                 {
                     set_flipped_pass(ctrl);
@@ -10597,28 +10595,23 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                     rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
-                    ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, t);
+                    ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, t, 3.0);
                     set_flipped_pass(ctrl);
                     rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
                 }
-                else if ((ctrl->target->aos - ctrl->pass->aos) >
-                         (ctrl->delay / secday / 1000 / 4.0))
+                else if (!isfinite(ctrl->pass->aos) ||
+                         !isfinite(ctrl->pass->los) ||
+                         (ctrl->pass->los < t))
                 {
                     if (ctrl->tracking)
                         rotctrl_finish_tracking_pass_over(ctrl,
                                                           "pass ended (rollover)");
 
-                    /* the target is expected to appear in a new pass 
-                       sufficiently later after the current pass says */
-
-                    /* converted milliseconds to gpredict time and took a 
-                       fraction of it as a threshold for deciding a new pass */
-
-                    /* if the next pass is not the one for the target */
+                    /* pass is stale/invalid; fetch the next upcoming pass */
                     rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
-                    ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
+                    ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, t, 3.0);
                     set_flipped_pass(ctrl);
                     /* update polar plot */
                     rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
@@ -10637,7 +10630,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
                     rot_plan_reset(&ctrl->trajectory_plan);
                     free_pass(ctrl->pass);
                     ctrl->pass = NULL;
-                    ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
+                    ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, t, 3.0);
                     set_flipped_pass(ctrl);
                     /* update polar plot */
                     rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
@@ -10648,10 +10641,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
         {
             /* we don't have any current pass; store the current one */
             rot_plan_reset(&ctrl->trajectory_plan);
-            if (ctrl->target->el > 0.0)
-                ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, t);
-            else
-                ctrl->pass = get_pass(ctrl->target, ctrl->qth, t, 3.0);
+            ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, t, 3.0);
 
             set_flipped_pass(ctrl);
             /* update polar plot */
@@ -10687,6 +10677,26 @@ void gtk_rot_ctrl_select_sat(GtkRotCtrl * ctrl, gint catnum)
             break;
         }
     }
+}
+
+void gtk_rot_ctrl_request_close(GtkRotCtrl *ctrl)
+{
+    if (!GTK_IS_ROT_CTRL(ctrl))
+        return;
+
+    /* Ask the worker to stop; caller can poll gtk_rot_ctrl_can_destroy(). */
+    rotctld_request_thread_stop(ctrl, TRUE);
+}
+
+gboolean gtk_rot_ctrl_can_destroy(GtkRotCtrl *ctrl)
+{
+    if (!GTK_IS_ROT_CTRL(ctrl))
+        return TRUE;
+
+    if (ctrl->client.thread == NULL)
+        return TRUE;
+
+    return rotctld_collect_client_thread(ctrl, FALSE, "close-poll");
 }
 
 /*
@@ -10899,10 +10909,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         if (ctrl->pass != NULL)
             free_pass(ctrl->pass);
 
-        if (ctrl->target->el > 0.0)
-            ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, ctrl->t);
-        else
-            ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
+        ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, ctrl->t, 3.0);
         ctrl->tracking_session_los =
             (ctrl->pass != NULL && isfinite(ctrl->pass->los))
                 ? ctrl->pass->los
@@ -20006,10 +20013,7 @@ static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
         ctrl->pass = NULL;
     }
 
-    if (ctrl->target->el > 0.0)
-        ctrl->pass = get_current_pass(ctrl->target, ctrl->qth, ctrl->t);
-    else
-        ctrl->pass = get_pass(ctrl->target, ctrl->qth, ctrl->t, 3.0);
+    ctrl->pass = get_pass_no_min_el(ctrl->target, ctrl->qth, ctrl->t, 3.0);
 
     set_flipped_pass(ctrl);
     rotctrl_set_pass_on_plots(ctrl, ctrl->pass);
@@ -21952,16 +21956,10 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     /* get next pass for target satellite */
     if (rot_ctrl->target)
     {
-        if (rot_ctrl->target->el > 0.0)
-        {
-            rot_ctrl->pass = get_current_pass(rot_ctrl->target,
-                                              rot_ctrl->qth, 0.0);
-        }
-        else
-        {
-            rot_ctrl->pass = get_next_pass(rot_ctrl->target,
-                                           rot_ctrl->qth, 3.0);
-        }
+        rot_ctrl->pass = get_pass_no_min_el(rot_ctrl->target,
+                                            rot_ctrl->qth,
+                                            rot_ctrl->t,
+                                            3.0);
     }
 
     /* create contents */
