@@ -8,7 +8,7 @@
 #ifndef GPREDICT_NET_COMPAT_H
 #define GPREDICT_NET_COMPAT_H
 
-#if defined(_WIN32) || defined(WIN32)
+#if defined(_WIN32) || defined(WIN32) || defined(__MINGW32__) || defined(__MINGW64__) || defined(__MSYS__)
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
