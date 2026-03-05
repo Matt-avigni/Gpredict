@@ -32,8 +32,10 @@
 #include <build-config.h>
 #endif
 
+#include <glib.h>
+
 /* NETWORK */
-#if defined(_WIN32) || defined(WIN32) || defined(__MINGW32__) || defined(__MINGW64__) || defined(__MSYS__)
+#ifdef G_OS_WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -49,7 +51,6 @@
 #endif
 
 #include <errno.h>
-#include <glib.h>
 #include <glib/gi18n.h>
 #include <gio/gio.h>
 #include <gtk/gtk.h>
