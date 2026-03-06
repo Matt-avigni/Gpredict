@@ -20073,7 +20073,7 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     guint           i, n;
     sat_t          *sat = NULL;
 
-    buff = g_strdup_printf(FMTSTR, 0.0);
+    buff = g_strdup(" --- ");
 
     table = gtk_grid_new();
     gtk_container_set_border_width(GTK_CONTAINER(table), 5);
@@ -20099,7 +20099,7 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
                                            sat_name);
         }
     }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->SatSel), 0);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ctrl->SatSel), -1);
     gtk_widget_set_tooltip_text(ctrl->SatSel, _("Select target object"));
     g_signal_connect(ctrl->SatSel, "changed", G_CALLBACK(sat_selected_cb),
                      ctrl);
@@ -20158,7 +20158,7 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
     label = gtk_label_new(_("\316\224T:"));
     g_object_set(label, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_grid_attach(GTK_GRID(values_grid), label, 0, 2, 1, 1);
-    ctrl->SatCnt = gtk_label_new("00:00:00");
+    ctrl->SatCnt = gtk_label_new("--:--");
     g_object_set(ctrl->SatCnt, "xalign", 0.0f, "yalign", 0.5f, NULL);
     gtk_label_set_width_chars(GTK_LABEL(ctrl->SatCnt), 8);
     gtk_label_set_max_width_chars(GTK_LABEL(ctrl->SatCnt), 8);
@@ -21949,19 +21949,8 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     /* store satellites */
     g_hash_table_foreach(module->satellites, store_sats, rot_ctrl);
 
-    rot_ctrl->target = SAT(g_slist_nth_data(rot_ctrl->sats, 0));
-
     /* store current time (don't know if real or simulated) */
     rot_ctrl->t = module->tmgCdnum;
-
-    /* get next pass for target satellite */
-    if (rot_ctrl->target)
-    {
-        rot_ctrl->pass = get_pass_no_min_el(rot_ctrl->target,
-                                            rot_ctrl->qth,
-                                            rot_ctrl->t,
-                                            3.0);
-    }
 
     /* create contents */
     table = gtk_grid_new();
