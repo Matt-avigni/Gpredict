@@ -1273,7 +1273,7 @@ static void update_sat(gpointer key, gpointer value, gpointer data)
         else
         {
             /* add sat to canvas */
-            obj = g_try_new(sat_obj_t, 1);
+            obj = g_try_new0(sat_obj_t, 1);
 
             if (obj != NULL)
             {
