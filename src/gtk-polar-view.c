@@ -856,10 +856,22 @@ static void update_polv_size(GtkPolarView * polv)
     if (gtk_widget_get_realized(GTK_WIDGET(polv)))
     {
         /* get graph dimensions */
-        gtk_widget_get_allocation(GTK_WIDGET(polv), &allocation);
+        gtk_widget_get_allocation(polv->canvas, &allocation);
+
+        if (allocation.width <= 0 || allocation.height <= 0)
+        {
+            return;
+        }
 
         polv->size = MIN(allocation.width, allocation.height);
-        polv->r = (polv->size / 2) - POLV_DEFAULT_MARGIN;
+        if (polv->size <= 2 * POLV_DEFAULT_MARGIN)
+        {
+            polv->r = 1;
+        }
+        else
+        {
+            polv->r = (polv->size / 2) - POLV_DEFAULT_MARGIN;
+        }
         polv->cx = allocation.width / 2;
         polv->cy = allocation.height / 2;
 
@@ -1087,7 +1099,7 @@ static void update_sat(gpointer key, gpointer value, gpointer data)
     sat_obj_t      *obj = NULL;
     gfloat          x, y;
     GooCanvasItemModel *root;
-    gint            idx, i;
+    gint            idx;
     gdouble         now;        // = get_current_daynum ();
     gchar          *text;
     gchar          *losstr;
@@ -1232,27 +1244,10 @@ static void update_sat(gpointer key, gpointer value, gpointer data)
                                 __FILE__, __func__, *catnum, qth_upd,
                                 time_upd);
 
-                    root =
-                        goo_canvas_get_root_item_model(GOO_CANVAS
-                                                       (polv->canvas));
-
                     /* remove sky track */
                     if (obj->showtrack)
                     {
-                        idx =
-                            goo_canvas_item_model_find_child(root, obj->track);
-                        if (idx != -1)
-                            goo_canvas_item_model_remove_child(root, idx);
-
-                        for (i = 0; i < TRACK_TICK_NUM; i++)
-                        {
-                            idx =
-                                goo_canvas_item_model_find_child(root,
-                                                                 obj->trtick
-                                                                 [i]);
-                            if (idx != -1)
-                                goo_canvas_item_model_remove_child(root, idx);
-                        }
+                        gtk_polar_view_delete_track(polv, obj, sat);
                     }
 
                     /* free pass info */
@@ -1525,6 +1520,14 @@ void gtk_polar_view_create_track(GtkPolarView * pv, sat_obj_t * obj,
         return;
     }
 
+    /* Reset item pointers before creating a new track to avoid stale pointers
+       being reused if creation fails part-way through. */
+    obj->track = NULL;
+    for (i = 0; i < TRACK_TICK_NUM; i++)
+    {
+        obj->trtick[i] = NULL;
+    }
+
     if (obj->pass == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -1611,24 +1614,31 @@ void gtk_polar_view_delete_track(GtkPolarView * pv, sat_obj_t * obj,
     (void)sat;
 
     root = goo_canvas_get_root_item_model(GOO_CANVAS(pv->canvas));
-    idx = goo_canvas_item_model_find_child(root, obj->track);
-
-    if (idx != -1)
+    if (obj->track != NULL)
     {
-        goo_canvas_item_model_remove_child(root, idx);
-    }
-
-    for (i = 0; i < TRACK_TICK_NUM; i++)
-    {
-        idx = goo_canvas_item_model_find_child(root, obj->trtick[i]);
+        idx = goo_canvas_item_model_find_child(root, obj->track);
 
         if (idx != -1)
         {
             goo_canvas_item_model_remove_child(root, idx);
         }
     }
-}
+    obj->track = NULL;
 
+    for (i = 0; i < TRACK_TICK_NUM; i++)
+    {
+        if (obj->trtick[i] != NULL)
+        {
+            idx = goo_canvas_item_model_find_child(root, obj->trtick[i]);
+
+            if (idx != -1)
+            {
+                goo_canvas_item_model_remove_child(root, idx);
+            }
+        }
+        obj->trtick[i] = NULL;
+    }
+}
 /** Reload reference to satellites (e.g. after TLE update). */
 void gtk_polar_view_reload_sats(GtkWidget * polv, GHashTable * sats)
 {
