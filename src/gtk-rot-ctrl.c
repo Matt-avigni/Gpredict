@@ -22035,9 +22035,6 @@ GtkWidget      *gtk_rot_ctrl_new(GtkSatModule * module)
     /* load initial rotator configuration */
     rot_selected_cb(GTK_COMBO_BOX(rot_ctrl->DevSel), rot_ctrl);
 
-    if (module->target > 0)
-        gtk_rot_ctrl_select_sat(rot_ctrl, module->target);
-
     /* start the control loop timer so we actually send commands */
     if (rot_ctrl->timerid == 0) {
         rot_ctrl->timerid = g_timeout_add(rot_ctrl->delay,
