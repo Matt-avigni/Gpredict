@@ -11,6 +11,7 @@
 #include <glib.h>
 
 GSList *gp_serial_list_candidates(void);
+gboolean gp_serial_port_is_windows_com(const gchar *candidate);
 void    gp_serial_free_candidates(GSList *list);
 
 #endif

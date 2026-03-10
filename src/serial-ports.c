@@ -66,6 +66,33 @@ GSList *gp_serial_list_candidates(void)
 #endif
 }
 
+gboolean gp_serial_port_is_windows_com(const gchar *candidate)
+{
+    const gchar *digits = NULL;
+
+    if (candidate == NULL || *candidate == '\0')
+        return FALSE;
+
+    while (g_ascii_isspace(*candidate))
+        candidate++;
+
+    if (g_ascii_strncasecmp(candidate, "\\\\.\\COM", 7) == 0)
+        digits = candidate + 7;
+    else if (g_ascii_strncasecmp(candidate, "COM", 3) == 0)
+        digits = candidate + 3;
+
+    if (digits == NULL || *digits == '\0')
+        return FALSE;
+
+    for (const gchar *p = digits; *p != '\0'; p++)
+    {
+        if (!g_ascii_isdigit(*p))
+            return FALSE;
+    }
+
+    return g_ascii_strtoll(digits, NULL, 10) > 0;
+}
+
 void gp_serial_free_candidates(GSList *list)
 {
     g_slist_free_full(list, g_free);

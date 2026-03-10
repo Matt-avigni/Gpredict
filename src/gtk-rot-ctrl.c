@@ -15689,6 +15689,10 @@ static gboolean rotctld_autodetect_is_candidate(const gchar *candidate)
     {
         ok = FALSE;
     }
+    else if (gp_serial_port_is_windows_com(candidate))
+    {
+        ok = TRUE;
+    }
     else if (rotctld_autodetect_is_tty(candidate) ||
              rotctld_autodetect_is_cu(candidate))
     {
@@ -16026,6 +16030,8 @@ static gint rotctld_autodetect_candidate_score(const gchar *candidate)
         score += 15;
     if (g_strrstr(lower, "ftdi") != NULL || g_strrstr(lower, "ft232") != NULL)
         score += 12;
+    if (gp_serial_port_is_windows_com(candidate))
+        score += 10;
 
     g_free(lower);
     return score;
@@ -16042,7 +16048,7 @@ static gint rotctld_autodetect_compare_candidates(gconstpointer a,
     if (score_a != score_b)
         return score_b - score_a;
 
-    return g_strcmp0(cand_a, cand_b);
+    return gpredict_strcmp(cand_a, cand_b);
 }
 
 static GSList *rotctld_autodetect_filter_candidates(GSList *candidates,
