@@ -7277,6 +7277,19 @@ static const gchar *vfo_name(vfo_t vfo)
     }
 }
 
+static const gchar *rigctld_conn_name(rigctld_conn_t conn)
+{
+    switch (conn)
+    {
+    case RIGCTLD_CONN_SERIAL:
+        return "SERIAL";
+    case RIGCTLD_CONN_TCP:
+        return "TCP";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static gboolean rigctld_vfo_map_refs(GtkRigCtrl *ctrl, gint sock,
                                      gchar ***main_ptr,
                                      gchar ***sub_ptr,
@@ -7675,6 +7688,7 @@ static void rigctrl_log_config(GtkRigCtrl *ctrl,
 {
     const gchar *host;
     gint port;
+    const gchar *device;
     const gchar *label = (role != NULL) ? role : _("rig");
 
     if (ctrl == NULL || conf == NULL)
@@ -7682,21 +7696,35 @@ static void rigctrl_log_config(GtkRigCtrl *ctrl,
 
     host = conf->host ? conf->host : "(null)";
     port = conf->port;
+    device = (conf->rigctld_device && *conf->rigctld_device)
+                 ? conf->rigctld_device
+                 : "(none)";
 
     rig_term_log(ctrl, "gpredict",
-                 "rig config (%s): model=%s mode=%s host=%s port=%d downlink_vfo=%s uplink_vfo=%s",
+                 "rig config (%s): model=%s mode=%s host=%s port=%d "
+                 "autostart=%d conn=%s baud=%d device=%s "
+                 "downlink_vfo=%s uplink_vfo=%s",
                  label,
                  radio_model_to_string(conf->radio_model),
                  radio_mode_to_string(conf->radio_mode),
                  host, port,
+                 conf->rigctld_autostart ? 1 : 0,
+                 rigctld_conn_name(conf->rigctld_conn),
+                 conf->rigctld_baud,
+                 device,
                  vfo_name(conf->downlink_vfo),
                  vfo_name(conf->uplink_vfo));
     sat_log_log(SAT_LOG_LEVEL_INFO,
-                _("%s: rig config (%s) model=%s mode=%s host=%s port=%d"),
+                _("%s: rig config (%s) model=%s mode=%s host=%s port=%d "
+                  "autostart=%d conn=%s baud=%d device=%s"),
                 __func__, label,
                 radio_model_to_string(conf->radio_model),
                 radio_mode_to_string(conf->radio_mode),
-                host, port);
+                host, port,
+                conf->rigctld_autostart ? 1 : 0,
+                rigctld_conn_name(conf->rigctld_conn),
+                conf->rigctld_baud,
+                device);
 }
 
 static gboolean rigctrl_validate_mode(GtkRigCtrl *ctrl,
@@ -10555,14 +10583,14 @@ static void rigctld_cache_device(radio_model_t model, const gchar *device)
                          g_strdup(device));
 }
 
-static gboolean G_GNUC_UNUSED rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
-                                                             radio_conf_t *conf,
-                                                             RigctldMgr **mgr,
-                                                             gboolean secondary,
-                                                             const gchar *role,
-                                                             gboolean *reported,
-                                                             gint *restart_attempts,
-                                                             const gchar *reason)
+static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
+                                               radio_conf_t *conf,
+                                               RigctldMgr **mgr,
+                                               gboolean secondary,
+                                               const gchar *role,
+                                               gboolean *reported,
+                                               gint *restart_attempts,
+                                               const gchar *reason)
 {
     if (restart_attempts == NULL || conf == NULL)
         return FALSE;
@@ -12423,6 +12451,7 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
     gint         so_err = 0;
     gboolean     connected = FALSE;
     gboolean     ic905_fallback = FALSE;
+    gint         autodetect_restart_attempts = 0;
 
     if (conf == NULL)
         return FALSE;
@@ -12461,6 +12490,13 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
             rig_term_log(ctrl, "gpredict:err",
                          "connect failed to %s:%d (errno=%d so_error=%d)",
                          host, conf->port, err, so_err);
+            rig_term_log(ctrl, "gpredict:err",
+                         "local recovery skipped: autostart=%d conn=%s device=%s",
+                         conf->rigctld_autostart ? 1 : 0,
+                         rigctld_conn_name(conf->rigctld_conn),
+                         (conf->rigctld_device && *conf->rigctld_device)
+                             ? conf->rigctld_device
+                             : "(none)");
             g_free(host);
             if (error_reported)
                 *error_reported = reported;
@@ -12560,6 +12596,23 @@ retry_autostart:
 
                 if (mgr && *mgr)
                     stderr_text = rigctld_mgr_get_log_tail(*mgr);
+
+                if (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                    rigctld_mgr_host_is_local(conf->host) &&
+                    (conf->rigctld_device == NULL ||
+                     *conf->rigctld_device == '\0' ||
+                     !rigctld_serial_device_exists(conf->rigctld_device) ||
+                     rigctld_log_tail_indicates_stale_device(stderr_text)) &&
+                    rigctld_try_autodetect_restart(
+                        ctrl, conf, mgr, secondary, role, &reported,
+                        &autodetect_restart_attempts,
+                        (stderr_text && *stderr_text) ? "startup failure"
+                                                      : "startup timeout"))
+                {
+                    g_free(exit_detail);
+                    g_free(stderr_text);
+                    goto retry_autostart;
+                }
 
                 if (stderr_text && *stderr_text)
                     detail = g_strdup_printf(
@@ -13316,7 +13369,12 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
         {
             gboolean error_reported = FALSE;
             gboolean stale_device = FALSE;
+            gint probe_restart_attempts = 0;
             RigSession *session = ctrl->rig_session;
+
+open_receiver_retry:
+            error_reported = FALSE;
+            stale_device = FALSE;
 
             if (!open_rigctld_socket_with_autostart(ctrl, ctrl->conf,
                                                     &(ctrl->sock),
@@ -13358,7 +13416,6 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                 if (mgr)
                     log_tail = rigctld_mgr_get_log_tail(mgr);
                 stale_device = rigctld_log_tail_indicates_stale_device(log_tail);
-                g_free(log_tail);
 
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: receiver rig session probe failed"), __func__);
@@ -13367,6 +13424,21 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                     rig_term_log_verbose(ctrl, "gpredict",
                                          "rigctld probe failed; leaving daemon running");
                 close_rigctld_socket(ctrl, &(ctrl->sock), FALSE);
+                if (ctrl->rigctld_mgr != NULL &&
+                    rigctld_spawned_by_us(ctrl, FALSE) &&
+                    ctrl->conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                    rigctld_mgr_host_is_local(ctrl->conf->host) &&
+                    rigctld_try_autodetect_restart(
+                        ctrl, ctrl->conf, &ctrl->rigctld_mgr, FALSE,
+                        _("receiver"), &error_reported,
+                        &probe_restart_attempts,
+                        stale_device ? "probe stale device"
+                                     : "probe failure"))
+                {
+                    g_free(log_tail);
+                    goto open_receiver_retry;
+                }
+                g_free(log_tail);
                 if (stale_device && !ctrl->rx_conn_error_reported)
                 {
                     schedule_rig_backend_error(ctrl, ctrl->conf, _("receiver"));
@@ -13421,7 +13493,12 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
         {
             gboolean error_reported = FALSE;
             gboolean stale_device = FALSE;
+            gint probe_restart_attempts = 0;
             RigSession *session = ctrl->rig_session2;
+
+open_uplink_retry:
+            error_reported = FALSE;
+            stale_device = FALSE;
 
             tx_ok = open_rigctld_socket_with_autostart(
                 ctrl, ctrl->conf2, &(ctrl->sock2), TRUE, _("uplink"),
@@ -13442,6 +13519,21 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                     if (mgr)
                         log_tail = rigctld_mgr_get_log_tail(mgr);
                     stale_device = rigctld_log_tail_indicates_stale_device(log_tail);
+                    close_rigctld_socket(ctrl, &(ctrl->sock2), FALSE);
+                    if (ctrl->rigctld_mgr2 != NULL &&
+                        rigctld_spawned_by_us(ctrl, TRUE) &&
+                        ctrl->conf2->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                        rigctld_mgr_host_is_local(ctrl->conf2->host) &&
+                        rigctld_try_autodetect_restart(
+                            ctrl, ctrl->conf2, &ctrl->rigctld_mgr2, TRUE,
+                            _("uplink"), &error_reported,
+                            &probe_restart_attempts,
+                            stale_device ? "probe stale device"
+                                         : "probe failure"))
+                    {
+                        g_free(log_tail);
+                        goto open_uplink_retry;
+                    }
                     g_free(log_tail);
                 }
             }
@@ -13453,7 +13545,8 @@ static gboolean rigctrl_open_internal(GtkRigCtrl * data)
                                           RIGCTRL_PROBE_LOG_INTERVAL_US))
                     rig_term_log_verbose(ctrl, "gpredict",
                                          "rigctld probe failed; leaving daemon running");
-                close_rigctld_socket(ctrl, &(ctrl->sock2), FALSE);
+                if (ctrl->sock2 >= 0)
+                    close_rigctld_socket(ctrl, &(ctrl->sock2), FALSE);
                 if (stale_device && !ctrl->tx_conn_error_reported)
                 {
                     schedule_rig_backend_error(ctrl, ctrl->conf2, _("uplink"));

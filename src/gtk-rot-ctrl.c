@@ -17559,116 +17559,72 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
         gint64 start_us = 0;
         gint64 elapsed_ms = 0;
         gboolean no_reply = FALSE;
+        gint retries = MAX(worker->retries, 0);
+        const gchar *status = "unknown";
+
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "autodetect validate_io: send cmd=p timeout=%d retries=%d",
+                    worker->timeout_ms,
+                    retries);
+
+        memset(&pos_info, 0, sizeof(pos_info));
+        pos_reply[0] = '\0';
+        start_us = g_get_monotonic_time();
+        pos_res = rotctld_client_get_pos_ex_timeout(probe,
+                                                    &az,
+                                                    &el,
+                                                    &pos_info,
+                                                    pos_reply,
+                                                    sizeof(pos_reply),
+                                                    worker->timeout_ms,
+                                                    retries);
+        elapsed_ms = (g_get_monotonic_time() - start_us) / 1000;
+
+        (void)rotctld_parse_position_reply_ex(pos_reply,
+                                              &az,
+                                              &el,
+                                              &parsed_rprt,
+                                              &have_az,
+                                              &have_el,
+                                              &have_rprt);
+        if (pos_info.saw_rprt)
+        {
+            have_rprt = TRUE;
+            parsed_rprt = pos_info.rprt_code;
+        }
+
+        no_reply = (pos_info.bytes == 0 && pos_reply[0] == '\0');
+        pos_ok = (pos_res == ROTCTLD_POS_OK && have_az && have_el);
+        if (pos_ok && have_rprt && parsed_rprt != 0)
+        {
+            pos_ok = FALSE;
+            pos_res = ROTCTLD_POS_RPRT_ERR;
+        }
+        if (!pos_ok && pos_res == ROTCTLD_POS_OK)
+            pos_res = ROTCTLD_POS_PARSE_FAIL;
+
+        if (pos_res == ROTCTLD_POS_OK)
+            status = "ok";
+        else if (pos_res == ROTCTLD_POS_TIMEOUT)
+            status = "timeout";
+        else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
+            status = "parse_fail";
+        else if (pos_res == ROTCTLD_POS_RPRT_ERR)
+            status = "rprt_err";
+        else
+            status = "io_error";
 
         {
-            const gint max_attempts = 3;
-            const gint retry_sleep_ms = 100;
-
+            gchar *view = rotctld_sanitize_reply(pos_reply, 80);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "autodetect validate_io: send cmd=p timeout=%d attempts=%d",
-                        worker->timeout_ms,
-                        max_attempts);
-
-            for (gint attempt = 0; attempt < max_attempts; attempt++)
-            {
-                gboolean ok = FALSE;
-                gboolean timeout_err = FALSE;
-                gboolean any_bytes = FALSE;
-                const gchar *status = "unknown";
-
-                memset(&pos_info, 0, sizeof(pos_info));
-                pos_reply[0] = '\0';
-                have_az = FALSE;
-                have_el = FALSE;
-                have_rprt = FALSE;
-                parsed_rprt = 0;
-
-                start_us = g_get_monotonic_time();
-                ok = rotctld_client_request_raw_timeout(probe,
-                                                        "p\n",
-                                                        worker->timeout_ms,
-                                                        pos_reply,
-                                                        sizeof(pos_reply),
-                                                        &pos_info);
-                elapsed_ms = (g_get_monotonic_time() - start_us) / 1000;
-                no_reply = (pos_info.bytes == 0 && pos_reply[0] == '\0');
-                any_bytes = (pos_info.bytes > 0 || pos_reply[0] != '\0');
-
-                (void)rotctld_parse_position_reply_ex(pos_reply,
-                                                      &az,
-                                                      &el,
-                                                      &parsed_rprt,
-                                                      &have_az,
-                                                      &have_el,
-                                                      &have_rprt);
-
-                timeout_err = (pos_info.err == EAGAIN ||
-                               pos_info.err == EWOULDBLOCK ||
-                               pos_info.err == ETIMEDOUT);
-
-                if (have_az && have_el)
-                {
-                    pos_ok = TRUE;
-                    pos_res = ROTCTLD_POS_OK;
-                }
-                else if (have_rprt && parsed_rprt != 0)
-                {
-                    pos_ok = FALSE;
-                    pos_res = ROTCTLD_POS_RPRT_ERR;
-                }
-                else if (!any_bytes && timeout_err)
-                {
-                    pos_ok = FALSE;
-                    pos_res = ROTCTLD_POS_TIMEOUT;
-                }
-                else if (!ok && !timeout_err)
-                {
-                    pos_ok = FALSE;
-                    pos_res = ROTCTLD_POS_IO_ERR;
-                }
-                else
-                {
-                    pos_ok = FALSE;
-                    pos_res = ROTCTLD_POS_PARSE_FAIL;
-                }
-
-                if (pos_ok && have_rprt && parsed_rprt != 0)
-                {
-                    pos_ok = FALSE;
-                    pos_res = ROTCTLD_POS_RPRT_ERR;
-                }
-
-                if (pos_res == ROTCTLD_POS_OK)
-                    status = "ok";
-                else if (pos_res == ROTCTLD_POS_TIMEOUT)
-                    status = "timeout";
-                else if (pos_res == ROTCTLD_POS_PARSE_FAIL)
-                    status = "parse_fail";
-                else if (pos_res == ROTCTLD_POS_RPRT_ERR)
-                    status = "rprt_err";
-                else
-                    status = "io_error";
-
-                {
-                    gchar *view = rotctld_sanitize_reply(pos_reply, 80);
-                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                "autodetect validate_io: p attempt=%d/%d bytes=%" G_GSIZE_FORMAT " ms=%lld err=%d status=%s view=%s",
-                                attempt + 1,
-                                max_attempts,
-                                pos_info.bytes,
-                                (long long) elapsed_ms,
-                                pos_info.err,
-                                status,
-                                view ? view : "(none)");
-                    g_free(view);
-                }
-
-                if (pos_ok)
-                    break;
-
-                if (attempt + 1 < max_attempts)
-                    g_usleep((gulong) retry_sleep_ms * 1000);
-            }
+                        "autodetect validate_io: p bytes=%" G_GSIZE_FORMAT " ms=%lld err=%d retries=%d status=%s view=%s",
+                        pos_info.bytes,
+                        (long long) elapsed_ms,
+                        pos_info.err,
+                        retries,
+                        status,
+                        view ? view : "(none)");
+            g_free(view);
         }
 
         rprt = have_rprt ? parsed_rprt : 0;

@@ -540,23 +540,6 @@ static gboolean rotctld_client_reply_is_ok(const gchar *reply)
     return ok;
 }
 
-static gboolean rotctld_client_cmd_is_get_pos(const gchar *cmd)
-{
-    const gchar *p = cmd;
-
-    if (p == NULL)
-        return FALSE;
-
-    while (*p != '\0' && g_ascii_isspace(*p))
-        p++;
-
-    if (*p != 'p')
-        return FALSE;
-
-    p++;
-    return (*p == '\0' || *p == '\n' || g_ascii_isspace(*p));
-}
-
 static gboolean rotctld_client_err_is_disconnect(gint err)
 {
     return (err == EPIPE ||
@@ -2068,8 +2051,6 @@ gboolean rotctld_client_request_raw(RotctldClient *client,
     if (client == NULL || cmd == NULL)
         return FALSE;
 
-    if (rotctld_client_cmd_is_get_pos(cmd))
-        mode = HAMLIB_READ_MULTILINE_IDLE;
     if (g_str_has_prefix(cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
 
@@ -2104,8 +2085,6 @@ gboolean rotctld_client_request_raw_timeout(RotctldClient *client,
     if (timeout_ms <= 0)
         timeout_ms = 1000;
 
-    if (rotctld_client_cmd_is_get_pos(cmd))
-        mode = HAMLIB_READ_MULTILINE_IDLE;
     if (g_str_has_prefix(cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
 
