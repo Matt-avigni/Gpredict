@@ -42,8 +42,8 @@ static gint hamlib_gio_error_to_errno(const GError *error)
         g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
         return EAGAIN;
 
-    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED) ||
-        g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_RESET))
+    /* Older MinGW/GLib builds do not expose a separate CONNECTION_RESET enum. */
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED))
         return ECONNRESET;
 
     if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE))
