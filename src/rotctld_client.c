@@ -2104,6 +2104,8 @@ gboolean rotctld_client_request_raw_timeout(RotctldClient *client,
     if (timeout_ms <= 0)
         timeout_ms = 1000;
 
+    if (rotctld_client_cmd_is_get_pos(cmd))
+        mode = HAMLIB_READ_MULTILINE_IDLE;
     if (g_str_has_prefix(cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
 

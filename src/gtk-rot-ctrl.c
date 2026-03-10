@@ -223,6 +223,9 @@ static const gdouble k_meas_tol_deg = 1.5;
 #define ROTCTLD_AUTODETECT_MAX_CANDIDATES 5
 #define ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS 3000
 #define ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS 500
+#define ROTCTLD_BACKEND_TIMEOUT_MS 1200
+#define ROTCTLD_WIN32_ROT2PROG_TIMEOUT_MS 6000
+#define ROTCTLD_WIN32_ROT2PROG_MARGIN_MS 1500
 #define ROTCTRL_DEFAULT_MIN_EL -5.0
 #define ROTCTRL_DEFAULT_MAX_EL 185.0
 #define ROTCTLD_KEEPALIVE_US 2000000
@@ -15557,6 +15560,49 @@ static gchar **rotctld_force_config(gchar **argv)
     return rotctld_force_config_timeout(argv, 1200, FALSE);
 }
 
+static gboolean rotctld_needs_extended_backend_timeout(const GtkRotCtrl *ctrl,
+                                                       const gchar *device)
+{
+#ifdef G_OS_WIN32
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return FALSE;
+    if (!gp_serial_port_is_windows_com(device))
+        return FALSE;
+
+    return (ctrl->conf->protocol == ROT_PROTOCOL_SPID_ROT2PROG ||
+            rot_conf_hamlib_model(ctrl->conf) == 901);
+#else
+    (void)ctrl;
+    (void)device;
+    return FALSE;
+#endif
+}
+
+static gint rotctld_backend_timeout_ms(GtkRotCtrl *ctrl,
+                                       const gchar *device,
+                                       gboolean probing)
+{
+    gint timeout_ms = probing ? ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS
+                              : ROTCTLD_BACKEND_TIMEOUT_MS;
+
+    if (rotctld_needs_extended_backend_timeout(ctrl, device))
+        timeout_ms = MAX(timeout_ms, ROTCTLD_WIN32_ROT2PROG_TIMEOUT_MS);
+
+    return timeout_ms;
+}
+
+static gint rotctld_validate_timeout_floor_ms(GtkRotCtrl *ctrl,
+                                              const gchar *device)
+{
+    gint margin_ms = ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS;
+    gint timeout_ms = rotctld_backend_timeout_ms(ctrl, device, TRUE);
+
+    if (rotctld_needs_extended_backend_timeout(ctrl, device))
+        margin_ms = MAX(margin_ms, ROTCTLD_WIN32_ROT2PROG_MARGIN_MS);
+
+    return timeout_ms + margin_ms;
+}
+
 static gchar **rotctld_build_argv_from_command(GtkRotCtrl *ctrl,
                                                const gchar *cmdline)
 {
@@ -17150,7 +17196,7 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
     gchar **argv = NULL;
     gint port = 0;
     gint rotctld_timeout_ms =
-        (port_override > 0) ? ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS : 1200;
+        rotctld_backend_timeout_ms(ctrl, device_override, port_override > 0);
 
     if (spawn_summary_out)
         *spawn_summary_out = NULL;
@@ -17247,6 +17293,9 @@ static gboolean rotctld_spawn_autostart(GtkRotCtrl *ctrl,
             g_free(device);
             return FALSE;
         }
+
+        rotctld_timeout_ms =
+            rotctld_backend_timeout_ms(ctrl, device, port_override > 0);
 
         if (ctrl->rotctld_mgr)
             rotctld_process_stop(ctrl);
@@ -18126,16 +18175,17 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
         if (!inflight && !done && thread == NULL)
         {
             gint validate_timeout_ms = state->validate_timeout_ms;
+            gint validate_floor_ms =
+                rotctld_validate_timeout_floor_ms(ctrl,
+                                                  state->autodetect_device);
             RotctldAutodetectWorker *worker = g_new0(RotctldAutodetectWorker, 1);
 
             if (validate_timeout_ms < ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS)
                 validate_timeout_ms = ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS;
             if (validate_timeout_ms < 2500)
                 validate_timeout_ms = 2500;
-            if (validate_timeout_ms < (ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
-                                       ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS))
-                validate_timeout_ms = ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
-                                      ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS;
+            if (validate_timeout_ms < validate_floor_ms)
+                validate_timeout_ms = validate_floor_ms;
             if (validate_timeout_ms > 8000)
                 validate_timeout_ms = 8000;
 
@@ -18808,15 +18858,28 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
 
         {
             gint validate_timeout_ms = ROTCTLD_AUTODETECT_VALIDATE_TIMEOUT_MS;
+            const gchar *device_hint = NULL;
+
+            if (ctrl->conf != NULL)
+            {
+                if (ctrl->conf->last_good_device &&
+                    *ctrl->conf->last_good_device)
+                    device_hint = ctrl->conf->last_good_device;
+                else if (ctrl->conf->device_manual &&
+                         *ctrl->conf->device_manual)
+                    device_hint = ctrl->conf->device_manual;
+                else
+                    device_hint = ctrl->conf->device;
+            }
 
             if (validate_timeout_ms < ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS)
                 validate_timeout_ms = ROTCTLD_AUTODETECT_LASTGOOD_WINDOW_MS;
             if (validate_timeout_ms < 2500)
                 validate_timeout_ms = 2500;
-            if (validate_timeout_ms < (ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
-                                       ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS))
-                validate_timeout_ms = ROTCTLD_AUTODETECT_ROT_TIMEOUT_MS +
-                                      ROTCTLD_AUTODETECT_VALIDATE_MARGIN_MS;
+            if (validate_timeout_ms <
+                rotctld_validate_timeout_floor_ms(ctrl, device_hint))
+                validate_timeout_ms =
+                    rotctld_validate_timeout_floor_ms(ctrl, device_hint);
             if (validate_timeout_ms > 8000)
                 validate_timeout_ms = 8000;
 
