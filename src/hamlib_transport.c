@@ -29,6 +29,83 @@ struct _HamlibTransport {
     gint64   last_rtt_us;
 };
 
+#ifdef G_OS_WIN32
+static gint hamlib_gio_error_to_errno(const GError *error)
+{
+    if (error == NULL)
+        return EIO;
+
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+        return ETIMEDOUT;
+
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK) ||
+        g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
+        return EAGAIN;
+
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED) ||
+        g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_RESET))
+        return ECONNRESET;
+
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE))
+        return EPIPE;
+
+    return EIO;
+}
+
+static gint hamlib_poll_socket(GSocket *socket,
+                               GIOCondition condition,
+                               gint timeout_ms,
+                               gint *err_out)
+{
+    GIOCondition ready;
+    GError *error = NULL;
+
+    if (err_out)
+        *err_out = 0;
+
+    if (socket == NULL)
+    {
+        if (err_out)
+            *err_out = EINVAL;
+        return -1;
+    }
+
+    if (timeout_ms < 0)
+        timeout_ms = 0;
+
+    if (timeout_ms > 0)
+    {
+        if (!g_socket_condition_timed_wait(socket, condition,
+                                           (gint64) timeout_ms * 1000,
+                                           NULL, &error))
+        {
+            if (error &&
+                (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) ||
+                 g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)))
+            {
+                g_clear_error(&error);
+                return 0;
+            }
+
+            if (err_out)
+                *err_out = hamlib_gio_error_to_errno(error);
+            g_clear_error(&error);
+            return -1;
+        }
+    }
+
+    ready = g_socket_condition_check(socket, condition | G_IO_ERR | G_IO_HUP);
+    if (ready & (G_IO_ERR | G_IO_HUP | G_IO_NVAL))
+    {
+        if (err_out)
+            *err_out = EIO;
+        return -1;
+    }
+
+    return (ready & condition) ? 1 : 0;
+}
+#endif
+
 static gboolean hamlib_rxbuf_find_line(const GString *buf, gsize *line_len)
 {
     const gchar *pos = NULL;
@@ -70,8 +147,14 @@ static gssize hamlib_rxbuf_take_line(GString *buf, gchar *out, gsize out_len)
     return (gssize)copy_len;
 }
 
-static gint hamlib_poll_readable(gint fd, gint timeout_ms, gint *err_out)
+static gint hamlib_poll_readable(GSocket *socket, gint fd, gint timeout_ms,
+                                 gint *err_out)
 {
+#ifdef G_OS_WIN32
+    (void) fd;
+    return hamlib_poll_socket(socket, G_IO_IN, timeout_ms, err_out);
+#else
+    (void) socket;
     GPollFD pfd;
     gint rc;
 
@@ -98,6 +181,67 @@ static gint hamlib_poll_readable(gint fd, gint timeout_ms, gint *err_out)
     }
 
     return 1;
+#endif
+}
+
+static gssize hamlib_socket_recv(GSocket *socket, gint fd, gchar *chunk,
+                                 gsize chunk_len, gint *err_out)
+{
+#ifdef G_OS_WIN32
+    GError *error = NULL;
+    gssize size;
+
+    (void) fd;
+
+    size = g_socket_receive(socket, chunk, chunk_len, NULL, &error);
+    if (size < 0)
+    {
+        if (err_out)
+            *err_out = hamlib_gio_error_to_errno(error);
+        g_clear_error(&error);
+        return -1;
+    }
+
+    return size;
+#else
+    (void) socket;
+    gssize size = recv(fd, chunk, chunk_len, 0);
+
+    if (size < 0 && err_out)
+        *err_out = errno;
+
+    return size;
+#endif
+}
+
+static gssize hamlib_socket_send(GSocket *socket, gint fd, const gchar *data,
+                                 gsize len, gint *err_out)
+{
+#ifdef G_OS_WIN32
+    GError *error = NULL;
+    gssize size;
+
+    (void) fd;
+
+    size = g_socket_send(socket, data, len, NULL, &error);
+    if (size < 0)
+    {
+        if (err_out)
+            *err_out = hamlib_gio_error_to_errno(error);
+        g_clear_error(&error);
+        return -1;
+    }
+
+    return size;
+#else
+    (void) socket;
+    gssize size = send(fd, data, len, 0);
+
+    if (size < 0 && err_out)
+        *err_out = errno;
+
+    return size;
+#endif
 }
 
 static gboolean hamlib_line_is_done(const gchar *line)
@@ -235,7 +379,8 @@ static gsize hamlib_append_out_line(gchar *out, gsize out_len, gsize used,
     return used;
 }
 
-static gssize hamlib_read_reply_line(gint fd,
+static gssize hamlib_read_reply_line(GSocket *socket,
+                                     gint fd,
                                      GString *buf,
                                      gchar *out,
                                      gsize out_len,
@@ -291,7 +436,7 @@ static gssize hamlib_read_reply_line(gint fd,
             if (remaining_ms <= 0)
                 remaining_ms = 1;
 
-            poll_rc = hamlib_poll_readable(fd, remaining_ms, err_out);
+            poll_rc = hamlib_poll_readable(socket, fd, remaining_ms, err_out);
             if (poll_rc <= 0)
             {
                 if (poll_rc == 0 && err_out)
@@ -299,22 +444,20 @@ static gssize hamlib_read_reply_line(gint fd,
                 return -1;
             }
 
-            size = recv(fd, chunk, sizeof(chunk), 0);
+            size = hamlib_socket_recv(socket, fd, chunk, sizeof(chunk),
+                                      err_out);
             if (size == 0)
                 return 0;
             if (size < 0)
-            {
-                if (err_out)
-                    *err_out = errno;
                 return -1;
-            }
 
             g_string_append_len(buf, chunk, (gsize)size);
         }
     }
 }
 
-static gssize hamlib_read_dump_state(gint fd,
+static gssize hamlib_read_dump_state(GSocket *socket,
+                                     gint fd,
                                      GString *buf,
                                      gchar *out,
                                      gsize out_len,
@@ -374,7 +517,7 @@ static gssize hamlib_read_dump_state(gint fd,
             timeout_ms = idle_timeout_ms;
         }
 
-        size = hamlib_read_reply_line(fd, buf, line, sizeof(line),
+        size = hamlib_read_reply_line(socket, fd, buf, line, sizeof(line),
                                       timeout_ms, &err);
         if (size <= 0)
         {
@@ -435,7 +578,8 @@ static gssize hamlib_read_dump_state(gint fd,
     return (gssize)used;
 }
 
-static gssize hamlib_read_response(gint fd,
+static gssize hamlib_read_response(GSocket *socket,
+                                   gint fd,
                                    GString *buf,
                                    hamlib_read_mode_t mode,
                                    hamlib_term_t term,
@@ -466,7 +610,7 @@ static gssize hamlib_read_response(gint fd,
 
     if (mode == HAMLIB_READ_MULTILINE_IDLE)
     {
-        gssize dump_size = hamlib_read_dump_state(fd, buf, out, out_len,
+        gssize dump_size = hamlib_read_dump_state(socket, fd, buf, out, out_len,
                                                   base_timeout_ms,
                                                   idle_timeout_ms, &err);
         if (info)
@@ -480,7 +624,7 @@ static gssize hamlib_read_response(gint fd,
 
     for (;;)
     {
-        size = hamlib_read_reply_line(fd, buf, line, sizeof(line),
+        size = hamlib_read_reply_line(socket, fd, buf, line, sizeof(line),
                                       base_timeout_ms, &err);
         if (size <= 0)
         {
@@ -520,7 +664,7 @@ static gssize hamlib_read_response(gint fd,
     }
     else if (!saw_term && idle_timeout_ms > 0)
     {
-        gint poll_rc = hamlib_poll_readable(fd, idle_timeout_ms, &err);
+        gint poll_rc = hamlib_poll_readable(socket, fd, idle_timeout_ms, &err);
         if (poll_rc < 0)
         {
             if (info)
@@ -551,7 +695,7 @@ static gssize hamlib_read_response(gint fd,
 
         while (!saw_term)
         {
-            size = hamlib_read_reply_line(fd, buf, line, sizeof(line),
+            size = hamlib_read_reply_line(socket, fd, buf, line, sizeof(line),
                                           follow_timeout_ms, &err);
             if (size <= 0)
             {
@@ -596,13 +740,15 @@ static gssize hamlib_read_response(gint fd,
     return (gssize)used;
 }
 
-static gboolean hamlib_send_all(gint fd, const gchar *data, gsize len)
+static gboolean hamlib_send_all(GSocket *socket, gint fd, const gchar *data,
+                                gsize len, gint *err_out)
 {
     gsize sent = 0;
 
     while (sent < len)
     {
-        gssize rc = send(fd, data + sent, len - sent, 0);
+        gssize rc = hamlib_socket_send(socket, fd, data + sent, len - sent,
+                                       err_out);
         if (rc <= 0)
             return FALSE;
         sent += (gsize)rc;
@@ -805,14 +951,17 @@ gboolean hamlib_transport_request(HamlibTransport *transport,
             g_string_set_size(transport->rxbuf, 0);
 
         start_us = g_get_monotonic_time();
-        if (!hamlib_send_all(transport->fd, cmd, strlen(cmd)))
+        if (!hamlib_send_all(transport->socket, transport->fd,
+                             cmd, strlen(cmd), &local.err))
         {
-            transport->last_err = errno;
-            local.err = errno;
+            if (local.err == 0)
+                local.err = EIO;
+            transport->last_err = local.err;
         }
         else
         {
-            gssize size = hamlib_read_response(transport->fd,
+            gssize size = hamlib_read_response(transport->socket,
+                                               transport->fd,
                                                transport->rxbuf,
                                                mode, term,
                                                out, out_len,
@@ -884,7 +1033,8 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
         gchar chunk[HAMLIB_RXBUF_CHUNK];
         gssize size;
 
-        poll_rc = hamlib_poll_readable(transport->fd, idle_timeout_ms, &err);
+        poll_rc = hamlib_poll_readable(transport->socket, transport->fd,
+                                       idle_timeout_ms, &err);
         if (poll_rc == 0)
             break;
         if (poll_rc < 0)
@@ -894,7 +1044,8 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
             return -1;
         }
 
-        size = recv(transport->fd, chunk, sizeof(chunk), 0);
+        size = hamlib_socket_recv(transport->socket, transport->fd, chunk,
+                                  sizeof(chunk), &err);
         if (size <= 0)
             break;
 
@@ -922,14 +1073,16 @@ gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
         gchar chunk[HAMLIB_RXBUF_CHUNK];
         gssize size;
 
-        poll_rc = hamlib_poll_readable(transport->fd, 0, &err);
+        poll_rc = hamlib_poll_readable(transport->socket, transport->fd, 0,
+                                       &err);
         if (poll_rc <= 0)
             break;
 
-        size = recv(transport->fd, chunk, sizeof(chunk), 0);
+        size = hamlib_socket_recv(transport->socket, transport->fd, chunk,
+                                  sizeof(chunk), &err);
         if (size <= 0)
         {
-            if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (size < 0 && (err == EAGAIN || err == EWOULDBLOCK))
                 break;
             break;
         }

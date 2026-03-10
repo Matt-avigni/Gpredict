@@ -678,7 +678,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                                        const gchar *role,
                                        gchar **connect_host,
                                        gboolean *error_reported,
-                                       gboolean ic905_force_fallback);
+                                       gboolean ic905_force_fallback,
+                                       gboolean force_local_recovery);
 static gboolean open_rigctld_socket_host(const gchar *host, gint port,
                                          gint *sock,
                                          gint *err_out,
@@ -12165,7 +12166,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                                        const gchar *role,
                                        gchar **connect_host,
                                        gboolean *error_reported,
-                                       gboolean ic905_force_fallback)
+                                       gboolean ic905_force_fallback,
+                                       gboolean force_local_recovery)
 {
     gchar          *host = NULL;
     gchar          *errmsg = NULL;
@@ -12241,10 +12243,12 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         gint expected_model = rigctld_expected_model(conf);
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "rigctld ensure: host=%s port=%d autostart=%d "
-                    "conn=%d model=%d baud=%d device=%s",
+                    "force_local_recovery=%d conn=%d model=%d baud=%d "
+                    "device=%s",
                     conf->host ? conf->host : "(null)",
                     conf->port,
                     conf->rigctld_autostart ? 1 : 0,
+                    force_local_recovery ? 1 : 0,
                     conf->rigctld_conn,
                     expected_model,
                     conf->rigctld_baud,
@@ -12260,7 +12264,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                     __func__);
     }
 
-    if (!conf->rigctld_autostart)
+    if (!conf->rigctld_autostart && !force_local_recovery)
     {
         ok = TRUE;
         goto out;
@@ -12315,7 +12319,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         }
     }
 
-    if (conf->rigctld_autostart &&
+    if ((conf->rigctld_autostart || force_local_recovery) &&
         conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
         (conf->rigctld_device == NULL || *conf->rigctld_device == '\0') &&
         radio_model_to_hamlib_model(conf->radio_model) > 0)
@@ -12452,6 +12456,7 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
     gboolean     connected = FALSE;
     gboolean     ic905_fallback = FALSE;
     gint         autodetect_restart_attempts = 0;
+    gboolean     force_local_recovery = FALSE;
 
     if (conf == NULL)
         return FALSE;
@@ -12484,30 +12489,47 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
     {
         if (!conf->rigctld_autostart)
         {
+            force_local_recovery =
+                (conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                 rigctld_mgr_host_is_local(conf->host) &&
+                 (radio_model_to_hamlib_model(conf->radio_model) > 0 ||
+                  conf->rigctld_model > 0) &&
+                 (conf->rigctld_device == NULL ||
+                  *conf->rigctld_device == '\0' ||
+                  !rigctld_serial_device_exists(conf->rigctld_device)));
+
             sat_log_log(SAT_LOG_LEVEL_ERROR,
                         _("%s: Failed to connect to %s:%d"),
                         __func__, host, conf->port);
             rig_term_log(ctrl, "gpredict:err",
                          "connect failed to %s:%d (errno=%d so_error=%d)",
                          host, conf->port, err, so_err);
-            rig_term_log(ctrl, "gpredict:err",
-                         "local recovery skipped: autostart=%d conn=%s device=%s",
-                         conf->rigctld_autostart ? 1 : 0,
-                         rigctld_conn_name(conf->rigctld_conn),
-                         (conf->rigctld_device && *conf->rigctld_device)
-                             ? conf->rigctld_device
-                             : "(none)");
-            g_free(host);
-            if (error_reported)
-                *error_reported = reported;
-            return FALSE;
+
+            if (!force_local_recovery)
+            {
+                rig_term_log(ctrl, "gpredict:err",
+                             "local recovery skipped: autostart=%d conn=%s device=%s",
+                             conf->rigctld_autostart ? 1 : 0,
+                             rigctld_conn_name(conf->rigctld_conn),
+                             (conf->rigctld_device && *conf->rigctld_device)
+                                 ? conf->rigctld_device
+                                 : "(none)");
+                g_free(host);
+                if (error_reported)
+                    *error_reported = reported;
+                return FALSE;
+            }
+
+            rig_term_log(ctrl, "gpredict",
+                         "forcing local serial recovery via autodetect (autostart=0)");
         }
 
 retry_autostart:
         g_free(host);
         host = NULL;
         if (!ensure_rigctld_running(ctrl, conf, mgr, secondary, role, &host,
-                                    &reported, ic905_fallback))
+                                    &reported, ic905_fallback,
+                                    force_local_recovery))
         {
             if (error_reported)
                 *error_reported = reported;
