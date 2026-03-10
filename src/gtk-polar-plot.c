@@ -212,6 +212,27 @@ static void azel_to_xy(GtkPolarPlot * p, gdouble az, gdouble el,
     *y = (gfloat) (p->cy - rel * cos(az));
 }
 
+static gboolean gtk_polar_plot_ready(GtkPolarPlot *plot,
+                                     GooCanvasItemModel **root_out)
+{
+    GooCanvasItemModel *root = NULL;
+
+    if (!GTK_IS_POLAR_PLOT(plot) || plot->canvas == NULL ||
+        !GOO_IS_CANVAS(plot->canvas))
+    {
+        return FALSE;
+    }
+
+    root = goo_canvas_get_root_item_model(GOO_CANVAS(plot->canvas));
+    if (root == NULL)
+        return FALSE;
+
+    if (root_out != NULL)
+        *root_out = root;
+
+    return TRUE;
+}
+
 /** Convert canvas based coordinates to Az/El. */
 static void xy_to_azel(GtkPolarPlot * p, gfloat x, gfloat y,
                        gfloat * az, gfloat * el)
@@ -850,11 +871,13 @@ void gtk_polar_plot_set_pass(GtkPolarPlot * plot, pass_t * pass)
     GooCanvasItemModel *root;
     gint            idx, i;
 
+    if (!gtk_polar_plot_ready(plot, &root))
+        return;
+
     /* remove sky track, time ticks and the pass itself */
     if (plot->pass != NULL)
     {
         /* remove sat from canvas */
-        root = goo_canvas_get_root_item_model(GOO_CANVAS(plot->canvas));
         idx = goo_canvas_item_model_find_child(root, plot->track);
 
         if (idx != -1)
@@ -894,10 +917,13 @@ void gtk_polar_plot_set_target_pos(GtkPolarPlot * plot, gdouble az, gdouble el)
     gfloat          x, y;
     guint32         col;
 
-    if (plot == NULL)
+    if (!gtk_polar_plot_ready(plot, &root))
         return;
-
-    root = goo_canvas_get_root_item_model(GOO_CANVAS(plot->canvas));
+    if (!isfinite(az) || !isfinite(el))
+    {
+        az = -1.0;
+        el = -1.0;
+    }
 
     if ((az < 0.0) || (el < 0.0))
     {
@@ -956,10 +982,13 @@ void gtk_polar_plot_set_ctrl_pos(GtkPolarPlot * plot, gdouble az, gdouble el)
     gfloat          x, y;
     guint32         col;
 
-    if (plot == NULL)
+    if (!gtk_polar_plot_ready(plot, &root))
         return;
-
-    root = goo_canvas_get_root_item_model(GOO_CANVAS(plot->canvas));
+    if (!isfinite(az) || !isfinite(el))
+    {
+        az = -1.0;
+        el = -1.0;
+    }
 
     if ((az < 0.0) || (el < 0.0))
     {
@@ -1015,10 +1044,13 @@ void gtk_polar_plot_set_rotor_pos(GtkPolarPlot * plot, gdouble az, gdouble el)
     gfloat          x, y;
     guint32         col;
 
-    if (plot == NULL)
+    if (!gtk_polar_plot_ready(plot, &root))
         return;
-
-    root = goo_canvas_get_root_item_model(GOO_CANVAS(plot->canvas));
+    if (!isfinite(az) || !isfinite(el))
+    {
+        az = -1.0;
+        el = -1.0;
+    }
 
     if ((az < 0.0) || (el < 0.0))
     {
@@ -1164,7 +1196,7 @@ void gtk_polar_plot_set_margin(GtkPolarPlot * plot, guint margin)
 {
     GtkAllocation aloc;
 
-    if (plot == NULL)
+    if (!GTK_IS_POLAR_PLOT(plot))
         return;
 
     plot->margin = margin;
@@ -1178,7 +1210,7 @@ void gtk_polar_plot_set_margin(GtkPolarPlot * plot, guint margin)
 
 void gtk_polar_plot_set_sat_name(GtkPolarPlot * plot, const gchar *name)
 {
-    if (plot == NULL || plot->satnam == NULL)
+    if (!GTK_IS_POLAR_PLOT(plot) || plot->satnam == NULL)
         return;
 
     g_object_set(plot->satnam, "text", name ? name : "", NULL);

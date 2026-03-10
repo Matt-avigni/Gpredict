@@ -492,6 +492,8 @@ struct _GtkRotCtrl {
     GtkWidget      *DevSel, *LockBut, *MonitorCheckBox;
     GtkWidget      *track, *freeze, *cycle_spin, *thld_spin;
     GtkWidget      *plot;
+    GtkWidget      *status_label_widget;
+    GtkWidget      *status_indicator_widget;
     GtkWidget      *axis_mode_combo;
     GtkWidget      *wrap_mode_combo;
     GtkWidget      *min_az_spin;
@@ -1423,13 +1425,13 @@ static void rotctrl_set_pass_on_plots(GtkRotCtrl *ctrl, pass_t *pass)
     if (ctrl == NULL)
         return;
 
-    if (ctrl->plot != NULL)
+    if (GTK_IS_POLAR_PLOT(ctrl->plot))
         gtk_polar_plot_set_pass(GTK_POLAR_PLOT(ctrl->plot), pass);
 
     for (node = ctrl->detached_plots; node != NULL; node = node->next)
     {
         RotDetachedPlot *entry = node->data;
-        if (entry != NULL && entry->plot != NULL)
+        if (entry != NULL && GTK_IS_POLAR_PLOT(entry->plot))
             gtk_polar_plot_set_pass(GTK_POLAR_PLOT(entry->plot), pass);
     }
 }
@@ -1442,13 +1444,13 @@ static void rotctrl_set_rotor_pos_on_plots(GtkRotCtrl *ctrl,
     if (ctrl == NULL)
         return;
 
-    if (ctrl->plot != NULL)
+    if (GTK_IS_POLAR_PLOT(ctrl->plot))
         gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(ctrl->plot), az, el);
 
     for (node = ctrl->detached_plots; node != NULL; node = node->next)
     {
         RotDetachedPlot *entry = node->data;
-        if (entry != NULL && entry->plot != NULL)
+        if (entry != NULL && GTK_IS_POLAR_PLOT(entry->plot))
             gtk_polar_plot_set_rotor_pos(GTK_POLAR_PLOT(entry->plot), az, el);
     }
 }
@@ -1461,13 +1463,13 @@ static void rotctrl_set_target_pos_on_plots(GtkRotCtrl *ctrl,
     if (ctrl == NULL)
         return;
 
-    if (ctrl->plot != NULL)
+    if (GTK_IS_POLAR_PLOT(ctrl->plot))
         gtk_polar_plot_set_target_pos(GTK_POLAR_PLOT(ctrl->plot), az, el);
 
     for (node = ctrl->detached_plots; node != NULL; node = node->next)
     {
         RotDetachedPlot *entry = node->data;
-        if (entry != NULL && entry->plot != NULL)
+        if (entry != NULL && GTK_IS_POLAR_PLOT(entry->plot))
             gtk_polar_plot_set_target_pos(GTK_POLAR_PLOT(entry->plot), az, el);
     }
 }
@@ -1480,13 +1482,13 @@ static void rotctrl_set_ctrl_pos_on_plots(GtkRotCtrl *ctrl,
     if (ctrl == NULL)
         return;
 
-    if (ctrl->plot != NULL)
+    if (GTK_IS_POLAR_PLOT(ctrl->plot))
         gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(ctrl->plot), az, el);
 
     for (node = ctrl->detached_plots; node != NULL; node = node->next)
     {
         RotDetachedPlot *entry = node->data;
-        if (entry != NULL && entry->plot != NULL)
+        if (entry != NULL && GTK_IS_POLAR_PLOT(entry->plot))
             gtk_polar_plot_set_ctrl_pos(GTK_POLAR_PLOT(entry->plot), az, el);
     }
 }
@@ -1498,13 +1500,13 @@ static void rotctrl_queue_draw_plots(GtkRotCtrl *ctrl)
     if (ctrl == NULL)
         return;
 
-    if (ctrl->plot != NULL)
+    if (GTK_IS_WIDGET(ctrl->plot))
         gtk_widget_queue_draw(ctrl->plot);
 
     for (node = ctrl->detached_plots; node != NULL; node = node->next)
     {
         RotDetachedPlot *entry = node->data;
-        if (entry != NULL && entry->plot != NULL)
+        if (entry != NULL && GTK_IS_WIDGET(entry->plot))
             gtk_widget_queue_draw(entry->plot);
     }
 }
@@ -2216,14 +2218,14 @@ static void rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
         ctrl->ui_status = next;
     }
 
-    status_label = g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
+    status_label = ctrl->status_label_widget;
     if (status_label == NULL)
         return;
 
     gtk_label_set_text(GTK_LABEL(status_label),
                        rotor_ui_status_to_string(ctrl->ui_status));
 
-    status_indicator = g_object_get_data(G_OBJECT(ctrl), "rot-status-indicator");
+    status_indicator = ctrl->status_indicator_widget;
     if (status_indicator != NULL)
     {
         prev_severity = status_indicator_get_severity(status_indicator);
@@ -11198,8 +11200,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gdouble backend_az_max = 360.0;
     gdouble backend_el_min = ROTCTRL_DEFAULT_MIN_EL;
     gdouble backend_el_max = ROTCTRL_DEFAULT_MAX_EL;
-    GtkWidget *status_label =
-        g_object_get_data(G_OBJECT(ctrl), "rot-status-label");
+    GtkWidget *status_label = ctrl->status_label_widget;
     gboolean plan_active = rot_plan_matches_pass(ctrl);
     gboolean session_ready = FALSE;
     gchar last_pos_error[64] = { 0 };
@@ -14212,6 +14213,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         {
             target_plot_az = live_az360;
             target_plot_el = live_el;
+        }
+
+        if (!isfinite(target_plot_az) || !isfinite(target_plot_el))
+        {
+            target_plot_az = -10.0;
+            target_plot_el = -10.0;
         }
 
         rotctrl_set_target_pos_on_plots(ctrl, target_plot_az, target_plot_el);
@@ -20464,9 +20471,12 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(main_table), status_panel, 1, 1, 1, 1);
 
-    /* store pointer on the controller object for later updates */
-    g_object_set_data(G_OBJECT(ctrl), "rot-status-indicator", status_led);
-    g_object_set_data(G_OBJECT(ctrl), "rot-status-label", status);
+    ctrl->status_indicator_widget = status_led;
+    ctrl->status_label_widget = status;
+    g_object_add_weak_pointer(G_OBJECT(status_led),
+                              (gpointer *)&ctrl->status_indicator_widget);
+    g_object_add_weak_pointer(G_OBJECT(status),
+                              (gpointer *)&ctrl->status_label_widget);
     {
         RotorStateSnapshot snap = { 0 };
         snap.control_active = FALSE;
@@ -21258,6 +21268,7 @@ static GtkWidget *create_plot_widget(GtkRotCtrl * ctrl)
     GtkWidget      *detach_button;
 
     ctrl->plot = gtk_polar_plot_new(ctrl->qth, ctrl->pass);
+    g_object_add_weak_pointer(G_OBJECT(ctrl->plot), (gpointer *)&ctrl->plot);
 
     overlay = gtk_overlay_new();
     gtk_widget_set_hexpand(overlay, TRUE);
@@ -21513,6 +21524,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->module = NULL;
     ctrl->module_sats = NULL;
     ctrl->plot = NULL;
+    ctrl->status_label_widget = NULL;
+    ctrl->status_indicator_widget = NULL;
     ctrl->detached_plots = NULL;
     ctrl->axis_mode_combo = NULL;
     ctrl->wrap_mode_combo = NULL;
