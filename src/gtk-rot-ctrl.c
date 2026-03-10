@@ -13620,7 +13620,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->client.desired_tracking = ctrl->tracking;
             ctrl->client.desired_update_us = now_us;
             ctrl->client.allow_send_no_pos = allow_no_pos_manual;
-            if (force_send && !ctrl->client.force_pending)
+            if (allow_send && send_ok && force_send &&
+                !ctrl->client.force_pending)
             {
                 ctrl->client.force_pending = TRUE;
                 if (ctrl->force_next_send)

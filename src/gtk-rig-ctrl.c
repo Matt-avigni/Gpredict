@@ -128,6 +128,8 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTLD_FOLLOW_IDLE_MS 50
 #define RIGCTLD_AUTODETECT_MAX_CANDIDATES 8
 #define RIGCTLD_AUTODETECT_TOTAL_MS 10000
+#define RIGCTLD_AUTODETECT_TOTAL_MS_PER_CANDIDATE 12000
+#define RIGCTLD_AUTODETECT_TOTAL_MS_MAX 60000
 #define RIGCTLD_AUTODETECT_WAIT_MS 1500
 #define RIGCTLD_AUTODETECT_PROBE_MS 1500
 #define RIGCTLD_PROBE_SHORT_MS 300
@@ -10701,6 +10703,26 @@ static gboolean rigctld_candidate_blocked_default(const gchar *candidate)
     return blocked;
 }
 
+#ifdef G_OS_WIN32
+static gint rigctld_candidate_windows_com_number(const gchar *candidate)
+{
+    const gchar *digits = NULL;
+
+    if (!gp_serial_port_is_windows_com(candidate))
+        return 0;
+
+    if (g_ascii_strncasecmp(candidate, "\\\\.\\COM", 7) == 0)
+        digits = candidate + 7;
+    else if (g_ascii_strncasecmp(candidate, "COM", 3) == 0)
+        digits = candidate + 3;
+
+    if (digits == NULL || *digits == '\0')
+        return 0;
+
+    return (gint) g_ascii_strtoll(digits, NULL, 10);
+}
+#endif
+
 static gint rigctld_autodetect_candidate_score(const gchar *candidate)
 {
     gchar *candidate_lc = NULL;
@@ -10726,6 +10748,25 @@ static gint rigctld_autodetect_candidate_score(const gchar *candidate)
         score -= 20;
     if (g_strrstr(candidate_lc, "ft06hpd7") != NULL)
         score -= 15;
+
+#ifdef G_OS_WIN32
+    {
+        gint com_number = rigctld_candidate_windows_com_number(candidate);
+
+        if (com_number > 0)
+        {
+            /* Prefer typical USB-assigned COM ports over legacy motherboard
+             * ports like COM1/COM2, which often stall rigctld on Windows.
+             */
+            if (com_number <= 2)
+                score -= 60;
+            else if (com_number <= 4)
+                score -= 10;
+            else
+                score += MIN(com_number, 20);
+        }
+    }
+#endif
 
     g_free(candidate_lc);
     return score;
@@ -11734,6 +11775,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     gchar  *fatal_err = NULL;
     gchar  *allowlist_lc = NULL;
     guint   filtered = 0;
+    guint   candidate_count = 0;
     rigctld_preset_defaults_t preset;
     const gchar *cached = NULL;
     gboolean is_ic905 = rigctld_is_ic905(conf);
@@ -11783,17 +11825,22 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     candidates = rigctld_autodetect_filter_candidates(candidates,
                                                       allowlist_lc,
                                                       &filtered);
+    candidate_count = g_slist_length(candidates);
     {
-        guint count = g_slist_length(candidates);
+        gint total_budget_ms = (gint) MIN(
+            (guint) RIGCTLD_AUTODETECT_TOTAL_MS_MAX,
+            MAX((guint) RIGCTLD_AUTODETECT_TOTAL_MS,
+                candidate_count *
+                    (guint) RIGCTLD_AUTODETECT_TOTAL_MS_PER_CANDIDATE));
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: auto-detect candidates=%u filtered=%u allowlist=%s"),
-                    __func__, count, filtered,
+                    _("%s: auto-detect candidates=%u filtered=%u total_budget_ms=%d allowlist=%s"),
+                    __func__, candidate_count, filtered, total_budget_ms,
                     (conf->rigctld_autodetect_match &&
                      *conf->rigctld_autodetect_match) ?
                         conf->rigctld_autodetect_match : "(none)");
         rig_term_log(ctrl, "gpredict",
-                     "auto-detect candidates=%u filtered=%u allowlist=%s",
-                     count, filtered,
+                     "auto-detect candidates=%u filtered=%u total_budget_ms=%d allowlist=%s",
+                     candidate_count, filtered, total_budget_ms,
                      (conf->rigctld_autodetect_match &&
                       *conf->rigctld_autodetect_match) ?
                         conf->rigctld_autodetect_match : "(none)");
@@ -11840,7 +11887,11 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
 
     start_us = g_get_monotonic_time();
     deadline_us = start_us +
-        ((gint64) RIGCTLD_AUTODETECT_TOTAL_MS * 1000);
+        ((gint64) MIN((guint) RIGCTLD_AUTODETECT_TOTAL_MS_MAX,
+                      MAX((guint) RIGCTLD_AUTODETECT_TOTAL_MS,
+                          candidate_count *
+                              (guint) RIGCTLD_AUTODETECT_TOTAL_MS_PER_CANDIDATE)) *
+         1000);
 
     gint expected_model = rigctld_expected_model(conf);
 

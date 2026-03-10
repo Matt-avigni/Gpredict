@@ -690,8 +690,15 @@ static gssize hamlib_read_response(GSocket *socket,
         info->used_multiline = TRUE;
 
     {
-        gint follow_timeout_ms =
-            (mode == HAMLIB_READ_MULTILINE_RPRT) ? base_timeout_ms : idle_timeout_ms;
+        gint follow_timeout_ms = idle_timeout_ms;
+
+        /* `p` replies from rotctld commonly return az/el lines without an
+         * RPRT terminator. Once data is flowing, use a short idle gap to
+         * decide the reply is complete instead of waiting the full command
+         * timeout after every position sample.
+         */
+        if (follow_timeout_ms <= 0)
+            follow_timeout_ms = base_timeout_ms;
 
         while (!saw_term)
         {
