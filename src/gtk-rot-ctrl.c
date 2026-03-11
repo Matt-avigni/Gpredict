@@ -1285,21 +1285,28 @@ static gboolean rot_backend_io_disengage_idle(gpointer data)
 {
     GtkRotCtrl *ctrl = GTK_ROT_CTRL(data);
 
-    if (ctrl == NULL)
-        return G_SOURCE_REMOVE;
+    if (ctrl != NULL)
+    {
+        rot_term_log(ctrl, "gpredict:err",
+                     "backend I/O error persists; staying engaged (DEGRADED)");
 
-    rot_term_log(ctrl, "gpredict:err",
-                 "backend I/O error persists; staying engaged (DEGRADED)");
+        g_object_unref(ctrl);
+    }
 
     return G_SOURCE_REMOVE;
 }
 
 static void rot_schedule_backend_io_disengage(GtkRotCtrl *ctrl)
 {
+    guint source_id;
+
     if (ctrl == NULL)
         return;
 
-    g_idle_add(rot_backend_io_disengage_idle, ctrl);
+    g_object_ref(ctrl);
+    source_id = g_idle_add(rot_backend_io_disengage_idle, ctrl);
+    if (source_id == 0)
+        g_object_unref(ctrl);
 }
 
 static void rot_term_log(GtkRotCtrl *ctrl, const gchar *prefix,
@@ -15154,12 +15161,14 @@ static void rotctld_log_exit(GtkRotCtrl *ctrl,
                 stderr_tail ? " stderr: " : "",
                 stderr_tail ? stderr_tail : "");
     rot_term_log(ctrl, "gpredict:err",
-                 "rotctld exited pid=%d status=%d signal=%d expected=%d owner=%s",
+                 "rotctld exited pid=%d status=%d signal=%d expected=%d owner=%s%s%s",
                  pid,
                  have_exit ? exit_status : -1,
                  have_exit ? exit_signal : 0,
                  expected ? 1 : 0,
-                 owner ? owner : "unknown");
+                 owner ? owner : "unknown",
+                 stderr_tail ? " stderr: " : "",
+                 stderr_tail ? stderr_tail : "");
 
     if (pid > 0 && ctrl->selected_child_pid == pid)
     {

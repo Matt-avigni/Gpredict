@@ -53,6 +53,7 @@ static gchar *rotctld_mgr_argv_to_shell_string(const gchar * const *argv)
 
 struct _RotctldMgr {
     GSubprocess *proc;
+    gchar       *identifier;
     GThread     *stdout_thread;
     GThread     *stderr_thread;
     GThread     *exit_thread;
@@ -857,6 +858,7 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
 
     mgr = g_new0(RotctldMgr, 1);
     mgr->proc = proc;
+    mgr->identifier = g_strdup(g_subprocess_get_identifier(proc));
     g_mutex_init(&mgr->log_lock);
     mgr->stdout_lines = g_queue_new();
     mgr->stderr_lines = g_queue_new();
@@ -1054,7 +1056,13 @@ gboolean rotctld_mgr_is_running(const RotctldMgr *mgr)
 
 const gchar *rotctld_mgr_get_identifier(const RotctldMgr *mgr)
 {
-    if (mgr == NULL || mgr->proc == NULL)
+    if (mgr == NULL)
+        return NULL;
+
+    if (mgr->identifier && *mgr->identifier)
+        return mgr->identifier;
+
+    if (mgr->proc == NULL)
         return NULL;
 
     return g_subprocess_get_identifier(mgr->proc);
@@ -1173,6 +1181,8 @@ void rotctld_mgr_terminate(RotctldMgr **mgr_ptr)
         g_thread_join(mgr->exit_thread);
 
     g_clear_object(&mgr->proc);
+    g_free(mgr->identifier);
+    mgr->identifier = NULL;
 
     g_mutex_clear(&mgr->log_lock);
     if (mgr->stdout_lines)

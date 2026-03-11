@@ -235,7 +235,8 @@ struct _gtk_rig_ctrl {
     guint           pending_ui_refresh_id; /*!< Coalesced UI refresh id */
     gchar          *primary_rig_id;     /*!< Selected primary rig ID */
     gchar          *secondary_rig_id;   /*!< Selected secondary rig ID */
-    GtkWidget      *status_label;       /*!< Command/status indicator */
+    GtkWidget      *status_label;       /*!< Weak-tracked command/status label */
+    GtkWidget      *status_indicator_widget; /*!< Weak-tracked status indicator */
     gboolean        cmd_error;          /*!< Last command status */
     RadioUiStatus   ui_status;          /*!< Operator-facing status */
     gboolean        ui_hard_error;      /*!< Latched startup/configuration failure */

@@ -2188,6 +2188,7 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
     const gchar *detail = NULL;
     gint64 now_us = g_get_monotonic_time();
     const gchar *why = (reason != NULL) ? reason : "update";
+    GtkWidget *status_label = NULL;
     GtkWidget *status_indicator = NULL;
 
     if (ctrl == NULL)
@@ -2260,13 +2261,13 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
         ctrl->ui_status = new_status;
     }
 
-    if (ctrl->status_label != NULL)
+    status_label = ctrl->status_label;
+    if (status_label != NULL)
     {
-        gtk_label_set_text(GTK_LABEL(ctrl->status_label),
+        gtk_label_set_text(GTK_LABEL(status_label),
                            radio_ui_status_to_string(ctrl->ui_status));
 
-        status_indicator =
-            g_object_get_data(G_OBJECT(ctrl), "rig-status-indicator");
+        status_indicator = ctrl->status_indicator_widget;
         if (status_indicator != NULL)
         {
             prev_severity = status_indicator_get_severity(status_indicator);
@@ -2289,7 +2290,7 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
         else if (ctrl->ui_status_detail[0] != '\0')
             detail = ctrl->ui_status_detail;
 
-        gtk_widget_set_tooltip_text(ctrl->status_label, detail);
+        gtk_widget_set_tooltip_text(status_label, detail);
     }
 }
 
@@ -2435,7 +2436,12 @@ static void rigctrl_update_freq_display(GtkRigCtrl *ctrl)
 
 static gboolean rigctrl_update_freq_display_idle(gpointer data)
 {
-    rigctrl_update_freq_display(GTK_RIG_CTRL(data));
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    if (ctrl != NULL && !ctrl->destroying)
+        rigctrl_update_freq_display(ctrl);
+    if (ctrl != NULL)
+        g_object_unref(ctrl);
     return G_SOURCE_REMOVE;
 }
 
@@ -2492,7 +2498,14 @@ static void rigctrl_set_conn_state(GtkRigCtrl *ctrl,
     if (rigctrl_on_main_thread(ctrl))
         rigctrl_update_freq_display(ctrl);
     else
-        g_idle_add(rigctrl_update_freq_display_idle, ctrl);
+    {
+        guint source_id;
+
+        g_object_ref(ctrl);
+        source_id = g_idle_add(rigctrl_update_freq_display_idle, ctrl);
+        if (source_id == 0)
+            g_object_unref(ctrl);
+    }
 
     rigctrl_queue_ui_status_refresh(ctrl, reason);
 }
@@ -3053,6 +3066,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->primary_rig_id = NULL;
     ctrl->secondary_rig_id = NULL;
     ctrl->status_label = NULL;
+    ctrl->status_indicator_widget = NULL;
     ctrl->cmd_error = FALSE;
     ctrl->ui_status = RADIO_UI_STATUS_DISENGAGED;
     ctrl->ui_hard_error = FALSE;
@@ -6928,7 +6942,11 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_size_request(status_panel, action_panel_width, 42);
     gtk_box_pack_start(GTK_BOX(status_panel), status_box, TRUE, TRUE, 0);
     gtk_grid_attach(GTK_GRID(table), status_panel, 1, 1, 1, 1);
-    g_object_set_data(G_OBJECT(ctrl), "rig-status-indicator", status_led);
+    ctrl->status_indicator_widget = status_led;
+    g_object_add_weak_pointer(G_OBJECT(ctrl->status_label),
+                              (gpointer *)&ctrl->status_label);
+    g_object_add_weak_pointer(G_OBJECT(status_led),
+                              (gpointer *)&ctrl->status_indicator_widget);
     g_object_unref(left_label_group);
     rigctrl_refresh_ui_status(ctrl, "widget init");
 
@@ -13027,7 +13045,7 @@ static gboolean rig_disengage_idle(gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
 
-    if (ctrl != NULL)
+    if (ctrl != NULL && !ctrl->destroying)
     {
         if (ctrl->DevSel != NULL)
             gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
@@ -13043,13 +13061,23 @@ static gboolean rig_disengage_idle(gpointer data)
             rig_engaged_cb(GTK_TOGGLE_BUTTON(ctrl->LockBut), ctrl);
         }
     }
+    if (ctrl != NULL)
+        g_object_unref(ctrl);
 
     return G_SOURCE_REMOVE;
 }
 
 static void schedule_rig_disengage(GtkRigCtrl *ctrl)
 {
-    g_idle_add(rig_disengage_idle, ctrl);
+    guint source_id;
+
+    if (ctrl == NULL)
+        return;
+
+    g_object_ref(ctrl);
+    source_id = g_idle_add(rig_disengage_idle, ctrl);
+    if (source_id == 0)
+        g_object_unref(ctrl);
 }
 
 static void rigctrl_fail_engage(GtkRigCtrl *ctrl, const gchar *reason)
