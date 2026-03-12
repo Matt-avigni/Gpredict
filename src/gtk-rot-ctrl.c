@@ -77,6 +77,7 @@
 #include "gtk-sat-module.h"
 #include "gp-term-view.h"
 #include "predict-tools.h"
+#include "time-tools.h"
 #include "sat-log.h"
 #include "rotor-conf.h"
 #include "rotor_calibration.h"
@@ -228,8 +229,6 @@ static const gdouble k_meas_tol_deg = 1.5;
 #define ROTCTLD_WIN32_ROT2PROG_MARGIN_MS 1500
 #define ROTCTRL_DEFAULT_MIN_EL -5.0
 #define ROTCTRL_DEFAULT_MAX_EL 185.0
-#define ROTCTRL_MIN_VALID_UNIX_SEC G_GINT64_CONSTANT(-62135596800)
-#define ROTCTRL_MAX_VALID_UNIX_SEC G_GINT64_CONSTANT(253402300799)
 #define ROTCTLD_KEEPALIVE_US 2000000
 #define ROT_SEND_MIN_INTERVAL_US ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000)
 #define ROT_TRACK_RESEND_US 2000000
@@ -6648,54 +6647,11 @@ static gdouble rotctrl_clamp_el_for_backend(GtkRotCtrl *ctrl,
 
 static void rotctrl_format_utc_jd(gdouble jd, gchar *buf, gsize buflen)
 {
-    GDateTime *utc_dt = NULL;
-    gchar *formatted = NULL;
-    long double unix_seconds_ld = 0.0L;
-    gint64 unix_seconds = 0;
-
     if (buf == NULL || buflen == 0)
         return;
 
-    buf[0] = '\0';
-
-    if (!isfinite(jd))
-    {
+    if (daynum_to_utc_str(buf, buflen, "%Y-%m-%d %H:%M:%S", jd) == 0)
         g_strlcpy(buf, "unknown", buflen);
-        return;
-    }
-
-    unix_seconds_ld = ((long double)jd - 2440587.5L) * 86400.0L;
-    if (!isfinite((gdouble)unix_seconds_ld))
-    {
-        g_strlcpy(buf, "unknown", buflen);
-        return;
-    }
-
-    unix_seconds = (gint64)floorl(unix_seconds_ld);
-    if (unix_seconds < ROTCTRL_MIN_VALID_UNIX_SEC ||
-        unix_seconds > ROTCTRL_MAX_VALID_UNIX_SEC)
-    {
-        g_strlcpy(buf, "unknown", buflen);
-        return;
-    }
-
-    /* Avoid CRT gmtime() here: on Windows, invalid time_t inputs can trip
-     * the invalid parameter handler and abort the process. */
-    utc_dt = g_date_time_new_from_unix_utc(unix_seconds);
-    if (utc_dt == NULL)
-    {
-        g_strlcpy(buf, "unknown", buflen);
-        return;
-    }
-
-    formatted = g_date_time_format(utc_dt, "%Y-%m-%d %H:%M:%S");
-    if (formatted == NULL || *formatted == '\0')
-        g_strlcpy(buf, "unknown", buflen);
-    else
-        g_strlcpy(buf, formatted, buflen);
-
-    g_free(formatted);
-    g_date_time_unref(utc_dt);
 }
 
 static gboolean rotctrl_predict_at(GtkRotCtrl *ctrl,
@@ -6717,6 +6673,20 @@ static gboolean rotctrl_predict_at(GtkRotCtrl *ctrl,
         *az360_out = rot_norm360(sat.az);
     if (el_out)
         *el_out = sat.el;
+
+    return TRUE;
+}
+
+static gboolean rotctrl_pretrack_target_values_valid(gdouble az,
+                                                     gdouble el,
+                                                     gdouble target_time,
+                                                     gboolean require_time)
+{
+    if (!isfinite(az) || !isfinite(el))
+        return FALSE;
+
+    if (require_time && (!isfinite(target_time) || target_time <= 0.0))
+        return FALSE;
 
     return TRUE;
 }
@@ -11417,6 +11387,20 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     }
                 }
 
+                if (aos_found &&
+                    !rotctrl_pretrack_target_values_valid(aos_az360,
+                                                          aos_el,
+                                                          aos_time,
+                                                          TRUE))
+                {
+                    sat_log_log(SAT_LOG_LEVEL_WARN,
+                                "pretrack: rejecting invalid AOS target az=%.2f el=%.2f t=%.9f",
+                                aos_az360,
+                                aos_el,
+                                aos_time);
+                    aos_found = FALSE;
+                }
+
                 if (aos_found)
                 {
                     gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
@@ -11452,6 +11436,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     gdouble plan_az = 0.0;
                     gdouble plan_el = 0.0;
                     gdouble plan_t = 0.0;
+                    gboolean plan_found = FALSE;
                     gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
 
                     if (ctrl->conf != NULL)
@@ -11459,12 +11444,18 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                             ctrl->conf->minel,
                                             ctrl->conf->maxel);
 
-                    if (rotctrl_find_pretrack_cmd(ctrl,
-                                                       ctrl->t,
-                                                       elev_floor,
-                                                       &plan_az,
-                                                       &plan_el,
-                                                       &plan_t))
+                    plan_found = rotctrl_find_pretrack_cmd(ctrl,
+                                                           ctrl->t,
+                                                           elev_floor,
+                                                           &plan_az,
+                                                           &plan_el,
+                                                           &plan_t);
+
+                    if (plan_found &&
+                        rotctrl_pretrack_target_values_valid(plan_az,
+                                                             plan_el,
+                                                             plan_t,
+                                                             TRUE))
                     {
                         ctrl->pretrack_target_az = plan_az;
                         ctrl->pretrack_target_el = plan_el;
@@ -11480,6 +11471,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                         plan_az,
                                         plan_el);
                         }
+                    }
+                    else if (plan_found)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_WARN,
+                                    "pretrack: rejecting invalid plan entry az=%.2f el=%.2f t=%.9f",
+                                    plan_az,
+                                    plan_el,
+                                    plan_t);
                     }
                     else if (live_valid &&
                              live_el >= (elev_floor -

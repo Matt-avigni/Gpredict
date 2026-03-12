@@ -28,9 +28,13 @@
 #ifndef TIME_TOOLS_H
 #define TIME_TOOLS_H 1
 
+#include <stddef.h>
+
+#include <glib.h>
+
 gdouble  get_current_daynum  (void);
 //long     get_daynum_from_dmy (int d, int m, int y);
 int      daynum_to_str(char *s, size_t max, const char *format, gdouble jultime);
+int      daynum_to_utc_str(char *s, size_t max, const char *format, gdouble jultime);
 #endif
-
 

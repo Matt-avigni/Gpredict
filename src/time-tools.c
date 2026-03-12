@@ -28,6 +28,7 @@
 
 #include <glib.h>
 #include <glib/gi18n.h>
+#include <math.h>
 //#include <sys/time.h>
 #ifdef HAVE_CONFIG_H
 #  include <build-config.h>
@@ -39,6 +40,99 @@
 //#  include "libc_internal.h"
 //#  include "libc_interface.h"
 //#endif
+
+#define TIME_TOOLS_MIN_VALID_UNIX_SEC G_GINT64_CONSTANT(-62135596800)
+#define TIME_TOOLS_MAX_VALID_UNIX_SEC G_GINT64_CONSTANT(253402300799)
+
+static gboolean daynum_to_time_t_checked(gdouble jultime, time_t *tim_out)
+{
+    long double unix_seconds_ld = 0.0L;
+    gint64 unix_seconds = 0;
+
+    if (tim_out == NULL || !isfinite(jultime))
+        return FALSE;
+
+    unix_seconds_ld = ((long double)jultime - 2440587.5L) * 86400.0L;
+    if (!isfinite((gdouble)unix_seconds_ld))
+        return FALSE;
+
+    unix_seconds = (gint64)floorl(unix_seconds_ld);
+    if (unix_seconds < TIME_TOOLS_MIN_VALID_UNIX_SEC ||
+        unix_seconds > TIME_TOOLS_MAX_VALID_UNIX_SEC)
+    {
+        return FALSE;
+    }
+
+    if ((gint64)(time_t)unix_seconds != unix_seconds)
+        return FALSE;
+
+    *tim_out = (time_t)unix_seconds;
+    return TRUE;
+}
+
+static gboolean daynum_to_tm_checked(time_t tim,
+                                     gboolean use_local_time,
+                                     struct tm *tm_out)
+{
+    if (tm_out == NULL)
+        return FALSE;
+
+#ifdef G_OS_WIN32
+    if (use_local_time)
+    {
+        if (localtime_s(tm_out, &tim) != 0)
+            return FALSE;
+    }
+    else
+    {
+        if (gmtime_s(tm_out, &tim) != 0)
+            return FALSE;
+    }
+#else
+    if (use_local_time)
+    {
+        if (localtime_r(&tim, tm_out) == NULL)
+            return FALSE;
+    }
+    else
+    {
+        if (gmtime_r(&tim, tm_out) == NULL)
+            return FALSE;
+    }
+#endif
+
+    return TRUE;
+}
+
+static int daynum_to_str_internal(char *s,
+                                  size_t max,
+                                  const char *format,
+                                  gdouble jultime,
+                                  gboolean use_local_time)
+{
+    time_t tim = (time_t)0;
+    struct tm tm_value = { 0 };
+    size_t size = 0;
+
+    if (s == NULL || max == 0 || format == NULL)
+        return 0;
+
+    s[0] = '\0';
+
+    if (!daynum_to_time_t_checked(jultime, &tim))
+        return 0;
+
+    if (!daynum_to_tm_checked(tim, use_local_time, &tm_value))
+        return 0;
+
+    size = strftime(s, max, format, &tm_value);
+    if (size < max)
+        s[size] = '\0';
+    else
+        s[max - 1] = '\0';
+
+    return (int)size;
+}
 
 
 
@@ -64,20 +158,14 @@ get_current_daynum(void)
 
 int
 daynum_to_str(char *s, size_t max, const char *format, gdouble jultime){
-    //    printf("Someone called me\n");
-    time_t tim;
-    size_t size=0;
-    tim = (jultime - 2440587.5)*86400.0;
-    if (sat_cfg_get_bool (SAT_CFG_BOOL_USE_LOCAL_TIME))
-        size = strftime (s, max, format, localtime (&tim));
-    else
-        size = strftime (s, max, format, gmtime (&tim));
+    return daynum_to_str_internal(s, max, format, jultime,
+                                  sat_cfg_get_bool(SAT_CFG_BOOL_USE_LOCAL_TIME));
+}
 
-    if (size<max) 
-        s[size] = '\0';
-    else
-        s[max-1] = '\0';
-    return size;
+int
+daynum_to_utc_str(char *s, size_t max, const char *format, gdouble jultime)
+{
+    return daynum_to_str_internal(s, max, format, jultime, FALSE);
 }
 
 /* This function calculates the day number from m/d/y. */

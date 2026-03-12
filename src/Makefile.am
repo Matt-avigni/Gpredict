@@ -157,11 +157,11 @@ gpredict_LDADD = @PACKAGE_LIBS@
 check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
     azel-mapping-test safety-window-test hamlib-mock-test \
-    payload-profile-test ui-status-test
+    payload-profile-test ui-status-test time-tools-test
 TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
     azel-mapping-test safety-window-test hamlib-mock-test \
-    payload-profile-test ui-status-test
+    payload-profile-test ui-status-test time-tools-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -224,3 +224,13 @@ ui_status_test_SOURCES = \
     ui-status.c \
     ui-status.h
 ui_status_test_LDADD = @PACKAGE_LIBS@
+
+time_tools_test_SOURCES = \
+    time-tools-test.c \
+    time-tools.c \
+    time-tools.h \
+    sat-cfg-time-test-stub.c \
+    sgpsdp/sgp_math.c \
+    sgpsdp/sgp_time.c \
+    sgpsdp/sgp4sdp4.h
+time_tools_test_LDADD = @PACKAGE_LIBS@

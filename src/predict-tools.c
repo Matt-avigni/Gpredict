@@ -35,6 +35,7 @@
 
 #include <glib.h>
 #include <glib/gi18n.h>
+#include <math.h>
 
 #include "gtk-sat-data.h"
 #include "orbit-tools.h"
@@ -123,10 +124,11 @@ gchar *predict_format_aoslos_countdown(const sat_t *sat, gdouble t,
     gdouble         targettime;
     gdouble         delta;
     guint           h, m, s;
+    guint64         total_sec = 0;
     const gchar    *aoslos;
     gchar          *text;
 
-    if (sat == NULL)
+    if (sat == NULL || !isfinite(t))
         return NULL;
 
     if (sat->el < 0.0)
@@ -140,14 +142,23 @@ gchar *predict_format_aoslos_countdown(const sat_t *sat, gdouble t,
         aoslos = _("LOS in");
     }
 
-    if (targettime <= 0.0)
+    if (!isfinite(targettime) || targettime <= 0.0)
         return NULL;
 
     delta = targettime - t;
+    if (!isfinite(delta))
+        return NULL;
     if (delta < 0.0)
         delta = 0.0;
 
-    s = (guint) (delta * 86400.0);
+    delta *= 86400.0;
+    if (!isfinite(delta))
+        return NULL;
+    if (delta > 359999.0)
+        delta = 359999.0;
+
+    total_sec = (guint64)llround(delta);
+    s = (guint)total_sec;
     h = s / 3600;
     s -= 3600 * h;
     m = s / 60;
