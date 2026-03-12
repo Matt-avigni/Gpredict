@@ -228,6 +228,8 @@ static const gdouble k_meas_tol_deg = 1.5;
 #define ROTCTLD_WIN32_ROT2PROG_MARGIN_MS 1500
 #define ROTCTRL_DEFAULT_MIN_EL -5.0
 #define ROTCTRL_DEFAULT_MAX_EL 185.0
+#define ROTCTRL_MIN_VALID_UNIX_SEC G_GINT64_CONSTANT(-62135596800)
+#define ROTCTRL_MAX_VALID_UNIX_SEC G_GINT64_CONSTANT(253402300799)
 #define ROTCTLD_KEEPALIVE_US 2000000
 #define ROT_SEND_MIN_INTERVAL_US ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000)
 #define ROT_TRACK_RESEND_US 2000000
@@ -6646,22 +6648,54 @@ static gdouble rotctrl_clamp_el_for_backend(GtkRotCtrl *ctrl,
 
 static void rotctrl_format_utc_jd(gdouble jd, gchar *buf, gsize buflen)
 {
-    time_t unix_time;
-    struct tm *utc_tm;
+    GDateTime *utc_dt = NULL;
+    gchar *formatted = NULL;
+    long double unix_seconds_ld = 0.0L;
+    gint64 unix_seconds = 0;
 
     if (buf == NULL || buflen == 0)
         return;
 
-    unix_time = (time_t)((jd - 2440587.5) * 86400.0);
-    utc_tm = gmtime(&unix_time);
-    if (utc_tm == NULL)
+    buf[0] = '\0';
+
+    if (!isfinite(jd))
     {
         g_strlcpy(buf, "unknown", buflen);
         return;
     }
 
-    if (strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", utc_tm) == 0)
+    unix_seconds_ld = ((long double)jd - 2440587.5L) * 86400.0L;
+    if (!isfinite((gdouble)unix_seconds_ld))
+    {
         g_strlcpy(buf, "unknown", buflen);
+        return;
+    }
+
+    unix_seconds = (gint64)floorl(unix_seconds_ld);
+    if (unix_seconds < ROTCTRL_MIN_VALID_UNIX_SEC ||
+        unix_seconds > ROTCTRL_MAX_VALID_UNIX_SEC)
+    {
+        g_strlcpy(buf, "unknown", buflen);
+        return;
+    }
+
+    /* Avoid CRT gmtime() here: on Windows, invalid time_t inputs can trip
+     * the invalid parameter handler and abort the process. */
+    utc_dt = g_date_time_new_from_unix_utc(unix_seconds);
+    if (utc_dt == NULL)
+    {
+        g_strlcpy(buf, "unknown", buflen);
+        return;
+    }
+
+    formatted = g_date_time_format(utc_dt, "%Y-%m-%d %H:%M:%S");
+    if (formatted == NULL || *formatted == '\0')
+        g_strlcpy(buf, "unknown", buflen);
+    else
+        g_strlcpy(buf, formatted, buflen);
+
+    g_free(formatted);
+    g_date_time_unref(utc_dt);
 }
 
 static gboolean rotctrl_predict_at(GtkRotCtrl *ctrl,
