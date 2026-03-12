@@ -11863,6 +11863,66 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
     return RIGCTLD_PROBE_OK;
 }
 
+static rigctld_probe_result_t
+rigctld_wait_for_ready(const gchar *host,
+                       gint port,
+                       gint timeout_ms,
+                       gint expected_model,
+                       gint *model_out,
+                       gchar **reply_out)
+{
+    gint64 deadline_us = g_get_monotonic_time() +
+                         ((gint64) MAX(timeout_ms, 0) * 1000);
+    const gint interval_ms = 200;
+    rigctld_probe_result_t result = RIGCTLD_PROBE_NOT_READY;
+    gchar *last_reply = NULL;
+
+    if (reply_out)
+        *reply_out = NULL;
+    if (model_out)
+        *model_out = 0;
+
+    while (g_get_monotonic_time() < deadline_us)
+    {
+        gint64 now_us = g_get_monotonic_time();
+        gint remaining_ms = (gint) MAX((deadline_us - now_us) / 1000, 1);
+        gint probe_timeout_ms = MIN(RIGCTLD_PROBE_SHORT_MS, remaining_ms);
+
+        g_free(last_reply);
+        last_reply = NULL;
+        result = rigctld_probe_simple(host, port,
+                                      probe_timeout_ms,
+                                      expected_model,
+                                      model_out,
+                                      &last_reply);
+        if (result != RIGCTLD_PROBE_NOT_READY)
+        {
+            if (reply_out)
+                *reply_out = last_reply;
+            else
+                g_free(last_reply);
+            return result;
+        }
+
+        now_us = g_get_monotonic_time();
+        if (now_us < deadline_us)
+        {
+            gint sleep_ms =
+                MIN(interval_ms, (gint) MAX((deadline_us - now_us) / 1000, 0));
+
+            if (sleep_ms > 0)
+                g_usleep((gulong) sleep_ms * 1000);
+        }
+    }
+
+    if (reply_out)
+        *reply_out = last_reply;
+    else
+        g_free(last_reply);
+
+    return result;
+}
+
 static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                                           radio_conf_t *conf,
                                           const gchar *role,
@@ -12142,11 +12202,11 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
 
         {
             rigctld_probe_result_t probe =
-                rigctld_probe_simple(host, temp_port,
-                                     RIGCTLD_AUTODETECT_PROBE_MS,
-                                     expected_model,
-                                     &detected_model,
-                                     &reply);
+                rigctld_wait_for_ready(host, temp_port,
+                                       RIGCTLD_AUTODETECT_WAIT_MS,
+                                       expected_model,
+                                       &detected_model,
+                                       &reply);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         _("%s: auto-detect probe result=%s candidate=%s "
                           "port=%d model=%d reply=%s"),
