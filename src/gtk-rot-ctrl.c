@@ -16093,8 +16093,30 @@ static gint rotctld_autodetect_candidate_score(const gchar *candidate)
         score += 15;
     if (g_strrstr(lower, "ftdi") != NULL || g_strrstr(lower, "ft232") != NULL)
         score += 12;
+
+#ifdef G_OS_WIN32
+    {
+        gint com_number = gp_serial_windows_com_number(candidate);
+
+        if (com_number > 0)
+        {
+            score += 10;
+
+            /* Keep legacy COM ports available as a fallback, but try the
+             * higher-numbered USB-assigned ports first on Windows.
+             */
+            if (com_number <= 2)
+                score -= 60;
+            else if (com_number <= 4)
+                score -= 10;
+            else
+                score += MIN(com_number, 20);
+        }
+    }
+#else
     if (gp_serial_port_is_windows_com(candidate))
         score += 10;
+#endif
 
     g_free(lower);
     return score;

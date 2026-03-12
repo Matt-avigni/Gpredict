@@ -130,7 +130,7 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTLD_AUTODETECT_TOTAL_MS 10000
 #define RIGCTLD_AUTODETECT_TOTAL_MS_PER_CANDIDATE 12000
 #define RIGCTLD_AUTODETECT_TOTAL_MS_MAX 60000
-#define RIGCTLD_AUTODETECT_WAIT_MS 1500
+#define RIGCTLD_AUTODETECT_WAIT_MS 4000
 #define RIGCTLD_AUTODETECT_PROBE_MS 1500
 #define RIGCTLD_PROBE_SHORT_MS 300
 #define RIGCTLD_STARTUP_TIMEOUT_MS 2000
@@ -11937,6 +11937,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     gchar  *host = NULL;
     gchar  *detail = NULL;
     gchar  *fatal_err = NULL;
+    gchar  *fallback_candidate = NULL;
     gchar  *allowlist_lc = NULL;
     guint   filtered = 0;
     guint   candidate_count = 0;
@@ -12258,13 +12259,41 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                         rigctld_probe_result_name(probe),
                         reply ? reply : "(none)");
             if (probe == RIGCTLD_PROBE_NOT_READY)
+            {
                 rig_term_log(ctrl, "gpredict:err",
                              "auto-detect probe timeout for %s on %s:%d",
                              candidate, host, temp_port);
+                if (log_path)
+                    log_tail = rigctld_read_log_tail(log_path, 30);
+                if (log_tail && *log_tail)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                _("%s: auto-detect rigctld log tail for %s:\n%s"),
+                                __func__, candidate, log_tail);
+                    rig_term_log(ctrl, "gpredict:err",
+                                 "auto-detect rigctld log tail for %s:\n%s",
+                                 candidate, log_tail);
+                }
+                if (fallback_candidate == NULL &&
+                    !rigctld_log_tail_indicates_stale_device(log_tail))
+                {
+                    fallback_candidate = g_strdup(candidate);
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                _("%s: auto-detect keeping listening fallback %s"),
+                                __func__, candidate);
+                    rig_term_log(ctrl, "gpredict",
+                                 "auto-detect keeping listening fallback %s",
+                                 candidate);
+                }
+                g_free(log_tail);
+                log_tail = NULL;
+            }
             else if (probe == RIGCTLD_PROBE_MISMATCH)
+            {
                 rig_term_log(ctrl, "gpredict:err",
                              "auto-detect model mismatch expected=%d got=%d for %s",
                              expected_model, detected_model, candidate);
+            }
             g_free(reply);
             rigctld_mgr_terminate(&probe_mgr);
         }
@@ -12281,7 +12310,25 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     g_free(host);
 
     if (success)
+    {
+        g_free(fallback_candidate);
         return TRUE;
+    }
+
+    if (fallback_candidate != NULL)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: auto-detect selected listening fallback %s"),
+                    __func__, fallback_candidate);
+        rig_term_log(ctrl, "gpredict",
+                     "auto-detect selected listening fallback %s",
+                     fallback_candidate);
+        g_free(conf->rigctld_device);
+        conf->rigctld_device = fallback_candidate;
+        rigctld_cache_device(conf->radio_model, fallback_candidate);
+        g_free(fatal_err);
+        return TRUE;
+    }
 
     sat_log_log(SAT_LOG_LEVEL_ERROR,
                 _("%s: auto-detect failed after %d candidate(s)"),
