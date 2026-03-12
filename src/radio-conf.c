@@ -253,6 +253,19 @@ const gchar *radio_mode_to_string(radio_mode_t mode)
     }
 }
 
+void radio_conf_refresh_runtime_flags(radio_conf_t *conf)
+{
+    if (conf == NULL)
+        return;
+
+    conf->supports_dual_vfo_sat =
+        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
+    conf->supports_full_duplex =
+        conf->supports_dual_vfo_sat ||
+        (conf->radio_mode == RADIO_MODE_SPLIT);
+    conf->supports_rit_xit = (conf->radio_model == RADIO_MODEL_IC9700);
+}
+
 /**
  * \brief Read radio configuration.
  * \param conf Pointer to a radio_conf_t structure where the data will be
@@ -586,12 +599,7 @@ gboolean radio_conf_read(radio_conf_t * conf)
             conf->rig_log_level = (rig_log_level_t) level;
     }
 
-    conf->supports_dual_vfo_sat =
-        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
-    conf->supports_full_duplex =
-        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB) ||
-        (conf->radio_mode == RADIO_MODE_SPLIT);
-    conf->supports_rit_xit = (conf->radio_model == RADIO_MODEL_IC9700);
+    radio_conf_refresh_runtime_flags(conf);
 
     g_key_file_free(cfg);
     sat_log_log(SAT_LOG_LEVEL_INFO,

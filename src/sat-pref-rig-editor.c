@@ -1717,8 +1717,7 @@ static gboolean apply_changes(RigPrefUi *ui, radio_conf_t * conf)
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->sigaos));
     conf->signal_los =
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->siglos));
-    conf->supports_dual_vfo_sat =
-        (conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
+    radio_conf_refresh_runtime_flags(conf);
 
     /* rigctld auto-start */
     conf->rigctld_autostart =

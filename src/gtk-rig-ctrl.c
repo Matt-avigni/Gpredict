@@ -803,6 +803,14 @@ static void     rigctrl_schedule_status(GtkRigCtrl *ctrl,
                                         gboolean is_error,
                                         RigUiCommandOutcome outcome);
 static gboolean rigctrl_on_main_thread(const GtkRigCtrl *ctrl);
+static void     rig_show_warning_dialog(GtkRigCtrl *ctrl,
+                                        const gchar *primary,
+                                        const gchar *secondary);
+static void     rigctrl_warn_shared_uplink_mode(GtkRigCtrl *ctrl,
+                                                const radio_conf_t *conf);
+static void     rigctrl_register_combo_quarantine_cb(GtkWidget *widget,
+                                                     gpointer data);
+static void     rigctrl_register_combo_quarantine(GtkComboBox *combo);
 static void     rigctrl_queue_ui_status_refresh(GtkRigCtrl *ctrl,
                                                 const gchar *reason);
 static const gchar *rigctrl_conn_state_name(rigctrl_conn_state_t state);
@@ -937,11 +945,11 @@ static void     remove_timer(GtkRigCtrl * data);
 
 static void     start_timer(GtkRigCtrl * data);
 
-/* Show a simple error dialog related to radio control */
 static void
-rig_show_error_dialog(GtkRigCtrl *ctrl,
-                      const gchar *primary,
-                      const gchar *secondary)
+rig_show_message_dialog(GtkRigCtrl *ctrl,
+                        GtkMessageType type,
+                        const gchar *primary,
+                        const gchar *secondary)
 {
     GtkWidget *toplevel;
     GtkWindow *parent = NULL;
@@ -952,9 +960,6 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
     if (ctrl->destroying)
         return;
 
-    if (ctrl->destroying)
-        return;
-
     toplevel = gtk_widget_get_toplevel(GTK_WIDGET(ctrl));
     if (GTK_IS_WINDOW(toplevel))
         parent = GTK_WINDOW(toplevel);
@@ -962,7 +967,7 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
     dialog =
         gtk_message_dialog_new(parent,
                                GTK_DIALOG_DESTROY_WITH_PARENT,
-                               GTK_MESSAGE_ERROR,
+                               type,
                                GTK_BUTTONS_CLOSE,
                                "%s",
                                primary ? primary : _("Radio error"));
@@ -977,6 +982,90 @@ rig_show_error_dialog(GtkRigCtrl *ctrl,
     g_signal_connect_swapped(dialog, "response",
                              G_CALLBACK(gtk_widget_destroy), dialog);
     gtk_widget_show(dialog);
+}
+
+/* Show a simple error dialog related to radio control */
+static void
+rig_show_error_dialog(GtkRigCtrl *ctrl,
+                      const gchar *primary,
+                      const gchar *secondary)
+{
+    rig_show_message_dialog(ctrl, GTK_MESSAGE_ERROR, primary, secondary);
+}
+
+static void
+rig_show_warning_dialog(GtkRigCtrl *ctrl,
+                        const gchar *primary,
+                        const gchar *secondary)
+{
+    rig_show_message_dialog(ctrl, GTK_MESSAGE_WARNING, primary, secondary);
+}
+
+static void rigctrl_warn_shared_uplink_mode(GtkRigCtrl *ctrl,
+                                            const radio_conf_t *conf)
+{
+    const gchar *name;
+    gchar *secondary = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    name = (conf != NULL && conf->name != NULL && *conf->name != '\0') ?
+        conf->name : _("selected radio");
+
+    if (conf != NULL && conf->radio_mode == RADIO_MODE_SIMPLEX)
+    {
+        secondary = g_strdup_printf(_("The uplink selector cannot reuse \"%s\" "
+                                      "while its Radio mode is Simplex. "
+                                      "Set the radio configuration to "
+                                      "Full-duplex MAIN/SUB and try again."),
+                                    name);
+        rig_show_warning_dialog(ctrl,
+                                _("Radio is in simplex mode"),
+                                secondary);
+    }
+    else
+    {
+        secondary = g_strdup_printf(_("The uplink selector cannot reuse \"%s\" "
+                                      "unless its Radio mode is set to "
+                                      "Full-duplex MAIN/SUB."),
+                                    name);
+        rig_show_warning_dialog(ctrl,
+                                _("Shared uplink requires Full-duplex MAIN/SUB"),
+                                secondary);
+    }
+
+    g_free(secondary);
+}
+
+static void rigctrl_register_combo_quarantine_cb(GtkWidget *widget,
+                                                 gpointer data)
+{
+    GtkWidget *toplevel;
+
+    (void)data;
+
+    if (widget == NULL || !GTK_IS_COMBO_BOX(widget))
+        return;
+
+    toplevel = gtk_widget_get_toplevel(widget);
+    if (!GTK_IS_WINDOW(toplevel))
+        return;
+
+    gp_ui_quarantine_register_combo(toplevel, GTK_COMBO_BOX(widget));
+}
+
+static void rigctrl_register_combo_quarantine(GtkComboBox *combo)
+{
+    GtkWidget *widget;
+
+    if (combo == NULL)
+        return;
+
+    widget = GTK_WIDGET(combo);
+    rigctrl_register_combo_quarantine_cb(widget, NULL);
+    g_signal_connect(widget, "map",
+                     G_CALLBACK(rigctrl_register_combo_quarantine_cb), NULL);
 }
 
 static void rig_error_dialog_response(GtkDialog *dialog, gint response_id,
@@ -6075,6 +6164,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
                                          ctrl);
         rigctrl_set_selection_id(ctrl, "secondary", &ctrl->secondary_rig_id,
                                  NULL, FALSE);
+        rigctrl_warn_shared_uplink_mode(ctrl, ctrl->conf);
         g_free(selected_id);
 
         return;
@@ -6298,8 +6388,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
     gtk_widget_set_tooltip_text(ctrl->SatSel, _("Select target object"));
     g_signal_connect(ctrl->SatSel, "changed", G_CALLBACK(sat_selected_cb),
                      ctrl);
-    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
-                                    GTK_COMBO_BOX(ctrl->SatSel));
+    rigctrl_register_combo_quarantine(GTK_COMBO_BOX(ctrl->SatSel));
     gtk_grid_attach(GTK_GRID(table), ctrl->SatSel, 1, 0, 3, 1);
     gtk_size_group_add_widget(combo_group, ctrl->SatSel);
 
@@ -6320,8 +6409,7 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
                      G_CALLBACK(rigctrl_trsp_combo_realize), NULL);
     g_signal_connect(ctrl->TrspSel, "changed", G_CALLBACK(trsp_selected_cb),
                      ctrl);
-    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
-                                    GTK_COMBO_BOX(ctrl->TrspSel));
+    rigctrl_register_combo_quarantine(GTK_COMBO_BOX(ctrl->TrspSel));
     gtk_grid_attach(GTK_GRID(table), ctrl->TrspSel, 1, 1, 3, 1);
     gtk_size_group_add_widget(combo_group, ctrl->TrspSel);
 
@@ -6816,15 +6904,13 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 
     g_signal_connect(ctrl->DevSel, "changed",
                      G_CALLBACK(primary_rig_selected_cb), ctrl);
-    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
-                                    GTK_COMBO_BOX(ctrl->DevSel));
+    rigctrl_register_combo_quarantine(GTK_COMBO_BOX(ctrl->DevSel));
     gtk_widget_set_hexpand(ctrl->DevSel, TRUE);
     gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(downlink_row), ctrl->DevSel, 1, 0, 1, 1);
     g_signal_connect(ctrl->DevSel2, "changed",
                      G_CALLBACK(secondary_rig_selected_cb), ctrl);
-    gp_ui_quarantine_register_combo(gtk_widget_get_toplevel(GTK_WIDGET(ctrl)),
-                                    GTK_COMBO_BOX(ctrl->DevSel2));
+    rigctrl_register_combo_quarantine(GTK_COMBO_BOX(ctrl->DevSel2));
     gtk_widget_set_hexpand(ctrl->DevSel2, TRUE);
     gtk_widget_set_halign(ctrl->DevSel2, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(uplink_row), ctrl->DevSel2, 1, 0, 1, 1);
@@ -13973,8 +14059,6 @@ GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module)
 
     widget = g_object_new(GTK_TYPE_RIG_CTRL, NULL);
     rigctrl = GTK_RIG_CTRL(widget);
-
-    gp_ui_quarantine_install(gtk_widget_get_toplevel(widget));
 
     g_signal_connect(widget, "key-press-event", G_CALLBACK(key_press_cb),
                      NULL);

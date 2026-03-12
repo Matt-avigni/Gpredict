@@ -129,6 +129,7 @@ typedef struct {
 
 gboolean        radio_conf_read(radio_conf_t * conf);
 void            radio_conf_save(radio_conf_t * conf);
+void            radio_conf_refresh_runtime_flags(radio_conf_t *conf);
 gboolean        radio_mode_allowed_for_model(radio_model_t model,
                                              radio_mode_t mode);
 gchar          *radio_mode_allowed_string(radio_model_t model);
