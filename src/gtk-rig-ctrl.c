@@ -945,6 +945,45 @@ static void     remove_timer(GtkRigCtrl * data);
 
 static void     start_timer(GtkRigCtrl * data);
 
+void gtk_rig_ctrl_request_close(GtkRigCtrl *ctrl)
+{
+    if (!IS_GTK_RIG_CTRL(ctrl) || ctrl->destroying)
+        return;
+
+    if (ctrl->LockBut != NULL &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
+    {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+    }
+    else
+    {
+        ctrl->engaged = FALSE;
+        ctrl->engage_pending = FALSE;
+        rigctrl_cancel_open_task(ctrl);
+        if (!ctrl->rigctl_thread_done && ctrl->rigctlq != NULL)
+            setconfig(ctrl);
+    }
+
+    rigctrl_request_close(ctrl);
+}
+
+gboolean gtk_rig_ctrl_can_destroy(GtkRigCtrl *ctrl)
+{
+    if (!IS_GTK_RIG_CTRL(ctrl))
+        return TRUE;
+
+    if (!ctrl->rigctl_thread_done)
+        return FALSE;
+    if (ctrl->open_task != NULL || ctrl->open_cancellable != NULL)
+        return FALSE;
+    if (ctrl->close_pending_id != 0)
+        return FALSE;
+    if (ctrl->opening || ctrl->opening2)
+        return FALSE;
+
+    return TRUE;
+}
+
 static void
 rig_show_message_dialog(GtkRigCtrl *ctrl,
                         GtkMessageType type,
@@ -3111,6 +3150,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->pending_close_sock2 = -1;
     ctrl->destroying = FALSE;
     ctrl->main_thread = g_thread_self();
+    ctrl->rigctl_thread_done = TRUE;
     ctrl->reconnect_backoff_ms = 0;
     ctrl->reconnect_backoff_ms2 = 0;
     ctrl->reconnect_next_us = 0;
@@ -6245,10 +6285,6 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         /* Notify worker thread about the new configuration/state */
         if (ctrl->rigctlq != NULL)
             setconfig(ctrl);
-        /* The worker thread will clean up and exit; we just clear the
-         * handle so a new thread can be started on the next engage.
-         */
-        ctrl->rigctl_thread = NULL;
     }
     else
     {
@@ -6306,6 +6342,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         if (ctrl->rigctl_thread == NULL)
         {
             ctrl->rigctlq = g_async_queue_new();
+            ctrl->rigctl_thread_done = FALSE;
             ctrl->rigctl_thread =
                 g_thread_new("rigctl_run", rigctl_run, ctrl);
         }
@@ -7461,13 +7498,15 @@ static void rigctld_reset_offset_state_for_socket(GtkRigCtrl *ctrl, gint sock)
     }
 }
 
-static gboolean rigctld_fetch_frequency(GtkRigCtrl *ctrl, gint sock,
-                                        gint64 *freq_out)
+static gboolean rigctld_fetch_frequency_token(GtkRigCtrl *ctrl, gint sock,
+                                              const gchar *token,
+                                              gint64 *freq_out)
 {
     gchar buffback[128];
     gboolean retcode;
     gchar **vbuff = NULL;
     gint64 freq = 0;
+    gchar *cmd = NULL;
 
     if (freq_out)
         *freq_out = 0;
@@ -7475,7 +7514,13 @@ static gboolean rigctld_fetch_frequency(GtkRigCtrl *ctrl, gint sock,
     if (ctrl == NULL)
         return FALSE;
 
-    retcode = send_rigctld_command(ctrl, sock, "f\n", buffback, sizeof(buffback));
+    if (token != NULL && *token != '\0')
+        cmd = g_strdup_printf("f %s\x0a", token);
+    else
+        cmd = g_strdup("f\x0a");
+
+    retcode = send_rigctld_command(ctrl, sock, cmd, buffback, sizeof(buffback));
+    g_free(cmd);
     retcode = check_get_response(buffback, retcode, __func__);
     if (!retcode)
         return FALSE;
@@ -7496,7 +7541,14 @@ static gboolean rigctld_fetch_frequency(GtkRigCtrl *ctrl, gint sock,
     return freq > 0;
 }
 
+static gboolean rigctld_fetch_frequency(GtkRigCtrl *ctrl, gint sock,
+                                        gint64 *freq_out)
+{
+    return rigctld_fetch_frequency_token(ctrl, sock, NULL, freq_out);
+}
+
 static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
+                                      RigSession *session,
                                       const gchar *token)
 {
     gchar *buff = NULL;
@@ -7506,16 +7558,35 @@ static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
 
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
-    buff = g_strdup_printf("V %s\x0a", token);
-    retcode = send_rigctld_command(ctrl, sock, buff, buffback, sizeof(buffback));
-    g_free(buff);
-    retcode = check_set_response(buffback, retcode, __func__);
-    if (!retcode)
-        return FALSE;
 
-    /* Avoid writing a probe frequency while mapping tokens. */
-    if (!rigctld_fetch_frequency(ctrl, sock, &verify))
-        return FALSE;
+    if (session != NULL && session->strategy == RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        /* Reuse tokenized reads on rigs that already advertised stable
+           VFO-option args support instead of perturbing the live VFO. */
+        if (!rigctld_fetch_frequency_token(ctrl, sock, token, &verify))
+            return FALSE;
+    }
+    else
+    {
+        buff = g_strdup_printf("V %s\x0a", token);
+        retcode = send_rigctld_command(ctrl, sock, buff, buffback,
+                                       sizeof(buffback));
+        g_free(buff);
+        retcode = check_set_response(buffback, retcode, __func__);
+        if (!retcode)
+            return FALSE;
+
+        /* Avoid writing a probe frequency while mapping tokens. */
+        if (!rigctld_fetch_frequency(ctrl, sock, &verify))
+            return FALSE;
+    }
+
+    if (verify > 0 && session != NULL && session->vfo_working != NULL)
+    {
+        g_hash_table_replace(session->vfo_working,
+                             g_strdup(token),
+                             GINT_TO_POINTER(1));
+    }
 
     return verify > 0;
 }
@@ -7559,6 +7630,49 @@ static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
         return FALSE;
 
     return rprt_code != 0;
+}
+
+static gboolean rig_session_vfo_token_working(const RigSession *session,
+                                              const gchar *token)
+{
+    GHashTableIter iter;
+    gpointer key = NULL;
+    gpointer value = NULL;
+
+    if (session == NULL || token == NULL || *token == '\0' ||
+        session->vfo_working == NULL)
+        return FALSE;
+
+    if (g_hash_table_contains(session->vfo_working, token))
+        return TRUE;
+
+    g_hash_table_iter_init(&iter, session->vfo_working);
+    while (g_hash_table_iter_next(&iter, &key, &value))
+    {
+        const gchar *entry = key;
+
+        (void)value;
+
+        if (entry != NULL && g_ascii_strcasecmp(entry, token) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static const gchar *rigctld_find_known_vfo_token(const RigSession *session,
+                                                 const gchar * const *candidates)
+{
+    if (session == NULL || candidates == NULL)
+        return NULL;
+
+    for (gint i = 0; candidates[i] != NULL; i++)
+    {
+        if (rig_session_vfo_token_working(session, candidates[i]))
+            return candidates[i];
+    }
+
+    return NULL;
 }
 
 static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
@@ -7644,21 +7758,33 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
 
     {
         gboolean mapped = FALSE;
+        const gchar *known_token =
+            rigctld_find_known_vfo_token(session, candidates);
 
-    for (gint i = 0; candidates[i] != NULL; i++)
-    {
-        if (!allow_unlisted &&
-            session != NULL && session->vfo_candidates->len > 0 &&
-            !rig_session_vfo_candidate_exists(session, candidates[i]))
-            continue;
+        if (known_token == NULL && fallback_candidates != NULL)
+            known_token = rigctld_find_known_vfo_token(session,
+                                                       fallback_candidates);
 
-        if (rigctld_try_vfo_token(ctrl, sock, candidates[i]))
+        if (known_token != NULL)
         {
-            *target_ptr = g_strdup(candidates[i]);
+            *target_ptr = g_strdup(known_token);
             mapped = TRUE;
-            break;
         }
-    }
+
+        for (gint i = 0; !mapped && candidates[i] != NULL; i++)
+        {
+            if (!allow_unlisted &&
+                session != NULL && session->vfo_candidates->len > 0 &&
+                !rig_session_vfo_candidate_exists(session, candidates[i]))
+                continue;
+
+            if (rigctld_try_vfo_token(ctrl, sock, session, candidates[i]))
+            {
+                *target_ptr = g_strdup(candidates[i]);
+                mapped = TRUE;
+                break;
+            }
+        }
 
         if (!mapped && fallback_candidates != NULL)
         {
@@ -7672,7 +7798,8 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
                     !rig_session_vfo_candidate_exists(session, fallback_candidates[i]))
                     continue;
 
-                if (rigctld_try_vfo_token(ctrl, sock, fallback_candidates[i]))
+                if (rigctld_try_vfo_token(ctrl, sock, session,
+                                          fallback_candidates[i]))
                 {
                     *target_ptr = g_strdup(fallback_candidates[i]);
                     break;
@@ -14045,6 +14172,7 @@ gpointer rigctl_run(gpointer data)
         else
         {
             g_mutex_lock(&t_ctrl->widgetsync);
+            t_ctrl->rigctl_thread_done = TRUE;
 
             if (t_ctrl->sock != -1 || t_ctrl->sock2 != -1)
                 rigctrl_close(t_ctrl);
@@ -14131,6 +14259,11 @@ gpointer rigctl_run(gpointer data)
 
     if (t_ctrl->sock >= 0 || t_ctrl->sock2 >= 0)
         rigctrl_close(t_ctrl);
+
+    g_mutex_lock(&t_ctrl->widgetsync);
+    t_ctrl->rigctl_thread_done = TRUE;
+    g_cond_broadcast(&t_ctrl->widgetready);
+    g_mutex_unlock(&t_ctrl->widgetsync);
 
     return NULL;
 }

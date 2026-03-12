@@ -212,6 +212,7 @@ struct _gtk_rig_ctrl {
     GCond           widgetready;        /*!< Condition when work is done (sync stuff) */
     GAsyncQueue    *rigctlq;    /*!< Message queue to indicate something has changed */
     GThread        *rigctl_thread;      /*!< Pointer to current rigctl-thread */
+    gboolean        rigctl_thread_done; /*!< TRUE once the rigctl thread has fully exited */
     GThread        *main_thread;        /*!< GTK main thread owning this widget */
 
     RigctldMgr     *rigctld_mgr;        /*!< Auto-started rigctld manager (primary) */
@@ -253,5 +254,7 @@ GType           gtk_rig_ctrl_get_type(void);
 GtkWidget      *gtk_rig_ctrl_new(GtkSatModule * module);
 void            gtk_rig_ctrl_update(GtkRigCtrl * ctrl, gdouble t);
 void            gtk_rig_ctrl_select_sat(GtkRigCtrl * ctrl, gint catnum);
+void            gtk_rig_ctrl_request_close(GtkRigCtrl *ctrl);
+gboolean        gtk_rig_ctrl_can_destroy(GtkRigCtrl *ctrl);
 
 #endif /* __GTK_RIG_CTRL_H__ */

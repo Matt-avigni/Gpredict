@@ -1006,6 +1006,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
 static gpointer rotctld_autodetect_validate_thread(gpointer data);
 static gboolean rotctld_autodetect_worker_done_cb(gpointer data);
 static gboolean rotctld_probe_retry_cb(gpointer data);
+static void     rotctld_probe_cancel(GtkRotCtrl *ctrl);
 static guint64  rotctld_get_engage_generation(GtkRotCtrl *ctrl);
 static gboolean rotctld_generation_stale(GtkRotCtrl *ctrl,
                                          guint64 generation);
@@ -10701,7 +10702,16 @@ void gtk_rot_ctrl_request_close(GtkRotCtrl *ctrl)
     if (!GTK_IS_ROT_CTRL(ctrl))
         return;
 
-    /* Ask the worker to stop; caller can poll gtk_rot_ctrl_can_destroy(). */
+    if (ctrl->LockBut != NULL &&
+        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
+    {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
+        return;
+    }
+
+    ctrl->engaged = FALSE;
+    ctrl->engage_pending = FALSE;
+    rotctld_probe_cancel(ctrl);
     rotctld_request_thread_stop(ctrl, TRUE);
 }
 
@@ -11340,8 +11350,34 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         if (below_horizon && ctrl->pretrack_enabled)
         {
-            if (!ctrl->pretrack_target_valid)
+            gboolean pretrack_refresh_due =
+                !ctrl->pretrack_target_valid ||
+                ctrl->pretrack_last_update_us == 0 ||
+                (now_us - ctrl->pretrack_last_update_us >= ROT_PRETRACK_RECALC_US);
+
+            if (pretrack_refresh_due)
             {
+                gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
+                gdouble selected_az = 0.0;
+                gdouble selected_el = 0.0;
+                gdouble selected_time = 0.0;
+                gboolean selected_valid = FALSE;
+                enum {
+                    ROT_PRETRACK_SOURCE_NONE = 0,
+                    ROT_PRETRACK_SOURCE_PLAN,
+                    ROT_PRETRACK_SOURCE_LIVE,
+                    ROT_PRETRACK_SOURCE_AOS
+                } selected_source = ROT_PRETRACK_SOURCE_NONE;
+                gboolean target_changed = FALSE;
+                gdouble prev_target_az = ctrl->pretrack_target_az;
+                gdouble prev_target_el = ctrl->pretrack_target_el;
+                gdouble prev_target_time = ctrl->pretrack_aos_time;
+
+                if (ctrl->conf != NULL)
+                    pretrack_el = CLAMP(pretrack_el,
+                                        ctrl->conf->minel,
+                                        ctrl->conf->maxel);
+
                 aos_found = rotctrl_find_next_aos(ctrl,
                                                   ctrl->t,
                                                   pretrack_window,
@@ -11401,48 +11437,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     aos_found = FALSE;
                 }
 
-                if (aos_found)
-                {
-                    gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
-                    if (ctrl->conf != NULL)
-                        pretrack_el = CLAMP(pretrack_el,
-                                            ctrl->conf->minel,
-                                            ctrl->conf->maxel);
-                    ctrl->pretrack_target_az = aos_az360;
-                    ctrl->pretrack_target_el = pretrack_el;
-                    ctrl->pretrack_aos_time = aos_time;
-                    ctrl->pretrack_target_valid = TRUE;
-                    ctrl->pretrack_last_update_us = now_us;
-                    ctrl->last_desired_update_us = now_us;
-                    ctrl->force_next_send = TRUE;
-                    if (ctrl->verbose_logging)
-                    {
-                        gchar aos_buf[64] = { 0 };
-                        const gchar *aos_str = "unknown";
-
-                        rotctrl_format_utc_jd(aos_time, aos_buf, sizeof(aos_buf));
-                        if (aos_buf[0] != '\0')
-                            aos_str = aos_buf;
-                        sat_log_log(SAT_LOG_LEVEL_INFO,
-                                    "pretrack aos=%s az=%.2f el=%.2f lead=%.1fs",
-                                    aos_str,
-                                    aos_az360,
-                                    ctrl->pretrack_target_el,
-                                    ROT_PRETRACK_AOS_OFFSET_SEC);
-                    }
-                }
-                else
                 {
                     gdouble plan_az = 0.0;
                     gdouble plan_el = 0.0;
                     gdouble plan_t = 0.0;
                     gboolean plan_found = FALSE;
-                    gdouble pretrack_el = MAX(ctrl->pretrack_min_el, elev_floor);
-
-                    if (ctrl->conf != NULL)
-                        pretrack_el = CLAMP(pretrack_el,
-                                            ctrl->conf->minel,
-                                            ctrl->conf->maxel);
 
                     plan_found = rotctrl_find_pretrack_cmd(ctrl,
                                                            ctrl->t,
@@ -11457,20 +11456,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                                              plan_t,
                                                              TRUE))
                     {
-                        ctrl->pretrack_target_az = plan_az;
-                        ctrl->pretrack_target_el = plan_el;
-                        ctrl->pretrack_aos_time = plan_t;
-                        ctrl->pretrack_target_valid = TRUE;
-                        ctrl->pretrack_last_update_us = now_us;
-                        ctrl->last_desired_update_us = now_us;
-                        ctrl->force_next_send = TRUE;
-                        if (ctrl->verbose_logging)
-                        {
-                            sat_log_log(SAT_LOG_LEVEL_INFO,
-                                        "pretrack plan_entry az=%.2f el=%.2f",
-                                        plan_az,
-                                        plan_el);
-                        }
+                        selected_az = plan_az;
+                        selected_el = plan_el;
+                        selected_time = plan_t;
+                        selected_valid = TRUE;
+                        selected_source = ROT_PRETRACK_SOURCE_PLAN;
                     }
                     else if (plan_found)
                     {
@@ -11480,36 +11470,109 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                                     plan_el,
                                     plan_t);
                     }
-                    else if (live_valid &&
-                             live_el >= (elev_floor -
-                                         ROT_PRETRACK_LIVE_FALLBACK_MARGIN_DEG))
+                }
+
+                if (!selected_valid &&
+                    live_valid &&
+                    live_el >= (elev_floor - ROT_PRETRACK_LIVE_FALLBACK_MARGIN_DEG))
+                {
+                    selected_az = live_az360;
+                    selected_el = pretrack_el;
+                    selected_time = 0.0;
+                    selected_valid = TRUE;
+                    selected_source = ROT_PRETRACK_SOURCE_LIVE;
+                }
+
+                if (!selected_valid && aos_found)
+                {
+                    selected_az = aos_az360;
+                    selected_el = pretrack_el;
+                    selected_time = aos_time;
+                    selected_valid = TRUE;
+                    selected_source = ROT_PRETRACK_SOURCE_AOS;
+                }
+
+                if (selected_valid)
+                {
+                    target_changed =
+                        !ctrl->pretrack_target_valid ||
+                        fabs(shortest_az_delta(selected_az, prev_target_az)) > 0.25 ||
+                        fabs(selected_el - prev_target_el) > 0.25 ||
+                        fabs((selected_time - prev_target_time) * secday) > 1.0;
+
+                    ctrl->pretrack_target_az = selected_az;
+                    ctrl->pretrack_target_el = selected_el;
+                    ctrl->pretrack_aos_time = selected_time;
+                    ctrl->pretrack_target_valid = TRUE;
+                    ctrl->pretrack_last_update_us = now_us;
+                    ctrl->last_desired_update_us = now_us;
+                    if (target_changed)
                     {
-                        ctrl->pretrack_target_az = live_az360;
-                        ctrl->pretrack_target_el = pretrack_el;
-                        ctrl->pretrack_aos_time = 0.0;
-                        ctrl->pretrack_target_valid = TRUE;
-                        ctrl->pretrack_last_update_us = now_us;
-                        ctrl->last_desired_update_us = now_us;
-                        ctrl->force_next_send = TRUE;
-                        if (ctrl->verbose_logging)
-                        {
-                            sat_log_log(SAT_LOG_LEVEL_INFO,
-                                        "pretrack fallback live az=%.2f el=%.2f",
-                                        live_az360,
-                                        pretrack_el);
-                        }
-                    }
-                    else
-                    {
-                        ctrl->pretrack_target_valid = FALSE;
-                        ctrl->pretrack_aos_time = 0.0;
-                        ctrl->pretrack_last_update_us = now_us;
-                        ctrl->last_desired_update_us = now_us;
-                        ctrl->pretrack_wait_log_us = 0;
                         ctrl->pretrack_wrap_valid = FALSE;
                         ctrl->pretrack_wrap_user_az = 0.0;
                         ctrl->pretrack_wrap_raw_az = 0.0;
                         ctrl->pretrack_wrap_k = 0;
+                        ctrl->force_next_send = TRUE;
+                    }
+
+                    if (ctrl->verbose_logging && target_changed)
+                    {
+                        if (selected_source == ROT_PRETRACK_SOURCE_PLAN)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack plan_entry az=%.2f el=%.2f",
+                                        selected_az,
+                                        selected_el);
+                        }
+                        else if (selected_source == ROT_PRETRACK_SOURCE_LIVE)
+                        {
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack live_follow az=%.2f el=%.2f now_el=%.2f",
+                                        selected_az,
+                                        selected_el,
+                                        live_el);
+                        }
+                        else if (selected_source == ROT_PRETRACK_SOURCE_AOS)
+                        {
+                            gchar aos_buf[64] = { 0 };
+                            const gchar *aos_str = "unknown";
+
+                            rotctrl_format_utc_jd(selected_time,
+                                                  aos_buf,
+                                                  sizeof(aos_buf));
+                            if (aos_buf[0] != '\0')
+                                aos_str = aos_buf;
+                            sat_log_log(SAT_LOG_LEVEL_INFO,
+                                        "pretrack aos=%s az=%.2f el=%.2f lead=%.1fs",
+                                        aos_str,
+                                        selected_az,
+                                        selected_el,
+                                        ROT_PRETRACK_AOS_OFFSET_SEC);
+                        }
+                    }
+                }
+                else if (!ctrl->pretrack_target_valid)
+                {
+                    ctrl->pretrack_target_valid = FALSE;
+                    ctrl->pretrack_aos_time = 0.0;
+                    ctrl->pretrack_last_update_us = now_us;
+                    ctrl->last_desired_update_us = now_us;
+                    ctrl->pretrack_wait_log_us = 0;
+                    ctrl->pretrack_wrap_valid = FALSE;
+                    ctrl->pretrack_wrap_user_az = 0.0;
+                    ctrl->pretrack_wrap_raw_az = 0.0;
+                    ctrl->pretrack_wrap_k = 0;
+                }
+                else
+                {
+                    ctrl->pretrack_last_update_us = now_us;
+                    ctrl->last_desired_update_us = now_us;
+                    if (ctrl->verbose_logging)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                    "pretrack refresh: keeping latched target az=%.2f el=%.2f",
+                                    ctrl->pretrack_target_az,
+                                    ctrl->pretrack_target_el);
                     }
                 }
             }

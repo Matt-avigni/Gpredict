@@ -60,6 +60,13 @@ typedef struct
     guint           source_id;
 } RotCtrlCloseState;
 
+typedef struct
+{
+    GtkWidget      *window;
+    GtkSatModule   *module;
+    guint           source_id;
+} RigCtrlCloseState;
+
 static void window_geom_info_free(gpointer data, GClosure *closure)
 {
     (void)closure;
@@ -814,6 +821,25 @@ static void rotctrl_close_state_free(gpointer data)
     g_free(state);
 }
 
+static void rigctrl_close_state_free(gpointer data)
+{
+    RigCtrlCloseState *state = data;
+
+    if (state == NULL)
+        return;
+
+    if (state->source_id != 0)
+    {
+        g_source_remove(state->source_id);
+        state->source_id = 0;
+    }
+
+    if (state->window != NULL)
+        g_object_unref(state->window);
+
+    g_free(state);
+}
+
 static gboolean rotctrl_window_close_poll_cb(gpointer data)
 {
     RotCtrlCloseState *state = data;
@@ -837,6 +863,38 @@ static gboolean rotctrl_window_close_poll_cb(gpointer data)
     gtk_rot_ctrl_request_close(GTK_ROT_CTRL(state->module->rotctrl));
 
     if (gtk_rot_ctrl_can_destroy(GTK_ROT_CTRL(state->module->rotctrl)))
+    {
+        state->source_id = 0;
+        gtk_widget_destroy(state->window);
+        return G_SOURCE_REMOVE;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean rigctrl_window_close_poll_cb(gpointer data)
+{
+    RigCtrlCloseState *state = data;
+
+    if (state == NULL || state->window == NULL ||
+        !GTK_IS_WIDGET(state->window) ||
+        state->module == NULL || !IS_GTK_SAT_MODULE(state->module))
+    {
+        if (state != NULL)
+            state->source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    if (state->module->rigctrl == NULL ||
+        !IS_GTK_RIG_CTRL(state->module->rigctrl))
+    {
+        state->source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    gtk_rig_ctrl_request_close(GTK_RIG_CTRL(state->module->rigctrl));
+
+    if (gtk_rig_ctrl_can_destroy(GTK_RIG_CTRL(state->module->rigctrl)))
     {
         state->source_id = 0;
         gtk_widget_destroy(state->window);
@@ -877,6 +935,40 @@ static gint rotctrl_window_delete(GtkWidget *widget, GdkEvent *event, gpointer d
     {
         state->source_id = g_timeout_add(50, rotctrl_window_close_poll_cb, state);
     }
+
+    /* Keep window alive while async close completes. */
+    return TRUE;
+}
+
+static gint rigctrl_window_delete(GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+    GtkSatModule *module = GTK_SAT_MODULE(data);
+    RigCtrlCloseState *state = NULL;
+
+    (void)event;
+
+    if (module == NULL || module->rigctrl == NULL ||
+        !IS_GTK_RIG_CTRL(module->rigctrl))
+    {
+        return FALSE;
+    }
+
+    gtk_rig_ctrl_request_close(GTK_RIG_CTRL(module->rigctrl));
+    if (gtk_rig_ctrl_can_destroy(GTK_RIG_CTRL(module->rigctrl)))
+        return FALSE;
+
+    state = g_object_get_data(G_OBJECT(widget), "rigctrl-close-state");
+    if (state == NULL)
+    {
+        state = g_new0(RigCtrlCloseState, 1);
+        state->window = g_object_ref(widget);
+        state->module = module;
+        g_object_set_data_full(G_OBJECT(widget), "rigctrl-close-state",
+                               state, rigctrl_close_state_free);
+    }
+
+    if (state->source_id == 0)
+        state->source_id = g_timeout_add(50, rigctrl_window_close_poll_cb, state);
 
     /* Keep window alive while async close completes. */
     return TRUE;
@@ -1037,7 +1129,7 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
     gtk_window_set_title(GTK_WINDOW(module->rigctrlwin), buff);
     g_free(buff);
     g_signal_connect(G_OBJECT(module->rigctrlwin), "delete_event",
-                     G_CALLBACK(window_delete), NULL);
+                     G_CALLBACK(rigctrl_window_delete), module);
     g_signal_connect(G_OBJECT(module->rigctrlwin), "destroy",
                      G_CALLBACK(destroy_rigctrl), module);
     {
