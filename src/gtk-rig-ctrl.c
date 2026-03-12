@@ -13835,6 +13835,11 @@ open_uplink_retry:
 
     if ((rx_opened || tx_opened))
     {
+        /* Refresh Doppler from the current target before the first tune after
+         * connect/reconnect so the initial cycle does not reuse a stale zero.
+         */
+        rigctrl_update_doppler(ctrl);
+
         if (is_full_duplex_main_sub_configured(ctrl->conf))
         {
             rigctrl_reset_send_tracking(ctrl, TRUE);
@@ -13892,6 +13897,18 @@ open_uplink_retry:
         }
 
         apply_rit_xit_offsets(ctrl, 0.0, 0.0);
+
+        if (ctrl->sock < 0 ||
+            ctrl->conn_state == RIGCTRL_CONN_DISCONNECTING ||
+            ctrl->conn_state == RIGCTRL_CONN_DISCONNECTED)
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "%s: receiver socket lost during initial tune cycle",
+                        __func__);
+            ctrl->opening = FALSE;
+            ctrl->opening2 = FALSE;
+            return FALSE;
+        }
     }
 
     ctrl->opening = FALSE;
