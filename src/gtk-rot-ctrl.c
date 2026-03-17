@@ -10824,7 +10824,8 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
     gboolean        session_ready = FALSE;
     gboolean        requested;
 
-    if (ctrl == NULL || ctrl->ui_updating)
+    if (ctrl == NULL || ctrl->ui_updating ||
+        ctrl->LockBut == NULL || ctrl->MonitorCheckBox == NULL)
         return;
 
     if (ctrl->cal_hold_active)
@@ -15075,7 +15076,8 @@ static void rot_monitor_cb(GtkCheckButton * button, gpointer data)
     ctrl->monitor = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(button));
     gtk_widget_set_sensitive(ctrl->AzSet, !ctrl->monitor);
     gtk_widget_set_sensitive(ctrl->ElSet, !ctrl->monitor);
-    gtk_widget_set_sensitive(ctrl->track, !ctrl->monitor);
+    if (ctrl->track != NULL)
+        gtk_widget_set_sensitive(ctrl->track, !ctrl->monitor);
     if (ctrl->freeze)
         gtk_widget_set_sensitive(ctrl->freeze, !ctrl->monitor);
 }
@@ -17233,7 +17235,8 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
             sat_log_log(SAT_LOG_LEVEL_WARN,
                         _("%s: rotctld client thread already running; reusing existing thread"),
                         __func__);
-            gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
+            if (ctrl->DevSel != NULL)
+                gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
             ctrl->engaged = TRUE;
             rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
                                   "thread reuse", FALSE);
@@ -17259,7 +17262,8 @@ static void rotctld_finish_engage(GtkRotCtrl *ctrl)
     ctrl->client.thread =
         g_thread_new("gpredict_rotctl", rotctld_client_thread, ctrl);
 
-    gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
+    if (ctrl->DevSel != NULL)
+        gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
     ctrl->engaged = TRUE;
     rot_session_set_state(ctrl, ROT_SESSION_ENGAGING,
                           "thread started", FALSE);
@@ -17308,7 +17312,8 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     g_mutex_unlock(&ctrl->client.mutex);
     rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
                           "engage failed", FALSE);
-    gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
+    if (ctrl->DevSel != NULL)
+        gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
     rotctrl_set_ui_hard_error(ctrl, "rotctld engage failed");
     rotctrl_set_ui_status_detail(ctrl, "ERROR: rotctld");
     {
@@ -19940,7 +19945,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
                     "rotctld disengage: cancel probe, request thread stop");
         rot_term_log(ctrl, "gpredict:rx",
                      "rotctld disengage: cancel probe, request thread stop");
-        gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
+        if (ctrl->DevSel != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
         will_send_quit = ctrl->client.thread != NULL || ctrl->client.running;
         reason = "user disengage";
         rot_session_set_state(ctrl, ROT_SESSION_DISCONNECTED,
@@ -20015,7 +20021,9 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
          * or manual positioning.
          */
         if (ctrl->tracking) {
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track), FALSE);
+            if (ctrl->track != NULL)
+                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->track),
+                                             FALSE);
             ctrl->tracking = FALSE;
         }
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
@@ -20024,7 +20032,11 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->target_invalid_since_us = 0;
 
         /* ensure we are not in monitor mode when engaging by default */
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->MonitorCheckBox), FALSE);
+        if (ctrl->MonitorCheckBox != NULL)
+        {
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->MonitorCheckBox),
+                                         FALSE);
+        }
         ctrl->monitor = FALSE;
         ctrl->hold_position_on_engage = TRUE;
         ctrl->hold_position_log_emitted = FALSE;
@@ -20086,7 +20098,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             if (ensure == ROTCTLD_ENSURE_PENDING)
             {
                 RotorStateSnapshot snap = { 0 };
-                gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
+                if (ctrl->DevSel != NULL)
+                    gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
                 rotctrl_set_ui_status_detail(ctrl, "ENGAGING");
                 snap.control_active = TRUE;
                 snap.engaging = TRUE;
@@ -20272,6 +20285,8 @@ static GtkWidget *create_target_widgets(GtkRotCtrl * ctrl)
 
     /* tracking button */
     ctrl->track = gtk_toggle_button_new_with_label(_("Track"));
+    g_object_add_weak_pointer(G_OBJECT(ctrl->track),
+                              (gpointer *)&ctrl->track);
     gtk_widget_set_tooltip_text(ctrl->track,
                                 _
                                 ("Track the satellite when it is within range"));
@@ -20397,6 +20412,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(device_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel = gtk_combo_box_text_new();
+    g_object_add_weak_pointer(G_OBJECT(ctrl->DevSel),
+                              (gpointer *)&ctrl->DevSel);
     gtk_widget_set_tooltip_text(ctrl->DevSel,
                                 _("Select antenna rotator device"));
     gtk_widget_set_halign(ctrl->DevSel, GTK_ALIGN_START);
@@ -20459,6 +20476,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     /* Engage button */
     ctrl->LockBut = gtk_toggle_button_new_with_label(_("Engage"));
+    g_object_add_weak_pointer(G_OBJECT(ctrl->LockBut),
+                              (gpointer *)&ctrl->LockBut);
     gtk_widget_set_tooltip_text(ctrl->LockBut,
                                 _("Engage the selected rotor device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rot_locked_cb),
@@ -20476,6 +20495,8 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     /* Monitor checkbox */
     ctrl->MonitorCheckBox = gtk_check_button_new_with_label(_("Monitor"));
+    g_object_add_weak_pointer(G_OBJECT(ctrl->MonitorCheckBox),
+                              (gpointer *)&ctrl->MonitorCheckBox);
     gtk_widget_set_tooltip_text(ctrl->MonitorCheckBox,
                                 _("Monitor rotator but do not send any "
                                   "position commands"));

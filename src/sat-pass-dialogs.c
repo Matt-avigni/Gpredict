@@ -874,8 +874,6 @@ static void single_pass_dialog_destroy(GtkWidget * dialog, gpointer data)
     (void)data;
 
     free_pass(PASS(pass));
-
-    gtk_widget_destroy(dialog);
 }
 
 /*** FIXME: other copies */
@@ -1137,7 +1135,6 @@ static void multi_pass_dialog_destroy(GtkWidget * dialog, gpointer data)
     (void)data;
 
     free_passes(passes);
-    gtk_widget_destroy(dialog);
 }
 
 /** Set cell renderer function. */

@@ -833,6 +833,9 @@ static void     rigctrl_open_task(GTask *task, gpointer source_object,
                                   gpointer task_data, GCancellable *cancellable);
 static void     rigctrl_open_task_done(GObject *source, GAsyncResult *res,
                                        gpointer user_data);
+static gboolean rigctrl_collect_thread(GtkRigCtrl *ctrl,
+                                       gboolean allow_block,
+                                       const gchar *context);
 static void     rigctrl_request_close(GtkRigCtrl *ctrl);
 static gboolean rigctrl_close_idle(gpointer data);
 static void     rigctrl_close_internal(GtkRigCtrl *ctrl);
@@ -973,18 +976,57 @@ void gtk_rig_ctrl_request_close(GtkRigCtrl *ctrl)
     rigctrl_request_close(ctrl);
 }
 
+static gboolean rigctrl_collect_thread(GtkRigCtrl *ctrl,
+                                       gboolean allow_block,
+                                       const gchar *context)
+{
+    GThread *thread = NULL;
+
+    if (!IS_GTK_RIG_CTRL(ctrl))
+        return TRUE;
+
+    thread = ctrl->rigctl_thread;
+    if (thread == NULL)
+        return TRUE;
+
+#if GLIB_CHECK_VERSION(2, 32, 0)
+    if (!allow_block)
+    {
+        gboolean thread_done = FALSE;
+
+        g_mutex_lock(&ctrl->widgetsync);
+        thread_done = ctrl->rigctl_thread_done;
+        g_mutex_unlock(&ctrl->widgetsync);
+
+        if (!thread_done)
+            return FALSE;
+
+        g_thread_unref(thread);
+    }
+    else
+#endif
+    {
+        g_thread_join(thread);
+    }
+
+    ctrl->rigctl_thread = NULL;
+    if (context != NULL && *context != '\0')
+        rig_term_log(ctrl, "gpredict", "rigctl thread collected (%s)", context);
+    return TRUE;
+}
+
 gboolean gtk_rig_ctrl_can_destroy(GtkRigCtrl *ctrl)
 {
     if (!IS_GTK_RIG_CTRL(ctrl))
         return TRUE;
 
-    if (!ctrl->rigctl_thread_done)
-        return FALSE;
     if (ctrl->open_task != NULL || ctrl->open_cancellable != NULL)
         return FALSE;
     if (ctrl->close_pending_id != 0)
         return FALSE;
     if (ctrl->opening || ctrl->opening2)
+        return FALSE;
+    if (!rigctrl_collect_thread(ctrl, FALSE, "close-poll"))
         return FALSE;
 
     return TRUE;
@@ -3026,15 +3068,10 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
 
     if (ctrl->rigctl_thread != NULL)
     {
-        g_mutex_lock(&ctrl->widgetsync);
-
         ctrl->engaged = 0;
-        setconfig(ctrl);
-
-        /* synchronization */
-        g_cond_wait(&ctrl->widgetready, &ctrl->widgetsync);
-        g_mutex_unlock(&ctrl->widgetsync);
-        ctrl->rigctl_thread = NULL;
+        if (ctrl->rigctlq != NULL)
+            setconfig(ctrl);
+        (void)rigctrl_collect_thread(ctrl, TRUE, "destroy");
     }
 
     rigctrl_close_internal(ctrl);
@@ -6301,8 +6338,10 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     if (!gtk_toggle_button_get_active(button))
     {
         /* Disengage: close socket / stop worker thread */
-        gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
-        gtk_widget_set_sensitive(ctrl->DevSel2, TRUE);
+        if (ctrl->DevSel != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
+        if (ctrl->DevSel2 != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel2, TRUE);
         ctrl->engaged = FALSE;
         ctrl->engage_pending = FALSE;
         rigctrl_cancel_open_task(ctrl);
@@ -6375,8 +6414,10 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         }
 
         /* Engage: start worker thread */
-        gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
-        gtk_widget_set_sensitive(ctrl->DevSel2, FALSE);
+        if (ctrl->DevSel != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
+        if (ctrl->DevSel2 != NULL)
+            gtk_widget_set_sensitive(ctrl->DevSel2, FALSE);
         ctrl->engaged = TRUE;
         rig_term_log(ctrl, "gpredict", "engage");
 
@@ -6961,6 +7002,8 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(downlink_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel = gtk_combo_box_text_new();
+    g_object_add_weak_pointer(G_OBJECT(ctrl->DevSel),
+                              (gpointer *)&ctrl->DevSel);
     gtk_widget_set_tooltip_text(ctrl->DevSel,
                                 _("Select primary radio device."
                                   "This device will be used for downlink and "
@@ -6975,6 +7018,8 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
     gtk_grid_attach(GTK_GRID(uplink_row), label, 0, 0, 1, 1);
 
     ctrl->DevSel2 = gtk_combo_box_text_new();
+    g_object_add_weak_pointer(G_OBJECT(ctrl->DevSel2),
+                              (gpointer *)&ctrl->DevSel2);
     gtk_widget_set_tooltip_text(ctrl->DevSel2,
                                 _("Select secondary radio device\n"
                                   "This device will be used for uplink"));
@@ -7034,6 +7079,8 @@ static GtkWidget *create_conf_widgets(GtkRigCtrl * ctrl)
 
     /* Engage button */
     ctrl->LockBut = gtk_toggle_button_new_with_label(_("Engage"));
+    g_object_add_weak_pointer(G_OBJECT(ctrl->LockBut),
+                              (gpointer *)&ctrl->LockBut);
     gtk_widget_set_tooltip_text(ctrl->LockBut,
                                 _("Engage the selected radio device"));
     g_signal_connect(ctrl->LockBut, "toggled", G_CALLBACK(rig_engaged_cb),
@@ -14231,14 +14278,8 @@ gpointer rigctl_run(gpointer data)
         }
         else
         {
-            g_mutex_lock(&t_ctrl->widgetsync);
-            t_ctrl->rigctl_thread_done = TRUE;
-
             if (t_ctrl->sock != -1 || t_ctrl->sock2 != -1)
                 rigctrl_close(t_ctrl);
-
-            g_cond_signal(&t_ctrl->widgetready);
-            g_mutex_unlock(&t_ctrl->widgetsync);
             break;
         }
 
