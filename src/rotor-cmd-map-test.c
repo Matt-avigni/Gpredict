@@ -64,5 +64,19 @@ int main(void)
     assert(st == ROT_CMD_MAP_OK);
     expect_close(map.send_az, 0.0);
 
+    conf.aztype = ROT_AZ_TYPE_180;
+    conf.azstoppos = 0.0;
+    rot_conf_apply_default_az_limits(&conf, TRUE);
+    expect_close(conf.minaz, -180.0);
+    expect_close(conf.maxaz, 180.0);
+    expect_close(conf.azstoppos, -180.0);
+
+    conf.aztype = ROT_AZ_TYPE_360;
+    conf.azstoppos = -180.0;
+    rot_conf_apply_default_az_limits(&conf, TRUE);
+    expect_close(conf.minaz, 0.0);
+    expect_close(conf.maxaz, 360.0);
+    expect_close(conf.azstoppos, 0.0);
+
     return 0;
 }

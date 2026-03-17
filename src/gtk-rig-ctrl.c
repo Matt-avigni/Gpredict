@@ -422,6 +422,12 @@ static const gchar *rig_strategy_name(rig_strategy_t strategy)
     }
 }
 
+static gboolean rig_strategy_supports_explicit_vfo(rig_strategy_t strategy)
+{
+    return (strategy == RIG_STRATEGY_SELECT_VFO ||
+            strategy == RIG_STRATEGY_VFO_OPT_ARGS);
+}
+
 static void rigctrl_clear_ui_hard_error(GtkRigCtrl *ctrl);
 static void rigctrl_queue_ui_status_refresh(GtkRigCtrl *ctrl,
                                             const gchar *reason);
@@ -3712,6 +3718,42 @@ static gint64 rigctrl_round_hz(gdouble hz)
     if (hz <= (gdouble)G_MININT64)
         return G_MININT64;
     return (gint64) llround(hz);
+}
+
+static gboolean rigctrl_reject_main_sub_without_vfo_strategy(
+    GtkRigCtrl *ctrl, RigSession *session, const radio_conf_t *conf,
+    const gchar *reason)
+{
+    const gchar *strategy = NULL;
+
+    if (!is_full_duplex_main_sub_configured(conf))
+        return FALSE;
+
+    if (session != NULL &&
+        rig_strategy_supports_explicit_vfo(session->strategy))
+        return FALSE;
+
+    if (session != NULL)
+        rig_session_set_state(ctrl, session, RIG_SESSION_DEGRADED,
+                              "%s",
+                              reason ? reason
+                                     : "Main/Sub requires rigctld VFO support");
+
+    strategy = session ? rig_strategy_name(session->strategy) : "UNKNOWN";
+    sat_log_log(SAT_LOG_LEVEL_WARN,
+                "FULL-DUPLEX MAIN/SUB: refusing strategy %s (%s)",
+                strategy,
+                reason ? reason : "rigctld VFO support required");
+
+    if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
+                              RIGCTRL_PROBE_LOG_INTERVAL_US))
+    {
+        rig_term_log(ctrl, "gpredict:err",
+                     "Main/Sub requires rigctld VFO support; strategy=%s (try rigctld --vfo)",
+                     strategy);
+    }
+
+    return TRUE;
 }
 
 static gboolean rigctrl_parse_freq_text(const gchar *text, gint64 *hz_out)
@@ -7715,6 +7757,11 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
 
     if (!rigctld_vfo_map_refs(ctrl, sock, &main_ptr, &sub_ptr, &logged_ptr))
         return fallback;
+
+    if (rigctrl_reject_main_sub_without_vfo_strategy(
+            ctrl, session, ctrl->conf,
+            "Main/Sub requires rigctld VFO support; try rigctld --vfo"))
+        return NULL;
 
     if (vfo == VFO_MAIN)
     {
@@ -11765,6 +11812,10 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
             session->strategy = RIG_STRATEGY_PLAIN_FREQ;
             session->strategy_logged = FALSE;
             session->rig_model = rigctld_expected_model(conf);
+            if (rigctrl_reject_main_sub_without_vfo_strategy(
+                    ctrl, session, conf,
+                    "probe failed; Main/Sub requires rigctld VFO support"))
+                return FALSE;
             if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
                                       RIGCTRL_PROBE_LOG_INTERVAL_US))
                 rig_term_log_verbose(ctrl, "gpredict",
@@ -11779,6 +11830,10 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         session->strategy = RIG_STRATEGY_PLAIN_FREQ;
         session->strategy_logged = FALSE;
         session->rig_model = rigctld_expected_model(conf);
+        if (rigctrl_reject_main_sub_without_vfo_strategy(
+                ctrl, session, conf,
+                "probe failed; Main/Sub requires rigctld VFO support"))
+            return FALSE;
         if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
                                   RIGCTRL_PROBE_LOG_INTERVAL_US))
             rig_term_log_verbose(ctrl, "gpredict",
@@ -11799,6 +11854,11 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     }
 
     rig_session_apply_caps(session, caps);
+
+    if (rigctrl_reject_main_sub_without_vfo_strategy(
+            ctrl, session, conf,
+            "probe succeeded without a usable Main/Sub VFO strategy"))
+        return FALSE;
 
     rig_term_log(ctrl, "gpredict",
                  "rig session (%s) dump_state model=%d backend=%s signature=%s vfo_candidates=%u",

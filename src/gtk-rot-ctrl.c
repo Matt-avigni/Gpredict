@@ -14750,7 +14750,10 @@ static void wrap_mode_changed_cb(GtkComboBox *box, gpointer data)
         return;
 
     ctrl->conf->aztype = (idx == 0) ? ROT_AZ_TYPE_180 : ROT_AZ_TYPE_360;
+    rot_conf_apply_default_az_limits(ctrl->conf, TRUE);
 
+    rotctrl_update_geometry_widgets(ctrl);
+    rotctrl_update_user_limits(ctrl);
     rot_transform_update(ctrl);
     rot_plan_reset(&ctrl->trajectory_plan);
     set_flipped_pass(ctrl);

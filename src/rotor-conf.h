@@ -100,6 +100,68 @@ typedef struct {
     gint            last_good_baud; /*!< Last validated baud rate */
 } rotor_conf_t;
 
+static inline void rot_conf_get_default_az_limits(rot_az_type_t aztype,
+                                                  gdouble *minaz_out,
+                                                  gdouble *maxaz_out,
+                                                  gdouble *azstoppos_out)
+{
+    gdouble minaz = 0.0;
+    gdouble maxaz = 360.0;
+    gdouble azstoppos = 0.0;
+
+    switch (aztype)
+    {
+    case ROT_AZ_TYPE_180:
+        minaz = -180.0;
+        maxaz = 180.0;
+        azstoppos = -180.0;
+        break;
+
+    case ROT_AZ_TYPE_480:
+        minaz = 0.0;
+        maxaz = 480.0;
+        azstoppos = 0.0;
+        break;
+
+    case ROT_AZ_TYPE_360:
+    default:
+        break;
+    }
+
+    if (minaz_out)
+        *minaz_out = minaz;
+    if (maxaz_out)
+        *maxaz_out = maxaz;
+    if (azstoppos_out)
+        *azstoppos_out = azstoppos;
+}
+
+static inline void rot_conf_apply_default_az_limits(rotor_conf_t *conf,
+                                                    gboolean reset_endstop)
+{
+    gdouble minaz = 0.0;
+    gdouble maxaz = 360.0;
+    gdouble azstoppos = 0.0;
+
+    if (conf == NULL)
+        return;
+
+    rot_conf_get_default_az_limits(conf->aztype,
+                                   &minaz,
+                                   &maxaz,
+                                   &azstoppos);
+
+    conf->minaz = minaz;
+    conf->maxaz = maxaz;
+
+    if (reset_endstop ||
+        conf->azstoppos < minaz ||
+        conf->azstoppos > maxaz)
+    {
+        conf->azstoppos = azstoppos;
+    }
+}
+
 
 gboolean        rotor_conf_read(rotor_conf_t * conf);
 void            rotor_conf_save(rotor_conf_t * conf);

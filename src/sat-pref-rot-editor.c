@@ -1220,28 +1220,30 @@ static void aztype_changed_cb(GtkComboBox * box, gpointer data)
 {
     RotPrefUi *ui = data;
     gint            type = gtk_combo_box_get_active(box);
+    gdouble         minaz = 0.0;
+    gdouble         maxaz = 360.0;
+    gdouble         azstoppos = 0.0;
 
     if (ui != NULL && ui->ui_updating)
         return;
 
     rot_pref_ui_begin_update(ui, "aztype_changed");
-    switch (type)
+    if (type != ROT_AZ_TYPE_360 &&
+        type != ROT_AZ_TYPE_180 &&
+        type != ROT_AZ_TYPE_480)
     {
-    case ROT_AZ_TYPE_360:
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), 0.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), 360.0);
-        break;
-
-    case ROT_AZ_TYPE_180:
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), -180.0);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), +180.0);
-        break;
-
-    default:
         sat_log_log(SAT_LOG_LEVEL_ERROR,
                     _("%s:%s: Invalid AZ rotator type."), __FILE__, __func__);
-        break;
+        rot_pref_ui_end_update(ui, "aztype_changed");
+        return;
     }
+
+    rot_conf_get_default_az_limits((rot_az_type_t)type,
+                                   &minaz,
+                                   &maxaz,
+                                   &azstoppos);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->minaz), minaz);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->maxaz), maxaz);
     rot_pref_ui_end_update(ui, "aztype_changed");
 }
 
@@ -1614,9 +1616,12 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
     gboolean el_overtravel_enable = FALSE;
     gdouble el_min_deg = 0.0;
     gdouble el_max_deg = 180.0;
+    rot_az_type_t prev_aztype = ROT_AZ_TYPE_360;
 
     if (ui == NULL || conf == NULL)
         return FALSE;
+
+    prev_aztype = conf->aztype;
 
     /* name */
     if (conf->name)
@@ -1696,6 +1701,12 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
     conf->maxaz = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->maxaz));
     conf->minel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->minel));
     conf->maxel = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ui->maxel));
+    if (conf->aztype != prev_aztype ||
+        conf->azstoppos < conf->minaz ||
+        conf->azstoppos > conf->maxaz)
+    {
+        conf->azstoppos = conf->minaz;
+    }
 
     if (ui->el_overtravel_enable)
         el_overtravel_enable = gtk_toggle_button_get_active(

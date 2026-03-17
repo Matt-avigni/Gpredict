@@ -203,6 +203,10 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     gchar          *confdir;
     gchar          *fname;
     GError         *error = NULL;
+    gdouble         default_minaz = 0.0;
+    gdouble         default_maxaz = 360.0;
+    gdouble         default_azstoppos = 0.0;
+    const gdouble   eps = 1e-6;
 
     if (conf->name == NULL)
     {
@@ -600,24 +604,29 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
         conf->aztype = ROT_AZ_TYPE_360;
     }
 
+    rot_conf_get_default_az_limits(conf->aztype,
+                                   &default_minaz,
+                                   &default_maxaz,
+                                   &default_azstoppos);
+
     conf->minaz = g_key_file_get_double(cfg, GROUP, KEY_MINAZ, &error);
     if (error != NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: MinAz not defined for %s. Assuming 0\302\260."),
-                    __func__, conf->name);
+                    _("%s: MinAz not defined for %s. Assuming %.0f\302\260."),
+                    __func__, conf->name, default_minaz);
         g_clear_error(&error);
-        conf->minaz = 0.0;
+        conf->minaz = default_minaz;
     }
 
     conf->maxaz = g_key_file_get_double(cfg, GROUP, KEY_MAXAZ, &error);
     if (error != NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: MaxAz not defined for %s. Assuming 360\302\260."),
-                    __func__, conf->name);
+                    _("%s: MaxAz not defined for %s. Assuming %.0f\302\260."),
+                    __func__, conf->name, default_maxaz);
         g_clear_error(&error);
-        conf->maxaz = 360.0;
+        conf->maxaz = default_maxaz;
     }
 
     conf->minel = g_key_file_get_double(cfg, GROUP, KEY_MINEL, &error);
@@ -697,10 +706,24 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
     if (error != NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("%s: AzStopPos not defined for %s. Assuming at minaz (%f\302\260)."),
+                    _("%s: AzStopPos not defined for %s. Assuming at minaz (%.0f\302\260)."),
                     __func__, conf->name, conf->minaz);
         g_clear_error(&error);
         conf->azstoppos = conf->minaz;
+    }
+
+    if (conf->aztype == ROT_AZ_TYPE_180 &&
+        fabs(conf->minaz - 0.0) < eps &&
+        fabs(conf->maxaz - 360.0) < eps)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: Correcting signed azimuth interval for %s to -180\302\260..180\302\260."),
+                    __func__, conf->name);
+        conf->minaz = -180.0;
+        conf->maxaz = 180.0;
+        if (fabs(conf->azstoppos - 0.0) < eps ||
+            fabs(conf->azstoppos - 360.0) < eps)
+            conf->azstoppos = -180.0;
     }
 
     conf->axis_mode = ROT_AXIS_MODE_AZ_EL;

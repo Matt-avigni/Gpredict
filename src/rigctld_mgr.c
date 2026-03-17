@@ -38,6 +38,7 @@
 #endif
 
 #define RIGCTLD_LOG_MAX_LEN 4096
+#define RIGCTLD_MODEL_IC9700 3081
 
 struct _RigctldMgr {
     GSubprocess *proc;
@@ -187,6 +188,35 @@ static gchar *prepend_path_env_if_missing(const gchar *existing,
 
     updated = g_strdup_printf("%s:%s", path, existing);
     return updated;
+}
+
+static gboolean rigctld_argv_has_flag(gchar **argv, gint argc,
+                                      const gchar *flag)
+{
+    if (argv == NULL || argc <= 0 || flag == NULL || *flag == '\0')
+        return FALSE;
+
+    for (gint i = 0; i < argc; i++)
+    {
+        if (g_strcmp0(argv[i], flag) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean rigctld_conf_needs_vfo_switch(const radio_conf_t *conf)
+{
+    gint model_id = 0;
+
+    if (conf == NULL || conf->radio_mode != RADIO_MODE_FULL_DUPLEX_MAIN_SUB)
+        return FALSE;
+
+    model_id = conf->rigctld_model;
+    if (model_id <= 0)
+        model_id = radio_model_to_hamlib_model(conf->radio_model);
+
+    return model_id == RIGCTLD_MODEL_IC9700;
 }
 
 static void rigctld_mgr_emit_log(RigctldMgr *mgr, const gchar *prefix,
@@ -807,6 +837,8 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     }
     {
         gboolean extra_verbose = FALSE;
+        gboolean want_vfo_switch = rigctld_conf_needs_vfo_switch(conf);
+        gboolean have_vfo_switch = FALSE;
         gboolean want_verbose = (conf != NULL &&
                                  conf->rig_log_level >= RIG_LOG_VERBOSE);
         gchar **extra_argv = NULL;
@@ -832,10 +864,19 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
                     g_str_has_prefix(extra_argv[i], "--verbose"))
                     extra_verbose = TRUE;
             }
+
+            have_vfo_switch = rigctld_argv_has_flag(extra_argv, extra_argc,
+                                                    "--vfo");
         }
 
         if (!extra_verbose && want_verbose)
             g_ptr_array_add(argv, g_strdup("-v"));
+
+        /* IC-9700 Main/Sub control requires rigctld VFO mode so Gpredict can
+         * address Main and Sub explicitly on the shared socket.
+         */
+        if (want_vfo_switch && !have_vfo_switch)
+            g_ptr_array_add(argv, g_strdup("--vfo"));
 
         if (extra_argv != NULL)
         {
