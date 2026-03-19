@@ -452,6 +452,112 @@ static gboolean rigctld_client_try_select_vfo(RigctldClient *client,
                                      timeout_ms);
 }
 
+static gboolean rigctld_client_working_tokens_contains(GHashTable *working,
+                                                       const gchar *token)
+{
+    GHashTableIter iter;
+    gpointer key = NULL;
+    gpointer value = NULL;
+
+    if (working == NULL || token == NULL || *token == '\0')
+        return FALSE;
+
+    if (g_hash_table_contains(working, token))
+        return TRUE;
+
+    g_hash_table_iter_init(&iter, working);
+    while (g_hash_table_iter_next(&iter, &key, &value))
+    {
+        const gchar *entry = key;
+
+        (void)value;
+
+        if (entry != NULL && g_ascii_strcasecmp(entry, token) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static const gchar *rigctld_client_find_working_vfo_token(const RigCaps *caps,
+                                                          GHashTable *working,
+                                                          vfo_t vfo)
+{
+    static const gchar *main_candidates_default[] =
+        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates_default[] =
+        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+    static const gchar *main_candidates_prefer[] =
+        { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
+    static const gchar *sub_candidates_prefer[] =
+        { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+    static const gchar *main_candidates_strict[] =
+        { "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates_strict[] =
+        { "Sub", "SubA", "VFO_SUB", NULL };
+    const gchar * const *candidates = NULL;
+
+    if (caps == NULL || working == NULL)
+        return NULL;
+
+    if (vfo == VFO_MAIN)
+    {
+        if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
+            candidates = main_candidates_strict;
+        else if (caps->prefer_main_sub_tokens)
+            candidates = main_candidates_prefer;
+        else
+            candidates = main_candidates_default;
+    }
+    else if (vfo == VFO_SUB)
+    {
+        if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
+            candidates = sub_candidates_strict;
+        else if (caps->prefer_main_sub_tokens)
+            candidates = sub_candidates_prefer;
+        else
+            candidates = sub_candidates_default;
+    }
+    else
+    {
+        return NULL;
+    }
+
+    for (gint i = 0; candidates[i] != NULL; i++)
+    {
+        if (rigctld_client_working_tokens_contains(working, candidates[i]))
+            return candidates[i];
+    }
+
+    return NULL;
+}
+
+static void rigctld_client_replace_working_tokens(RigCaps *caps,
+                                                  GHashTable *working)
+{
+    GHashTableIter iter;
+    gpointer key = NULL;
+    gpointer value = NULL;
+
+    if (caps == NULL || caps->vfo_working == NULL)
+        return;
+
+    g_hash_table_remove_all(caps->vfo_working);
+    if (working == NULL)
+        return;
+
+    g_hash_table_iter_init(&iter, working);
+    while (g_hash_table_iter_next(&iter, &key, &value))
+    {
+        const gchar *token = key;
+
+        if (token != NULL && *token != '\0')
+            g_hash_table_replace(caps->vfo_working,
+                                 g_strdup(token),
+                                 value);
+    }
+}
+
 static const gchar *rigctld_client_vfo_token(RigctldClient *client,
                                              vfo_t vfo)
 {
@@ -678,6 +784,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
     gboolean vfo_opt_set = FALSE;
+    GHashTable *vfo_opt_working = NULL;
+    gchar *vfo_opt_default_token = NULL;
     HamlibResponseInfo info = { 0 };
     gint expected_model = rigctld_client_expected_model(conf);
     gint64 now_us = g_get_monotonic_time();
@@ -695,6 +803,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
     rigctld_client_set_state(client, RIGCTLD_CLIENT_PROBING, "probe start");
 
     rigctld_client_caps_clear(&client->caps);
+    vfo_opt_working = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                            g_free, NULL);
     if (!hamlib_transport_request(client->transport,
                                   "\\dump_state\n",
                                   HAMLIB_READ_MULTILINE_IDLE,
@@ -734,6 +844,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
             rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                      "model mismatch expected=%d got=%d",
                                      expected_model, client->caps.rig_model);
+            g_free(vfo_opt_default_token);
+            g_hash_table_destroy(vfo_opt_working);
             return FALSE;
         }
     }
@@ -799,8 +911,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
             }
             else
             {
-                gboolean have_default_vfo_token = FALSE;
-
                 for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
                 {
                     const gchar *token =
@@ -821,14 +931,12 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   timeout_ms))
                     {
                         vfo_opt_args_ok = TRUE;
-                        g_hash_table_replace(client->caps.vfo_working,
+                        g_hash_table_replace(vfo_opt_working,
                                              g_strdup(token),
                                              GINT_TO_POINTER(1));
-                        if (!have_default_vfo_token)
+                        if (vfo_opt_default_token == NULL)
                         {
-                            g_free(client->caps.default_vfo_token);
-                            client->caps.default_vfo_token = g_strdup(token);
-                            have_default_vfo_token = TRUE;
+                            vfo_opt_default_token = g_strdup(token);
                         }
                     }
                 }
@@ -836,9 +944,40 @@ gboolean rigctld_client_probe(RigctldClient *client,
         }
     }
 
+    if (vfo_opt_args_ok &&
+        conf != NULL &&
+        conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB)
+    {
+        const gchar *main_token =
+            rigctld_client_find_working_vfo_token(&client->caps,
+                                                  vfo_opt_working,
+                                                  VFO_MAIN);
+        const gchar *sub_token =
+            rigctld_client_find_working_vfo_token(&client->caps,
+                                                  vfo_opt_working,
+                                                  VFO_SUB);
+
+        if (main_token == NULL || sub_token == NULL)
+            vfo_opt_args_ok = FALSE;
+    }
+
     if (vfo_opt_args_ok)
     {
         client->caps.strategy = RIG_STRATEGY_VFO_OPT_ARGS;
+        rigctld_client_replace_working_tokens(&client->caps, vfo_opt_working);
+        g_free(client->caps.vfo_token_main);
+        client->caps.vfo_token_main =
+            g_strdup(rigctld_client_find_working_vfo_token(&client->caps,
+                                                           vfo_opt_working,
+                                                           VFO_MAIN));
+        g_free(client->caps.vfo_token_sub);
+        client->caps.vfo_token_sub =
+            g_strdup(rigctld_client_find_working_vfo_token(&client->caps,
+                                                           vfo_opt_working,
+                                                           VFO_SUB));
+        g_free(client->caps.default_vfo_token);
+        client->caps.default_vfo_token = g_strdup(
+            vfo_opt_default_token ? vfo_opt_default_token : "currVFO");
         if (client->caps.default_vfo_token == NULL)
             client->caps.default_vfo_token = g_strdup("currVFO");
     }
@@ -870,6 +1009,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "no usable control strategy");
+        g_free(vfo_opt_default_token);
+        g_hash_table_destroy(vfo_opt_working);
         return FALSE;
     }
 
@@ -886,11 +1027,15 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "probe failed");
+        g_free(vfo_opt_default_token);
+        g_hash_table_destroy(vfo_opt_working);
         return FALSE;
     }
 
     rigctld_client_set_state(client, RIGCTLD_CLIENT_READY,
                              "strategy=%d", client->caps.strategy);
+    g_free(vfo_opt_default_token);
+    g_hash_table_destroy(vfo_opt_working);
     return TRUE;
 }
 

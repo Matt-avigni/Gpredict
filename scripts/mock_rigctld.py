@@ -92,6 +92,15 @@ class RigctldHandler(socketserver.StreamRequestHandler):
 
             if cmd.startswith("F"):
                 parts = cmd.split()
+                token = parts[1] if len(parts) >= 3 else None
+                if (
+                    token is not None
+                    and state["reject_main_sub_tokenized_set"]
+                    and token in {"Main", "Sub", "MainA", "SubA", "VFO_MAIN", "VFO_SUB"}
+                ):
+                    self.wfile.write(b"RPRT -1\n")
+                    self.wfile.flush()
+                    continue
                 if len(parts) >= 2:
                     freq_str = parts[-1]
                     try:
@@ -137,6 +146,7 @@ def main():
     parser.add_argument("--port", type=int, default=4532)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-vfo-opt", action="store_true")
+    parser.add_argument("--reject-main-sub-tokenized-set", action="store_true")
     args = parser.parse_args()
 
     server = RigctldServer((args.host, args.port), RigctldHandler)
@@ -146,6 +156,7 @@ def main():
         "set_freq_count": 0,
         "conn_count": 0,
         "has_set_vfo_opt": not args.no_vfo_opt,
+        "reject_main_sub_tokenized_set": args.reject_main_sub_tokenized_set,
         "cmd_log": [],
     }
     server.conn_lock = threading.Lock()

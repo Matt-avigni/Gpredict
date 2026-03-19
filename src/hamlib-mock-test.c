@@ -49,7 +49,8 @@ static guint16 pick_free_port(void)
 static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        const gchar *script,
                                        guint16 port,
-                                       gboolean no_vfo_opt)
+                                       gboolean no_vfo_opt,
+                                       gboolean reject_main_sub_tokenized_set)
 {
     GSubprocess *proc = NULL;
     GError *error = NULL;
@@ -68,6 +69,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
     g_ptr_array_add(argv, g_strdup("--once"));
     if (no_vfo_opt)
         g_ptr_array_add(argv, g_strdup("--no-vfo-opt"));
+    if (reject_main_sub_tokenized_set)
+        g_ptr_array_add(argv, g_strdup("--reject-main-sub-tokenized-set"));
     g_ptr_array_add(argv, NULL);
 
     proc = g_subprocess_newv((const gchar *const *)argv->pdata,
@@ -234,18 +237,21 @@ int main(void)
     gchar *rot_script = NULL;
     guint16 rig_port = 0;
     guint16 rig_port_select = 0;
+    guint16 rig_port_reject = 0;
     guint16 rot_port = 0;
     guint16 rot_fail_port = 0;
     guint16 rot_split_port = 0;
     guint16 rot_drop_port = 0;
     GSubprocess *rig_proc = NULL;
     GSubprocess *rig_select_proc = NULL;
+    GSubprocess *rig_reject_proc = NULL;
     GSubprocess *rot_proc = NULL;
     GSubprocess *rot_fail_proc = NULL;
     GSubprocess *rot_split_proc = NULL;
     GSubprocess *rot_drop_proc = NULL;
     RigctldClient *rig = NULL;
     RigctldClient *rig_select = NULL;
+    RigctldClient *rig_reject = NULL;
     RotctldClient *rot = NULL;
     RotctldClient *rot_fail = NULL;
     RotctldClient *rot_split = NULL;
@@ -282,6 +288,7 @@ int main(void)
     rig_port = pick_free_port();
     rot_port = pick_free_port();
     rig_port_select = pick_free_port();
+    rig_port_reject = pick_free_port();
     for (gint attempt = 0; attempt < 5 && rot_port == rig_port; attempt++)
         rot_port = pick_free_port();
     for (gint attempt = 0;
@@ -291,24 +298,38 @@ int main(void)
           rig_port_select == rot_port);
          attempt++)
         rig_port_select = pick_free_port();
-    if (rig_port == 0 || rot_port == 0 || rig_port_select == 0)
+    for (gint attempt = 0;
+         attempt < 5 &&
+         (rig_port_reject == 0 ||
+          rig_port_reject == rig_port ||
+          rig_port_reject == rot_port ||
+          rig_port_reject == rig_port_select);
+         attempt++)
+        rig_port_reject = pick_free_port();
+    if (rig_port == 0 || rot_port == 0 || rig_port_select == 0 ||
+        rig_port_reject == 0)
     {
         ok = FALSE;
         goto cleanup;
     }
     if (rot_port == rig_port || rig_port_select == rig_port ||
-        rig_port_select == rot_port)
+        rig_port_select == rot_port || rig_port_reject == rig_port ||
+        rig_port_reject == rot_port || rig_port_reject == rig_port_select)
     {
         g_printerr("failed to select distinct mock ports\n");
         ok = FALSE;
         goto cleanup;
     }
 
-    rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE);
-    rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select, TRUE);
+    rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE);
+    rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select, TRUE,
+                                         FALSE);
+    rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
+                                         FALSE, TRUE);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
                                   FALSE, FALSE, FALSE, FALSE, 0, TRUE);
-    if (rig_proc == NULL || rig_select_proc == NULL || rot_proc == NULL)
+    if (rig_proc == NULL || rig_select_proc == NULL ||
+        rig_reject_proc == NULL || rot_proc == NULL)
     {
         ok = FALSE;
         goto cleanup;
@@ -316,8 +337,9 @@ int main(void)
 
     rig = rigctld_client_new("mock-rig");
     rig_select = rigctld_client_new("mock-rig-select");
+    rig_reject = rigctld_client_new("mock-rig-reject");
     rot = rotctld_client_new("mock-rot");
-    if (rig == NULL || rig_select == NULL || rot == NULL)
+    if (rig == NULL || rig_select == NULL || rig_reject == NULL || rot == NULL)
     {
         ok = FALSE;
         goto cleanup;
@@ -347,6 +369,18 @@ int main(void)
     if (!rigctld_client_probe(rig_select, &conf, 500))
     {
         g_printerr("rigctld probe failed (no-vfo-opt)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!connect_rigctld_with_retry(rig_reject, "127.0.0.1", rig_port_reject))
+    {
+        g_printerr("failed to connect to rigctld mock (tokenized Main/Sub reject)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!rigctld_client_probe(rig_reject, &conf, 500))
+    {
+        g_printerr("rigctld probe failed (tokenized Main/Sub reject)\n");
         ok = FALSE;
         goto cleanup;
     }
@@ -567,6 +601,119 @@ int main(void)
             g_strrstr(lines[idx_v_main], "Main") == NULL)
         {
             g_printerr("rigctld VFO token mismatch: sub=%s main=%s\n",
+                       lines[idx_v_sub], lines[idx_v_main]);
+            ok = FALSE;
+            g_strfreev(lines);
+            goto cleanup;
+        }
+
+        g_strfreev(lines);
+    }
+    {
+        HamlibResponseInfo info = { 0 };
+        gchar reply[512] = { 0 };
+        gchar **lines = NULL;
+        const RigCaps *reject_caps = rigctld_client_get_caps(rig_reject);
+        gboolean saw_bad_tokenized_set = FALSE;
+        gint idx_v_sub = -1;
+        gint idx_f_set = -1;
+        gint idx_v_main = -1;
+        gint idx_f_get = -1;
+
+        if (reject_caps == NULL ||
+            reject_caps->strategy != RIG_STRATEGY_SELECT_VFO)
+        {
+            g_printerr("rigctld probe should have downgraded to SELECT_VFO when Main/Sub tokenized set is rejected\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_request_raw(rig_reject, "\\reset_cmd_log",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld cmd log reset failed (tokenized Main/Sub reject)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_set_freq(rig_reject, VFO_SUB, 145920000))
+        {
+            g_printerr("rigctld set freq failed after SELECT_VFO downgrade\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_get_freq(rig_reject, VFO_MAIN, &freq))
+        {
+            g_printerr("rigctld get freq failed after SELECT_VFO downgrade\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_request_raw(rig_reject, "\\get_cmd_log",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld cmd log query failed (tokenized Main/Sub reject)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        lines = g_strsplit(reply, "\n", -1);
+        for (gint i = 0; lines[i] != NULL; i++)
+        {
+            const gchar *line = lines[i];
+
+            if (line[0] == '\0' || g_str_has_prefix(line, "RPRT"))
+                continue;
+
+            if (g_strcmp0(line, "F Sub 145920000") == 0 ||
+                g_strcmp0(line, "F Main 145920000") == 0 ||
+                g_strcmp0(line, "f Main") == 0 ||
+                g_strcmp0(line, "f Sub") == 0)
+            {
+                saw_bad_tokenized_set = TRUE;
+            }
+
+            if (g_str_has_prefix(line, "V "))
+            {
+                if (idx_v_sub == -1)
+                    idx_v_sub = i;
+                else if (idx_v_main == -1)
+                    idx_v_main = i;
+                continue;
+            }
+
+            if (g_str_has_prefix(line, "F ") && idx_f_set == -1)
+            {
+                idx_f_set = i;
+                continue;
+            }
+            if (g_strcmp0(line, "f") == 0 && idx_f_get == -1)
+            {
+                idx_f_get = i;
+                continue;
+            }
+        }
+
+        if (saw_bad_tokenized_set)
+        {
+            g_printerr("rigctld should not issue tokenized Main/Sub freq ops after downgrade\n");
+            ok = FALSE;
+            g_strfreev(lines);
+            goto cleanup;
+        }
+        if (idx_v_sub < 0 || idx_f_set < idx_v_sub ||
+            idx_v_main < 0 || idx_f_get < idx_v_main)
+        {
+            g_printerr("rigctld downgraded SELECT_VFO sequence mismatch\n");
+            ok = FALSE;
+            g_strfreev(lines);
+            goto cleanup;
+        }
+        if (g_strrstr(lines[idx_v_sub], "Sub") == NULL ||
+            g_strrstr(lines[idx_v_main], "Main") == NULL)
+        {
+            g_printerr("rigctld downgraded SELECT_VFO token mismatch: sub=%s main=%s\n",
                        lines[idx_v_sub], lines[idx_v_main]);
             ok = FALSE;
             g_strfreev(lines);
@@ -978,12 +1125,14 @@ int main(void)
 cleanup:
     rigctld_client_close(rig);
     rigctld_client_close(rig_select);
+    rigctld_client_close(rig_reject);
     rotctld_client_close(rot);
     rotctld_client_close(rot_fail);
     rotctld_client_close(rot_split);
     rotctld_client_close(rot_drop);
     rigctld_client_free(&rig);
     rigctld_client_free(&rig_select);
+    rigctld_client_free(&rig_reject);
     rotctld_client_free(&rot);
     rotctld_client_free(&rot_fail);
     rotctld_client_free(&rot_split);
@@ -1001,6 +1150,14 @@ cleanup:
         !g_subprocess_wait_check(rig_select_proc, NULL, &error))
     {
         g_printerr("rigctld mock (no-vfo-opt) exit error: %s\n",
+                   error ? error->message : "unknown");
+        ok = FALSE;
+        g_clear_error(&error);
+    }
+    if (rig_reject_proc != NULL && ok &&
+        !g_subprocess_wait_check(rig_reject_proc, NULL, &error))
+    {
+        g_printerr("rigctld mock (tokenized Main/Sub reject) exit error: %s\n",
                    error ? error->message : "unknown");
         ok = FALSE;
         g_clear_error(&error);
@@ -1048,6 +1205,11 @@ cleanup:
         g_subprocess_force_exit(rig_select_proc);
         (void)g_subprocess_wait(rig_select_proc, NULL, NULL);
     }
+    if (rig_reject_proc != NULL && !ok)
+    {
+        g_subprocess_force_exit(rig_reject_proc);
+        (void)g_subprocess_wait(rig_reject_proc, NULL, NULL);
+    }
     if (rot_proc != NULL && !ok)
     {
         g_subprocess_force_exit(rot_proc);
@@ -1071,6 +1233,7 @@ cleanup:
 
     g_clear_object(&rig_proc);
     g_clear_object(&rig_select_proc);
+    g_clear_object(&rig_reject_proc);
     g_clear_object(&rot_proc);
     g_clear_object(&rot_fail_proc);
     g_clear_object(&rot_split_proc);
