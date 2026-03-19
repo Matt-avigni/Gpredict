@@ -123,7 +123,6 @@ static gboolean winsock_ensure_init(void)
 #define AZEL_FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
-#define RIGCTRL_SHARED_MAIN_SUB_VFO_SETTLE_US 20000
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 #define RIGCTLD_DUMP_STATE_IDLE_MS 100
 #define RIGCTLD_FOLLOW_IDLE_MS 50
@@ -145,7 +144,6 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTRL_FREQ_PLACEHOLDER_DIGIT "<span size='xx-large'>-</span>"
 #define RIGCTLD_AUTOSTART_MAX_RESTARTS 2
 #define RIGCTLD_AUTOSTART_RETRY_DELAY_MS 150
-#define RIGCTLD_MODEL_IC9700 3081
 #define RIGCTLD_MODEL_IC905 3090
 #define RIGCTLD_IC905_FALLBACK_TIMEOUT_MS 12000
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000
@@ -706,6 +704,7 @@ static void     schedule_rig_autodetect_error(GtkRigCtrl *ctrl,
 static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
                                                   const radio_conf_t *conf);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
+static void     rig_connect_button_clicked_cb(GtkButton *button, gpointer data);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static gboolean radio_apply_ui_settings(GtkRigCtrl *ctrl, gboolean strict);
 static gboolean rigctrl_cycle_focus_out_cb(GtkWidget *widget,
@@ -6017,6 +6016,33 @@ static void tx_track_toggle_cb(GtkToggleButton *button, gpointer data)
     ctrl->lasttxf = 0;
 }
 
+static void rig_connect_button_clicked_cb(GtkButton *button, gpointer data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+
+    (void)button;
+
+    if (ctrl == NULL || ctrl->destroying)
+        return;
+
+    if (ctrl->LockBut != NULL &&
+        !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
+    {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), TRUE);
+        return;
+    }
+
+    if (!ctrl->engaged || ctrl->conn_state != RIGCTRL_CONN_CONNECTED)
+        return;
+
+    rigctrl_seed_user_base_from_ui(ctrl, "connect_button");
+    rigctrl_update_doppler(ctrl);
+    rigctrl_reset_send_tracking(ctrl, TRUE);
+    rigctrl_reset_send_tracking(ctrl, FALSE);
+    setconfig(ctrl);
+    start_timer(ctrl);
+}
+
 /* Called when the user changes the value of the cycle delay */
 static void delay_changed_cb(GtkSpinButton * spin, gpointer data)
 {
@@ -6482,7 +6508,7 @@ static void rigctrl_combo_set_ellipsize(GtkComboBox *combo)
 static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
 {
     GtkWidget      *frame, *table, *label;
-    GtkWidget      *rx_track, *tx_track, *track_box;
+    GtkWidget      *rx_track, *tx_track, *connect_button, *track_box;
     GtkWidget      *trsp_label;
     GtkSizeGroup   *combo_group;
     gchar          *buff;
@@ -6552,16 +6578,27 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
                                 _("Apply Doppler correction to the RX "
                                   "frequency."));
     g_signal_connect(rx_track, "toggled", G_CALLBACK(rx_track_toggle_cb), ctrl);
+    gtk_widget_set_size_request(rx_track, 96, -1);
 
     tx_track = gtk_toggle_button_new_with_label(_("TX Track"));
     gtk_widget_set_tooltip_text(tx_track,
                                 _("Apply Doppler correction to the TX "
                                   "frequency."));
     g_signal_connect(tx_track, "toggled", G_CALLBACK(tx_track_toggle_cb), ctrl);
+    gtk_widget_set_size_request(tx_track, 96, -1);
+
+    connect_button = gtk_button_new_with_label(_("Connect"));
+    gtk_widget_set_tooltip_text(connect_button,
+                                _("Engage the radio and start sending tracking "
+                                  "commands immediately."));
+    g_signal_connect(connect_button, "clicked",
+                     G_CALLBACK(rig_connect_button_clicked_cb), ctrl);
+    gtk_widget_set_size_request(connect_button, 88, -1);
 
     track_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_box_pack_start(GTK_BOX(track_box), rx_track, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(track_box), tx_track, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(track_box), rx_track, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(track_box), tx_track, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(track_box), connect_button, FALSE, FALSE, 0);
     gtk_widget_set_hexpand(track_box, TRUE);
     gtk_widget_set_halign(track_box, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), track_box, 1, 2, 3, 1);
@@ -7714,42 +7751,30 @@ static gboolean rigctld_force_main_sub_tokens(const GtkRigCtrl *ctrl,
     if (!rigctld_prefer_main_sub_tokens(ctrl))
         return FALSE;
 
-    if ((session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0)
-        return TRUE;
+    if (session->strategy != RIG_STRATEGY_VFO_OPT_ARGS)
+        return FALSE;
 
-    return session->rig_model == RIGCTLD_MODEL_IC9700;
+    return (session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0;
 }
 
 static gboolean rigctrl_skip_shared_main_sub_readback(GtkRigCtrl *ctrl,
                                                       gint sock,
                                                       vfo_t vfo)
 {
-    rig_strategy_t strategy = RIG_STRATEGY_PLAIN_FREQ;
+    (void)ctrl;
+    (void)sock;
+    (void)vfo;
 
-    if (ctrl == NULL || ctrl->conf == NULL)
-        return FALSE;
-
-    if (ctrl->conf2 != NULL || !is_full_duplex_main_sub_configured(ctrl->conf))
-        return FALSE;
-
-    if (vfo != VFO_MAIN && vfo != VFO_SUB)
-        return FALSE;
-
-    strategy = rig_session_strategy_for_vfo(ctrl, sock, vfo);
-    return strategy == RIG_STRATEGY_SELECT_VFO;
+    return FALSE;
 }
 
 static gboolean rigctrl_limit_shared_main_sub_to_single_op(GtkRigCtrl *ctrl,
                                                            gint sock)
 {
-    if (ctrl == NULL || ctrl->conf == NULL || ctrl->conf2 != NULL)
-        return FALSE;
+    (void)ctrl;
+    (void)sock;
 
-    if (!is_full_duplex_main_sub_configured(ctrl->conf))
-        return FALSE;
-
-    return rigctrl_skip_shared_main_sub_readback(ctrl, sock, VFO_MAIN) ||
-           rigctrl_skip_shared_main_sub_readback(ctrl, sock, VFO_SUB);
+    return FALSE;
 }
 
 static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
@@ -7897,7 +7922,9 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     gchar **target_ptr = NULL;
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
     gboolean prefer_main_sub =
-        (session != NULL && rigctld_prefer_main_sub_tokens(ctrl));
+        (session != NULL &&
+         session->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
+         rigctld_prefer_main_sub_tokens(ctrl));
     gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
     gboolean allow_unlisted = force_main_sub;
 
@@ -8621,12 +8648,6 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
         {
             g_mutex_unlock(&ctrl->writelock);
             return FALSE;
-        }
-        if (ctrl != NULL &&
-            ctrl->conf2 == NULL &&
-            is_full_duplex_main_sub_configured(ctrl->conf))
-        {
-            g_usleep(RIGCTRL_SHARED_MAIN_SUB_VFO_SETTLE_US);
         }
         freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
     }
@@ -14330,9 +14351,7 @@ open_uplink_retry:
         {
             if (is_full_duplex_main_sub_configured(ctrl->conf))
             {
-                /* Let the first timer tick perform the shared-rig tune. The
-                   IC-9700/rigctld chain is markedly less reliable if we
-                   switch both VFOs immediately after probe/open. */
+                exec_full_duplex_main_sub_cycle(ctrl, TRUE);
             }
             else
             {
