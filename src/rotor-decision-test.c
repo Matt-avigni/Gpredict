@@ -279,6 +279,39 @@ int main(void)
     assert(out.send);
     expect_reason(rot_cmd_reason_name(out.reason), "stopped");
 
+    /* Axis-specific progress: az improvement must not hide stalled el */
+    {
+        rot_cmd_progress_state_t state = { 0 };
+        rot_cmd_progress_t prog = { 0 };
+
+        rot_cmd_progress_step(&state, 4.0, 2.5, 0.8, 0.8, 0.05, &prog);
+        assert(!prog.moving_toward);
+        assert(!prog.stalled);
+
+        rot_cmd_progress_step(&state, 3.0, 2.5, 0.8, 0.8, 0.05, &prog);
+        assert(prog.moving_toward);
+        assert(!prog.stalled);
+        assert(prog.az_progressing);
+        assert(!prog.el_progressing);
+
+        rot_cmd_progress_step(&state, 2.0, 2.5, 0.8, 0.8, 0.05, &prog);
+        assert(prog.moving_toward);
+        assert(prog.stalled);
+    }
+
+    /* Inactive axis should not count as stalled */
+    {
+        rot_cmd_progress_state_t state = { 0 };
+        rot_cmd_progress_t prog = { 0 };
+
+        rot_cmd_progress_step(&state, 1.5, 0.2, 0.8, 0.8, 0.05, &prog);
+        rot_cmd_progress_step(&state, 1.0, 0.2, 0.8, 0.8, 0.05, &prog);
+        assert(prog.moving_toward);
+        assert(!prog.stalled);
+        assert(prog.az_progressing);
+        assert(prog.el_progressing);
+    }
+
     /* Force send */
     in = base_input();
     in.force_send = TRUE;

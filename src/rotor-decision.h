@@ -99,10 +99,34 @@ typedef struct {
     gboolean pos_fresh;
 } rot_cmd_decision_t;
 
+typedef struct {
+    gboolean valid;
+    gdouble last_err_az;
+    gdouble last_err_el;
+    guint stall_count;
+} rot_cmd_progress_state_t;
+
+typedef struct {
+    gboolean az_active;
+    gboolean el_active;
+    gboolean az_progressing;
+    gboolean el_progressing;
+    gboolean moving_toward;
+    gboolean stalled;
+} rot_cmd_progress_t;
+
 const char *rot_cmd_action_name(rot_cmd_action_t action);
 const char *rot_cmd_reason_name(rot_cmd_reason_t reason);
 
 void rot_cmd_decision_eval(const rot_cmd_decision_input_t *in,
                            rot_cmd_decision_t *out);
+void rot_cmd_progress_reset(rot_cmd_progress_state_t *state);
+void rot_cmd_progress_step(rot_cmd_progress_state_t *state,
+                           gdouble err_az,
+                           gdouble err_el,
+                           gdouble eps_az,
+                           gdouble eps_el,
+                           gdouble improve_eps,
+                           rot_cmd_progress_t *out);
 
 #endif

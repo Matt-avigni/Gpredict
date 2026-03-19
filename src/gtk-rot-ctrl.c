@@ -730,9 +730,7 @@ struct _GtkRotCtrl {
     gdouble         cal_window_el[ROT_AUTOCAL_STABLE_WINDOW];
     guint           cal_window_count;
     guint           cal_window_idx;
-    gdouble         motion_err_mag;
-    gboolean        motion_err_valid;
-    guint           motion_stall_count;
+    rot_cmd_progress_state_t motion_progress;
 };
 
 struct _GtkRotCtrlClass {
@@ -10518,8 +10516,7 @@ static void rotctrl_finish_tracking_pass_over(GtkRotCtrl *ctrl,
     ctrl->last_target_update_us = 0;
     ctrl->last_send_us = 0;
     ctrl->above_eps_count = 0;
-    ctrl->motion_err_valid = FALSE;
-    ctrl->motion_stall_count = 0;
+    rot_cmd_progress_reset(&ctrl->motion_progress);
     rot_plan_reset(&ctrl->trajectory_plan);
     set_flipped_pass(ctrl);
 
@@ -10942,8 +10939,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->stale_hold_since_us = 0;
         ctrl->stale_resume_since_us = 0;
         ctrl->stale_recovered_pulse = FALSE;
-        ctrl->motion_err_valid = FALSE;
-        ctrl->motion_stall_count = 0;
+        rot_cmd_progress_reset(&ctrl->motion_progress);
         rotctrl_tracking_policy_reset_reason(ctrl, "track_off");
         return;
     }
@@ -12123,7 +12119,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         gboolean pos_fresh = FALSE;
         gboolean moving_toward = FALSE;
         gboolean stopped_unexpected = FALSE;
-        gdouble motion_err = 0.0;
         gdouble err_backend_az = 0.0;
         gdouble err_backend_el = 0.0;
         gboolean resend_due = FALSE;
@@ -13419,40 +13414,29 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 err_backend_el = err_el;
                 if (reached)
                 {
-                    ctrl->motion_err_valid = FALSE;
-                    ctrl->motion_stall_count = 0;
+                    rot_cmd_progress_reset(&ctrl->motion_progress);
                     moving_toward = FALSE;
                     stopped_unexpected = FALSE;
                     stall_since_us = 0;
                 }
                 else
                 {
-                    motion_err = err_az + err_el;
+                    rot_cmd_progress_t progress = { 0 };
 
-                    if (ctrl->motion_err_valid)
-                    {
-                        if (motion_err <= (ctrl->motion_err_mag - 0.05))
-                        {
-                            moving_toward = TRUE;
-                            ctrl->motion_stall_count = 0;
-                            stall_since_us = 0;
-                        }
-                        else
-                        {
-                            if (ctrl->motion_stall_count < G_MAXUINT)
-                                ctrl->motion_stall_count++;
-                        }
-                    }
-                    else
-                    {
-                        ctrl->motion_err_valid = TRUE;
-                        ctrl->motion_stall_count = 0;
+                    rot_cmd_progress_step(&ctrl->motion_progress,
+                                          err_az,
+                                          err_el,
+                                          eps_az,
+                                          eps_el,
+                                          0.05,
+                                          &progress);
+
+                    moving_toward = progress.moving_toward;
+
+                    if (moving_toward)
                         stall_since_us = 0;
-                    }
 
-                    ctrl->motion_err_mag = motion_err;
-
-                    if (ctrl->motion_stall_count >= 2)
+                    if (progress.stalled)
                     {
                         if (stall_since_us == 0)
                             stall_since_us = now_us;
@@ -13470,8 +13454,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
             else
             {
-                ctrl->motion_err_valid = FALSE;
-                ctrl->motion_stall_count = 0;
+                rot_cmd_progress_reset(&ctrl->motion_progress);
                 stall_since_us = 0;
             }
 
@@ -13925,8 +13908,7 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->setpoint_user_el = desired_user_el;
             ctrl->setpoint_valid = TRUE;
             ctrl->force_next_send = FALSE;
-            ctrl->motion_err_valid = FALSE;
-            ctrl->motion_stall_count = 0;
+            rot_cmd_progress_reset(&ctrl->motion_progress);
             if (reason == ROT_CMD_REASON_PARK)
             {
                 rot_term_log(ctrl, "gpredict:tx",
@@ -21900,9 +21882,7 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->cal_settle_start_us = 0;
     ctrl->cal_window_count = 0;
     ctrl->cal_window_idx = 0;
-    ctrl->motion_err_mag = 0.0;
-    ctrl->motion_err_valid = FALSE;
-    ctrl->motion_stall_count = 0;
+    rot_cmd_progress_reset(&ctrl->motion_progress);
     memset(&ctrl->trajectory_plan, 0, sizeof(ctrl->trajectory_plan));
     rot_plan_reset(&ctrl->trajectory_plan);
     /* Reserved flag; keep FALSE (no special SEND-ONLY mode). */

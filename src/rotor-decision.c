@@ -320,3 +320,95 @@ void rot_cmd_decision_eval(const rot_cmd_decision_input_t *in,
     out->reason = in->setpoint_valid ? ROT_CMD_REASON_TARGET
                                      : ROT_CMD_REASON_INITIAL;
 }
+
+void rot_cmd_progress_reset(rot_cmd_progress_state_t *state)
+{
+    if (state == NULL)
+        return;
+
+    state->valid = FALSE;
+    state->last_err_az = 0.0;
+    state->last_err_el = 0.0;
+    state->stall_count = 0;
+}
+
+void rot_cmd_progress_step(rot_cmd_progress_state_t *state,
+                           gdouble err_az,
+                           gdouble err_el,
+                           gdouble eps_az,
+                           gdouble eps_el,
+                           gdouble improve_eps,
+                           rot_cmd_progress_t *out)
+{
+    gboolean az_active = FALSE;
+    gboolean el_active = FALSE;
+    gboolean az_progressing = FALSE;
+    gboolean el_progressing = FALSE;
+
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+
+    if (state == NULL)
+        return;
+
+    if (!isfinite(err_az) || !isfinite(err_el) ||
+        !isfinite(eps_az) || !isfinite(eps_el))
+    {
+        rot_cmd_progress_reset(state);
+        return;
+    }
+
+    if (eps_az < 0.0)
+        eps_az = 0.0;
+    if (eps_el < 0.0)
+        eps_el = 0.0;
+    if (improve_eps < 0.0)
+        improve_eps = 0.0;
+
+    az_active = (err_az > eps_az);
+    el_active = (err_el > eps_el);
+
+    if (out != NULL)
+    {
+        out->az_active = az_active;
+        out->el_active = el_active;
+    }
+
+    if (!az_active && !el_active)
+    {
+        rot_cmd_progress_reset(state);
+        return;
+    }
+
+    if (!state->valid)
+    {
+        state->valid = TRUE;
+        state->last_err_az = err_az;
+        state->last_err_el = err_el;
+        state->stall_count = 0;
+        return;
+    }
+
+    az_progressing = !az_active ||
+                     (err_az <= (state->last_err_az - improve_eps));
+    el_progressing = !el_active ||
+                     (err_el <= (state->last_err_el - improve_eps));
+
+    if (az_progressing && el_progressing)
+        state->stall_count = 0;
+    else if (state->stall_count < G_MAXUINT)
+        state->stall_count++;
+
+    state->last_err_az = err_az;
+    state->last_err_el = err_el;
+
+    if (out != NULL)
+    {
+        out->az_progressing = az_progressing;
+        out->el_progressing = el_progressing;
+        out->moving_toward =
+            (az_active && az_progressing) ||
+            (el_active && el_progressing);
+        out->stalled = (state->stall_count >= 2);
+    }
+}
