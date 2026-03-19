@@ -1068,6 +1068,7 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
     const gchar *send_cmd = NULL;
     gchar *tmp_cmd = NULL;
     gsize cmd_len = 0;
+    gint request_timeout_ms = 1000;
 
     if (info)
         memset(info, 0, sizeof(*info));
@@ -1088,12 +1089,15 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
 
     if (g_str_has_prefix(send_cmd, "\\dump_state"))
         mode = HAMLIB_READ_MULTILINE_IDLE;
+    else if (g_str_has_prefix(send_cmd, "F ") ||
+             g_str_has_prefix(send_cmd, "I "))
+        request_timeout_ms = 3000;
 
     ok = hamlib_transport_request(client->transport,
                                   send_cmd,
                                   mode,
                                   HAMLIB_TERM_RPRT,
-                                  1000,
+                                  request_timeout_ms,
                                   50,
                                   0, 0,
                                   out, out_len,

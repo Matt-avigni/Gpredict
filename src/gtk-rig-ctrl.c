@@ -123,6 +123,7 @@ static gboolean winsock_ensure_init(void)
 #define AZEL_FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
+#define RIGCTLD_MAIN_SUB_SELECT_SETTLE_US 100000
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 #define RIGCTLD_DUMP_STATE_IDLE_MS 100
 #define RIGCTLD_FOLLOW_IDLE_MS 50
@@ -8604,6 +8605,8 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
             g_mutex_unlock(&ctrl->writelock);
             return FALSE;
         }
+        if (is_full_duplex_main_sub_configured(ctrl->conf))
+            g_usleep(RIGCTLD_MAIN_SUB_SELECT_SETTLE_US);
         freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
     }
     else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
@@ -9712,6 +9715,14 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                                                     rigfreqd,
                                                     down_ok,
                                                     force_send));
+
+    if (ctrl->sock < 0 ||
+        ctrl->conn_state == RIGCTRL_CONN_DISCONNECTING ||
+        ctrl->conn_state == RIGCTRL_CONN_DISCONNECTED)
+    {
+        return;
+    }
+
     (void)(plan.send_uplink &&
            rigctrl_update_full_duplex_main_sub_side(ctrl, FALSE,
                                                     plan.uplink_vfo,
