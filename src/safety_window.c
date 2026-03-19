@@ -9,6 +9,10 @@
 
 #include <math.h>
 
+enum {
+    SAFETY_AZ_PERIOD_DEG = 360
+};
+
 static gboolean safety_path_crosses_band(double cur,
                                          double cand,
                                          double band_min,
@@ -18,6 +22,87 @@ static gboolean safety_path_crosses_band(double cur,
     double hi = MAX(cur, cand);
 
     return !(hi < band_min || lo > band_max);
+}
+
+static gboolean safety_pick_equivalent_in_window(double cand,
+                                                 double ref,
+                                                 double win_min,
+                                                 double win_max,
+                                                 double *cand_out)
+{
+    double best = 0.0;
+    double best_dist = 0.0;
+    gboolean found = FALSE;
+
+    if (cand_out == NULL || win_max < win_min)
+        return FALSE;
+
+    for (int k = -4; k <= 4; k++) {
+        double alias = cand + (SAFETY_AZ_PERIOD_DEG * (double)k);
+        double dist = fabs(alias - ref);
+
+        if (alias < win_min || alias > win_max)
+            continue;
+
+        if (!found || dist < best_dist) {
+            best = alias;
+            best_dist = dist;
+            found = TRUE;
+        }
+    }
+
+    if (found)
+        *cand_out = best;
+
+    return found;
+}
+
+static gboolean safety_pick_equivalent_avoiding_band(double cand,
+                                                     double ref,
+                                                     double win_min,
+                                                     double win_max,
+                                                     double band_min,
+                                                     double band_max,
+                                                     double *cand_out)
+{
+    double best = 0.0;
+    double best_dist = 0.0;
+    gboolean found = FALSE;
+
+    if (cand_out == NULL || win_max < win_min)
+        return FALSE;
+
+    for (int k = -4; k <= 4; k++) {
+        double alias = cand + (SAFETY_AZ_PERIOD_DEG * (double)k);
+        double dist = fabs(alias - ref);
+
+        if (alias < win_min || alias > win_max)
+            continue;
+        if (safety_path_crosses_band(ref, alias, band_min, band_max))
+            continue;
+
+        if (!found || dist < best_dist) {
+            best = alias;
+            best_dist = dist;
+            found = TRUE;
+        }
+    }
+
+    if (found)
+        *cand_out = best;
+
+    return found;
+}
+
+static double safety_clamp_to_window(double cand,
+                                     double win_min,
+                                     double win_max)
+{
+    if (cand < win_min)
+        return (fabs(cand - win_min) <= fabs(cand - win_max)) ? win_min : win_max;
+    if (cand > win_max)
+        return (fabs(cand - win_min) <= fabs(cand - win_max)) ? win_min : win_max;
+    return cand;
 }
 
 gboolean safety_project_command(const RotorSafety *s,
@@ -48,18 +133,16 @@ gboolean safety_project_command(const RotorSafety *s,
 
     span = win_max - win_min;
 
-    if (span > 0.0 && (cand < win_min || cand > win_max)) {
-        double offset = fmod(cand - win_min, span);
-        if (offset < 0.0)
-            offset += span;
-        cand = win_min + offset;
-    }
+    if (cand < win_min || cand > win_max) {
+        double projected = cand;
 
-    if (cand < win_min) {
-        cand = win_min;
-        clamped = TRUE;
-    } else if (cand > win_max) {
-        cand = win_max;
+        if (safety_pick_equivalent_in_window(cand, az_abs_cur,
+                                             win_min, win_max,
+                                             &projected)) {
+            cand = projected;
+        } else {
+            cand = safety_clamp_to_window(cand, win_min, win_max);
+        }
         clamped = TRUE;
     }
 
@@ -70,17 +153,14 @@ gboolean safety_project_command(const RotorSafety *s,
                                                     band_min, band_max);
 
         if (crosses && span > 0.0) {
-            double alt1 = cand - span;
-            double alt2 = cand + span;
-            gboolean alt1_ok = (alt1 >= win_min && alt1 <= win_max) &&
-                               !safety_path_crosses_band(az_abs_cur, alt1,
-                                                         band_min, band_max);
-            gboolean alt2_ok = (alt2 >= win_min && alt2 <= win_max) &&
-                               !safety_path_crosses_band(az_abs_cur, alt2,
-                                                         band_min, band_max);
+            double alt = cand;
 
-            if (alt1_ok || alt2_ok) {
-                cand = alt1_ok ? alt1 : alt2;
+            if (safety_pick_equivalent_avoiding_band(cand,
+                                                     az_abs_cur,
+                                                     win_min, win_max,
+                                                     band_min, band_max,
+                                                     &alt)) {
+                cand = alt;
                 crosses = FALSE;
             }
         }

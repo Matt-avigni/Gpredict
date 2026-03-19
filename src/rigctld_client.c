@@ -799,6 +799,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
             }
             else
             {
+                gboolean have_default_vfo_token = FALSE;
+
                 for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
                 {
                     const gchar *token =
@@ -812,8 +814,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                            timeout_ms, 1))
                         continue;
 
-                    g_free(client->caps.default_vfo_token);
-                    client->caps.default_vfo_token = g_strdup(token);
                     g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
                                token, freq);
                     if (rigctld_client_try_set_ok(client, cmd,
@@ -821,7 +821,15 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   timeout_ms))
                     {
                         vfo_opt_args_ok = TRUE;
-                        break;
+                        g_hash_table_replace(client->caps.vfo_working,
+                                             g_strdup(token),
+                                             GINT_TO_POINTER(1));
+                        if (!have_default_vfo_token)
+                        {
+                            g_free(client->caps.default_vfo_token);
+                            client->caps.default_vfo_token = g_strdup(token);
+                            have_default_vfo_token = TRUE;
+                        }
                     }
                 }
             }

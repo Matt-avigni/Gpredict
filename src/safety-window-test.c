@@ -36,6 +36,22 @@ int main(void)
     expect_close(cand, 0.0);
 
     safety.win_min_abs = 0.0;
+    safety.win_max_abs = 180.0;
+    cand = 200.0;
+    assert(!safety_project_command(&safety, 170.0, &cand));
+    expect_close(cand, 180.0);
+
+    safety.win_min_abs = 0.0;
+    safety.win_max_abs = 450.0;
+    cand = -10.0;
+    assert(!safety_project_command(&safety, 5.0, &cand));
+    expect_close(cand, 350.0);
+
+    cand = 460.0;
+    assert(!safety_project_command(&safety, 350.0, &cand));
+    expect_close(cand, 100.0);
+
+    safety.win_min_abs = 0.0;
     safety.win_max_abs = 360.0;
     safety.stop_enabled = TRUE;
     safety.stop_abs = 180.0;

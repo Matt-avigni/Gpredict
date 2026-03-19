@@ -5477,6 +5477,22 @@ static void rotctrl_update_safety(GtkRotCtrl *ctrl,
         ctrl->safety.win_max_abs = span_width;
     }
 
+    if (ctrl->user_limits.valid &&
+        ctrl->user_limits.wrap_mode == ROT_TARGET_WRAP_360 &&
+        ctrl->user_limits.az_min <= ctrl->user_limits.az_max)
+    {
+        gdouble user_min = ctrl->user_limits.az_min;
+        gdouble user_max = ctrl->user_limits.az_max;
+        gdouble eff_min = MAX(ctrl->safety.win_min_abs, user_min);
+        gdouble eff_max = MIN(ctrl->safety.win_max_abs, user_max);
+
+        if (eff_max >= eff_min)
+        {
+            ctrl->safety.win_min_abs = eff_min;
+            ctrl->safety.win_max_abs = eff_max;
+        }
+    }
+
     if (ctrl->safety.win_max_abs - ctrl->safety.win_min_abs <= 0.0)
         ctrl->safety.win_max_abs = ctrl->safety.win_min_abs + span_width;
 

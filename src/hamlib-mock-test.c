@@ -384,6 +384,14 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
+    if (caps->vfo_working == NULL ||
+        !g_hash_table_contains(caps->vfo_working, "VFOA") ||
+        !g_hash_table_contains(caps->vfo_working, "VFOB"))
+    {
+        g_printerr("rigctld probe did not cache expected VFO tokens\n");
+        ok = FALSE;
+        goto cleanup;
+    }
 
     if (!rigctld_client_get_freq(rig, VFO_MAIN, &freq))
     {
