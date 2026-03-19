@@ -7399,6 +7399,13 @@ static gboolean rotctrl_should_sync_manual(GtkRotCtrl *ctrl)
     if (!ctrl->manual_sync_pending)
         return FALSE;
 
+    /* In manual mode the knobs are the command source. After the user issues
+     * a manual move, keep that target stable instead of snapping the knobs back
+     * to live feedback while the rotor is still travelling.
+     */
+    if (!ctrl->tracking && ctrl->have_user_command)
+        return FALSE;
+
     now = g_get_monotonic_time();
     if (now < ctrl->manual_edit_until_us)
         return FALSE;
