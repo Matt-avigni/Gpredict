@@ -8020,7 +8020,7 @@ static gboolean rigctld_select_vfo_cached(GtkRigCtrl *ctrl, gint sock,
         return FALSE;
 
     if (session != NULL &&
-        session->strategy != RIG_STRATEGY_SELECT_VFO &&
+        session->strategy == RIG_STRATEGY_SELECT_VFO &&
         session->last_selected_vfo_valid &&
         session->last_selected_vfo == vfo)
         return TRUE;
@@ -8061,7 +8061,7 @@ static gboolean rigctld_select_vfo_cached_locked(GtkRigCtrl *ctrl, gint sock,
         return FALSE;
 
     if (session != NULL &&
-        session->strategy != RIG_STRATEGY_SELECT_VFO &&
+        session->strategy == RIG_STRATEGY_SELECT_VFO &&
         session->last_selected_vfo_valid &&
         session->last_selected_vfo == vfo)
         return TRUE;
