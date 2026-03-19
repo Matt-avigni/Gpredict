@@ -123,6 +123,7 @@ static gboolean winsock_ensure_init(void)
 #define AZEL_FMTSTR "%7.2f\302\260"
 #define MAX_ERROR_COUNT 5
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
+#define RIGCTRL_SHARED_MAIN_SUB_VFO_SETTLE_US 20000
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 #define RIGCTLD_DUMP_STATE_IDLE_MS 100
 #define RIGCTLD_FOLLOW_IDLE_MS 50
@@ -7738,6 +7739,19 @@ static gboolean rigctrl_skip_shared_main_sub_readback(GtkRigCtrl *ctrl,
     return strategy == RIG_STRATEGY_SELECT_VFO;
 }
 
+static gboolean rigctrl_limit_shared_main_sub_to_single_op(GtkRigCtrl *ctrl,
+                                                           gint sock)
+{
+    if (ctrl == NULL || ctrl->conf == NULL || ctrl->conf2 != NULL)
+        return FALSE;
+
+    if (!is_full_duplex_main_sub_configured(ctrl->conf))
+        return FALSE;
+
+    return rigctrl_skip_shared_main_sub_readback(ctrl, sock, VFO_MAIN) ||
+           rigctrl_skip_shared_main_sub_readback(ctrl, sock, VFO_SUB);
+}
+
 static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
                                               const RigSession *session,
                                               vfo_t vfo,
@@ -8608,6 +8622,12 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
             g_mutex_unlock(&ctrl->writelock);
             return FALSE;
         }
+        if (ctrl != NULL &&
+            ctrl->conf2 == NULL &&
+            is_full_duplex_main_sub_configured(ctrl->conf))
+        {
+            g_usleep(RIGCTRL_SHARED_MAIN_SUB_VFO_SETTLE_US);
+        }
         freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
     }
     else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
@@ -9476,6 +9496,143 @@ static void exec_toggle_tx_cycle(GtkRigCtrl * ctrl)
 
 }
 
+static gboolean rigctrl_update_full_duplex_main_sub_side(GtkRigCtrl *ctrl,
+                                                         gboolean downlink,
+                                                         vfo_t plan_vfo,
+                                                         gint64 base_sat,
+                                                         gint64 doppler_hz,
+                                                         gint64 target_hz,
+                                                         gboolean target_ok,
+                                                         gboolean force_send)
+{
+    gint64 readback = 0;
+    gboolean set_ok = FALSE;
+    gboolean read_ok = FALSE;
+    vfo_t set_vfo = VFO_NONE;
+
+    if (ctrl == NULL || ctrl->conf == NULL || !ctrl->engaged)
+        return FALSE;
+
+    if (plan_vfo == VFO_NONE)
+    {
+        sat_log_log(SAT_LOG_LEVEL_ERROR,
+                    "FULL-DUPLEX MAIN/SUB: invalid %s VFO",
+                    downlink ? "downlink" : "uplink");
+        ctrl->errcnt++;
+        return FALSE;
+    }
+
+    if (!target_ok)
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=%s skipped (out of range)",
+                    downlink ? "RX" : "TX");
+        return FALSE;
+    }
+
+    if (!rigctrl_freq_valid_for_send(ctrl, downlink, target_hz))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=%s skipped (invalid)",
+                    downlink ? "RX" : "TX");
+        return FALSE;
+    }
+
+    if (!force_send && !rigctrl_should_send_freq(ctrl, downlink, target_hz))
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=%s skipped (deadband/rate)",
+                    downlink ? "RX" : "TX");
+        return FALSE;
+    }
+
+    set_vfo = rigctrl_vfo_for_side(ctrl, downlink);
+    rigctrl_log_send(ctrl, downlink, vfo_name(plan_vfo),
+                     base_sat, doppler_hz, target_hz);
+    if (downlink)
+        ctrl->last_send_down_us = g_get_monotonic_time();
+    else
+        ctrl->last_send_up_us = g_get_monotonic_time();
+
+    set_ok = rigctrl_set_freq_for_role(ctrl, ctrl->sock, downlink,
+                                       FALSE, target_hz, NULL);
+    if (!set_ok)
+    {
+        ctrl->errcnt++;
+        return TRUE;
+    }
+
+    if (rigctrl_skip_shared_main_sub_readback(ctrl, ctrl->sock, set_vfo))
+    {
+        /* Shared Main/Sub rigs are more stable when we avoid an immediate
+           readback after every explicit VFO switch. */
+        g_usleep(WR_DEL);
+        ctrl->errcnt = 0;
+        if (downlink)
+        {
+            ctrl->lastrxf = target_hz;
+            ctrl->rig_actual_down_hz = target_hz;
+            rigctrl_update_last_sent(ctrl, TRUE, target_hz);
+        }
+        else
+        {
+            ctrl->lasttxf = target_hz;
+            ctrl->rig_actual_up_hz = target_hz;
+            rigctrl_update_last_sent(ctrl, FALSE, target_hz);
+        }
+
+        return TRUE;
+    }
+
+    g_usleep(WR_DEL);
+    read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, downlink,
+                                        FALSE, TRUE, &readback, NULL);
+    if (!read_ok)
+    {
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=%s readback failed; keeping last",
+                    downlink ? "RX" : "TX");
+        rigctrl_update_last_sent(ctrl, downlink, target_hz);
+        return TRUE;
+    }
+
+    if (rigctrl_verify_match(ctrl, downlink, set_vfo, target_hz,
+                             readback, 0))
+    {
+        ctrl->errcnt = 0;
+        if (downlink)
+        {
+            ctrl->lastrxf = readback;
+            ctrl->rig_actual_down_hz = readback;
+            rigctrl_update_last_sent(ctrl, TRUE, readback);
+            rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)readback);
+        }
+        else
+        {
+            ctrl->lasttxf = readback;
+            ctrl->rig_actual_up_hz = readback;
+            rigctrl_update_last_sent(ctrl, FALSE, readback);
+            rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)readback);
+        }
+    }
+    else
+    {
+        ctrl->errcnt++;
+        if (downlink)
+        {
+            ctrl->lastrxf = 0;
+            rigctrl_update_last_sent(ctrl, TRUE, 0);
+        }
+        else
+        {
+            ctrl->lasttxf = 0;
+            rigctrl_update_last_sent(ctrl, FALSE, 0);
+        }
+    }
+
+    return TRUE;
+}
+
 static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                                             gboolean force_send)
 {
@@ -9486,11 +9643,11 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
     gint64          rigfrequ = 0;
     gint64          doppler_down = 0;
     gint64          doppler_up = 0;
-    gint64          readback = 0;
-    gboolean        set_ok;
-    gboolean        read_ok;
     gboolean        down_ok = TRUE;
     gboolean        up_ok = TRUE;
+    gboolean        fragile_shared = FALSE;
+    gboolean        down_first = TRUE;
+    gboolean        attempted = FALSE;
 
     if (ctrl == NULL || ctrl->conf == NULL)
         return;
@@ -9517,165 +9674,76 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
     if (!ctrl->engaged)
         return;
 
-    if (plan.send_downlink)
+    fragile_shared = rigctrl_limit_shared_main_sub_to_single_op(ctrl,
+                                                                ctrl->sock);
+    down_first = (ctrl->last_send_down_us <= ctrl->last_send_up_us);
+
+    if (fragile_shared)
     {
-        if (plan.downlink_vfo == VFO_NONE)
+        if (down_first)
         {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        "FULL-DUPLEX MAIN/SUB: invalid downlink VFO");
-            ctrl->errcnt++;
-        }
-        else if (!down_ok)
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX skipped (out of range)");
-        }
-        else if (!rigctrl_freq_valid_for_send(ctrl, TRUE, rigfreqd))
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX skipped (invalid)");
-        }
-        else if (!force_send && !rigctrl_should_send_freq(ctrl, TRUE, rigfreqd))
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX skipped (deadband/rate)");
+            attempted = plan.send_downlink &&
+                rigctrl_update_full_duplex_main_sub_side(ctrl, TRUE,
+                                                         plan.downlink_vfo,
+                                                         base_sat_down,
+                                                         doppler_down,
+                                                         rigfreqd,
+                                                         down_ok,
+                                                         force_send);
+            if (attempted)
+                return;
+
+            (void)(plan.send_uplink &&
+                   rigctrl_update_full_duplex_main_sub_side(ctrl, FALSE,
+                                                            plan.uplink_vfo,
+                                                            base_sat_up,
+                                                            doppler_up,
+                                                            rigfrequ,
+                                                            up_ok,
+                                                            force_send));
         }
         else
         {
-            vfo_t set_vfo = rigctrl_vfo_for_side(ctrl, TRUE);
-            rigctrl_log_send(ctrl, TRUE, vfo_name(plan.downlink_vfo),
-                             base_sat_down, doppler_down, rigfreqd);
-            ctrl->last_send_down_us = g_get_monotonic_time();
-            set_ok = rigctrl_set_freq_for_role(ctrl, ctrl->sock, TRUE,
-                                               FALSE, rigfreqd, NULL);
-            if (set_ok)
-            {
-                if (rigctrl_skip_shared_main_sub_readback(ctrl, ctrl->sock,
-                                                          set_vfo))
-                {
-                    /* Shared Main/Sub rigs are more stable when we avoid an
-                       immediate readback after every explicit VFO switch. */
-                    g_usleep(WR_DEL);
-                    ctrl->errcnt = 0;
-                    ctrl->lastrxf = rigfreqd;
-                    ctrl->rig_actual_down_hz = rigfreqd;
-                    rigctrl_update_last_sent(ctrl, TRUE, rigfreqd);
-                }
-                else
-                {
-                    g_usleep(WR_DEL);
-                    read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, TRUE,
-                                                        FALSE, TRUE,
-                                                        &readback, NULL);
-                    if (!read_ok)
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX readback failed; keeping last");
-                        rigctrl_update_last_sent(ctrl, TRUE, rigfreqd);
-                    }
-                    else if (rigctrl_verify_match(ctrl, TRUE, set_vfo,
-                                                  rigfreqd, readback, 0))
-                    {
-                        ctrl->errcnt = 0;
-                        ctrl->lastrxf = readback;
-                        ctrl->rig_actual_down_hz = readback;
-                        rigctrl_update_last_sent(ctrl, TRUE, readback);
-                        rigctrl_set_freq_knob_value(ctrl, FALSE,
-                                                (gdouble)readback);
-                    }
-                    else
-                    {
-                        ctrl->errcnt++;
-                        ctrl->lastrxf = 0;
-                        rigctrl_update_last_sent(ctrl, TRUE, 0);
-                    }
-                }
-            }
-            else
-            {
-                ctrl->errcnt++;
-            }
+            attempted = plan.send_uplink &&
+                rigctrl_update_full_duplex_main_sub_side(ctrl, FALSE,
+                                                         plan.uplink_vfo,
+                                                         base_sat_up,
+                                                         doppler_up,
+                                                         rigfrequ,
+                                                         up_ok,
+                                                         force_send);
+            if (attempted)
+                return;
+
+            (void)(plan.send_downlink &&
+                   rigctrl_update_full_duplex_main_sub_side(ctrl, TRUE,
+                                                            plan.downlink_vfo,
+                                                            base_sat_down,
+                                                            doppler_down,
+                                                            rigfreqd,
+                                                            down_ok,
+                                                            force_send));
         }
+
+        return;
     }
 
-    if (plan.send_uplink)
-    {
-        if (plan.uplink_vfo == VFO_NONE)
-        {
-            sat_log_log(SAT_LOG_LEVEL_ERROR,
-                        "FULL-DUPLEX MAIN/SUB: invalid uplink VFO");
-            ctrl->errcnt++;
-        }
-        else if (!up_ok)
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX skipped (out of range)");
-        }
-        else if (!rigctrl_freq_valid_for_send(ctrl, FALSE, rigfrequ))
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX skipped (invalid)");
-        }
-        else if (!force_send && !rigctrl_should_send_freq(ctrl, FALSE, rigfrequ))
-        {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX skipped (deadband/rate)");
-        }
-        else
-        {
-            vfo_t set_vfo = rigctrl_vfo_for_side(ctrl, FALSE);
-            rigctrl_log_send(ctrl, FALSE, vfo_name(plan.uplink_vfo),
-                             base_sat_up, doppler_up, rigfrequ);
-            ctrl->last_send_up_us = g_get_monotonic_time();
-            set_ok = rigctrl_set_freq_for_role(ctrl, ctrl->sock, FALSE,
-                                               FALSE, rigfrequ, NULL);
-            if (set_ok)
-            {
-                if (rigctrl_skip_shared_main_sub_readback(ctrl, ctrl->sock,
-                                                          set_vfo))
-                {
-                    g_usleep(WR_DEL);
-                    ctrl->errcnt = 0;
-                    ctrl->lasttxf = rigfrequ;
-                    ctrl->rig_actual_up_hz = rigfrequ;
-                    rigctrl_update_last_sent(ctrl, FALSE, rigfrequ);
-                }
-                else
-                {
-                    g_usleep(WR_DEL);
-                    read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, FALSE,
-                                                        FALSE, TRUE,
-                                                        &readback, NULL);
-                    if (!read_ok)
-                    {
-                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX readback failed; keeping last");
-                        rigctrl_update_last_sent(ctrl, FALSE, rigfrequ);
-                    }
-                    else if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
-                                                  rigfrequ, readback, 0))
-                    {
-                        ctrl->errcnt = 0;
-                        ctrl->lasttxf = readback;
-                        ctrl->rig_actual_up_hz = readback;
-                        rigctrl_update_last_sent(ctrl, FALSE, readback);
-                        rigctrl_set_freq_knob_value(ctrl, TRUE,
-                                                (gdouble)readback);
-                    }
-                    else
-                    {
-                        ctrl->errcnt++;
-                        ctrl->lasttxf = 0;
-                        rigctrl_update_last_sent(ctrl, FALSE, 0);
-                    }
-                }
-            }
-            else
-            {
-                ctrl->errcnt++;
-            }
-        }
-    }
+    (void)(plan.send_downlink &&
+           rigctrl_update_full_duplex_main_sub_side(ctrl, TRUE,
+                                                    plan.downlink_vfo,
+                                                    base_sat_down,
+                                                    doppler_down,
+                                                    rigfreqd,
+                                                    down_ok,
+                                                    force_send));
+    (void)(plan.send_uplink &&
+           rigctrl_update_full_duplex_main_sub_side(ctrl, FALSE,
+                                                    plan.uplink_vfo,
+                                                    base_sat_up,
+                                                    doppler_up,
+                                                    rigfrequ,
+                                                    up_ok,
+                                                    force_send));
 }
 
 static void exec_duplex_tx_cycle(GtkRigCtrl * ctrl)
