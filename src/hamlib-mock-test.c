@@ -50,7 +50,7 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        const gchar *script,
                                        guint16 port,
                                        gboolean no_vfo_opt,
-                                       gboolean reject_main_sub_tokenized_set)
+                                       gboolean reject_main_sub_tokenized_retune)
 {
     GSubprocess *proc = NULL;
     GError *error = NULL;
@@ -69,8 +69,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
     g_ptr_array_add(argv, g_strdup("--once"));
     if (no_vfo_opt)
         g_ptr_array_add(argv, g_strdup("--no-vfo-opt"));
-    if (reject_main_sub_tokenized_set)
-        g_ptr_array_add(argv, g_strdup("--reject-main-sub-tokenized-set"));
+    if (reject_main_sub_tokenized_retune)
+        g_ptr_array_add(argv, g_strdup("--reject-main-sub-tokenized-retune"));
     g_ptr_array_add(argv, NULL);
 
     proc = g_subprocess_newv((const gchar *const *)argv->pdata,
@@ -374,13 +374,13 @@ int main(void)
     }
     if (!connect_rigctld_with_retry(rig_reject, "127.0.0.1", rig_port_reject))
     {
-        g_printerr("failed to connect to rigctld mock (tokenized Main/Sub reject)\n");
+        g_printerr("failed to connect to rigctld mock (tokenized Main/Sub retune reject)\n");
         ok = FALSE;
         goto cleanup;
     }
     if (!rigctld_client_probe(rig_reject, &conf, 500))
     {
-        g_printerr("rigctld probe failed (tokenized Main/Sub reject)\n");
+        g_printerr("rigctld probe failed (tokenized Main/Sub retune reject)\n");
         ok = FALSE;
         goto cleanup;
     }
@@ -623,7 +623,7 @@ int main(void)
         if (reject_caps == NULL ||
             reject_caps->strategy != RIG_STRATEGY_SELECT_VFO)
         {
-            g_printerr("rigctld probe should have downgraded to SELECT_VFO when Main/Sub tokenized set is rejected\n");
+            g_printerr("rigctld probe should have downgraded to SELECT_VFO when Main/Sub tokenized retune is rejected\n");
             ok = FALSE;
             goto cleanup;
         }
@@ -631,7 +631,7 @@ int main(void)
         if (!rigctld_client_request_raw(rig_reject, "\\reset_cmd_log",
                                         reply, sizeof(reply), &info))
         {
-            g_printerr("rigctld cmd log reset failed (tokenized Main/Sub reject)\n");
+            g_printerr("rigctld cmd log reset failed (tokenized Main/Sub retune reject)\n");
             ok = FALSE;
             goto cleanup;
         }
@@ -653,7 +653,7 @@ int main(void)
         if (!rigctld_client_request_raw(rig_reject, "\\get_cmd_log",
                                         reply, sizeof(reply), &info))
         {
-            g_printerr("rigctld cmd log query failed (tokenized Main/Sub reject)\n");
+            g_printerr("rigctld cmd log query failed (tokenized Main/Sub retune reject)\n");
             ok = FALSE;
             goto cleanup;
         }

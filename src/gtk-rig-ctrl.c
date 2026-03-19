@@ -7721,6 +7721,53 @@ static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
     return rprt_code != 0;
 }
 
+static void rigctld_force_select_vfo_strategy(GtkRigCtrl *ctrl,
+                                              RigSession *session,
+                                              const gchar *reason)
+{
+    if (session == NULL)
+        return;
+
+    if (session->strategy == RIG_STRATEGY_SELECT_VFO)
+    {
+        session->last_selected_vfo_valid = FALSE;
+        return;
+    }
+
+    session->strategy = RIG_STRATEGY_SELECT_VFO;
+    session->vfo_opt_enabled = FALSE;
+    session->vfo_opt_unsafe = TRUE;
+    session->last_selected_vfo = VFO_NONE;
+    session->last_selected_vfo_valid = FALSE;
+    session->strategy_logged = FALSE;
+
+    rig_term_log(ctrl, "gpredict",
+                 "rig session (%s) strategy fallback=SELECT_VFO reason=%s",
+                 session->label ? session->label : "rig",
+                 reason ? reason : "tokenized Main/Sub rejected");
+}
+
+static void rigctld_downgrade_main_sub_to_select_vfo(GtkRigCtrl *ctrl,
+                                                      gint sock,
+                                                      const gchar *reason)
+{
+    RigSession *session = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    session = rig_session_for_socket(ctrl, sock);
+    rigctld_force_select_vfo_strategy(ctrl, session, reason);
+
+    if (sock == ctrl->sock &&
+        ctrl->conf2 == NULL &&
+        is_full_duplex_main_sub_configured(ctrl->conf) &&
+        ctrl->rig_session2 != NULL)
+    {
+        rigctld_force_select_vfo_strategy(ctrl, ctrl->rig_session2, reason);
+    }
+}
+
 static gboolean rig_session_vfo_token_working(const RigSession *session,
                                               const gchar *token)
 {
@@ -8546,16 +8593,19 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
         rigctld_should_retry_main_sub(ctrl, session, vfo, rprt_code))
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
-                    "FULL-DUPLEX MAIN/SUB: set %s rejected (RPRT %d); retrying",
+                    "FULL-DUPLEX MAIN/SUB: set %s rejected (RPRT %d); downgrading to explicit VFO",
                     vfo_name(vfo), rprt_code);
-        if (session != NULL)
-            session->last_selected_vfo_valid = FALSE;
+        rigctld_downgrade_main_sub_to_select_vfo(
+            ctrl, sock, "Main/Sub tokenized set rejected");
         if (!rigctld_select_vfo_cached_locked(ctrl, sock, vfo, token))
         {
             g_free(freq_cmd);
             g_mutex_unlock(&ctrl->writelock);
             return FALSE;
         }
+
+        g_free(freq_cmd);
+        freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
 
         if (freq_cmd != NULL)
         {
