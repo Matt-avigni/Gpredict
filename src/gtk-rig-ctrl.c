@@ -704,7 +704,6 @@ static void     schedule_rig_autodetect_error(GtkRigCtrl *ctrl,
 static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
                                                   const radio_conf_t *conf);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
-static void     rig_connect_button_clicked_cb(GtkButton *button, gpointer data);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static gboolean radio_apply_ui_settings(GtkRigCtrl *ctrl, gboolean strict);
 static gboolean rigctrl_cycle_focus_out_cb(GtkWidget *widget,
@@ -6016,33 +6015,6 @@ static void tx_track_toggle_cb(GtkToggleButton *button, gpointer data)
     ctrl->lasttxf = 0;
 }
 
-static void rig_connect_button_clicked_cb(GtkButton *button, gpointer data)
-{
-    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
-
-    (void)button;
-
-    if (ctrl == NULL || ctrl->destroying)
-        return;
-
-    if (ctrl->LockBut != NULL &&
-        !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
-    {
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), TRUE);
-        return;
-    }
-
-    if (!ctrl->engaged || ctrl->conn_state != RIGCTRL_CONN_CONNECTED)
-        return;
-
-    rigctrl_seed_user_base_from_ui(ctrl, "connect_button");
-    rigctrl_update_doppler(ctrl);
-    rigctrl_reset_send_tracking(ctrl, TRUE);
-    rigctrl_reset_send_tracking(ctrl, FALSE);
-    setconfig(ctrl);
-    start_timer(ctrl);
-}
-
 /* Called when the user changes the value of the cycle delay */
 static void delay_changed_cb(GtkSpinButton * spin, gpointer data)
 {
@@ -6508,7 +6480,7 @@ static void rigctrl_combo_set_ellipsize(GtkComboBox *combo)
 static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
 {
     GtkWidget      *frame, *table, *label;
-    GtkWidget      *rx_track, *tx_track, *connect_button, *track_box;
+    GtkWidget      *rx_track, *tx_track, *track_box;
     GtkWidget      *trsp_label;
     GtkSizeGroup   *combo_group;
     gchar          *buff;
@@ -6578,27 +6550,16 @@ static GtkWidget *create_target_widgets(GtkRigCtrl * ctrl)
                                 _("Apply Doppler correction to the RX "
                                   "frequency."));
     g_signal_connect(rx_track, "toggled", G_CALLBACK(rx_track_toggle_cb), ctrl);
-    gtk_widget_set_size_request(rx_track, 96, -1);
 
     tx_track = gtk_toggle_button_new_with_label(_("TX Track"));
     gtk_widget_set_tooltip_text(tx_track,
                                 _("Apply Doppler correction to the TX "
                                   "frequency."));
     g_signal_connect(tx_track, "toggled", G_CALLBACK(tx_track_toggle_cb), ctrl);
-    gtk_widget_set_size_request(tx_track, 96, -1);
-
-    connect_button = gtk_button_new_with_label(_("Connect"));
-    gtk_widget_set_tooltip_text(connect_button,
-                                _("Engage the radio and start sending tracking "
-                                  "commands immediately."));
-    g_signal_connect(connect_button, "clicked",
-                     G_CALLBACK(rig_connect_button_clicked_cb), ctrl);
-    gtk_widget_set_size_request(connect_button, 88, -1);
 
     track_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_box_pack_start(GTK_BOX(track_box), rx_track, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(track_box), tx_track, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(track_box), connect_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(track_box), rx_track, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(track_box), tx_track, TRUE, TRUE, 0);
     gtk_widget_set_hexpand(track_box, TRUE);
     gtk_widget_set_halign(track_box, GTK_ALIGN_FILL);
     gtk_grid_attach(GTK_GRID(table), track_box, 1, 2, 3, 1);
