@@ -7712,9 +7712,6 @@ static gboolean rigctld_force_main_sub_tokens(const GtkRigCtrl *ctrl,
     if (!rigctld_prefer_main_sub_tokens(ctrl))
         return FALSE;
 
-    if (session->strategy != RIG_STRATEGY_VFO_OPT_ARGS)
-        return FALSE;
-
     return (session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0;
 }
 
@@ -7882,10 +7879,7 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     gboolean *logged_ptr = NULL;
     gchar **target_ptr = NULL;
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
-    gboolean prefer_main_sub =
-        (session != NULL &&
-         session->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
-         rigctld_prefer_main_sub_tokens(ctrl));
+    gboolean prefer_main_sub = rigctld_prefer_main_sub_tokens(ctrl);
     gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
     gboolean allow_unlisted = force_main_sub;
 

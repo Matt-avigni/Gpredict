@@ -452,243 +452,6 @@ static gboolean rigctld_client_try_select_vfo(RigctldClient *client,
                                      timeout_ms);
 }
 
-static gboolean rigctld_client_restore_vfo_opt_freq(RigctldClient *client,
-                                                    const gchar *token,
-                                                    gint64 freq_hz,
-                                                    gint timeout_ms)
-{
-    gchar cmd[96];
-    gchar reply[256];
-    gint64 verify = 0;
-
-    if (client == NULL || token == NULL || *token == '\0')
-        return FALSE;
-
-    g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
-               token, freq_hz);
-    if (rigctld_client_try_set_ok(client, cmd, reply, sizeof(reply),
-                                  timeout_ms))
-    {
-        g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-        if (rigctld_client_try_get_freq_retry(client, cmd,
-                                              &verify, reply, sizeof(reply),
-                                              timeout_ms, 1) &&
-            verify == freq_hz)
-        {
-            return TRUE;
-        }
-    }
-
-    if (!rigctld_client_try_select_vfo(client, token, timeout_ms))
-        return FALSE;
-
-    g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
-    if (!rigctld_client_try_set_ok(client, cmd, reply, sizeof(reply),
-                                   timeout_ms))
-        return FALSE;
-
-    return rigctld_client_try_get_freq_retry(client, "f\x0a",
-                                             &verify, reply, sizeof(reply),
-                                             timeout_ms, 1) &&
-           verify == freq_hz;
-}
-
-static gboolean rigctld_client_try_vfo_opt_roundtrip(RigctldClient *client,
-                                                     const gchar *token,
-                                                     gint timeout_ms)
-{
-    static const gint64 deltas[] = { 1, 10, 100, 1000 };
-    gchar cmd[96];
-    gchar reply[256];
-    gint64 original_freq = 0;
-    gint64 verify_freq = 0;
-
-    if (client == NULL || token == NULL || *token == '\0')
-        return FALSE;
-
-    g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-    if (!rigctld_client_try_get_freq_retry(client, cmd,
-                                           &original_freq, reply,
-                                           sizeof(reply),
-                                           timeout_ms, 1))
-    {
-        return FALSE;
-    }
-
-    for (guint i = 0; i < G_N_ELEMENTS(deltas); i++)
-    {
-        gint64 delta = deltas[i];
-        gint64 probe_freq = 0;
-
-        if (original_freq <= (G_MAXINT64 - delta))
-            probe_freq = original_freq + delta;
-        else if (original_freq > delta)
-            probe_freq = original_freq - delta;
-
-        if (probe_freq <= 0 || probe_freq == original_freq)
-            continue;
-
-        g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
-                   token, probe_freq);
-        if (!rigctld_client_try_set_ok(client, cmd, reply, sizeof(reply),
-                                       timeout_ms))
-        {
-            continue;
-        }
-
-        g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-        if (!rigctld_client_try_get_freq_retry(client, cmd,
-                                               &verify_freq, reply,
-                                               sizeof(reply),
-                                               timeout_ms, 1))
-        {
-            if (!rigctld_client_restore_vfo_opt_freq(client, token,
-                                                     original_freq,
-                                                     timeout_ms))
-            {
-                return FALSE;
-            }
-            continue;
-        }
-
-        if (!rigctld_client_restore_vfo_opt_freq(client, token, original_freq,
-                                                 timeout_ms))
-        {
-            return FALSE;
-        }
-
-        if (verify_freq != original_freq)
-            return TRUE;
-    }
-
-    return FALSE;
-}
-
-static gboolean rigctld_client_working_tokens_contains(GHashTable *working,
-                                                       const gchar *token)
-{
-    GHashTableIter iter;
-    gpointer key = NULL;
-    gpointer value = NULL;
-
-    if (working == NULL || token == NULL || *token == '\0')
-        return FALSE;
-
-    if (g_hash_table_contains(working, token))
-        return TRUE;
-
-    g_hash_table_iter_init(&iter, working);
-    while (g_hash_table_iter_next(&iter, &key, &value))
-    {
-        const gchar *entry = key;
-
-        (void)value;
-
-        if (entry != NULL && g_ascii_strcasecmp(entry, token) == 0)
-            return TRUE;
-    }
-
-    return FALSE;
-}
-
-static const gchar *rigctld_client_find_working_vfo_token(const RigCaps *caps,
-                                                          GHashTable *working,
-                                                          vfo_t vfo)
-{
-    static const gchar *main_candidates_default[] =
-        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
-    static const gchar *sub_candidates_default[] =
-        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
-    static const gchar *main_candidates_prefer[] =
-        { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
-    static const gchar *sub_candidates_prefer[] =
-        { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
-    static const gchar *main_candidates_strict[] =
-        { "Main", "MainA", "VFO_MAIN", NULL };
-    static const gchar *sub_candidates_strict[] =
-        { "Sub", "SubA", "VFO_SUB", NULL };
-    const gchar * const *candidates = NULL;
-    const gchar * const *fallback_candidates = NULL;
-
-    if (caps == NULL || working == NULL)
-        return NULL;
-
-    if (vfo == VFO_MAIN)
-    {
-        if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
-        {
-            candidates = main_candidates_strict;
-            fallback_candidates = main_candidates_default;
-        }
-        else if (caps->prefer_main_sub_tokens)
-            candidates = main_candidates_prefer;
-        else
-            candidates = main_candidates_default;
-    }
-    else if (vfo == VFO_SUB)
-    {
-        if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
-        {
-            candidates = sub_candidates_strict;
-            fallback_candidates = sub_candidates_default;
-        }
-        else if (caps->prefer_main_sub_tokens)
-            candidates = sub_candidates_prefer;
-        else
-            candidates = sub_candidates_default;
-    }
-    else
-    {
-        return NULL;
-    }
-
-    for (gint i = 0; candidates[i] != NULL; i++)
-    {
-        if (rigctld_client_working_tokens_contains(working, candidates[i]))
-            return candidates[i];
-    }
-
-    if (fallback_candidates != NULL)
-    {
-        for (gint i = 0; fallback_candidates[i] != NULL; i++)
-        {
-            if (rigctld_client_working_tokens_contains(working,
-                                                       fallback_candidates[i]))
-            {
-                return fallback_candidates[i];
-            }
-        }
-    }
-
-    return NULL;
-}
-
-static void rigctld_client_replace_working_tokens(RigCaps *caps,
-                                                  GHashTable *working)
-{
-    GHashTableIter iter;
-    gpointer key = NULL;
-    gpointer value = NULL;
-
-    if (caps == NULL || caps->vfo_working == NULL)
-        return;
-
-    g_hash_table_remove_all(caps->vfo_working);
-    if (working == NULL)
-        return;
-
-    g_hash_table_iter_init(&iter, working);
-    while (g_hash_table_iter_next(&iter, &key, &value))
-    {
-        const gchar *token = key;
-
-        if (token != NULL && *token != '\0')
-            g_hash_table_replace(caps->vfo_working,
-                                 g_strdup(token),
-                                 value);
-    }
-}
-
 static const gchar *rigctld_client_vfo_token(RigctldClient *client,
                                              vfo_t vfo)
 {
@@ -706,10 +469,7 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
         { "Sub", "SubA", "VFO_SUB", NULL };
     const gchar *fallback = (vfo == VFO_SUB) ? "Sub" : "Main";
     const gchar * const *candidates = NULL;
-    const gchar * const *fallback_candidates = NULL;
     RigCaps *caps = NULL;
-    gboolean prefer_main_sub = FALSE;
-    gboolean force_main_sub = FALSE;
 
     if (client == NULL)
         return fallback;
@@ -724,19 +484,10 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
     if (vfo == VFO_SUB && caps->vfo_token_sub)
         return caps->vfo_token_sub;
 
-    prefer_main_sub = (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
-                       caps->prefer_main_sub_tokens);
-    force_main_sub = (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
-                      (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
-
-    if (force_main_sub)
-    {
+    if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
         candidates = (vfo == VFO_MAIN) ? main_candidates_strict
                                        : sub_candidates_strict;
-        fallback_candidates = (vfo == VFO_MAIN) ? main_candidates_default
-                                                : sub_candidates_default;
-    }
-    else if (prefer_main_sub)
+    else if (caps->prefer_main_sub_tokens)
         candidates = (vfo == VFO_MAIN) ? main_candidates_prefer
                                        : sub_candidates_prefer;
     else
@@ -752,21 +503,6 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
             else
                 caps->vfo_token_sub = g_strdup(candidates[i]);
             return candidates[i];
-        }
-    }
-
-    if (fallback_candidates != NULL)
-    {
-        for (gint i = 0; fallback_candidates[i] != NULL; i++)
-        {
-            if (g_hash_table_contains(caps->vfo_working, fallback_candidates[i]))
-            {
-                if (vfo == VFO_MAIN)
-                    caps->vfo_token_main = g_strdup(fallback_candidates[i]);
-                else
-                    caps->vfo_token_sub = g_strdup(fallback_candidates[i]);
-                return fallback_candidates[i];
-            }
         }
     }
 
@@ -942,8 +678,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
     gboolean vfo_opt_set = FALSE;
-    GHashTable *vfo_opt_working = NULL;
-    gchar *vfo_opt_default_token = NULL;
     HamlibResponseInfo info = { 0 };
     gint expected_model = rigctld_client_expected_model(conf);
     gint64 now_us = g_get_monotonic_time();
@@ -961,8 +695,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
     rigctld_client_set_state(client, RIGCTLD_CLIENT_PROBING, "probe start");
 
     rigctld_client_caps_clear(&client->caps);
-    vfo_opt_working = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                            g_free, NULL);
     if (!hamlib_transport_request(client->transport,
                                   "\\dump_state\n",
                                   HAMLIB_READ_MULTILINE_IDLE,
@@ -1002,8 +734,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
             rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                      "model mismatch expected=%d got=%d",
                                      expected_model, client->caps.rig_model);
-            g_free(vfo_opt_default_token);
-            g_hash_table_destroy(vfo_opt_working);
             return FALSE;
         }
     }
@@ -1069,132 +799,48 @@ gboolean rigctld_client_probe(RigctldClient *client,
             }
             else
             {
-                if (conf != NULL &&
-                    conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB)
+                for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
                 {
-                    const gchar *main_token =
-                        rigctld_client_find_working_vfo_token(
-                            &client->caps,
-                            client->caps.vfo_working,
-                            VFO_MAIN);
-                    const gchar *sub_token =
-                        rigctld_client_find_working_vfo_token(
-                            &client->caps,
-                            client->caps.vfo_working,
-                            VFO_SUB);
+                    const gchar *token =
+                        g_ptr_array_index(client->caps.vfo_candidates, i);
+                    gchar cmd[96];
 
-                    if (main_token != NULL &&
-                        rigctld_client_try_vfo_opt_roundtrip(client,
-                                                             main_token,
-                                                             timeout_ms))
+                    g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
+                    if (!rigctld_client_try_get_freq_retry(client, cmd,
+                                                           &freq, reply,
+                                                           sizeof(reply),
+                                                           timeout_ms, 1))
+                        continue;
+
+                    g_free(client->caps.default_vfo_token);
+                    client->caps.default_vfo_token = g_strdup(token);
+                    g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
+                               token, freq);
+                    if (rigctld_client_try_set_ok(client, cmd,
+                                                  reply, sizeof(reply),
+                                                  timeout_ms))
                     {
                         vfo_opt_args_ok = TRUE;
-                        g_hash_table_replace(vfo_opt_working,
-                                             g_strdup(main_token),
-                                             GINT_TO_POINTER(1));
-                        if (vfo_opt_default_token == NULL)
-                            vfo_opt_default_token = g_strdup(main_token);
-                    }
-
-                    if (sub_token != NULL &&
-                        rigctld_client_try_vfo_opt_roundtrip(client,
-                                                             sub_token,
-                                                             timeout_ms))
-                    {
-                        vfo_opt_args_ok = TRUE;
-                        g_hash_table_replace(vfo_opt_working,
-                                             g_strdup(sub_token),
-                                             GINT_TO_POINTER(1));
-                        if (vfo_opt_default_token == NULL)
-                            vfo_opt_default_token = g_strdup(sub_token);
-                    }
-
-                    if (!rigctld_client_working_tokens_contains(vfo_opt_working,
-                                                                main_token) ||
-                        !rigctld_client_working_tokens_contains(vfo_opt_working,
-                                                                sub_token))
-                    {
-                        vfo_opt_args_ok = FALSE;
-                    }
-                }
-                else
-                {
-                    for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
-                    {
-                        const gchar *token =
-                            g_ptr_array_index(client->caps.vfo_candidates, i);
-                        gchar cmd[96];
-
-                        g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-                        if (!rigctld_client_try_get_freq_retry(client, cmd,
-                                                               &freq, reply,
-                                                               sizeof(reply),
-                                                               timeout_ms, 1))
-                            continue;
-
-                        g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
-                                   token, freq);
-                        if (rigctld_client_try_set_ok(client, cmd,
-                                                      reply, sizeof(reply),
-                                                      timeout_ms))
-                        {
-                            vfo_opt_args_ok = TRUE;
-                            g_hash_table_replace(vfo_opt_working,
-                                                 g_strdup(token),
-                                                 GINT_TO_POINTER(1));
-                            if (vfo_opt_default_token == NULL)
-                                vfo_opt_default_token = g_strdup(token);
-                        }
+                        break;
                     }
                 }
             }
         }
     }
 
-    if (vfo_opt_args_ok &&
-        conf != NULL &&
-        conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB)
-    {
-        const gchar *main_token =
-            rigctld_client_find_working_vfo_token(&client->caps,
-                                                  vfo_opt_working,
-                                                  VFO_MAIN);
-        const gchar *sub_token =
-            rigctld_client_find_working_vfo_token(&client->caps,
-                                                  vfo_opt_working,
-                                                  VFO_SUB);
-
-        if (main_token == NULL || sub_token == NULL)
-            vfo_opt_args_ok = FALSE;
-    }
-
     if (conf != NULL &&
         conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB &&
         vfo_select_ok)
     {
-        /* Main/Sub shared-rig control is more reliable with explicit VFO
-           selection than tokenized F/I/f commands. Prefer the known-good
-           V command path whenever the backend can select both sides. */
+        /* Shared Main/Sub rigs should stay on the simpler V + F path when
+           both sides already prove selectable. The failing logs are on the
+           tokenized F <vfo> <freq> path, so do not promote that strategy. */
         vfo_opt_args_ok = FALSE;
     }
 
     if (vfo_opt_args_ok)
     {
         client->caps.strategy = RIG_STRATEGY_VFO_OPT_ARGS;
-        rigctld_client_replace_working_tokens(&client->caps, vfo_opt_working);
-        g_free(client->caps.vfo_token_main);
-        client->caps.vfo_token_main =
-            g_strdup(rigctld_client_find_working_vfo_token(&client->caps,
-                                                           vfo_opt_working,
-                                                           VFO_MAIN));
-        g_free(client->caps.vfo_token_sub);
-        client->caps.vfo_token_sub =
-            g_strdup(rigctld_client_find_working_vfo_token(&client->caps,
-                                                           vfo_opt_working,
-                                                           VFO_SUB));
-        g_free(client->caps.default_vfo_token);
-        client->caps.default_vfo_token = g_strdup(
-            vfo_opt_default_token ? vfo_opt_default_token : "currVFO");
         if (client->caps.default_vfo_token == NULL)
             client->caps.default_vfo_token = g_strdup("currVFO");
     }
@@ -1226,8 +872,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "no usable control strategy");
-        g_free(vfo_opt_default_token);
-        g_hash_table_destroy(vfo_opt_working);
         return FALSE;
     }
 
@@ -1244,15 +888,11 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "probe failed");
-        g_free(vfo_opt_default_token);
-        g_hash_table_destroy(vfo_opt_working);
         return FALSE;
     }
 
     rigctld_client_set_state(client, RIGCTLD_CLIENT_READY,
                              "strategy=%d", client->caps.strategy);
-    g_free(vfo_opt_default_token);
-    g_hash_table_destroy(vfo_opt_working);
     return TRUE;
 }
 
