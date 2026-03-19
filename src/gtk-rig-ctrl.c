@@ -2411,6 +2411,18 @@ static void rigctrl_refresh_ui_status(GtkRigCtrl *ctrl, const gchar *reason)
                       ctrl->verify_degraded_up ||
                       rig_session_state_is_degraded(ctrl->rig_session) ||
                       rig_session_state_is_degraded(ctrl->rig_session2)));
+
+    if (!snap.engaging &&
+        snap.control_active &&
+        !snap.hard_error &&
+        !snap.link_lost &&
+        ctrl->ui_cmd_window.count == 0)
+    {
+        /* A fresh engage should stay in ENGAGING until the first command
+           outcome arrives instead of flipping through an idle status. */
+        snap.engaging = TRUE;
+    }
+
     snap.active_flow = stats.active;
     snap.consecutive_link_failures = stats.consecutive_link_failures;
     snap.link_fail_count_in_window = stats.link_fail_count;
@@ -7701,6 +7713,9 @@ static gboolean rigctld_force_main_sub_tokens(const GtkRigCtrl *ctrl,
     if (!rigctld_prefer_main_sub_tokens(ctrl))
         return FALSE;
 
+    if (session->strategy != RIG_STRATEGY_VFO_OPT_ARGS)
+        return FALSE;
+
     return (session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0;
 }
 
@@ -7725,12 +7740,24 @@ static void rigctld_force_select_vfo_strategy(GtkRigCtrl *ctrl,
                                               RigSession *session,
                                               const gchar *reason)
 {
+    gint sock = -1;
+
     if (session == NULL)
         return;
+
+    if (ctrl != NULL)
+    {
+        if (session == ctrl->rig_session2)
+            sock = ctrl->sock2;
+        else if (session == ctrl->rig_session)
+            sock = ctrl->sock;
+    }
 
     if (session->strategy == RIG_STRATEGY_SELECT_VFO)
     {
         session->last_selected_vfo_valid = FALSE;
+        if (ctrl != NULL && sock >= 0)
+            rigctld_clear_vfo_map_for_socket(ctrl, sock);
         return;
     }
 
@@ -7740,6 +7767,9 @@ static void rigctld_force_select_vfo_strategy(GtkRigCtrl *ctrl,
     session->last_selected_vfo = VFO_NONE;
     session->last_selected_vfo_valid = FALSE;
     session->strategy_logged = FALSE;
+
+    if (ctrl != NULL && sock >= 0)
+        rigctld_clear_vfo_map_for_socket(ctrl, sock);
 
     rig_term_log(ctrl, "gpredict",
                  "rig session (%s) strategy fallback=SELECT_VFO reason=%s",
@@ -7833,7 +7863,10 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     gboolean *logged_ptr = NULL;
     gchar **target_ptr = NULL;
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
-    gboolean prefer_main_sub = rigctld_prefer_main_sub_tokens(ctrl);
+    gboolean prefer_main_sub =
+        (session != NULL &&
+         session->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
+         rigctld_prefer_main_sub_tokens(ctrl));
     gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
     gboolean allow_unlisted = force_main_sub;
 

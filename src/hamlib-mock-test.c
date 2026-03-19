@@ -46,6 +46,21 @@ static guint16 pick_free_port(void)
     return port;
 }
 
+static gboolean command_matches_any_token(const gchar *line,
+                                          const gchar * const *tokens)
+{
+    if (line == NULL || tokens == NULL)
+        return FALSE;
+
+    for (gint i = 0; tokens[i] != NULL; i++)
+    {
+        if (g_strrstr(line, tokens[i]) != NULL)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
 static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        const gchar *script,
                                        guint16 port,
@@ -412,6 +427,12 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
+    if (caps->strategy != RIG_STRATEGY_SELECT_VFO)
+    {
+        g_printerr("rigctld FULL_DUPLEX_MAIN_SUB should prefer SELECT_VFO over tokenized Main/Sub args\n");
+        ok = FALSE;
+        goto cleanup;
+    }
     if ((caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) == 0)
     {
         g_printerr("rigctld quirk missing (expected IC-9700 signature)\n");
@@ -525,6 +546,10 @@ int main(void)
         HamlibResponseInfo info = { 0 };
         gchar reply[512] = { 0 };
         gchar **lines = NULL;
+        static const gchar *sub_tokens[] =
+            { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+        static const gchar *main_tokens[] =
+            { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
         gint idx_v_sub = -1;
         gint idx_f_set = -1;
         gint idx_v_main = -1;
@@ -597,8 +622,8 @@ int main(void)
             g_strfreev(lines);
             goto cleanup;
         }
-        if (g_strrstr(lines[idx_v_sub], "Sub") == NULL ||
-            g_strrstr(lines[idx_v_main], "Main") == NULL)
+        if (!command_matches_any_token(lines[idx_v_sub], sub_tokens) ||
+            !command_matches_any_token(lines[idx_v_main], main_tokens))
         {
             g_printerr("rigctld VFO token mismatch: sub=%s main=%s\n",
                        lines[idx_v_sub], lines[idx_v_main]);
@@ -613,6 +638,10 @@ int main(void)
         HamlibResponseInfo info = { 0 };
         gchar reply[512] = { 0 };
         gchar **lines = NULL;
+        static const gchar *sub_tokens[] =
+            { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+        static const gchar *main_tokens[] =
+            { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
         const RigCaps *reject_caps = rigctld_client_get_caps(rig_reject);
         gboolean saw_bad_tokenized_set = FALSE;
         gint idx_v_sub = -1;
@@ -710,8 +739,8 @@ int main(void)
             g_strfreev(lines);
             goto cleanup;
         }
-        if (g_strrstr(lines[idx_v_sub], "Sub") == NULL ||
-            g_strrstr(lines[idx_v_main], "Main") == NULL)
+        if (!command_matches_any_token(lines[idx_v_sub], sub_tokens) ||
+            !command_matches_any_token(lines[idx_v_main], main_tokens))
         {
             g_printerr("rigctld downgraded SELECT_VFO token mismatch: sub=%s main=%s\n",
                        lines[idx_v_sub], lines[idx_v_main]);

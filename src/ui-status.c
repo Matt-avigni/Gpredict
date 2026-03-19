@@ -107,7 +107,7 @@ RadioUiStatus radio_compute_ui_status(const RigStateSnapshot *s)
     if (s->link_lost)
         return RADIO_UI_STATUS_LINK_LOST;
     if (!s->active_flow)
-        return RADIO_UI_STATUS_STANDBY;
+        return RADIO_UI_STATUS_STABLE;
     if (s->consecutive_link_failures >= 2u ||
         s->link_fail_count_in_window >= 3u)
         return RADIO_UI_STATUS_LINK_LOST;

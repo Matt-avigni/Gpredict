@@ -688,6 +688,8 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
     const gchar *fallback = (vfo == VFO_SUB) ? "Sub" : "Main";
     const gchar * const *candidates = NULL;
     RigCaps *caps = NULL;
+    gboolean prefer_main_sub = FALSE;
+    gboolean force_main_sub = FALSE;
 
     if (client == NULL)
         return fallback;
@@ -702,10 +704,15 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
     if (vfo == VFO_SUB && caps->vfo_token_sub)
         return caps->vfo_token_sub;
 
-    if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
+    prefer_main_sub = (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
+                       caps->prefer_main_sub_tokens);
+    force_main_sub = (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
+                      (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
+
+    if (force_main_sub)
         candidates = (vfo == VFO_MAIN) ? main_candidates_strict
                                        : sub_candidates_strict;
-    else if (caps->prefer_main_sub_tokens)
+    else if (prefer_main_sub)
         candidates = (vfo == VFO_MAIN) ? main_candidates_prefer
                                        : sub_candidates_prefer;
     else
@@ -1120,6 +1127,16 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
         if (main_token == NULL || sub_token == NULL)
             vfo_opt_args_ok = FALSE;
+    }
+
+    if (conf != NULL &&
+        conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB &&
+        vfo_select_ok)
+    {
+        /* Main/Sub shared-rig control is more reliable with explicit VFO
+           selection than tokenized F/I/f commands. Prefer the known-good
+           V command path whenever the backend can select both sides. */
+        vfo_opt_args_ok = FALSE;
     }
 
     if (vfo_opt_args_ok)

@@ -129,7 +129,7 @@ static void run_rig_tests(void)
                              RADIO_UI_STATUS_LINK_LOST,
                              "rig link lost with 3 link fails in window");
 
-    /* e) inactive (connected) => STANDBY */
+    /* e) inactive (connected) but engaged => STABLE */
     rig_ui_command_window_init(&window);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 100000);
     {
@@ -138,11 +138,11 @@ static void run_rig_tests(void)
         expect_radio_from_window(&window,
                                  idle_now,
                                  TRUE, FALSE, FALSE, FALSE, FALSE,
-                                 RADIO_UI_STATUS_STANDBY,
-                                 "rig standby when inactive");
+                                 RADIO_UI_STATUS_STABLE,
+                                 "rig stable when inactive");
     }
 
-    /* inactive with stale reliability failures still => STANDBY */
+    /* inactive with stale reliability failures still => STABLE */
     rig_ui_command_window_init(&window);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 100000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_COMMAND_REJECT, t0 + 200000);
@@ -153,8 +153,8 @@ static void run_rig_tests(void)
         expect_radio_from_window(&window,
                                  idle_now,
                                  TRUE, FALSE, FALSE, FALSE, FALSE,
-                                 RADIO_UI_STATUS_STANDBY,
-                                 "rig standby when inactive with stale failures");
+                                 RADIO_UI_STATUS_STABLE,
+                                 "rig stable when inactive with stale failures");
     }
 
     /* f) startup/configuration failure => ERROR */
