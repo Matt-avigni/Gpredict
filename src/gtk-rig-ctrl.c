@@ -7713,10 +7713,29 @@ static gboolean rigctld_force_main_sub_tokens(const GtkRigCtrl *ctrl,
     if (!rigctld_prefer_main_sub_tokens(ctrl))
         return FALSE;
 
-    if (session->strategy != RIG_STRATEGY_VFO_OPT_ARGS)
+    if ((session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0)
+        return TRUE;
+
+    return session->rig_model == RIGCTLD_MODEL_IC9700;
+}
+
+static gboolean rigctrl_skip_shared_main_sub_readback(GtkRigCtrl *ctrl,
+                                                      gint sock,
+                                                      vfo_t vfo)
+{
+    rig_strategy_t strategy = RIG_STRATEGY_PLAIN_FREQ;
+
+    if (ctrl == NULL || ctrl->conf == NULL)
         return FALSE;
 
-    return (session->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0;
+    if (ctrl->conf2 != NULL || !is_full_duplex_main_sub_configured(ctrl->conf))
+        return FALSE;
+
+    if (vfo != VFO_MAIN && vfo != VFO_SUB)
+        return FALSE;
+
+    strategy = rig_session_strategy_for_vfo(ctrl, sock, vfo);
+    return strategy == RIG_STRATEGY_SELECT_VFO;
 }
 
 static gboolean rigctld_should_retry_main_sub(GtkRigCtrl *ctrl,
@@ -7864,9 +7883,7 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     gchar **target_ptr = NULL;
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
     gboolean prefer_main_sub =
-        (session != NULL &&
-         session->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
-         rigctld_prefer_main_sub_tokens(ctrl));
+        (session != NULL && rigctld_prefer_main_sub_tokens(ctrl));
     gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
     gboolean allow_unlisted = force_main_sub;
 
@@ -9533,31 +9550,45 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                                                FALSE, rigfreqd, NULL);
             if (set_ok)
             {
-                g_usleep(WR_DEL);
-                read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, TRUE,
-                                                    FALSE, TRUE,
-                                                    &readback, NULL);
-                if (!read_ok)
+                if (rigctrl_skip_shared_main_sub_readback(ctrl, ctrl->sock,
+                                                          set_vfo))
                 {
-                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX readback failed; keeping last");
-                    rigctrl_update_last_sent(ctrl, TRUE, rigfreqd);
-                }
-                else if (rigctrl_verify_match(ctrl, TRUE, set_vfo,
-                                              rigfreqd, readback, 0))
-                {
+                    /* Shared Main/Sub rigs are more stable when we avoid an
+                       immediate readback after every explicit VFO switch. */
+                    g_usleep(WR_DEL);
                     ctrl->errcnt = 0;
-                    ctrl->lastrxf = readback;
-                    ctrl->rig_actual_down_hz = readback;
-                    rigctrl_update_last_sent(ctrl, TRUE, readback);
-                    rigctrl_set_freq_knob_value(ctrl, FALSE,
-                                            (gdouble)readback);
+                    ctrl->lastrxf = rigfreqd;
+                    ctrl->rig_actual_down_hz = rigfreqd;
+                    rigctrl_update_last_sent(ctrl, TRUE, rigfreqd);
                 }
                 else
                 {
-                    ctrl->errcnt++;
-                    ctrl->lastrxf = 0;
-                    rigctrl_update_last_sent(ctrl, TRUE, 0);
+                    g_usleep(WR_DEL);
+                    read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, TRUE,
+                                                        FALSE, TRUE,
+                                                        &readback, NULL);
+                    if (!read_ok)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=RX readback failed; keeping last");
+                        rigctrl_update_last_sent(ctrl, TRUE, rigfreqd);
+                    }
+                    else if (rigctrl_verify_match(ctrl, TRUE, set_vfo,
+                                                  rigfreqd, readback, 0))
+                    {
+                        ctrl->errcnt = 0;
+                        ctrl->lastrxf = readback;
+                        ctrl->rig_actual_down_hz = readback;
+                        rigctrl_update_last_sent(ctrl, TRUE, readback);
+                        rigctrl_set_freq_knob_value(ctrl, FALSE,
+                                                (gdouble)readback);
+                    }
+                    else
+                    {
+                        ctrl->errcnt++;
+                        ctrl->lastrxf = 0;
+                        rigctrl_update_last_sent(ctrl, TRUE, 0);
+                    }
                 }
             }
             else
@@ -9600,31 +9631,43 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
                                                FALSE, rigfrequ, NULL);
             if (set_ok)
             {
-                g_usleep(WR_DEL);
-                read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, FALSE,
-                                                    FALSE, TRUE,
-                                                    &readback, NULL);
-                if (!read_ok)
+                if (rigctrl_skip_shared_main_sub_readback(ctrl, ctrl->sock,
+                                                          set_vfo))
                 {
-                    sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                                "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX readback failed; keeping last");
-                    rigctrl_update_last_sent(ctrl, FALSE, rigfrequ);
-                }
-                else if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
-                                              rigfrequ, readback, 0))
-                {
+                    g_usleep(WR_DEL);
                     ctrl->errcnt = 0;
-                    ctrl->lasttxf = readback;
-                    ctrl->rig_actual_up_hz = readback;
-                    rigctrl_update_last_sent(ctrl, FALSE, readback);
-                    rigctrl_set_freq_knob_value(ctrl, TRUE,
-                                            (gdouble)readback);
+                    ctrl->lasttxf = rigfrequ;
+                    ctrl->rig_actual_up_hz = rigfrequ;
+                    rigctrl_update_last_sent(ctrl, FALSE, rigfrequ);
                 }
                 else
                 {
-                    ctrl->errcnt++;
-                    ctrl->lasttxf = 0;
-                    rigctrl_update_last_sent(ctrl, FALSE, 0);
+                    g_usleep(WR_DEL);
+                    read_ok = rigctrl_get_freq_for_role(ctrl, ctrl->sock, FALSE,
+                                                        FALSE, TRUE,
+                                                        &readback, NULL);
+                    if (!read_ok)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                                    "rig update: mode=FULL_DUPLEX_MAIN_SUB side=TX readback failed; keeping last");
+                        rigctrl_update_last_sent(ctrl, FALSE, rigfrequ);
+                    }
+                    else if (rigctrl_verify_match(ctrl, FALSE, set_vfo,
+                                                  rigfrequ, readback, 0))
+                    {
+                        ctrl->errcnt = 0;
+                        ctrl->lasttxf = readback;
+                        ctrl->rig_actual_up_hz = readback;
+                        rigctrl_update_last_sent(ctrl, FALSE, readback);
+                        rigctrl_set_freq_knob_value(ctrl, TRUE,
+                                                (gdouble)readback);
+                    }
+                    else
+                    {
+                        ctrl->errcnt++;
+                        ctrl->lasttxf = 0;
+                        rigctrl_update_last_sent(ctrl, FALSE, 0);
+                    }
                 }
             }
             else
@@ -14219,7 +14262,9 @@ open_uplink_retry:
         {
             if (is_full_duplex_main_sub_configured(ctrl->conf))
             {
-                exec_full_duplex_main_sub_cycle(ctrl, TRUE);
+                /* Let the first timer tick perform the shared-rig tune. The
+                   IC-9700/rigctld chain is markedly less reliable if we
+                   switch both VFOs immediately after probe/open. */
             }
             else
             {

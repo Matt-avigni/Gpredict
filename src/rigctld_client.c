@@ -14,6 +14,7 @@
 #include "rotctld-parse.h"
 #include "sat-log.h"
 
+#define RIGCTLD_MODEL_IC9700 3081
 #define RIGCTLD_PROBE_RETRY_DELAY_MS 50
 #define RIGCTLD_VFO_TOKEN_MAX 64
 
@@ -704,10 +705,10 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
     if (vfo == VFO_SUB && caps->vfo_token_sub)
         return caps->vfo_token_sub;
 
-    prefer_main_sub = (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
-                       caps->prefer_main_sub_tokens);
-    force_main_sub = (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS &&
-                      (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
+    prefer_main_sub = caps->prefer_main_sub_tokens;
+    force_main_sub = (caps->prefer_main_sub_tokens &&
+                      ((caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0 ||
+                       caps->rig_model == RIGCTLD_MODEL_IC9700));
 
     if (force_main_sub)
         candidates = (vfo == VFO_MAIN) ? main_candidates_strict
@@ -971,6 +972,13 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     client->caps.prefer_main_sub_tokens =
         (conf != NULL && conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
+
+    if (expected_model > 0 && client->caps.rig_model <= 0)
+        client->caps.rig_model = expected_model;
+
+    if (client->caps.rig_model == RIGCTLD_MODEL_IC9700 ||
+        expected_model == RIGCTLD_MODEL_IC9700)
+        client->caps.quirks |= RIG_QUIRK_FORCE_MAIN_SUB;
 
     if (client->caps.vfo_candidates->len == 0)
     {
