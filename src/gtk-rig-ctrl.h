@@ -99,6 +99,7 @@ struct _gtk_rig_ctrl {
     GMutex          busy;       /*!< Flag set when control algorithm is busy. */
     gboolean        engaged;    /*!< Flag indicating that rig device is engaged. */
     gboolean        engage_pending; /*!< True while initial engage attempt is unresolved. */
+    gint            engage_generation; /*!< Monotonic engage/disengage generation for async fencing. */
     gint            errcnt;     /*!< Error counter. */
 
     gboolean        lastrxptt;  /*!< PTT state of last rx cycle. */

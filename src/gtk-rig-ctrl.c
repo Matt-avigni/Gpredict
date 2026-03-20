@@ -947,7 +947,9 @@ static void     rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
 
 /*  add thread for hamlib communication */
 gpointer        rigctl_run(gpointer data);
-static gboolean rigctrl_open_internal(GtkRigCtrl * data);
+static gboolean rigctrl_open_internal(GtkRigCtrl *data,
+                                      guint generation,
+                                      GCancellable *cancellable);
 static void     rigctrl_close(GtkRigCtrl * data);
 static void     setconfig(gpointer data);
 static void     remove_timer(GtkRigCtrl * data);
@@ -2281,12 +2283,19 @@ typedef struct {
 typedef struct {
     GtkRigCtrl *ctrl;
     gboolean secondary;
+    guint generation;
+    gint sock;
 } RigctrlCloseSocketInfo;
 
 typedef struct {
     GtkRigCtrl *ctrl;
     gchar      *reason;
 } RigUiStatusRefreshInfo;
+
+typedef struct {
+    GtkRigCtrl *ctrl;
+    guint generation;
+} RigctrlDeferredActionInfo;
 
 static gboolean rig_session_state_is_engaging(const RigSession *session)
 {
@@ -2698,6 +2707,59 @@ static void rigctrl_set_conn_state(GtkRigCtrl *ctrl,
     rigctrl_queue_ui_status_refresh(ctrl, reason);
 }
 
+static guint rigctrl_get_engage_generation(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return 0;
+
+    return (guint) g_atomic_int_get(&ctrl->engage_generation);
+}
+
+static guint rigctrl_bump_engage_generation(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return 0;
+
+    return (guint) (g_atomic_int_add(&ctrl->engage_generation, 1) + 1);
+}
+
+static gboolean rigctrl_generation_stale(GtkRigCtrl *ctrl, guint generation)
+{
+    if (ctrl == NULL)
+        return TRUE;
+
+    return rigctrl_get_engage_generation(ctrl) != generation;
+}
+
+static gboolean rigctrl_open_attempt_active(GtkRigCtrl *ctrl,
+                                            guint generation,
+                                            GCancellable *cancellable,
+                                            const gchar *stage)
+{
+    guint current_generation;
+
+    if (ctrl == NULL || ctrl->destroying)
+        return FALSE;
+
+    if (cancellable != NULL && g_cancellable_is_cancelled(cancellable))
+        return FALSE;
+
+    current_generation = rigctrl_get_engage_generation(ctrl);
+    if (current_generation == generation)
+        return TRUE;
+
+    if (rigctrl_log_at_least(ctrl, RIG_LOG_VERBOSE))
+    {
+        rig_term_log_verbose(ctrl, "gpredict",
+                             "discarding stale open stage=%s generation=%u current=%u",
+                             stage ? stage : "open",
+                             generation,
+                             current_generation);
+    }
+
+    return FALSE;
+}
+
 static void G_GNUC_UNUSED rig_show_conn_error(GtkRigCtrl *ctrl,
                                 radio_conf_t *conf,
                                 const gchar *role)
@@ -2908,6 +2970,7 @@ typedef struct {
     GtkRigCtrl *ctrl;
     gboolean    secondary;
     gchar      *role;
+    guint       generation;
 } RigctrlReconnectInfo;
 
 static gboolean rigctrl_reconnect_cb(gpointer data)
@@ -2925,7 +2988,9 @@ static gboolean rigctrl_reconnect_cb(gpointer data)
         else
             ctrl->reconnect_source_id = 0;
 
-        if (!ctrl->destroying && ctrl->engaged)
+        if (!ctrl->destroying &&
+            !rigctrl_generation_stale(ctrl, info ? info->generation : 0) &&
+            ctrl->engaged)
         {
             if ((secondary && ctrl->link_lost_latched2) ||
                 (!secondary && ctrl->link_lost_latched))
@@ -3043,6 +3108,7 @@ static void rigctrl_schedule_reconnect(GtkRigCtrl *ctrl, gboolean secondary,
         info->ctrl = g_object_ref(ctrl);
         info->secondary = secondary;
         info->role = g_strdup(role);
+        info->generation = rigctrl_get_engage_generation(ctrl);
 
         *source_ptr = g_timeout_add(backoff, rigctrl_reconnect_cb, info);
         if (*source_ptr == 0)
@@ -3261,6 +3327,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     g_mutex_init(&ctrl->freq_cache_lock);
     ctrl->engaged = FALSE;
     ctrl->engage_pending = FALSE;
+    ctrl->engage_generation = 0;
     ctrl->delay = 1000;
     ctrl->timerid = 0;
     ctrl->errcnt = 0;
@@ -6349,6 +6416,8 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
 
     if (!gtk_toggle_button_get_active(button))
     {
+        rigctrl_bump_engage_generation(ctrl);
+
         /* Disengage: close socket / stop worker thread */
         if (ctrl->DevSel != NULL)
             gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
@@ -6381,6 +6450,8 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     }
     else
     {
+        rigctrl_bump_engage_generation(ctrl);
+
         /* Apply UI settings before starting any worker activity. */
         if (!radio_apply_ui_settings(ctrl, TRUE))
         {
@@ -12820,10 +12891,18 @@ static void rigctrl_handle_socket_error(GtkRigCtrl *ctrl, gint sock,
     else
     {
         RigctrlCloseSocketInfo *info = g_new0(RigctrlCloseSocketInfo, 1);
+        guint source_id;
 
         info->ctrl = g_object_ref(ctrl);
         info->secondary = secondary;
-        g_idle_add(rigctrl_close_socket_idle, info);
+        info->generation = rigctrl_get_engage_generation(ctrl);
+        info->sock = sock;
+        source_id = g_idle_add(rigctrl_close_socket_idle, info);
+        if (source_id == 0)
+        {
+            g_object_unref(info->ctrl);
+            g_free(info);
+        }
     }
 
     rigctrl_cancel_open_task(ctrl);
@@ -13651,9 +13730,12 @@ static void schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
 
 static gboolean rig_disengage_idle(gpointer data)
 {
-    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+    RigctrlDeferredActionInfo *info = data;
+    GtkRigCtrl *ctrl = info ? GTK_RIG_CTRL(info->ctrl) : NULL;
 
-    if (ctrl != NULL && !ctrl->destroying)
+    if (ctrl != NULL &&
+        !ctrl->destroying &&
+        !rigctrl_generation_stale(ctrl, info ? info->generation : 0))
     {
         if (ctrl->DevSel != NULL)
             gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
@@ -13671,21 +13753,28 @@ static gboolean rig_disengage_idle(gpointer data)
     }
     if (ctrl != NULL)
         g_object_unref(ctrl);
+    g_free(info);
 
     return G_SOURCE_REMOVE;
 }
 
 static void schedule_rig_disengage(GtkRigCtrl *ctrl)
 {
+    RigctrlDeferredActionInfo *info;
     guint source_id;
 
     if (ctrl == NULL)
         return;
 
-    g_object_ref(ctrl);
-    source_id = g_idle_add(rig_disengage_idle, ctrl);
+    info = g_new0(RigctrlDeferredActionInfo, 1);
+    info->ctrl = g_object_ref(ctrl);
+    info->generation = rigctrl_get_engage_generation(ctrl);
+    source_id = g_idle_add(rig_disengage_idle, info);
     if (source_id == 0)
-        g_object_unref(ctrl);
+    {
+        g_object_unref(info->ctrl);
+        g_free(info);
+    }
 }
 
 static void rigctrl_fail_engage(GtkRigCtrl *ctrl, const gchar *reason)
@@ -13716,7 +13805,7 @@ static gboolean G_GNUC_UNUSED rigctrl_open_idle(gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
 
-    rigctrl_open_internal(ctrl);
+    rigctrl_open_internal(ctrl, rigctrl_get_engage_generation(ctrl), NULL);
     g_object_unref(ctrl);
 
     return G_SOURCE_REMOVE;
@@ -13726,9 +13815,8 @@ static void rigctrl_open_task(GTask *task, gpointer source_object,
                               gpointer task_data, GCancellable *cancellable)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(source_object);
+    guint generation = GPOINTER_TO_UINT(task_data);
     gboolean ok = FALSE;
-
-    (void)task_data;
 
     if (ctrl == NULL)
     {
@@ -13737,16 +13825,18 @@ static void rigctrl_open_task(GTask *task, gpointer source_object,
         return;
     }
 
-    if (g_cancellable_is_cancelled(cancellable))
+    if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                     "task start"))
     {
         g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
                                 "rig engage cancelled");
         return;
     }
 
-    ok = rigctrl_open_internal(ctrl);
+    ok = rigctrl_open_internal(ctrl, generation, cancellable);
 
-    if (g_cancellable_is_cancelled(cancellable))
+    if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                     "task finish"))
     {
         g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
                                 "rig engage cancelled");
@@ -13760,7 +13850,9 @@ static void rigctrl_open_task_done(GObject *source, GAsyncResult *res,
                                    gpointer user_data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(source);
+    GTask *task = G_TASK(res);
     GError *error = NULL;
+    guint generation = 0;
     gboolean ok = FALSE;
 
     (void)user_data;
@@ -13768,7 +13860,8 @@ static void rigctrl_open_task_done(GObject *source, GAsyncResult *res,
     if (ctrl == NULL)
         return;
 
-    ok = g_task_propagate_boolean(G_TASK(res), &error);
+    generation = GPOINTER_TO_UINT(g_task_get_task_data(task));
+    ok = g_task_propagate_boolean(task, &error);
 
     if (ctrl->open_task != NULL)
         g_clear_object(&ctrl->open_task);
@@ -13776,6 +13869,25 @@ static void rigctrl_open_task_done(GObject *source, GAsyncResult *res,
 
     if (ctrl->destroying)
     {
+        g_clear_error(&error);
+        return;
+    }
+
+    if (rigctrl_generation_stale(ctrl, generation))
+    {
+        ctrl->opening = FALSE;
+        ctrl->opening2 = FALSE;
+
+        if (ctrl->sock >= 0 || ctrl->sock2 >= 0 ||
+            ctrl->conn_state != RIGCTRL_CONN_DISCONNECTED ||
+            ctrl->conn_state2 != RIGCTRL_CONN_DISCONNECTED)
+        {
+            rigctrl_close_internal(ctrl);
+        }
+
+        if (ctrl->engaged)
+            rigctrl_request_open(ctrl, "stale open completion");
+
         g_clear_error(&error);
         return;
     }
@@ -13814,6 +13926,9 @@ static void rigctrl_start_open_task(GtkRigCtrl *ctrl)
     ctrl->open_cancellable = g_cancellable_new();
     ctrl->open_task = g_task_new(ctrl, ctrl->open_cancellable,
                                  rigctrl_open_task_done, NULL);
+    g_task_set_task_data(ctrl->open_task,
+                         GUINT_TO_POINTER(rigctrl_get_engage_generation(ctrl)),
+                         NULL);
     g_task_run_in_thread(ctrl->open_task, rigctrl_open_task);
 }
 
@@ -13862,17 +13977,25 @@ static void rigctrl_request_open(GtkRigCtrl *ctrl, const gchar *reason)
 
 static gboolean rigctrl_close_idle(gpointer data)
 {
-    GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
+    RigctrlDeferredActionInfo *info = data;
+    GtkRigCtrl *ctrl = info ? GTK_RIG_CTRL(info->ctrl) : NULL;
 
-    ctrl->close_pending_id = 0;
-    rigctrl_close_internal(ctrl);
-    g_object_unref(ctrl);
+    if (ctrl != NULL)
+    {
+        ctrl->close_pending_id = 0;
+        if (!rigctrl_generation_stale(ctrl, info ? info->generation : 0))
+            rigctrl_close_internal(ctrl);
+        g_object_unref(ctrl);
+    }
+    g_free(info);
 
     return G_SOURCE_REMOVE;
 }
 
 static void rigctrl_request_close(GtkRigCtrl *ctrl)
 {
+    RigctrlDeferredActionInfo *info;
+
     if (ctrl == NULL)
         return;
 
@@ -13885,8 +14008,15 @@ static void rigctrl_request_close(GtkRigCtrl *ctrl)
     if (ctrl->close_pending_id != 0)
         return;
 
-    g_object_ref(ctrl);
-    ctrl->close_pending_id = g_idle_add(rigctrl_close_idle, ctrl);
+    info = g_new0(RigctrlDeferredActionInfo, 1);
+    info->ctrl = g_object_ref(ctrl);
+    info->generation = rigctrl_get_engage_generation(ctrl);
+    ctrl->close_pending_id = g_idle_add(rigctrl_close_idle, info);
+    if (ctrl->close_pending_id == 0)
+    {
+        g_object_unref(info->ctrl);
+        g_free(info);
+    }
 }
 
 static void rigctrl_close(GtkRigCtrl * data)
@@ -14009,28 +14139,38 @@ static void rigctrl_close_socket_internal(GtkRigCtrl *ctrl, gboolean secondary)
 static gboolean rigctrl_close_socket_idle(gpointer data)
 {
     RigctrlCloseSocketInfo *info = data;
+    GtkRigCtrl *ctrl = info ? info->ctrl : NULL;
+    gint current_sock = -1;
 
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
-    if (info->ctrl != NULL)
-        rigctrl_close_socket_internal(info->ctrl, info->secondary);
+    if (ctrl != NULL &&
+        !rigctrl_generation_stale(ctrl, info->generation))
+    {
+        current_sock = info->secondary ? ctrl->sock2 : ctrl->sock;
+        if (info->sock < 0 || current_sock == info->sock)
+            rigctrl_close_socket_internal(ctrl, info->secondary);
+    }
 
-    if (info->ctrl != NULL)
-        g_object_unref(info->ctrl);
+    if (ctrl != NULL)
+        g_object_unref(ctrl);
     g_free(info);
 
     return G_SOURCE_REMOVE;
 }
 
-static gboolean rigctrl_open_internal(GtkRigCtrl * data)
+static gboolean rigctrl_open_internal(GtkRigCtrl *data,
+                                      guint generation,
+                                      GCancellable *cancellable)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(data);
     gboolean        rx_opened = FALSE;
     gboolean        tx_opened = FALSE;
     gboolean        tx_ok = TRUE;
 
-    if (ctrl == NULL || ctrl->destroying || !ctrl->engaged)
+    if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                     "open start"))
         return FALSE;
 
     if (ctrl->conf == NULL)
@@ -14090,6 +14230,13 @@ open_receiver_retry:
                                                     FALSE, _("receiver"),
                                                     &error_reported))
             {
+                if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                                 "receiver open failed"))
+                {
+                    ctrl->opening = FALSE;
+                    ctrl->opening2 = FALSE;
+                    return FALSE;
+                }
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: receiver rig open/probe failed"), __func__);
                 close_rigctld_socket(ctrl, &(ctrl->sock),
@@ -14116,6 +14263,13 @@ open_receiver_retry:
             rig_session_reset(session);
             rig_session_set_state(ctrl, session, RIG_SESSION_CONNECTING,
                                   "connected");
+            if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                             "receiver connected"))
+            {
+                ctrl->opening = FALSE;
+                ctrl->opening2 = FALSE;
+                return FALSE;
+            }
             if (!rig_session_probe_and_configure(ctrl, session,
                                                  ctrl->sock, ctrl->conf))
             {
@@ -14148,6 +14302,13 @@ open_receiver_retry:
                     goto open_receiver_retry;
                 }
                 g_free(log_tail);
+                if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                                 "receiver probe failed"))
+                {
+                    ctrl->opening = FALSE;
+                    ctrl->opening2 = FALSE;
+                    return FALSE;
+                }
                 if (stale_device && !ctrl->rx_conn_error_reported)
                 {
                     schedule_rig_backend_error(ctrl, ctrl->conf, _("receiver"));
@@ -14168,6 +14329,13 @@ open_receiver_retry:
             }
         }
 
+        if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                         "receiver ready"))
+        {
+            ctrl->opening = FALSE;
+            ctrl->opening2 = FALSE;
+            return FALSE;
+        }
         rigctrl_reset_reconnect(ctrl, FALSE);
         rx_opened = TRUE;
 
@@ -14217,6 +14385,13 @@ open_uplink_retry:
                 rig_session_reset(session);
                 rig_session_set_state(ctrl, session, RIG_SESSION_CONNECTING,
                                       "connected");
+                if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                                 "uplink connected"))
+                {
+                    ctrl->opening = FALSE;
+                    ctrl->opening2 = FALSE;
+                    return FALSE;
+                }
                 tx_ok = rig_session_probe_and_configure(ctrl, session,
                                                         ctrl->sock2,
                                                         ctrl->conf2);
@@ -14248,6 +14423,13 @@ open_uplink_retry:
             }
             if (!tx_ok)
             {
+                if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                                 "uplink open failed"))
+                {
+                    ctrl->opening = FALSE;
+                    ctrl->opening2 = FALSE;
+                    return FALSE;
+                }
                 sat_log_log(SAT_LOG_LEVEL_ERROR,
                             _("%s: uplink rig open/probe failed"), __func__);
                 if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
@@ -14272,6 +14454,13 @@ open_uplink_retry:
 
         if (tx_ok)
         {
+            if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                             "uplink ready"))
+            {
+                ctrl->opening = FALSE;
+                ctrl->opening2 = FALSE;
+                return FALSE;
+            }
             rigctrl_reset_reconnect(ctrl, TRUE);
             tx_opened = TRUE;
             ctrl->conf2->vfo_opt = (ctrl->rig_session2 &&
@@ -14284,6 +14473,13 @@ open_uplink_retry:
 
     if (ctrl->sock < 0)
     {
+        if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                         "primary socket unavailable"))
+        {
+            ctrl->opening = FALSE;
+            ctrl->opening2 = FALSE;
+            return FALSE;
+        }
         rigctrl_fail_engage(ctrl, "uplink open/probe failed");
         rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                "open failed");
@@ -14292,6 +14488,13 @@ open_uplink_retry:
         return FALSE;
     }
 
+    if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                     "before initial tune"))
+    {
+        ctrl->opening = FALSE;
+        ctrl->opening2 = FALSE;
+        return FALSE;
+    }
     ctrl->engage_pending = FALSE;
     rigctrl_seed_user_base_from_ui(ctrl, "engage");
 
@@ -14373,6 +14576,13 @@ open_uplink_retry:
         }
     }
 
+    if (!rigctrl_open_attempt_active(ctrl, generation, cancellable,
+                                     "commit connected state"))
+    {
+        ctrl->opening = FALSE;
+        ctrl->opening2 = FALSE;
+        return FALSE;
+    }
     ctrl->opening = FALSE;
     ctrl->opening2 = FALSE;
 
