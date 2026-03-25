@@ -63,6 +63,7 @@ typedef struct {
     GtkWidget *rigctld_baud; /* rigctld baud */
     GtkWidget *rigctld_civaddr; /* rigctld CI-V address */
     GtkWidget *rigctld_extra_args; /* rigctld extra args */
+    GtkWidget *rigctld_identity_hint; /* rig autodetect identity hint */
     gint rigctld_model_custom; /* remember custom rig model */
     radio_model_t last_radio_model;
     gboolean ui_updating;
@@ -535,6 +536,8 @@ static void update_autostart_sensitivity(RigPrefUi *ui, gboolean enabled)
     gtk_widget_set_sensitive(ui->rigctld_device, enabled);
     gtk_widget_set_sensitive(ui->rigctld_civaddr, enabled);
     gtk_widget_set_sensitive(ui->rigctld_extra_args, enabled);
+    if (ui->rigctld_identity_hint != NULL)
+        gtk_widget_set_sensitive(ui->rigctld_identity_hint, enabled);
     update_rigctld_connection_ui(ui, enabled);
 }
 
@@ -821,6 +824,7 @@ static void clear_widgets(RigPrefUi *ui)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->rigctld_baud), 0);
     gtk_entry_set_text(GTK_ENTRY(ui->rigctld_civaddr), "");
     gtk_entry_set_text(GTK_ENTRY(ui->rigctld_extra_args), "");
+    gtk_entry_set_text(GTK_ENTRY(ui->rigctld_identity_hint), "");
     update_autostart_sensitivity(ui, TRUE);
 
     rig_pref_ui_end_update(ui, "clear_widgets");
@@ -927,6 +931,10 @@ static void update_widgets(RigPrefUi *ui, radio_conf_t * conf)
     if (conf->rigctld_extra_args)
         gtk_entry_set_text(GTK_ENTRY(ui->rigctld_extra_args),
                            conf->rigctld_extra_args);
+    gtk_entry_set_text(GTK_ENTRY(ui->rigctld_identity_hint), "");
+    if (conf->rigctld_autodetect_match)
+        gtk_entry_set_text(GTK_ENTRY(ui->rigctld_identity_hint),
+                           conf->rigctld_autodetect_match);
     apply_preset_rigctld_defaults(ui, conf->radio_model, FALSE);
     update_autostart_sensitivity(ui, conf->rigctld_autostart);
 
@@ -1572,22 +1580,42 @@ static GtkWidget *create_editor_widgets(RigPrefUi *ui, radio_conf_t * conf)
     gtk_widget_set_tooltip_text(ui->rigctld_extra_args,
                                 _("Extra rigctld arguments (optional)."));
     gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_extra_args, 1, 3, 3, 1);
+    g_signal_connect(ui->rigctld_extra_args, "changed",
+                     G_CALLBACK(rig_pref_on_field_changed), ui);
+
+    /* rig autodetect identity hint */
+    label = gtk_label_new(_("Identity hint"));
+    g_object_set(label, "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(advanced_table), label, 0, 4, 1, 1);
+
+    ui->rigctld_identity_hint = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(ui->rigctld_identity_hint), 200);
+    gtk_widget_set_tooltip_text(
+        ui->rigctld_identity_hint,
+        _("Optional substring used to narrow rig autodetect candidates "
+          "(for example part of a USB serial path)."));
+    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_identity_hint, 1, 4,
+                    3, 1);
+    g_signal_connect(ui->rigctld_identity_hint, "changed",
+                     G_CALLBACK(rig_pref_on_field_changed), ui);
 
     /* rigctld device (manual override) */
     ui->rigctld_device_label = gtk_label_new(_("Serial device (manual)"));
     g_object_set(ui->rigctld_device_label, "xalign", 1.0, "yalign", 0.5, NULL);
-    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_device_label, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_device_label, 0, 5, 1, 1);
 
     ui->rigctld_device = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(ui->rigctld_device), 200);
     gtk_widget_set_tooltip_text(ui->rigctld_device,
                                 _("Manual serial device override (e.g. /dev/cu.usbserial-1234)."));
-    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_device, 1, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_device, 1, 5, 2, 1);
+    g_signal_connect(ui->rigctld_device, "changed",
+                     G_CALLBACK(rig_pref_on_field_changed), ui);
 
     ui->rigctld_device_find = gtk_button_new_with_label(_("Choose..."));
     gtk_widget_set_tooltip_text(ui->rigctld_device_find,
                                 _("Choose a serial port from the available list."));
-    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_device_find, 3, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(advanced_table), ui->rigctld_device_find, 3, 5, 1, 1);
     g_signal_connect(ui->rigctld_device_find, "clicked",
                      G_CALLBACK(rigctld_find_port_cb), ui);
 
@@ -1761,6 +1789,11 @@ static gboolean apply_changes(RigPrefUi *ui, radio_conf_t * conf)
         g_free(conf->rigctld_extra_args);
     conf->rigctld_extra_args =
         g_strdup(gtk_entry_get_text(GTK_ENTRY(ui->rigctld_extra_args)));
+
+    if (conf->rigctld_autodetect_match)
+        g_free(conf->rigctld_autodetect_match);
+    conf->rigctld_autodetect_match =
+        g_strdup(gtk_entry_get_text(GTK_ENTRY(ui->rigctld_identity_hint)));
 
     return TRUE;
 }

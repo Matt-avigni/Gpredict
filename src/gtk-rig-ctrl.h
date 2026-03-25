@@ -191,6 +191,9 @@ struct _gtk_rig_ctrl {
     gboolean        edit_secondary;         /*!< Suppress reconnect while editing secondary config. */
     GHashTable     *autostart_error_reported; /*!< Deduplicate autostart error dialogs. */
     GHashTable     *missing_model_reported;   /*!< Deduplicate missing model dialogs. */
+    GHashTable     *autodetect_reserved_devices; /*!< Per-engage device reservations keyed by serial path. */
+    GMutex          probe_confirm_lock;        /*!< Guards probe confirmation request pointer. */
+    gpointer        probe_confirm_request;     /*!< Active dual-rig probe confirmation request. */
 
     /* debug related */
     guint           wrops;

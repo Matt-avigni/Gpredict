@@ -153,6 +153,8 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTRL_RESPONSE_OPEN_CONFIG 1001
 #define RIGCTRL_RESPONSE_DISABLE_AUTOSTART 1002
 #define RIGCTRL_RESPONSE_SHOW_LOG 1003
+#define RIGCTRL_RESPONSE_USE_RADIO 1004
+#define RIGCTRL_RESPONSE_TRY_NEXT 1005
 #define RIGCTRL_TRSP_POPUP_MAX_HEIGHT 360
 #define RIGCTRL_TRSP_POPUP_MAX_FACTOR 0.45
 #define RIGCTRL_TRSP_POPUP_SEARCH_THRESHOLD 20
@@ -205,6 +207,31 @@ typedef enum {
     RIG_BASE_SRC_PRESET,
     RIG_BASE_SRC_MANUAL
 } rig_base_source_t;
+
+typedef struct {
+    gchar                  *device;
+    gchar                  *civaddr;
+    gint                    detected_model;
+    gchar                  *signature;
+    gboolean                have_frequency;
+    gint64                  frequency_hz;
+    rigctld_probe_result_t  probe_result;
+    gboolean                listening_fallback;
+} RigAutodetectIdentity;
+
+typedef struct {
+    GtkRigCtrl             *ctrl;
+    guint                   generation;
+    gchar                  *rig_id;
+    gchar                  *role_label;
+    RigAutodetectIdentity   identity;
+    GMutex                  lock;
+    GCond                   cond;
+    GtkWidget              *dialog;
+    gboolean                cancelled;
+    gboolean                completed;
+    gint                    response;
+} RigProbeConfirmRequest;
 
 typedef struct _RigSession {
     rig_session_state_t state;
@@ -677,6 +704,7 @@ static gboolean open_rigctld_socket_with_autostart(GtkRigCtrl *ctrl,
                                                    gboolean *error_reported);
 static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                                           radio_conf_t *conf,
+                                          gboolean secondary,
                                           const gchar *role,
                                           gboolean *error_reported);
 static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
@@ -705,6 +733,7 @@ static void     schedule_rig_autodetect_error(GtkRigCtrl *ctrl,
 static void     schedule_rig_missing_model_dialog(GtkRigCtrl *ctrl,
                                                   const radio_conf_t *conf);
 static void     schedule_rig_disengage(GtkRigCtrl *ctrl);
+static void     rigctrl_cancel_probe_confirmation(GtkRigCtrl *ctrl);
 static void     rig_engaged_cb(GtkToggleButton * button, gpointer data);
 static gboolean radio_apply_ui_settings(GtkRigCtrl *ctrl, gboolean strict);
 static gboolean rigctrl_cycle_focus_out_cb(GtkWidget *widget,
@@ -827,6 +856,12 @@ static void     rigctrl_set_conn_state(GtkRigCtrl *ctrl,
 static void     rigctrl_cancel_reconnect(GtkRigCtrl *ctrl, gboolean secondary);
 static void     rigctrl_cancel_open_task(GtkRigCtrl *ctrl);
 static void     rigctrl_request_open(GtkRigCtrl *ctrl, const gchar *reason);
+static guint    rigctrl_get_engage_generation(GtkRigCtrl *ctrl);
+static gboolean rigctrl_generation_stale(GtkRigCtrl *ctrl, guint generation);
+static gboolean rigctrl_open_attempt_active(GtkRigCtrl *ctrl,
+                                            guint generation,
+                                            GCancellable *cancellable,
+                                            const gchar *context);
 static gboolean G_GNUC_UNUSED rigctrl_open_idle(gpointer data);
 static void     rigctrl_start_open_task(GtkRigCtrl *ctrl);
 static void     rigctrl_open_task(GTask *task, gpointer source_object,
@@ -929,6 +964,9 @@ static void     rigctrl_update_conf_from_disk(GtkRigCtrl *ctrl,
                                               const radio_conf_t *updated);
 static void     rigctrl_open_radio_config(GtkRigCtrl *ctrl,
                                           const gchar *rig_id);
+static void     rigctld_extract_first_lines(const gchar *text,
+                                            gchar **line1_out,
+                                            gchar **line2_out);
 static void     rigctrl_disable_autostart(GtkRigCtrl *ctrl,
                                           const gchar *rig_id);
 static gchar   *rigctrl_combo_get_active_id(GtkComboBox *box,
@@ -1125,6 +1163,502 @@ static void rigctrl_warn_shared_uplink_mode(GtkRigCtrl *ctrl,
     }
 
     g_free(secondary);
+}
+
+static void rigctld_autodetect_identity_clear(RigAutodetectIdentity *identity)
+{
+    if (identity == NULL)
+        return;
+
+    g_free(identity->device);
+    g_free(identity->civaddr);
+    g_free(identity->signature);
+    memset(identity, 0, sizeof(*identity));
+}
+
+static gchar *rigctld_probe_signature_from_reply(const gchar *reply)
+{
+    gchar *line1 = NULL;
+    gchar *line2 = NULL;
+    gchar *backend = NULL;
+    gchar *signature = NULL;
+    gchar **lines = NULL;
+
+    if (reply == NULL || *reply == '\0')
+        return NULL;
+
+    rigctld_extract_first_lines(reply, &line1, &line2);
+    lines = g_strsplit(reply, "\n", -1);
+    for (gint i = 0; lines != NULL && lines[i] != NULL; i++)
+    {
+        gchar *line = g_strstrip(lines[i]);
+        gchar *lower = NULL;
+
+        if (line[0] == '\0')
+            continue;
+
+        lower = g_ascii_strdown(line, -1);
+        if (g_strrstr(lower, "hamlib") != NULL ||
+            g_strrstr(lower, "rigctld") != NULL ||
+            g_strrstr(lower, "backend") != NULL)
+        {
+            backend = g_strdup(line);
+            g_free(lower);
+            break;
+        }
+        g_free(lower);
+    }
+    g_strfreev(lines);
+
+    if (backend != NULL && *backend != '\0')
+        signature = g_strdup(backend);
+    else if (line1 != NULL && line2 != NULL)
+        signature = g_strdup_printf("%s | %s", line1, line2);
+    else if (line2 != NULL)
+        signature = g_strdup(line2);
+    else if (line1 != NULL)
+        signature = g_strdup(line1);
+
+    g_free(line1);
+    g_free(line2);
+    g_free(backend);
+    return signature;
+}
+
+static gboolean rigctld_parse_frequency_reply(const gchar *reply,
+                                              gint64 *freq_out)
+{
+    const gchar *scan = reply;
+    gchar *endptr = NULL;
+
+    if (freq_out != NULL)
+        *freq_out = 0;
+
+    if (reply == NULL || *reply == '\0')
+        return FALSE;
+
+    while (*scan != '\0')
+    {
+        if (g_ascii_isdigit(*scan) || *scan == '+' || *scan == '-')
+        {
+            gint64 value = g_ascii_strtoll(scan, &endptr, 10);
+
+            if (endptr != scan)
+            {
+                if (freq_out != NULL)
+                    *freq_out = value;
+                return TRUE;
+            }
+        }
+        scan++;
+    }
+
+    return FALSE;
+}
+
+static gboolean rigctld_probe_read_frequency(gint sock,
+                                             gint timeout_ms,
+                                             gint64 *freq_out)
+{
+    GString *rxbuf = NULL;
+    gchar buffer[256];
+    gint size;
+    gint err = 0;
+    const gchar *cmd = "f\n";
+
+    if (freq_out != NULL)
+        *freq_out = 0;
+
+    if (send(sock, cmd, strlen(cmd), 0) != (gssize) strlen(cmd))
+        return FALSE;
+
+    rxbuf = rigctld_rxbuf_new(128);
+    size = (gint) rigctld_read_response(sock, rxbuf,
+                                        RIGCTLD_READ_MULTILINE_RPRT,
+                                        buffer, sizeof(buffer),
+                                        timeout_ms,
+                                        RIGCTLD_FOLLOW_IDLE_MS,
+                                        NULL, NULL, &err);
+    rigctld_rxbuf_free(&rxbuf);
+    if (size <= 0)
+        return FALSE;
+
+    buffer[size] = '\0';
+    return rigctld_parse_frequency_reply(buffer, freq_out);
+}
+
+static gboolean rigctrl_dual_rig_autodetect_active(const GtkRigCtrl *ctrl)
+{
+    return (ctrl != NULL && ctrl->conf2 != NULL);
+}
+
+static const gchar *rigctrl_probe_role_label(gboolean secondary)
+{
+    return secondary ? _("Uplink") : _("Downlink");
+}
+
+static const gchar *rigctld_cached_device(const radio_conf_t *conf)
+{
+    if (rigctld_device_cache == NULL || conf == NULL ||
+        conf->name == NULL || *conf->name == '\0')
+        return NULL;
+
+    return g_hash_table_lookup(rigctld_device_cache, conf->name);
+}
+
+static void rigctld_cache_device(const radio_conf_t *conf,
+                                 const gchar *device)
+{
+    if (conf == NULL || conf->name == NULL || *conf->name == '\0' ||
+        device == NULL || *device == '\0')
+        return;
+
+    if (rigctld_device_cache == NULL)
+    {
+        rigctld_device_cache =
+            g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    }
+
+    g_hash_table_replace(rigctld_device_cache,
+                         g_strdup(conf->name),
+                         g_strdup(device));
+}
+
+static void rigctrl_autodetect_reservations_reset(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    if (ctrl->autodetect_reserved_devices == NULL)
+    {
+        ctrl->autodetect_reserved_devices =
+            g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        return;
+    }
+
+    g_hash_table_remove_all(ctrl->autodetect_reserved_devices);
+}
+
+static void rigctrl_autodetect_reserve_device(GtkRigCtrl *ctrl,
+                                              const radio_conf_t *conf,
+                                              const gchar *device)
+{
+    if (ctrl == NULL || conf == NULL ||
+        conf->name == NULL || *conf->name == '\0' ||
+        device == NULL || *device == '\0')
+        return;
+
+    if (ctrl->autodetect_reserved_devices == NULL)
+    {
+        ctrl->autodetect_reserved_devices =
+            g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    }
+
+    g_hash_table_replace(ctrl->autodetect_reserved_devices,
+                         g_strdup(device),
+                         g_strdup(conf->name));
+}
+
+static gboolean rigctrl_autodetect_device_reserved(GtkRigCtrl *ctrl,
+                                                   const radio_conf_t *conf,
+                                                   const gchar *device)
+{
+    const gchar *owner = NULL;
+
+    if (ctrl == NULL || ctrl->autodetect_reserved_devices == NULL ||
+        device == NULL || *device == '\0')
+        return FALSE;
+
+    owner = g_hash_table_lookup(ctrl->autodetect_reserved_devices, device);
+    if (owner == NULL)
+        return FALSE;
+
+    if (conf != NULL && conf->name != NULL &&
+        g_strcmp0(owner, conf->name) == 0)
+        return FALSE;
+
+    return TRUE;
+}
+
+static void rigctrl_autodetect_seed_reservations(GtkRigCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    rigctrl_autodetect_reservations_reset(ctrl);
+
+    if (!rigctrl_dual_rig_autodetect_active(ctrl))
+        return;
+
+    if (ctrl->conf != NULL &&
+        ctrl->conf->rigctld_device != NULL &&
+        *ctrl->conf->rigctld_device != '\0' &&
+        ctrl->sock >= 0)
+    {
+        rigctrl_autodetect_reserve_device(ctrl, ctrl->conf,
+                                          ctrl->conf->rigctld_device);
+    }
+
+    if (ctrl->conf2 != NULL &&
+        ctrl->conf2->rigctld_device != NULL &&
+        *ctrl->conf2->rigctld_device != '\0' &&
+        ctrl->sock2 >= 0)
+    {
+        rigctrl_autodetect_reserve_device(ctrl, ctrl->conf2,
+                                          ctrl->conf2->rigctld_device);
+    }
+}
+
+static gchar *rigctrl_format_probe_frequency(gint64 hz)
+{
+    return g_strdup_printf("%.6f MHz (%" G_GINT64_FORMAT " Hz)",
+                           (gdouble) hz / 1.0e6,
+                           hz);
+}
+
+static gboolean rigctrl_cancel_probe_dialog_idle(gpointer data)
+{
+    GtkWidget *dialog = GTK_WIDGET(data);
+
+    if (GTK_IS_DIALOG(dialog))
+        gtk_dialog_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+
+    g_object_unref(dialog);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean rigctrl_probe_confirm_idle(gpointer data)
+{
+    RigProbeConfirmRequest *request = data;
+    GtkWidget *dialog = NULL;
+    GtkWidget *toplevel = NULL;
+    GtkWindow *parent = NULL;
+    gchar *detail = NULL;
+    gchar *frequency = NULL;
+    gchar *title = NULL;
+    gint response = GTK_RESPONSE_CANCEL;
+    gboolean cancelled = FALSE;
+
+    if (request == NULL)
+        return G_SOURCE_REMOVE;
+
+    g_mutex_lock(&request->lock);
+    cancelled = request->cancelled;
+    g_mutex_unlock(&request->lock);
+
+    if (cancelled || request->ctrl == NULL || request->ctrl->destroying)
+        goto out;
+
+    toplevel = gtk_widget_get_toplevel(GTK_WIDGET(request->ctrl));
+    if (GTK_IS_WINDOW(toplevel))
+        parent = GTK_WINDOW(toplevel);
+
+    title = request->role_label
+        ? g_strdup_printf(_("Confirm %s radio"), request->role_label)
+        : g_strdup(_("Confirm radio"));
+
+    dialog = gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_NONE,
+        "%s",
+        title);
+
+    if (request->identity.have_frequency)
+        frequency = rigctrl_format_probe_frequency(request->identity.frequency_hz);
+
+    detail = g_strdup_printf(
+        _("Gpredict found more than one candidate for the %s role.\n\n"
+          "Device: %s\n"
+          "CI-V addr: %s\n"
+          "Detected model: %d\n"
+          "Signature: %s\n"
+          "Current frequency: %s\n"
+          "Probe status: %s"),
+        request->role_label ? request->role_label : _("radio"),
+        request->identity.device ? request->identity.device : _("(unknown)"),
+        (request->identity.civaddr && *request->identity.civaddr)
+            ? request->identity.civaddr
+            : _("(none)"),
+        request->identity.detected_model,
+        (request->identity.signature && *request->identity.signature)
+            ? request->identity.signature
+            : _("(unavailable)"),
+        frequency ? frequency : _("(unavailable)"),
+        request->identity.listening_fallback
+            ? _("Listening only")
+            : rigctld_probe_result_name(request->identity.probe_result));
+
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+                                             "%s",
+                                             detail);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Use this radio"),
+                          RIGCTRL_RESPONSE_USE_RADIO);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Try next"),
+                          RIGCTRL_RESPONSE_TRY_NEXT);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Open Radio Config"),
+                          RIGCTRL_RESPONSE_OPEN_CONFIG);
+    gtk_dialog_add_button(GTK_DIALOG(dialog),
+                          _("Abort"),
+                          GTK_RESPONSE_CANCEL);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog),
+                                    RIGCTRL_RESPONSE_USE_RADIO);
+
+    g_mutex_lock(&request->lock);
+    request->dialog = dialog;
+    cancelled = request->cancelled;
+    g_mutex_unlock(&request->lock);
+
+    if (cancelled)
+    {
+        gtk_widget_destroy(dialog);
+        dialog = NULL;
+        goto out;
+    }
+
+    gtk_widget_show_all(dialog);
+    response = gtk_dialog_run(GTK_DIALOG(dialog));
+    if (response == RIGCTRL_RESPONSE_OPEN_CONFIG &&
+        request->rig_id != NULL && *request->rig_id != '\0' &&
+        request->ctrl != NULL && !request->ctrl->destroying)
+    {
+        rigctrl_open_radio_config(request->ctrl, request->rig_id);
+    }
+    gtk_widget_destroy(dialog);
+    dialog = NULL;
+
+out:
+    g_free(title);
+    if (detail != NULL)
+        g_free(detail);
+    if (frequency != NULL)
+        g_free(frequency);
+
+    g_mutex_lock(&request->lock);
+    request->dialog = NULL;
+    request->response = response;
+    request->completed = TRUE;
+    g_cond_signal(&request->cond);
+    g_mutex_unlock(&request->lock);
+
+    return G_SOURCE_REMOVE;
+}
+
+static gint rigctrl_confirm_probe_identity(GtkRigCtrl *ctrl,
+                                           guint generation,
+                                           gboolean secondary,
+                                           const radio_conf_t *conf,
+                                           const RigAutodetectIdentity *identity)
+{
+    RigProbeConfirmRequest *request = NULL;
+    gint response = GTK_RESPONSE_CANCEL;
+
+    if (ctrl == NULL || conf == NULL || identity == NULL)
+        return GTK_RESPONSE_CANCEL;
+
+    request = g_new0(RigProbeConfirmRequest, 1);
+    request->ctrl = g_object_ref(ctrl);
+    request->generation = generation;
+    request->rig_id = g_strdup(conf->name);
+    request->role_label = g_strdup(rigctrl_probe_role_label(secondary));
+    request->identity.device = g_strdup(identity->device);
+    request->identity.civaddr = g_strdup(identity->civaddr);
+    request->identity.detected_model = identity->detected_model;
+    request->identity.signature = g_strdup(identity->signature);
+    request->identity.have_frequency = identity->have_frequency;
+    request->identity.frequency_hz = identity->frequency_hz;
+    request->identity.probe_result = identity->probe_result;
+    request->identity.listening_fallback = identity->listening_fallback;
+    g_mutex_init(&request->lock);
+    g_cond_init(&request->cond);
+    request->dialog = NULL;
+    request->cancelled = FALSE;
+    request->completed = FALSE;
+    request->response = GTK_RESPONSE_CANCEL;
+
+    g_mutex_lock(&ctrl->probe_confirm_lock);
+    ctrl->probe_confirm_request = request;
+    g_mutex_unlock(&ctrl->probe_confirm_lock);
+
+    g_main_context_invoke(NULL, rigctrl_probe_confirm_idle, request);
+
+    g_mutex_lock(&request->lock);
+    while (!request->completed)
+    {
+        GtkWidget *dialog = NULL;
+        gint64 deadline = g_get_monotonic_time() + (250 * 1000);
+
+        g_cond_wait_until(&request->cond, &request->lock, deadline);
+        if (!request->completed &&
+            !request->cancelled &&
+            (ctrl->destroying || rigctrl_generation_stale(ctrl, generation)))
+        {
+            request->cancelled = TRUE;
+            if (request->dialog != NULL)
+                dialog = g_object_ref(request->dialog);
+        }
+
+        if (dialog != NULL)
+        {
+            g_mutex_unlock(&request->lock);
+            g_main_context_invoke(NULL, rigctrl_cancel_probe_dialog_idle, dialog);
+            g_mutex_lock(&request->lock);
+        }
+    }
+    response = request->response;
+    g_mutex_unlock(&request->lock);
+
+    g_mutex_lock(&ctrl->probe_confirm_lock);
+    if (ctrl->probe_confirm_request == request)
+        ctrl->probe_confirm_request = NULL;
+    g_mutex_unlock(&ctrl->probe_confirm_lock);
+
+    rigctld_autodetect_identity_clear(&request->identity);
+    g_free(request->rig_id);
+    g_free(request->role_label);
+    g_cond_clear(&request->cond);
+    g_mutex_clear(&request->lock);
+    g_object_unref(request->ctrl);
+    g_free(request);
+
+    return response;
+}
+
+static void rigctrl_cancel_probe_confirmation(GtkRigCtrl *ctrl)
+{
+    RigProbeConfirmRequest *request = NULL;
+    GtkWidget *dialog = NULL;
+
+    if (ctrl == NULL)
+        return;
+
+    g_mutex_lock(&ctrl->probe_confirm_lock);
+    request = ctrl->probe_confirm_request;
+    if (request != NULL)
+    {
+        g_mutex_lock(&request->lock);
+        request->cancelled = TRUE;
+        if (request->dialog != NULL)
+            dialog = g_object_ref(request->dialog);
+        g_mutex_unlock(&request->lock);
+    }
+    g_mutex_unlock(&ctrl->probe_confirm_lock);
+
+    if (dialog == NULL)
+        return;
+
+    if (rigctrl_on_main_thread(ctrl))
+    {
+        gtk_dialog_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+        g_object_unref(dialog);
+        return;
+    }
+
+    g_idle_add(rigctrl_cancel_probe_dialog_idle, dialog);
 }
 
 static void rigctrl_register_combo_quarantine_cb(GtkWidget *widget,
@@ -3128,6 +3662,7 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
 
     ctrl->destroying = TRUE;
     rigctrl_cancel_open_task(ctrl);
+    rigctrl_cancel_probe_confirmation(ctrl);
     g_clear_object(&ctrl->open_task);
     g_clear_object(&ctrl->open_cancellable);
     rigctrl_cancel_reconnect(ctrl, FALSE);
@@ -3196,6 +3731,12 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         g_hash_table_destroy(ctrl->missing_model_reported);
         ctrl->missing_model_reported = NULL;
     }
+    if (ctrl->autodetect_reserved_devices != NULL)
+    {
+        g_hash_table_destroy(ctrl->autodetect_reserved_devices);
+        ctrl->autodetect_reserved_devices = NULL;
+    }
+    g_mutex_clear(&ctrl->probe_confirm_lock);
     g_free(ctrl->primary_rig_id);
     g_free(ctrl->secondary_rig_id);
     ctrl->primary_rig_id = NULL;
@@ -3286,6 +3827,9 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->edit_secondary = FALSE;
     ctrl->autostart_error_reported = NULL;
     ctrl->missing_model_reported = NULL;
+    ctrl->autodetect_reserved_devices = NULL;
+    g_mutex_init(&ctrl->probe_confirm_lock);
+    ctrl->probe_confirm_request = NULL;
     ctrl->rigctld_mgr = NULL;
     ctrl->rigctld_mgr2 = NULL;
     ctrl->rigctld_spawned = FALSE;
@@ -6417,6 +6961,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     if (!gtk_toggle_button_get_active(button))
     {
         rigctrl_bump_engage_generation(ctrl);
+        rigctrl_autodetect_reservations_reset(ctrl);
 
         /* Disengage: close socket / stop worker thread */
         if (ctrl->DevSel != NULL)
@@ -6451,6 +6996,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     else
     {
         rigctrl_bump_engage_generation(ctrl);
+        rigctrl_autodetect_reservations_reset(ctrl);
 
         /* Apply UI settings before starting any worker activity. */
         if (!radio_apply_ui_settings(ctrl, TRUE))
@@ -11139,30 +11685,6 @@ static void rigctld_apply_socket_timeouts_ms(gint fd, gint timeout_ms)
 #endif
 }
 
-static const gchar *rigctld_cached_device(radio_model_t model)
-{
-    if (rigctld_device_cache == NULL)
-        return NULL;
-
-    return g_hash_table_lookup(rigctld_device_cache, GINT_TO_POINTER(model));
-}
-
-static void rigctld_cache_device(radio_model_t model, const gchar *device)
-{
-    if (device == NULL || *device == '\0')
-        return;
-
-    if (rigctld_device_cache == NULL)
-    {
-        rigctld_device_cache =
-            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
-    }
-
-    g_hash_table_replace(rigctld_device_cache,
-                         GINT_TO_POINTER(model),
-                         g_strdup(device));
-}
-
 static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
                                                radio_conf_t *conf,
                                                RigctldMgr **mgr,
@@ -11200,7 +11722,7 @@ static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
                  *restart_attempts);
     rigctld_terminate_spawned(ctrl, secondary, mgr);
 
-    if (!rigctld_autodetect_device(ctrl, conf, role, reported))
+    if (!rigctld_autodetect_device(ctrl, conf, secondary, role, reported))
         return FALSE;
 
     rigctld_persist_device(ctrl, conf, reason);
@@ -12247,27 +12769,31 @@ static gboolean close_rigctld_socket(GtkRigCtrl *ctrl, gint * sock,
     return TRUE;
 }
 
-static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
-                                                   gint timeout_ms,
-                                                   gint expected_model,
-                                                   gint *model_out,
-                                                   gchar **reply_out)
+static rigctld_probe_result_t rigctld_probe_identity(const gchar *host,
+                                                     gint port,
+                                                     gint timeout_ms,
+                                                     gint expected_model,
+                                                     gboolean include_frequency,
+                                                     RigAutodetectIdentity *identity_out,
+                                                     gchar **reply_out)
 {
     gint  sock = -1;
     gchar buffer[1024];
     GString *rxbuf = NULL;
     const gchar *cmd = "\\dump_state\n";
     gint  size;
-    gchar *line1 = NULL;
-    gchar *line2 = NULL;
     gint model = 0;
     gboolean parsed = FALSE;
     gint err = 0;
+    gint64 freq_hz = 0;
 
     if (reply_out)
         *reply_out = NULL;
-    if (model_out)
-        *model_out = 0;
+    if (identity_out != NULL)
+    {
+        rigctld_autodetect_identity_clear(identity_out);
+        identity_out->detected_model = 0;
+    }
 
     rigctld_io_lock_acquire();
 
@@ -12306,43 +12832,45 @@ static rigctld_probe_result_t rigctld_probe_simple(const gchar *host, gint port,
     if (reply_out)
         *reply_out = g_strdup(buffer);
 
-    rigctld_extract_first_lines(buffer, &line1, &line2);
     parsed = parse_dump_state_model_id(buffer, &model);
+    if (identity_out != NULL)
+    {
+        identity_out->detected_model = model;
+        identity_out->signature = rigctld_probe_signature_from_reply(buffer);
+    }
     if (rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rigctld dump_state: line1=%s line2=%s model=%d",
-                    line1 ? line1 : "(none)",
-                    line2 ? line2 : "(none)",
-                    model);
+                    "rigctld dump_state: model=%d signature=%s",
+                    model,
+                    (identity_out && identity_out->signature)
+                        ? identity_out->signature
+                        : "(none)");
 
     if (!parsed)
     {
-        g_free(line1);
-        g_free(line2);
         rigctld_close_fd(sock);
         rigctld_io_lock_release();
         return RIGCTLD_PROBE_NOT_READY;
     }
 
-    if (model_out)
-        *model_out = model;
-
     if (expected_model > 0 && model > 0 && model != expected_model)
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
-                    "rigctld model mismatch expected=%d got=%d line1=%s line2=%s",
-                    expected_model, model,
-                    line1 ? line1 : "(none)",
-                    line2 ? line2 : "(none)");
-        g_free(line1);
-        g_free(line2);
+                    "rigctld model mismatch expected=%d got=%d",
+                    expected_model, model);
         rigctld_close_fd(sock);
         rigctld_io_lock_release();
         return RIGCTLD_PROBE_MISMATCH;
     }
 
-    g_free(line1);
-    g_free(line2);
+    if (include_frequency &&
+        identity_out != NULL &&
+        rigctld_probe_read_frequency(sock, timeout_ms, &freq_hz))
+    {
+        identity_out->have_frequency = TRUE;
+        identity_out->frequency_hz = freq_hz;
+    }
+
     rigctld_close_fd(sock);
     rigctld_io_lock_release();
 
@@ -12354,7 +12882,8 @@ rigctld_wait_for_ready(const gchar *host,
                        gint port,
                        gint timeout_ms,
                        gint expected_model,
-                       gint *model_out,
+                       gboolean include_frequency,
+                       RigAutodetectIdentity *identity_out,
                        gchar **reply_out)
 {
     gint64 deadline_us = g_get_monotonic_time() +
@@ -12362,11 +12891,12 @@ rigctld_wait_for_ready(const gchar *host,
     const gint interval_ms = 200;
     rigctld_probe_result_t result = RIGCTLD_PROBE_NOT_READY;
     gchar *last_reply = NULL;
+    RigAutodetectIdentity last_identity = { 0 };
 
     if (reply_out)
         *reply_out = NULL;
-    if (model_out)
-        *model_out = 0;
+    if (identity_out != NULL)
+        rigctld_autodetect_identity_clear(identity_out);
 
     while (g_get_monotonic_time() < deadline_us)
     {
@@ -12376,17 +12906,23 @@ rigctld_wait_for_ready(const gchar *host,
 
         g_free(last_reply);
         last_reply = NULL;
-        result = rigctld_probe_simple(host, port,
-                                      probe_timeout_ms,
-                                      expected_model,
-                                      model_out,
-                                      &last_reply);
+        rigctld_autodetect_identity_clear(&last_identity);
+        result = rigctld_probe_identity(host, port,
+                                        probe_timeout_ms,
+                                        expected_model,
+                                        include_frequency,
+                                        &last_identity,
+                                        &last_reply);
         if (result != RIGCTLD_PROBE_NOT_READY)
         {
             if (reply_out)
                 *reply_out = last_reply;
             else
                 g_free(last_reply);
+            if (identity_out != NULL)
+                *identity_out = last_identity;
+            else
+                rigctld_autodetect_identity_clear(&last_identity);
             return result;
         }
 
@@ -12405,12 +12941,14 @@ rigctld_wait_for_ready(const gchar *host,
         *reply_out = last_reply;
     else
         g_free(last_reply);
+    rigctld_autodetect_identity_clear(&last_identity);
 
     return result;
 }
 
 static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                                           radio_conf_t *conf,
+                                          gboolean secondary,
                                           const gchar *role,
                                           gboolean *error_reported)
 {
@@ -12420,6 +12958,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     gint64  deadline_us;
     gint    tried = 0;
     gboolean success = FALSE;
+    gboolean reported = FALSE;
     gchar  *host = NULL;
     gchar  *detail = NULL;
     gchar  *fatal_err = NULL;
@@ -12427,9 +12966,15 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     gchar  *allowlist_lc = NULL;
     guint   filtered = 0;
     guint   candidate_count = 0;
+    guint   generation = 0;
     rigctld_preset_defaults_t preset;
     const gchar *cached = NULL;
     gboolean is_ic905 = rigctld_is_ic905(conf);
+    gboolean dual_mode = rigctrl_dual_rig_autodetect_active(ctrl);
+    gboolean have_pending = FALSE;
+    gboolean ambiguous = FALSE;
+    RigAutodetectIdentity pending_identity = { 0 };
+    gint expected_model;
 
     if (error_reported)
         *error_reported = FALSE;
@@ -12496,7 +13041,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                       *conf->rigctld_autodetect_match) ?
                         conf->rigctld_autodetect_match : "(none)");
     }
-    cached = rigctld_cached_device(conf->radio_model);
+    cached = rigctld_cached_device(conf);
     if (cached != NULL)
     {
         if (rigctld_candidate_matches_allowlist(cached, allowlist_lc))
@@ -12536,6 +13081,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
         return FALSE;
     }
 
+    generation = rigctrl_get_engage_generation(ctrl);
     start_us = g_get_monotonic_time();
     deadline_us = start_us +
         ((gint64) MIN((guint) RIGCTLD_AUTODETECT_TOTAL_MS_MAX,
@@ -12543,8 +13089,7 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                           candidate_count *
                               (guint) RIGCTLD_AUTODETECT_TOTAL_MS_PER_CANDIDATE)) *
          1000);
-
-    gint expected_model = rigctld_expected_model(conf);
+    expected_model = rigctld_expected_model(conf);
 
     for (item = candidates; item != NULL; item = item->next)
     {
@@ -12557,9 +13102,9 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
         gchar *log_tail = NULL;
         gchar *exit_detail = NULL;
         gint temp_port = -1;
-        gint detected_model = 0;
         gint waited_ms = 0;
         radio_conf_t probe_conf;
+        RigAutodetectIdentity identity = { 0 };
 
         if (tried >= RIGCTLD_AUTODETECT_MAX_CANDIDATES)
             break;
@@ -12569,6 +13114,16 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
 
         if (candidate == NULL || *candidate == '\0')
             continue;
+
+        if (dual_mode &&
+            rigctrl_autodetect_device_reserved(ctrl, conf, candidate))
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "auto-detect skip reserved %s for %s",
+                         candidate,
+                         role ? role : "rig");
+            continue;
+        }
 
         tried++;
         temp_port = rigctld_pick_ephemeral_port(conf->port);
@@ -12692,93 +13247,183 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                 rigctld_wait_for_ready(host, temp_port,
                                        RIGCTLD_AUTODETECT_WAIT_MS,
                                        expected_model,
-                                       &detected_model,
+                                       dual_mode,
+                                       &identity,
                                        &reply);
+            if (identity.device == NULL)
+                identity.device = g_strdup(candidate);
+            if (identity.civaddr == NULL && probe_conf.rigctld_civaddr != NULL)
+                identity.civaddr = g_strdup(probe_conf.rigctld_civaddr);
+            identity.probe_result = probe;
+            if (identity.signature == NULL && reply != NULL)
+                identity.signature = rigctld_probe_signature_from_reply(reply);
             sat_log_log(SAT_LOG_LEVEL_INFO,
                         _("%s: auto-detect probe result=%s candidate=%s "
                           "port=%d model=%d reply=%s"),
                         __func__, rigctld_probe_result_name(probe),
-                        candidate, temp_port, detected_model,
+                        candidate, temp_port, identity.detected_model,
                         reply ? reply : "(none)");
             rig_term_log(ctrl, "gpredict",
                          "auto-detect probe result=%s candidate=%s port=%d model=%d",
                          rigctld_probe_result_name(probe),
-                         candidate, temp_port, detected_model);
+                         candidate, temp_port, identity.detected_model);
             if (probe == RIGCTLD_PROBE_MISMATCH)
             {
                 sat_log_log(SAT_LOG_LEVEL_WARN,
                             _("%s: auto-detect model mismatch for %s "
                               "(expected=%d got=%d)"),
                             __func__, candidate, expected_model,
-                            detected_model);
+                            identity.detected_model);
             }
 
             if (probe == RIGCTLD_PROBE_OK)
             {
-                sat_log_log(SAT_LOG_LEVEL_INFO,
-                            _("%s: auto-detect succeeded for %s "
-                              "(model=%d reply: %s)"),
-                            __func__, candidate,
-                            detected_model,
-                            reply ? reply : "(none)");
-                rig_term_log(ctrl, "gpredict",
-                             "auto-detect selected %s model=%d",
-                             candidate, detected_model);
-                g_free(conf->rigctld_device);
-                conf->rigctld_device = g_strdup(candidate);
-                rigctld_cache_device(conf->radio_model, candidate);
-                success = TRUE;
-                g_free(reply);
-                rigctld_mgr_terminate(&probe_mgr);
-                g_free(cmdline);
-                if (log_path)
-                {
-                    g_unlink(log_path);
-                    g_free(log_path);
-                }
-                break;
-            }
-
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        _("%s: auto-detect probe failed for %s (result=%s reply: %s)"),
-                        __func__, candidate,
-                        rigctld_probe_result_name(probe),
-                        reply ? reply : "(none)");
-            if (probe == RIGCTLD_PROBE_NOT_READY)
-            {
-                rig_term_log(ctrl, "gpredict:err",
-                             "auto-detect probe timeout for %s on %s:%d",
-                             candidate, host, temp_port);
-                if (log_path)
-                    log_tail = rigctld_read_log_tail(log_path, 30);
-                if (log_tail && *log_tail)
+                if (!dual_mode)
                 {
                     sat_log_log(SAT_LOG_LEVEL_INFO,
-                                _("%s: auto-detect rigctld log tail for %s:\n%s"),
-                                __func__, candidate, log_tail);
-                    rig_term_log(ctrl, "gpredict:err",
-                                 "auto-detect rigctld log tail for %s:\n%s",
-                                 candidate, log_tail);
-                }
-                if (fallback_candidate == NULL &&
-                    !rigctld_log_tail_indicates_stale_device(log_tail))
-                {
-                    fallback_candidate = g_strdup(candidate);
-                    sat_log_log(SAT_LOG_LEVEL_INFO,
-                                _("%s: auto-detect keeping listening fallback %s"),
-                                __func__, candidate);
+                                _("%s: auto-detect succeeded for %s "
+                                  "(model=%d reply: %s)"),
+                                __func__, candidate,
+                                identity.detected_model,
+                                reply ? reply : "(none)");
                     rig_term_log(ctrl, "gpredict",
-                                 "auto-detect keeping listening fallback %s",
-                                 candidate);
+                                 "auto-detect selected %s model=%d",
+                                 candidate, identity.detected_model);
+                    g_free(conf->rigctld_device);
+                    conf->rigctld_device = g_strdup(candidate);
+                    rigctld_cache_device(conf, candidate);
+                    success = TRUE;
                 }
-                g_free(log_tail);
-                log_tail = NULL;
+                else if (!have_pending)
+                {
+                    pending_identity = identity;
+                    memset(&identity, 0, sizeof(identity));
+                    have_pending = TRUE;
+                }
+                else
+                {
+                    gint choice;
+
+                    ambiguous = TRUE;
+                    choice = rigctrl_confirm_probe_identity(ctrl,
+                                                            generation,
+                                                            secondary,
+                                                            conf,
+                                                            &pending_identity);
+                    if (choice == RIGCTRL_RESPONSE_USE_RADIO)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    _("%s: auto-detect confirmed %s for %s"),
+                                    __func__,
+                                    pending_identity.device
+                                        ? pending_identity.device
+                                        : candidate,
+                                    role ? role : _("rig"));
+                        g_free(conf->rigctld_device);
+                        conf->rigctld_device =
+                            g_strdup(pending_identity.device);
+                        rigctld_cache_device(conf, conf->rigctld_device);
+                        rigctrl_autodetect_reserve_device(ctrl, conf,
+                                                          conf->rigctld_device);
+                        success = TRUE;
+                    }
+                    else if (choice == RIGCTRL_RESPONSE_TRY_NEXT)
+                    {
+                        rigctld_autodetect_identity_clear(&pending_identity);
+                        pending_identity = identity;
+                        memset(&identity, 0, sizeof(identity));
+                    }
+                    else
+                    {
+                        reported = TRUE;
+                    }
+                }
             }
-            else if (probe == RIGCTLD_PROBE_MISMATCH)
+            else
             {
-                rig_term_log(ctrl, "gpredict:err",
-                             "auto-detect model mismatch expected=%d got=%d for %s",
-                             expected_model, detected_model, candidate);
+                sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                            _("%s: auto-detect probe failed for %s (result=%s reply: %s)"),
+                            __func__, candidate,
+                            rigctld_probe_result_name(probe),
+                            reply ? reply : "(none)");
+                if (probe == RIGCTLD_PROBE_NOT_READY)
+                {
+                    rig_term_log(ctrl, "gpredict:err",
+                                 "auto-detect probe timeout for %s on %s:%d",
+                                 candidate, host, temp_port);
+                    if (log_path)
+                        log_tail = rigctld_read_log_tail(log_path, 30);
+                    if (log_tail && *log_tail)
+                    {
+                        sat_log_log(SAT_LOG_LEVEL_INFO,
+                                    _("%s: auto-detect rigctld log tail for %s:\n%s"),
+                                    __func__, candidate, log_tail);
+                        rig_term_log(ctrl, "gpredict:err",
+                                     "auto-detect rigctld log tail for %s:\n%s",
+                                     candidate, log_tail);
+                    }
+                    if (!rigctld_log_tail_indicates_stale_device(log_tail))
+                    {
+                        if (dual_mode)
+                        {
+                            identity.listening_fallback = TRUE;
+                            rig_term_log(ctrl, "gpredict",
+                                         "auto-detect keeping listening fallback %s",
+                                         candidate);
+                            if (!have_pending)
+                            {
+                                pending_identity = identity;
+                                memset(&identity, 0, sizeof(identity));
+                                have_pending = TRUE;
+                            }
+                            else
+                            {
+                                gint choice;
+
+                                ambiguous = TRUE;
+                                choice = rigctrl_confirm_probe_identity(ctrl,
+                                                                        generation,
+                                                                        secondary,
+                                                                        conf,
+                                                                        &pending_identity);
+                                if (choice == RIGCTRL_RESPONSE_USE_RADIO)
+                                {
+                                    g_free(conf->rigctld_device);
+                                    conf->rigctld_device =
+                                        g_strdup(pending_identity.device);
+                                    rigctld_cache_device(conf,
+                                                         conf->rigctld_device);
+                                    rigctrl_autodetect_reserve_device(
+                                        ctrl, conf, conf->rigctld_device);
+                                    success = TRUE;
+                                }
+                                else if (choice == RIGCTRL_RESPONSE_TRY_NEXT)
+                                {
+                                    rigctld_autodetect_identity_clear(
+                                        &pending_identity);
+                                    pending_identity = identity;
+                                    memset(&identity, 0, sizeof(identity));
+                                }
+                                else
+                                {
+                                    reported = TRUE;
+                                }
+                            }
+                        }
+                        else if (fallback_candidate == NULL)
+                        {
+                            fallback_candidate = g_strdup(candidate);
+                        }
+                    }
+                    g_free(log_tail);
+                    log_tail = NULL;
+                }
+                else if (probe == RIGCTLD_PROBE_MISMATCH)
+                {
+                    rig_term_log(ctrl, "gpredict:err",
+                                 "auto-detect model mismatch expected=%d got=%d for %s",
+                                 expected_model, identity.detected_model, candidate);
+                }
             }
             g_free(reply);
             rigctld_mgr_terminate(&probe_mgr);
@@ -12789,6 +13434,10 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
             g_unlink(log_path);
             g_free(log_path);
         }
+        rigctld_autodetect_identity_clear(&identity);
+
+        if (reported || success)
+            break;
     }
 
     gp_serial_free_candidates(candidates);
@@ -12798,8 +13447,64 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
     if (success)
     {
         g_free(fallback_candidate);
+        rigctld_autodetect_identity_clear(&pending_identity);
         return TRUE;
     }
+
+    if (reported)
+    {
+        g_free(fallback_candidate);
+        rigctld_autodetect_identity_clear(&pending_identity);
+        if (error_reported)
+            *error_reported = TRUE;
+        g_free(fatal_err);
+        return FALSE;
+    }
+
+    if (dual_mode && have_pending)
+    {
+        if (!ambiguous)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: auto-detect selected %s for %s"),
+                        __func__,
+                        pending_identity.device ? pending_identity.device : "(unknown)",
+                        role ? role : _("rig"));
+            g_free(conf->rigctld_device);
+            conf->rigctld_device = g_strdup(pending_identity.device);
+            rigctld_cache_device(conf, conf->rigctld_device);
+            rigctrl_autodetect_reserve_device(ctrl, conf, conf->rigctld_device);
+            rigctld_autodetect_identity_clear(&pending_identity);
+            g_free(fallback_candidate);
+            g_free(fatal_err);
+            return TRUE;
+        }
+
+        switch (rigctrl_confirm_probe_identity(ctrl,
+                                               generation,
+                                               secondary,
+                                               conf,
+                                               &pending_identity))
+        {
+        case RIGCTRL_RESPONSE_USE_RADIO:
+            g_free(conf->rigctld_device);
+            conf->rigctld_device = g_strdup(pending_identity.device);
+            rigctld_cache_device(conf, conf->rigctld_device);
+            rigctrl_autodetect_reserve_device(ctrl, conf, conf->rigctld_device);
+            rigctld_autodetect_identity_clear(&pending_identity);
+            g_free(fallback_candidate);
+            g_free(fatal_err);
+            return TRUE;
+        case RIGCTRL_RESPONSE_TRY_NEXT:
+            reported = TRUE;
+            break;
+        default:
+            reported = TRUE;
+            break;
+        }
+    }
+
+    rigctld_autodetect_identity_clear(&pending_identity);
 
     if (fallback_candidate != NULL)
     {
@@ -12811,9 +13516,17 @@ static gboolean rigctld_autodetect_device(GtkRigCtrl *ctrl,
                      fallback_candidate);
         g_free(conf->rigctld_device);
         conf->rigctld_device = fallback_candidate;
-        rigctld_cache_device(conf->radio_model, fallback_candidate);
+        rigctld_cache_device(conf, fallback_candidate);
         g_free(fatal_err);
         return TRUE;
+    }
+
+    if (reported)
+    {
+        if (error_reported)
+            *error_reported = TRUE;
+        g_free(fatal_err);
+        return FALSE;
     }
 
     sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -13046,7 +13759,7 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
     if (conf->rigctld_device && *conf->rigctld_device &&
         radio_model_to_hamlib_model(conf->radio_model) > 0)
     {
-        rigctld_cache_device(conf->radio_model, conf->rigctld_device);
+        rigctld_cache_device(conf, conf->rigctld_device);
     }
 
     /* Connection probing is handled by the session socket to avoid extra
@@ -13069,7 +13782,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
                          conf->rigctld_device);
             g_free(conf->rigctld_device);
             conf->rigctld_device = NULL;
-            if (!rigctld_autodetect_device(ctrl, conf, role, &reported))
+            if (!rigctld_autodetect_device(ctrl, conf, secondary, role,
+                                           &reported))
                 goto out;
             rigctld_persist_device(ctrl, conf, "missing device");
         }
@@ -13080,7 +13794,8 @@ static gboolean ensure_rigctld_running(GtkRigCtrl *ctrl,
         (conf->rigctld_device == NULL || *conf->rigctld_device == '\0') &&
         radio_model_to_hamlib_model(conf->radio_model) > 0)
     {
-        if (!rigctld_autodetect_device(ctrl, conf, role, &reported))
+        if (!rigctld_autodetect_device(ctrl, conf, secondary, role,
+                                       &reported))
             goto out;
         rigctld_persist_device(ctrl, conf, "autodetect");
     }
@@ -13799,6 +14514,7 @@ static void rigctrl_cancel_open_task(GtkRigCtrl *ctrl)
 
     if (ctrl->open_cancellable != NULL)
         g_cancellable_cancel(ctrl->open_cancellable);
+    rigctrl_cancel_probe_confirmation(ctrl);
 }
 
 static gboolean G_GNUC_UNUSED rigctrl_open_idle(gpointer data)
@@ -14190,6 +14906,8 @@ static gboolean rigctrl_open_internal(GtkRigCtrl *data,
     if (ctrl->timerid)
         remove_timer(ctrl);
 
+    rigctrl_autodetect_seed_reservations(ctrl);
+
     if (!ctrl->opening && ctrl->sock < 0)
         ctrl->opening = TRUE;
     if (!ctrl->opening2 && ctrl->conf2 != NULL && ctrl->sock2 < 0)
@@ -14338,6 +15056,13 @@ open_receiver_retry:
         }
         rigctrl_reset_reconnect(ctrl, FALSE);
         rx_opened = TRUE;
+        if (ctrl->conf != NULL &&
+            ctrl->conf->rigctld_device != NULL &&
+            *ctrl->conf->rigctld_device != '\0')
+        {
+            rigctrl_autodetect_reserve_device(ctrl, ctrl->conf,
+                                              ctrl->conf->rigctld_device);
+        }
 
         ctrl->conf->vfo_opt = (ctrl->rig_session &&
                                ctrl->rig_session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
@@ -14463,6 +15188,13 @@ open_uplink_retry:
             }
             rigctrl_reset_reconnect(ctrl, TRUE);
             tx_opened = TRUE;
+            if (ctrl->conf2 != NULL &&
+                ctrl->conf2->rigctld_device != NULL &&
+                *ctrl->conf2->rigctld_device != '\0')
+            {
+                rigctrl_autodetect_reserve_device(ctrl, ctrl->conf2,
+                                                  ctrl->conf2->rigctld_device);
+            }
             ctrl->conf2->vfo_opt = (ctrl->rig_session2 &&
                                     ctrl->rig_session2->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
