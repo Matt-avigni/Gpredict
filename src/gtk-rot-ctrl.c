@@ -2194,6 +2194,85 @@ static void rotctrl_clear_ui_hard_error(GtkRotCtrl *ctrl)
     ctrl->ui_hard_error_reason[0] = '\0';
 }
 
+static void rotctrl_reset_tracking_runtime_state(GtkRotCtrl *ctrl,
+                                                 const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->target_valid_since_us = 0;
+    ctrl->target_invalid_since_us = 0;
+    ctrl->last_target_update_us = 0;
+    ctrl->last_cmd_time_us = 0;
+    ctrl->last_send_us = 0;
+    ctrl->above_eps_count = 0;
+    ctrl->last_hold_log_us = 0;
+    ctrl->force_next_send = FALSE;
+    ctrl->pretrack_target_az = 0.0;
+    ctrl->pretrack_target_el = 0.0;
+    ctrl->pretrack_target_valid = FALSE;
+    ctrl->pretrack_last_update_us = 0;
+    ctrl->pretrack_aos_time = 0.0;
+    ctrl->pretrack_wait_log_us = 0;
+    ctrl->pretrack_wrap_valid = FALSE;
+    ctrl->pretrack_wrap_user_az = 0.0;
+    ctrl->pretrack_wrap_raw_az = 0.0;
+    ctrl->pretrack_wrap_k = 0;
+    ctrl->seam_az360 = 0.0;
+    ctrl->seam_valid = FALSE;
+    ctrl->seam_crossing_active = FALSE;
+    ctrl->seam_crossing_sent = FALSE;
+    ctrl->seam_crossing_lane_valid = FALSE;
+    ctrl->seam_crossing_lane_k = 0;
+    ctrl->seam_crossing_target_az360 = 0.0;
+    ctrl->seam_crossing_since_us = 0;
+    ctrl->wrap_acquire_active = FALSE;
+    ctrl->wrap_acquire_sent = FALSE;
+    ctrl->wrap_acquire_target_backend = 0.0;
+    ctrl->wrap_acquire_target_az360 = 0.0;
+    ctrl->wrap_acquire_target_k = 0;
+    ctrl->wrap_acquire_since_us = 0;
+    ctrl->wrap_acquire_last_log_us = 0;
+    ctrl->pending_lane_backend = 0.0;
+    ctrl->pending_lane_valid = FALSE;
+    ctrl->pending_lane_since_us = 0;
+    ctrl->locked_lane_k = 0;
+    ctrl->locked_lane_valid = FALSE;
+    ctrl->last_target_valid = FALSE;
+    ctrl->last_cmd_az360 = 0.0;
+    ctrl->last_cmd_el = 0.0;
+    ctrl->last_cmd_valid = FALSE;
+    ctrl->last_cmd_backend_az = 0.0;
+    ctrl->last_cmd_backend_el = 0.0;
+    ctrl->last_cmd_backend_valid = FALSE;
+    ctrl->setpoint_user_az = 0.0;
+    ctrl->setpoint_user_el = 0.0;
+    ctrl->setpoint_backend_az = 0.0;
+    ctrl->setpoint_backend_el = 0.0;
+    ctrl->setpoint_valid = FALSE;
+    ctrl->committed_user_az = 0.0;
+    ctrl->committed_user_el = 0.0;
+    ctrl->committed_raw_az360 = 0.0;
+    ctrl->committed_raw_el = 0.0;
+    ctrl->committed_backend_az = 0.0;
+    ctrl->committed_backend_el = 0.0;
+    ctrl->committed_valid = FALSE;
+    ctrl->committed_since_us = 0;
+    ctrl->last_keepalive_time_us = 0;
+    ctrl->last_desired_update_us = 0;
+    ctrl->pos_stale_active = FALSE;
+    ctrl->last_stale_check_log_us = 0;
+    ctrl->pos_stale_hyst_active = FALSE;
+    ctrl->pos_stale_ready_hits = 0;
+    ctrl->stale_hold_active = FALSE;
+    ctrl->stale_hold_since_us = 0;
+    ctrl->stale_resume_since_us = 0;
+    ctrl->stale_recovered_pulse = FALSE;
+    rot_cmd_progress_reset(&ctrl->motion_progress);
+    rotctrl_tracking_policy_reset_reason(ctrl,
+                                         reason ? reason : "track_reset");
+}
+
 static void rotctrl_apply_ui_status(GtkRotCtrl *ctrl,
                                     const RotorStateSnapshot *snap,
                                     const gchar *reason)
@@ -10402,13 +10481,6 @@ static void rotctrl_finish_tracking_pass_over(GtkRotCtrl *ctrl,
     ctrl->tracking_session_los = 0.0;
     ctrl->target_state = ROT_TARGET_STATE_IDLE;
     ctrl->target_state_since_us = 0;
-    ctrl->target_valid_since_us = 0;
-    ctrl->target_invalid_since_us = 0;
-    ctrl->setpoint_valid = FALSE;
-    ctrl->last_target_update_us = 0;
-    ctrl->last_send_us = 0;
-    ctrl->above_eps_count = 0;
-    rot_cmd_progress_reset(&ctrl->motion_progress);
     rot_plan_reset(&ctrl->trajectory_plan);
     set_flipped_pass(ctrl);
 
@@ -10417,16 +10489,7 @@ static void rotctrl_finish_tracking_pass_over(GtkRotCtrl *ctrl,
     ctrl->hold_position_log_emitted = FALSE;
     ctrl->force_next_send = FALSE;
     ctrl->park_requested = FALSE;
-    ctrl->stale_hold_active = FALSE;
-    ctrl->pretrack_target_valid = FALSE;
-    ctrl->pretrack_last_update_us = 0;
-    ctrl->pretrack_aos_time = 0.0;
-    ctrl->pretrack_wait_log_us = 0;
-    ctrl->pretrack_wrap_valid = FALSE;
-    ctrl->pretrack_wrap_user_az = 0.0;
-    ctrl->pretrack_wrap_raw_az = 0.0;
-    ctrl->pretrack_wrap_k = 0;
-    rotctrl_tracking_policy_reset_reason(ctrl, "pass_over");
+    rotctrl_reset_tracking_runtime_state(ctrl, "pass_over");
 
     snap.control_active = ctrl->engaged || ctrl->engage_pending || ctrl->ui_hard_error;
     snap.engaging = ctrl->engage_pending;
@@ -10756,12 +10819,11 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
 
     if (ctrl->tracking)
     {
+        ctrl->tracking_active = FALSE;
+        ctrl->target_state = ROT_TARGET_STATE_IDLE;
+        ctrl->target_state_since_us = 0;
+        rotctrl_reset_tracking_runtime_state(ctrl, "track_on");
         ctrl->force_next_send = TRUE;
-        ctrl->setpoint_valid = FALSE;
-        ctrl->setpoint_user_az = 0.0;
-        ctrl->setpoint_user_el = 0.0;
-        ctrl->setpoint_backend_az = 0.0;
-        ctrl->setpoint_backend_el = 0.0;
     }
 
     if (!ctrl->tracking)
@@ -10772,67 +10834,8 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->tracking_session_los = 0.0;
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
         ctrl->target_state_since_us = 0;
-        ctrl->target_valid_since_us = 0;
-        ctrl->target_invalid_since_us = 0;
-        ctrl->last_target_update_us = 0;
-        ctrl->last_send_us = 0;
-        ctrl->above_eps_count = 0;
         ctrl->park_requested = FALSE;
-        ctrl->pretrack_target_valid = FALSE;
-        ctrl->pretrack_last_update_us = 0;
-        ctrl->pretrack_aos_time = 0.0;
-        ctrl->pretrack_wait_log_us = 0;
-        ctrl->pretrack_wrap_valid = FALSE;
-        ctrl->pretrack_wrap_user_az = 0.0;
-        ctrl->pretrack_wrap_raw_az = 0.0;
-        ctrl->pretrack_wrap_k = 0;
-        ctrl->seam_valid = FALSE;
-        ctrl->seam_crossing_active = FALSE;
-        ctrl->seam_crossing_sent = FALSE;
-        ctrl->seam_crossing_lane_valid = FALSE;
-        ctrl->seam_crossing_lane_k = 0;
-        ctrl->seam_crossing_target_az360 = 0.0;
-        ctrl->seam_crossing_since_us = 0;
-        ctrl->wrap_acquire_active = FALSE;
-        ctrl->wrap_acquire_sent = FALSE;
-        ctrl->wrap_acquire_target_backend = 0.0;
-        ctrl->wrap_acquire_target_az360 = 0.0;
-        ctrl->wrap_acquire_target_k = 0;
-        ctrl->wrap_acquire_since_us = 0;
-        ctrl->wrap_acquire_last_log_us = 0;
-        ctrl->pending_lane_valid = FALSE;
-        ctrl->pending_lane_since_us = 0;
-        ctrl->locked_lane_valid = FALSE;
-        ctrl->last_target_valid = FALSE;
-        ctrl->last_cmd_backend_az = 0.0;
-        ctrl->last_cmd_backend_el = 0.0;
-        ctrl->last_cmd_backend_valid = FALSE;
-        ctrl->setpoint_user_az = 0.0;
-        ctrl->setpoint_user_el = 0.0;
-        ctrl->setpoint_backend_az = 0.0;
-        ctrl->setpoint_backend_el = 0.0;
-        ctrl->setpoint_valid = FALSE;
-        ctrl->force_next_send = FALSE;
-        ctrl->committed_user_az = 0.0;
-        ctrl->committed_user_el = 0.0;
-        ctrl->committed_raw_az360 = 0.0;
-        ctrl->committed_raw_el = 0.0;
-        ctrl->committed_backend_az = 0.0;
-        ctrl->committed_backend_el = 0.0;
-        ctrl->committed_valid = FALSE;
-        ctrl->committed_since_us = 0;
-        ctrl->last_keepalive_time_us = 0;
-        ctrl->last_desired_update_us = 0;
-        ctrl->pos_stale_active = FALSE;
-        ctrl->last_stale_check_log_us = 0;
-        ctrl->pos_stale_hyst_active = FALSE;
-        ctrl->pos_stale_ready_hits = 0;
-        ctrl->stale_hold_active = FALSE;
-        ctrl->stale_hold_since_us = 0;
-        ctrl->stale_resume_since_us = 0;
-        ctrl->stale_recovered_pulse = FALSE;
-        rot_cmd_progress_reset(&ctrl->motion_progress);
-        rotctrl_tracking_policy_reset_reason(ctrl, "track_off");
+        rotctrl_reset_tracking_runtime_state(ctrl, "track_off");
         return;
     }
 
@@ -10848,46 +10851,6 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
                 : 0.0;
 
         rot_plan_reset(&ctrl->trajectory_plan);
-        rotctrl_tracking_policy_reset_reason(ctrl, "track_on");
-        ctrl->pretrack_target_valid = FALSE;
-        ctrl->pretrack_last_update_us = 0;
-        ctrl->pretrack_aos_time = 0.0;
-        ctrl->pretrack_wait_log_us = 0;
-        ctrl->pretrack_wrap_valid = FALSE;
-        ctrl->pretrack_wrap_user_az = 0.0;
-        ctrl->pretrack_wrap_raw_az = 0.0;
-        ctrl->pretrack_wrap_k = 0;
-        ctrl->seam_valid = FALSE;
-        ctrl->seam_crossing_active = FALSE;
-        ctrl->seam_crossing_sent = FALSE;
-        ctrl->seam_crossing_lane_valid = FALSE;
-        ctrl->seam_crossing_lane_k = 0;
-        ctrl->seam_crossing_target_az360 = 0.0;
-        ctrl->seam_crossing_since_us = 0;
-        ctrl->wrap_acquire_active = FALSE;
-        ctrl->wrap_acquire_sent = FALSE;
-        ctrl->wrap_acquire_target_backend = 0.0;
-        ctrl->wrap_acquire_target_az360 = 0.0;
-        ctrl->wrap_acquire_target_k = 0;
-        ctrl->wrap_acquire_since_us = 0;
-        ctrl->wrap_acquire_last_log_us = 0;
-        ctrl->pending_lane_valid = FALSE;
-        ctrl->pending_lane_since_us = 0;
-        ctrl->locked_lane_valid = FALSE;
-        ctrl->last_target_valid = FALSE;
-        ctrl->last_cmd_backend_az = 0.0;
-        ctrl->last_cmd_backend_el = 0.0;
-        ctrl->last_cmd_backend_valid = FALSE;
-        ctrl->committed_user_az = 0.0;
-        ctrl->committed_user_el = 0.0;
-        ctrl->committed_raw_az360 = 0.0;
-        ctrl->committed_raw_el = 0.0;
-        ctrl->committed_backend_az = 0.0;
-        ctrl->committed_backend_el = 0.0;
-        ctrl->committed_valid = FALSE;
-        ctrl->committed_since_us = 0;
-        ctrl->last_keepalive_time_us = 0;
-        ctrl->last_desired_update_us = 0;
 
         pos_recent = rotctrl_pos_recent(ctrl,
                                         (gint64)rotctrl_stale_ms(ctrl) * 1000,
@@ -10911,8 +10874,10 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
             gtk_toggle_button_set_active(button, FALSE);
             ctrl->tracking = FALSE;
             ctrl->tracking_session_los = 0.0;
+            ctrl->target_state = ROT_TARGET_STATE_IDLE;
+            ctrl->target_state_since_us = 0;
             set_flipped_pass(ctrl);
-            rotctrl_tracking_policy_reset_reason(ctrl, "track_off_no_session");
+            rotctrl_reset_tracking_runtime_state(ctrl, "track_off_no_session");
             return;
         }
 
@@ -10956,18 +10921,9 @@ static void freeze_clicked_cb(GtkButton *button, gpointer data)
     ctrl->tracking_session_los = 0.0;
     ctrl->target_state = ROT_TARGET_STATE_IDLE;
     ctrl->target_state_since_us = 0;
-    ctrl->target_valid_since_us = 0;
-    ctrl->target_invalid_since_us = 0;
     rot_plan_reset(&ctrl->trajectory_plan);
     set_flipped_pass(ctrl);
-    rotctrl_tracking_policy_reset_reason(ctrl, "freeze");
-    ctrl->pretrack_target_valid = FALSE;
-    ctrl->pretrack_aos_time = 0.0;
-    ctrl->pretrack_wait_log_us = 0;
-    ctrl->pretrack_wrap_valid = FALSE;
-    ctrl->pretrack_wrap_user_az = 0.0;
-    ctrl->pretrack_wrap_raw_az = 0.0;
-    ctrl->pretrack_wrap_k = 0;
+    rotctrl_reset_tracking_runtime_state(ctrl, "freeze");
 
     if (ctrl->engaged && ctrl->client.running)
     {
@@ -17183,6 +17139,7 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     ctrl->az_hold_active = FALSE;
     ctrl->az_hold_value = 0.0;
     ctrl->axis_swap_warned = FALSE;
+    ctrl->selected_child_pid = -1;
     ctrl->selected_child_port = 0;
     ctrl->hold_position_on_engage = FALSE;
     ctrl->hold_position_log_emitted = FALSE;
@@ -17190,6 +17147,7 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
     ctrl->bad_streak = 0;
     ctrl->timeout_streak = 0;
     ctrl->comm_status = ROT_COMM_DISENGAGED;
+    rotctrl_reset_tracking_runtime_state(ctrl, "engage_failed");
     if (ctrl->LockBut &&
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
     {
@@ -17197,6 +17155,8 @@ static void rotctld_fail_engage(GtkRotCtrl *ctrl, gboolean error_reported)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctrl->LockBut), FALSE);
         rotctrl_ui_end_update(ctrl, "engage_failed");
     }
+    if (ctrl->rotctld_mgr != NULL)
+        rotctld_process_stop_async(ctrl, "engage_failed");
     g_mutex_lock(&ctrl->client.mutex);
     ctrl->client.send_quit = FALSE;
     g_mutex_unlock(&ctrl->client.mutex);
@@ -19848,6 +19808,7 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
                               reason, will_send_quit);
         rotctrl_clear_ui_hard_error(ctrl);
         rotctrl_set_ui_status_detail(ctrl, NULL);
+        rotctrl_reset_tracking_runtime_state(ctrl, "user_disengage");
 
         if (!ctrl->client.running && ctrl->client.thread == NULL)
         {
@@ -19855,8 +19816,13 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             RotorStateSnapshot snap = { 0 };
             if (ctrl->rotctld_mgr)
                 rotctld_process_stop_async(ctrl, "user_disengage");
+            ctrl->selected_child_pid = -1;
+            ctrl->selected_child_port = 0;
+            ctrl->hold_position_on_engage = FALSE;
+            ctrl->hold_position_log_emitted = FALSE;
             snap.control_active = FALSE;
             rotctrl_apply_ui_status(ctrl, &snap, "user disengage");
+            rotctrl_reset_lock_button_visual(ctrl);
             return;
         }
 
@@ -19870,6 +19836,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
             snap.control_active = FALSE;
             rotctrl_apply_ui_status(ctrl, &snap, "user disengage");
         }
+        ctrl->selected_child_pid = -1;
+        ctrl->selected_child_port = 0;
         ctrl->hold_position_on_engage = FALSE;
         ctrl->hold_position_log_emitted = FALSE;
         rotctrl_reset_lock_button_visual(ctrl);
@@ -19936,6 +19904,9 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
         ctrl->hold_position_on_engage = TRUE;
         ctrl->hold_position_log_emitted = FALSE;
         ctrl->have_user_command = FALSE;
+        ctrl->selected_child_pid = -1;
+        ctrl->selected_child_port = 0;
+        rotctrl_reset_tracking_runtime_state(ctrl, "engage_request");
         rotctrl_clear_ui_hard_error(ctrl);
         rotctrl_set_ui_status_detail(ctrl, NULL);
 
