@@ -288,7 +288,7 @@ int main(void)
     }
 
     rig_script = g_build_filename("..", "scripts", "mock_rigctld.py", NULL);
-    rot_script = g_build_filename("..", "tests", "mock_rotctld_server.py", NULL);
+    rot_script = g_build_filename("..", "scripts", "mock_rotctld.py", NULL);
 
     if (!g_file_test(rig_script, G_FILE_TEST_EXISTS) ||
         !g_file_test(rot_script, G_FILE_TEST_EXISTS))

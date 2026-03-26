@@ -209,6 +209,7 @@ hamlib_mock_test_SOURCES = \
     hamlib_transport.h \
     rotctld-parse.c \
     rotctld-parse.h \
+    sat-log-stub.c \
     radio-conf.h \
     radio-conf-stub.c
 hamlib_mock_test_LDADD = @PACKAGE_LIBS@

@@ -2,13 +2,36 @@
 import argparse
 import socketserver
 import threading
+import time
 
 
 class RotctldHandler(socketserver.StreamRequestHandler):
     def setup(self):
         super().setup()
+        self.command_count = 0
         with self.server.conn_lock:
             self.server.state["conn_count"] += 1
+
+    def send_reply(self, text):
+        encoded = text.encode("ascii")
+
+        if not self.server.state.get("split_replies"):
+            self.wfile.write(encoded)
+            self.wfile.flush()
+            return
+
+        chunk_size = max(1, len(encoded) // 2)
+        for idx in range(0, len(encoded), chunk_size):
+            self.wfile.write(encoded[idx : idx + chunk_size])
+            self.wfile.flush()
+            if idx + chunk_size < len(encoded):
+                time.sleep(0.01)
+
+    def maybe_disconnect(self):
+        disconnect_after = self.server.state.get("disconnect_after", 0)
+
+        self.command_count += 1
+        return disconnect_after > 0 and self.command_count >= disconnect_after
 
     def handle(self):
         state = self.server.state
@@ -36,42 +59,48 @@ class RotctldHandler(socketserver.StreamRequestHandler):
                     "done",
                     "",
                 ]
-                self.wfile.write("\n".join(dump).encode("ascii"))
-                self.wfile.flush()
+                self.send_reply("\n".join(dump))
+                if self.maybe_disconnect():
+                    break
                 continue
 
             if cmd == "\\reset_conn_count":
                 state["conn_count"] = 0
-                self.wfile.write(b"RPRT 0\n")
-                self.wfile.flush()
+                self.send_reply("RPRT 0\n")
+                if self.maybe_disconnect():
+                    break
                 continue
 
             if cmd == "\\get_conn_count":
-                self.wfile.write(
-                    ("%d\nRPRT 0\n" % state["conn_count"]).encode("ascii")
-                )
-                self.wfile.flush()
+                self.send_reply("%d\nRPRT 0\n" % state["conn_count"])
+                if self.maybe_disconnect():
+                    break
                 continue
 
             if cmd == "p":
                 if state.get("fail_get_pos"):
-                    self.wfile.write(b"RPRT -6\n")
-                    self.wfile.flush()
+                    self.send_reply("RPRT -6\n")
+                    if self.maybe_disconnect():
+                        break
                     continue
                 reply = "%0.1f\n%0.1f\n" % (
                     state["az"],
                     state["el"],
                 )
-                self.wfile.write(reply.encode("ascii"))
-                self.wfile.flush()
+                self.send_reply(reply)
+                if self.maybe_disconnect():
+                    break
                 continue
 
             if cmd.startswith("P "):
                 if state.get("drop_set_pos"):
+                    if self.maybe_disconnect():
+                        break
                     continue
                 if state.get("fail_set_pos"):
-                    self.wfile.write(b"RPRT -6\n")
-                    self.wfile.flush()
+                    self.send_reply("RPRT -6\n")
+                    if self.maybe_disconnect():
+                        break
                     continue
                 parts = cmd.split()
                 if len(parts) >= 3:
@@ -80,17 +109,20 @@ class RotctldHandler(socketserver.StreamRequestHandler):
                         state["el"] = float(parts[2])
                     except ValueError:
                         pass
-                self.wfile.write(b"RPRT 0\n")
-                self.wfile.flush()
+                self.send_reply("RPRT 0\n")
+                if self.maybe_disconnect():
+                    break
                 continue
 
             if cmd == "S":
-                self.wfile.write(b"RPRT 0\n")
-                self.wfile.flush()
+                self.send_reply("RPRT 0\n")
+                if self.maybe_disconnect():
+                    break
                 continue
 
-            self.wfile.write(b"RPRT 0\n")
-            self.wfile.flush()
+            self.send_reply("RPRT 0\n")
+            if self.maybe_disconnect():
+                break
 
 
 class RotctldServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -106,6 +138,8 @@ def main():
     parser.add_argument("--fail-get-pos", action="store_true")
     parser.add_argument("--fail-set-pos", action="store_true")
     parser.add_argument("--drop-set-pos", action="store_true")
+    parser.add_argument("--split-replies", action="store_true")
+    parser.add_argument("--disconnect-after", type=int, default=0)
     args = parser.parse_args()
 
     server = RotctldServer((args.host, args.port), RotctldHandler)
@@ -116,6 +150,8 @@ def main():
         "fail_get_pos": args.fail_get_pos,
         "fail_set_pos": args.fail_set_pos,
         "drop_set_pos": args.drop_set_pos,
+        "split_replies": args.split_replies,
+        "disconnect_after": args.disconnect_after,
     }
     server.conn_lock = threading.Lock()
 

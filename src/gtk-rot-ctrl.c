@@ -8216,93 +8216,6 @@ static rot_set_result_t rotctrl_send_position(GtkRotCtrl *ctrl,
     return ROT_SET_IO_ERROR;
 }
 
-static gboolean rotctrl_set_position_guarded(GtkRotCtrl *ctrl,
-                                             gdouble az,
-                                             gdouble el,
-                                             const gchar *context)
-{
-    const gdouble eps = 1e-6;
-    gdouble send_az = az;
-    gdouble send_el = el;
-    gchar txbuf[64];
-    gboolean caps_valid = FALSE;
-    gboolean caps_extended = FALSE;
-    gdouble az_min = 0.0;
-    gdouble az_max = 0.0;
-    gdouble el_min = ROTCTRL_DEFAULT_MIN_EL;
-    gdouble el_max = ROTCTRL_DEFAULT_MAX_EL;
-
-    if (ctrl == NULL || ctrl->client.client == NULL)
-        return FALSE;
-
-    if (ctrl->conf)
-    {
-        el_min = ctrl->conf->minel;
-        el_max = ctrl->conf->maxel;
-    }
-
-    if (ctrl->tracking_active)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "%s: set_position blocked during tracking (%s)",
-                    __func__, context ? context : "unknown");
-        rot_term_log(ctrl, "gpredict:err",
-                     "set_position blocked during tracking (%s)",
-                     context ? context : "unknown");
-        return FALSE;
-    }
-
-    g_mutex_lock(&ctrl->client.mutex);
-    caps_valid = ctrl->client.limits_valid;
-    if (caps_valid)
-    {
-        az_min = ctrl->client.az_min;
-        az_max = ctrl->client.az_max;
-        el_min = ctrl->client.el_min;
-        el_max = ctrl->client.el_max;
-    }
-    g_mutex_unlock(&ctrl->client.mutex);
-
-    if (caps_valid)
-    {
-        gdouble span = az_max - az_min;
-        if (az_min > az_max)
-            span += 360.0;
-        caps_extended = (span > 360.0 + eps);
-
-        if (el_min > el_max)
-        {
-            gdouble tmp = el_min;
-            el_min = el_max;
-            el_max = tmp;
-        }
-        send_el = CLAMP(send_el, el_min, el_max);
-        send_az = rotctrl_normalize_az_to_limits(send_az, az_min, az_max);
-        send_az = rotctrl_normalize_backend_az(send_az, az_min, az_max);
-    }
-    else
-    {
-        send_el = CLAMP(send_el, el_min, el_max);
-        send_az = rotctrl_normalize_backend_az(send_az, 0.0, 360.0);
-    }
-
-    if (!(caps_extended && ctrl != NULL && !ctrl->tracking))
-        send_az = rotctrl_clamp_user_az_interval(ctrl, send_az);
-
-    format_rotctld_setpos(ctrl, send_az, send_el,
-                          &send_az, &send_el,
-                          txbuf, sizeof(txbuf));
-    {
-        gchar txline[sizeof(txbuf)];
-
-        g_strlcpy(txline, txbuf, sizeof(txline));
-        g_strchomp(txline);
-        rot_term_log(ctrl, "gpredict:tx", "rotctld cmd: %s", txline);
-    }
-
-    return rotctld_client_set_pos(ctrl->client.client, send_az, send_el);
-}
-
 /* Rotctl client thread */
 static gpointer rotctld_client_thread(gpointer data)
 {
@@ -9840,34 +9753,6 @@ static gpointer rotctld_client_thread(gpointer data)
                     ctrl->client.pos_degraded = FALSE;
                     g_mutex_unlock(&ctrl->client.mutex);
 
-                    {
-                        gboolean do_probe = FALSE;
-                        g_mutex_lock(&ctrl->client.mutex);
-                        if (!ctrl->client.set_pos_ok)
-                        {
-                            gint64 last_probe_us = ctrl->client.last_set_attempt_us;
-                            if (last_probe_us == 0 ||
-                                (now_us - last_probe_us) > ROTCTLD_POS_UNKNOWN_BACKOFF_US)
-                            {
-                                ctrl->client.last_set_attempt_us = now_us;
-                                do_probe = TRUE;
-                            }
-                        }
-                        g_mutex_unlock(&ctrl->client.mutex);
-
-                        if (do_probe)
-                        {
-                            if (rotctrl_set_position_guarded(ctrl,
-                                                             cur_az,
-                                                             cur_el,
-                                                             "pos_probe"))
-                            {
-                                g_mutex_lock(&ctrl->client.mutex);
-                                ctrl->client.set_pos_ok = TRUE;
-                                g_mutex_unlock(&ctrl->client.mutex);
-                            }
-                        }
-                    }
                 }
                 else if (pos_timeout || pos_rprt_err)
                 {
@@ -19506,7 +19391,12 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
     }
 
     if (ctrl->rotctld_mgr != NULL)
-        rotctld_process_stop_async(ctrl, "probe_restart");
+    {
+        /* Avoid racing autodetect against an older managed child that may
+         * still own the same serial device for a short time after disengage.
+         */
+        rotctld_process_stop(ctrl);
+    }
 
     if (ctrl->rotctld_probe_state)
         return ROTCTLD_ENSURE_PENDING;

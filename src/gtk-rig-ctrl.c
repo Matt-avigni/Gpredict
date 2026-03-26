@@ -8913,6 +8913,13 @@ static gboolean rigctrl_prepare_shared_tx_session(GtkRigCtrl *ctrl)
     else
         rig_session_copy_caps(tx, rx);
 
+    if (!rig_strategy_supports_explicit_vfo(rx->strategy))
+    {
+        rig_session_set_state(ctrl, tx, RIG_SESSION_DEGRADED,
+                              "shared rig missing Main/Sub VFO support");
+        return FALSE;
+    }
+
     rig_session_set_state(ctrl, tx, RIG_SESSION_READY, "shared rig");
     return TRUE;
 }
@@ -10247,6 +10254,20 @@ static void exec_full_duplex_main_sub_cycle(GtkRigCtrl * ctrl,
 
     if (ctrl == NULL || ctrl->conf == NULL)
         return;
+
+    if (ctrl->rig_session == NULL ||
+        ctrl->rig_session2 == NULL ||
+        !rig_strategy_supports_explicit_vfo(ctrl->rig_session->strategy) ||
+        !rig_strategy_supports_explicit_vfo(ctrl->rig_session2->strategy))
+    {
+        if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
+                                  RIGCTRL_PROBE_LOG_INTERVAL_US))
+        {
+            rig_term_log(ctrl, "gpredict:err",
+                         "Main/Sub tuning suspended; explicit VFO control unavailable");
+        }
+        return;
+    }
 
     rig_mode_dispatch(ctrl->conf->radio_mode,
                       rigctrl_target_vfo_for_role(ctrl->conf, VFO_ROLE_DOWNLINK),
@@ -12636,7 +12657,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
             if (rigctrl_reject_main_sub_without_vfo_strategy(
                     ctrl, session, conf,
                     "probe failed; Main/Sub requires rigctld VFO support"))
-                return FALSE;
+                return TRUE;
             if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
                                       RIGCTRL_PROBE_LOG_INTERVAL_US))
                 rig_term_log_verbose(ctrl, "gpredict",
@@ -12654,7 +12675,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         if (rigctrl_reject_main_sub_without_vfo_strategy(
                 ctrl, session, conf,
                 "probe failed; Main/Sub requires rigctld VFO support"))
-            return FALSE;
+            return TRUE;
         if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
                                   RIGCTRL_PROBE_LOG_INTERVAL_US))
             rig_term_log_verbose(ctrl, "gpredict",
@@ -12671,6 +12692,10 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         session->strategy = RIG_STRATEGY_PLAIN_FREQ;
         session->strategy_logged = FALSE;
         session->rig_model = rigctld_expected_model(conf);
+        if (rigctrl_reject_main_sub_without_vfo_strategy(
+                ctrl, session, conf,
+                "caps missing; Main/Sub requires rigctld VFO support"))
+            return TRUE;
         return TRUE;
     }
 
@@ -12679,7 +12704,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     if (rigctrl_reject_main_sub_without_vfo_strategy(
             ctrl, session, conf,
             "probe succeeded without a usable Main/Sub VFO strategy"))
-        return FALSE;
+        return TRUE;
 
     rig_term_log(ctrl, "gpredict",
                  "rig session (%s) dump_state model=%d backend=%s signature=%s vfo_candidates=%u",
