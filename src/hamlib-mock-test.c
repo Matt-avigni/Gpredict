@@ -273,6 +273,7 @@ int main(void)
     RotctldClient *rot_drop = NULL;
     radio_conf_t conf;
     const RigCaps *caps = NULL;
+    RotCaps rcaps_snapshot = { 0 };
     const RotCaps *rcaps = NULL;
     gint64 freq = 0;
     gdouble az = 0.0;
@@ -764,7 +765,12 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
-    rcaps = rotctld_client_get_caps(rot);
+    {
+        memset(&rcaps_snapshot, 0, sizeof(rcaps_snapshot));
+        rcaps = rotctld_client_get_caps_snapshot(rot, &rcaps_snapshot)
+                    ? &rcaps_snapshot
+                    : NULL;
+    }
     if (rcaps == NULL || !rcaps->has_get_pos || !rcaps->has_set_pos)
     {
         g_printerr("rotctld caps missing expected position support\n");

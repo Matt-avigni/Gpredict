@@ -28,6 +28,7 @@
 
 struct _RotctldClient {
     HamlibTransport        *transport;
+    GMutex                  meta_mutex;
     rotctld_client_state_t  state;
     gchar                  *state_reason;
     gchar                  *label;
@@ -42,6 +43,11 @@ struct _RotctldClient {
     gboolean                recovery_triggered;
     RotCaps                 caps;
 };
+
+static GMutex *rotctld_client_meta_mutex(const RotctldClient *client)
+{
+    return (GMutex *)&client->meta_mutex;
+}
 
 static void rotctld_client_set_state(RotctldClient *client,
                                      rotctld_client_state_t state,
@@ -80,6 +86,30 @@ static void rotctld_client_caps_init(RotCaps *caps)
     caps->el_min = 0.0;
     caps->el_max = 180.0;
     caps->south_zero = FALSE;
+}
+
+static void rotctld_client_caps_copy_snapshot(const RotCaps *src,
+                                              RotCaps *dst)
+{
+    if (dst == NULL)
+        return;
+
+    rotctld_client_caps_init(dst);
+    if (src == NULL)
+        return;
+
+    dst->model_id = src->model_id;
+    dst->has_get_pos = src->has_get_pos;
+    dst->has_set_pos = src->has_set_pos;
+    dst->has_stop = src->has_stop;
+    dst->has_park = src->has_park;
+    dst->limits_valid = src->limits_valid;
+    dst->az_min = src->az_min;
+    dst->az_max = src->az_max;
+    dst->el_min = src->el_min;
+    dst->el_max = src->el_max;
+    dst->south_zero = src->south_zero;
+    dst->quirks = src->quirks;
 }
 
 static gboolean rotctld_client_parse_first_two_numbers(const gchar *line,
@@ -305,10 +335,12 @@ static void rotctld_client_update_caps_from_dump(RotctldClient *client,
     if (client == NULL || dump_state == NULL)
         return;
 
+    g_mutex_lock(rotctld_client_meta_mutex(client));
     rotctld_client_caps_clear(&client->caps);
     rotctld_parse_model(dump_state, &client->caps.model_id);
     client->caps.signature = g_strdup(dump_state);
     rotctld_client_parse_limits(&client->caps, dump_state);
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
 }
 
 typedef struct {
@@ -339,6 +371,26 @@ static rot_limits_t rotctld_client_limits_from_caps(const RotCaps *caps)
     }
 
     return lim;
+}
+
+static void rotctld_client_get_limits_snapshot(const RotctldClient *client,
+                                               gint *model_id_out,
+                                               rot_limits_t *limits_out)
+{
+    if (model_id_out)
+        *model_id_out = 0;
+    if (limits_out)
+        *limits_out = rotctld_client_limits_from_caps(NULL);
+
+    if (client == NULL)
+        return;
+
+    g_mutex_lock(rotctld_client_meta_mutex(client));
+    if (model_id_out)
+        *model_id_out = client->caps.model_id;
+    if (limits_out)
+        *limits_out = rotctld_client_limits_from_caps(&client->caps);
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
 }
 
 static gboolean rotctld_client_is_gs232b_model(gint model_id)
@@ -937,7 +989,10 @@ static void rotctld_client_note_invalid_reply(RotctldClient *client,
     if (client == NULL)
         return;
 
+    g_mutex_lock(rotctld_client_meta_mutex(client));
     client->recovery_triggered = TRUE;
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
+
     if (client->invalid_backoff_ms == 0)
         client->invalid_backoff_ms = 100;
 
@@ -989,20 +1044,23 @@ static void rotctld_client_set_state(RotctldClient *client,
                                      ...)
 {
     va_list args;
+    gchar *reason = NULL;
 
     if (client == NULL)
         return;
 
-    client->state = state;
-    g_free(client->state_reason);
-    client->state_reason = NULL;
-
     if (fmt != NULL)
     {
         va_start(args, fmt);
-        client->state_reason = g_strdup_vprintf(fmt, args);
+        reason = g_strdup_vprintf(fmt, args);
         va_end(args);
     }
+
+    g_mutex_lock(rotctld_client_meta_mutex(client));
+    client->state = state;
+    g_free(client->state_reason);
+    client->state_reason = reason;
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
 }
 
 RotctldClient *rotctld_client_new(const gchar *label)
@@ -1010,6 +1068,7 @@ RotctldClient *rotctld_client_new(const gchar *label)
     RotctldClient *client = g_new0(RotctldClient, 1);
 
     client->transport = hamlib_transport_new();
+    g_mutex_init(&client->meta_mutex);
     client->state = ROTCTLD_CLIENT_STOPPED;
     client->label = g_strdup(label ? label : "rot");
     rotctld_client_caps_init(&client->caps);
@@ -1031,10 +1090,13 @@ void rotctld_client_free(RotctldClient **client)
         return;
 
     rotctld_client_close(*client);
+    g_mutex_lock(rotctld_client_meta_mutex(*client));
     rotctld_client_caps_clear(&(*client)->caps);
     g_free((*client)->state_reason);
+    g_mutex_unlock(rotctld_client_meta_mutex(*client));
     g_free((*client)->label);
     g_free((*client)->last_parse_class);
+    g_mutex_clear(&(*client)->meta_mutex);
     g_free(*client);
     *client = NULL;
 }
@@ -1044,7 +1106,10 @@ void rotctld_client_reset(RotctldClient *client)
     if (client == NULL)
         return;
 
+    g_mutex_lock(rotctld_client_meta_mutex(client));
     rotctld_client_caps_clear(&client->caps);
+    client->recovery_triggered = FALSE;
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
     rotctld_client_set_state(client, ROTCTLD_CLIENT_STOPPED, "reset");
     client->last_probe_us = 0;
     client->last_failure_log_us = 0;
@@ -1055,7 +1120,6 @@ void rotctld_client_reset(RotctldClient *client)
     client->last_setpos_warn_log_us = 0;
     client->invalid_backoff_until_us = 0;
     client->invalid_backoff_ms = 0;
-    client->recovery_triggered = FALSE;
 }
 
 gboolean rotctld_client_connect(RotctldClient *client,
@@ -1069,11 +1133,13 @@ gboolean rotctld_client_connect(RotctldClient *client,
     if (client == NULL)
         return FALSE;
 
+    g_mutex_lock(rotctld_client_meta_mutex(client));
     rotctld_client_caps_clear(&client->caps);
+    client->recovery_triggered = FALSE;
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
     client->last_probe_us = 0;
     client->invalid_backoff_until_us = 0;
     client->invalid_backoff_ms = 0;
-    client->recovery_triggered = FALSE;
     g_free(client->last_parse_class);
     client->last_parse_class = NULL;
 
@@ -1102,23 +1168,54 @@ void rotctld_client_close(RotctldClient *client)
 
 rotctld_client_state_t rotctld_client_get_state(const RotctldClient *client)
 {
+    rotctld_client_state_t state = ROTCTLD_CLIENT_STOPPED;
+
     if (client == NULL)
         return ROTCTLD_CLIENT_STOPPED;
-    return client->state;
+
+    g_mutex_lock(rotctld_client_meta_mutex(client));
+    state = client->state;
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
+    return state;
 }
 
-const gchar *rotctld_client_get_state_reason(const RotctldClient *client)
+void rotctld_client_get_status(const RotctldClient *client,
+                               rotctld_client_state_t *state_out,
+                               gchar *reason_out,
+                               gsize reason_len)
 {
+    if (state_out)
+        *state_out = ROTCTLD_CLIENT_STOPPED;
+    if (reason_out && reason_len > 0)
+        reason_out[0] = '\0';
+
     if (client == NULL)
-        return NULL;
-    return client->state_reason;
+        return;
+
+    g_mutex_lock(rotctld_client_meta_mutex(client));
+    if (state_out)
+        *state_out = client->state;
+    if (reason_out && reason_len > 0)
+        g_strlcpy(reason_out,
+                  client->state_reason ? client->state_reason : "",
+                  reason_len);
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
 }
 
-const RotCaps *rotctld_client_get_caps(const RotctldClient *client)
+gboolean rotctld_client_get_caps_snapshot(const RotctldClient *client,
+                                          RotCaps *caps_out)
 {
+    if (caps_out == NULL)
+        return FALSE;
+
+    rotctld_client_caps_init(caps_out);
     if (client == NULL)
-        return NULL;
-    return &client->caps;
+        return FALSE;
+
+    g_mutex_lock(rotctld_client_meta_mutex(client));
+    rotctld_client_caps_copy_snapshot(&client->caps, caps_out);
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
+    return TRUE;
 }
 
 HamlibTransport *rotctld_client_get_transport(RotctldClient *client)
@@ -1136,13 +1233,19 @@ gboolean rotctld_client_probe(RotctldClient *client,
     gdouble az = 0.0;
     gdouble el = 0.0;
     gint64 now_us = g_get_monotonic_time();
+    RotCaps caps_snapshot = { 0 };
+    gboolean ready_cached = FALSE;
+    gboolean has_get_pos = FALSE;
 
     if (client == NULL || client->transport == NULL)
         return FALSE;
 
-    if (client->caps.signature != NULL &&
-        client->caps.has_get_pos &&
-        client->state == ROTCTLD_CLIENT_READY &&
+    ready_cached = (rotctld_client_get_state(client) == ROTCTLD_CLIENT_READY);
+    if (rotctld_client_get_caps_snapshot(client, &caps_snapshot))
+        has_get_pos = caps_snapshot.has_get_pos;
+
+    if (has_get_pos &&
+        ready_cached &&
         hamlib_transport_is_ready(client->transport) &&
         client->last_probe_us > 0 &&
         (now_us - client->last_probe_us) < 500000)
@@ -1155,7 +1258,7 @@ gboolean rotctld_client_probe(RotctldClient *client,
     if (client->last_probe_us > 0 &&
         (now_us - client->last_probe_us) < 500000)
     {
-        return (client->state == ROTCTLD_CLIENT_READY);
+        return ready_cached;
     }
 
     client->last_probe_us = now_us;
@@ -1176,21 +1279,25 @@ gboolean rotctld_client_probe(RotctldClient *client,
     }
 
     rotctld_client_update_caps_from_dump(client, dump_state);
+    rotctld_client_get_caps_snapshot(client, &caps_snapshot);
     (void)hamlib_transport_clear_rxbuf(client->transport);
     (void)hamlib_transport_drain(client->transport, 50, NULL);
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "rotctld dump_state caps: model=%d az=%.2f..%.2f el=%.2f..%.2f south_zero=%d limits=%d",
-                client->caps.model_id,
-                client->caps.az_min, client->caps.az_max,
-                client->caps.el_min, client->caps.el_max,
-                client->caps.south_zero ? 1 : 0,
-                client->caps.limits_valid ? 1 : 0);
+                caps_snapshot.model_id,
+                caps_snapshot.az_min, caps_snapshot.az_max,
+                caps_snapshot.el_min, caps_snapshot.el_max,
+                caps_snapshot.south_zero ? 1 : 0,
+                caps_snapshot.limits_valid ? 1 : 0);
 
     for (gint attempt = 0; attempt < 3; attempt++)
     {
         if (rotctld_client_get_pos(client, &az, &el))
         {
+            g_mutex_lock(rotctld_client_meta_mutex(client));
             client->caps.has_get_pos = TRUE;
+            g_mutex_unlock(rotctld_client_meta_mutex(client));
+            has_get_pos = TRUE;
             break;
         }
 
@@ -1198,14 +1305,20 @@ gboolean rotctld_client_probe(RotctldClient *client,
         g_usleep((gulong)ROTCTLD_PROBE_RETRY_DELAY_MS * 1000);
     }
 
-    if (client->caps.has_get_pos)
+    if (has_get_pos)
     {
         if (rotctld_client_set_pos(client, az, el))
+        {
+            g_mutex_lock(rotctld_client_meta_mutex(client));
             client->caps.has_set_pos = TRUE;
+            g_mutex_unlock(rotctld_client_meta_mutex(client));
+        }
     }
     else
     {
+        g_mutex_lock(rotctld_client_meta_mutex(client));
         rotctld_client_caps_clear(&client->caps);
+        g_mutex_unlock(rotctld_client_meta_mutex(client));
         sat_log_log(SAT_LOG_LEVEL_WARN,
                     "rotctld probe: get_position failed");
         return FALSE;
@@ -1231,8 +1344,6 @@ gboolean rotctld_client_handshake(RotctldClient *client,
     gdouble el = 0.0;
     gboolean pos_ok = FALSE;
     gboolean ok = FALSE;
-    gint model_id = 0;
-    RotCaps dump_caps;
 
     if (pos_ok_out)
         *pos_ok_out = FALSE;
@@ -1295,12 +1406,6 @@ gboolean rotctld_client_handshake(RotctldClient *client,
                     "rotctld handshake: dump_state missing done; accepting");
     }
 
-    rotctld_client_caps_init(&dump_caps);
-    if (rotctld_parse_model(dump_state_out, &model_id))
-        dump_caps.model_id = model_id;
-    rotctld_client_parse_limits(&dump_caps, dump_state_out);
-    if (client != NULL && model_id != 0)
-        client->caps.model_id = model_id;
     rotctld_client_update_caps_from_dump(client, dump_state_out);
     client->last_probe_us = g_get_monotonic_time();
     (void)hamlib_transport_clear_rxbuf(client->transport);
@@ -1377,7 +1482,11 @@ gboolean rotctld_client_handshake(RotctldClient *client,
     if (el_out)
         *el_out = el;
     if (pos_ok)
+    {
+        g_mutex_lock(rotctld_client_meta_mutex(client));
         client->caps.has_get_pos = TRUE;
+        g_mutex_unlock(rotctld_client_meta_mutex(client));
+    }
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
                 "rotor handshake OK az=%.2f el=%.2f RTT=%.1fms",
@@ -1537,9 +1646,12 @@ rotctld_pos_result_t rotctld_client_get_pos_ex_timeout(RotctldClient *client,
 
         if (parsed)
         {
-            if (rotctld_client_is_gs232b_model(client->caps.model_id))
+            gint model_id = 0;
+            rot_limits_t limits;
+
+            rotctld_client_get_limits_snapshot(client, &model_id, &limits);
+            if (rotctld_client_is_gs232b_model(model_id))
             {
-                rot_limits_t limits = rotctld_client_limits_from_caps(&client->caps);
                 if (!normalize_gs232b_pos(az_out, el_out, &limits))
                     return ROTCTLD_POS_PARSE_FAIL;
             }
@@ -1723,9 +1835,12 @@ rotctld_pos_result_t rotctld_client_get_position_timed(RotctldClient *client,
 
         if (parsed)
         {
-            if (rotctld_client_is_gs232b_model(client->caps.model_id))
+            gint model_id = 0;
+            rot_limits_t limits;
+
+            rotctld_client_get_limits_snapshot(client, &model_id, &limits);
+            if (rotctld_client_is_gs232b_model(model_id))
             {
-                rot_limits_t limits = rotctld_client_limits_from_caps(&client->caps);
                 if (!normalize_gs232b_pos(az_out, el_out, &limits))
                     return ROTCTLD_POS_PARSE_FAIL;
             }
@@ -2109,7 +2224,13 @@ gint64 rotctld_client_last_rtt_us(const RotctldClient *client)
 
 gboolean rotctld_client_recovery_triggered(const RotctldClient *client)
 {
+    gboolean recovery = FALSE;
+
     if (client == NULL)
         return FALSE;
-    return client->recovery_triggered;
+
+    g_mutex_lock(rotctld_client_meta_mutex(client));
+    recovery = client->recovery_triggered;
+    g_mutex_unlock(rotctld_client_meta_mutex(client));
+    return recovery;
 }

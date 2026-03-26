@@ -640,6 +640,8 @@ struct _GtkRotCtrl {
     gboolean        ui_updating;
     guint           pending_ui_refresh_id;
     guint           resize_idle_id;
+    guint           wrong_daemon_idle_id;
+    guint           cmd_reject_idle_id;
     RotctldMgr     *rotctld_mgr;
     gboolean        verbose_logging;
     gint            selected_child_pid;
@@ -2406,6 +2408,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
                                          guint pos_failures)
 {
     rotctld_client_state_t client_state = ROTCTLD_CLIENT_STOPPED;
+    gchar reason_buf[128] = { 0 };
     const gchar *reason = NULL;
     const gchar *io_reason = NULL;
     gchar io_reason_buf[64] = { 0 };
@@ -2457,8 +2460,12 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
 
     if (ctrl->client.client)
     {
-        client_state = rotctld_client_get_state(ctrl->client.client);
-        reason = rotctld_client_get_state_reason(ctrl->client.client);
+        rotctld_client_get_status(ctrl->client.client,
+                                  &client_state,
+                                  reason_buf,
+                                  sizeof(reason_buf));
+        if (reason_buf[0] != '\0')
+            reason = reason_buf;
     }
 
     now_us = g_get_monotonic_time();
@@ -2681,9 +2688,8 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
 
     if (ctrl->diagnostics_logged_generation != ctrl->engage_generation)
     {
-        const RotCaps *caps = ctrl->client.client
-                              ? rotctld_client_get_caps(ctrl->client.client)
-                              : NULL;
+        RotCaps caps_snapshot = { 0 };
+        const RotCaps *caps = NULL;
         const gchar *device = ctrl->conf ? ctrl->conf->device : NULL;
         gint baud = ctrl->conf ? ctrl->conf->baud : 0;
         gdouble first_az = 0.0;
@@ -2699,6 +2705,13 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
                                        : ROT_TARGET_WRAP_360);
         gchar first_pos_buf[64] = "unknown";
         const gchar *first_pos = first_pos_buf;
+
+        if (ctrl->client.client &&
+            rotctld_client_get_caps_snapshot(ctrl->client.client,
+                                             &caps_snapshot))
+        {
+            caps = &caps_snapshot;
+        }
 
         g_mutex_lock(&ctrl->client.mutex);
         first_az = ctrl->client.azi_in;
@@ -8910,7 +8923,7 @@ static gpointer rotctld_client_thread(gpointer data)
                 }
 
                 {
-                    const RotCaps *caps = NULL;
+                    RotCaps caps_snapshot = { 0 };
                     gdouble cur_az = 0.0;
                     gdouble cur_el = 0.0;
                     g_mutex_lock(&ctrl->client.mutex);
@@ -8921,17 +8934,17 @@ static gpointer rotctld_client_thread(gpointer data)
                     ctrl->client.pos_backoff_until_us = 0;
                     ctrl->client.pos_backoff_sec = 0.5;
                     ctrl->client.pos_degraded = FALSE;
-                    caps = rotctld_client_get_caps(ctrl->client.client);
-                    if (caps != NULL)
+                    if (rotctld_client_get_caps_snapshot(ctrl->client.client,
+                                                         &caps_snapshot))
                     {
-                        ctrl->client.limits_valid = caps->limits_valid;
-                        ctrl->client.az_min = caps->az_min;
-                        ctrl->client.az_max = caps->az_max;
-                        ctrl->client.el_min = caps->el_min;
-                        ctrl->client.el_max = caps->el_max;
-                        ctrl->client.south_zero = caps->south_zero;
+                        ctrl->client.limits_valid = caps_snapshot.limits_valid;
+                        ctrl->client.az_min = caps_snapshot.az_min;
+                        ctrl->client.az_max = caps_snapshot.az_max;
+                        ctrl->client.el_min = caps_snapshot.el_min;
+                        ctrl->client.el_max = caps_snapshot.el_max;
+                        ctrl->client.south_zero = caps_snapshot.south_zero;
                         g_atomic_int_set(&ctrl->south_zero_cached,
-                                         caps->south_zero ? 1 : 0);
+                                         caps_snapshot.south_zero ? 1 : 0);
                     }
                     else
                     {
@@ -14773,7 +14786,7 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
         g_free(ctrl->conf);
     }
 
-    ctrl->conf = g_try_new(rotor_conf_t, 1);
+    ctrl->conf = g_try_new0(rotor_conf_t, 1);
     if (ctrl->conf == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -15175,22 +15188,6 @@ static gpointer rotctld_process_stop_thread(gpointer data)
 
     if (job == NULL)
         return NULL;
-
-#ifdef G_OS_UNIX
-    if (job->pid && *job->pid)
-    {
-        gchar *endp = NULL;
-        long pid_val = strtol(job->pid, &endp, 10);
-        if (endp != job->pid && pid_val > 1)
-        {
-            pid_t pid = (pid_t)pid_val;
-            (void)kill(pid, SIGTERM);
-            g_usleep(300 * 1000);
-            if (kill(pid, 0) == 0)
-                (void)kill(pid, SIGKILL);
-        }
-    }
-#endif
 
     if (job->mgr)
         rotctld_mgr_terminate(&job->mgr);
@@ -19473,6 +19470,9 @@ static gboolean rot_wrong_daemon_idle(gpointer data)
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
+    if (info->ctrl != NULL)
+        info->ctrl->wrong_daemon_idle_id = 0;
+
     rot_show_message(info->ctrl,
                      GTK_MESSAGE_ERROR,
                      _("Rotor error"),
@@ -19499,11 +19499,28 @@ static void rot_schedule_wrong_daemon(GtkRotCtrl *ctrl,
 {
     RotWrongDaemonInfo *info = g_new0(RotWrongDaemonInfo, 1);
 
+    if (ctrl == NULL)
+    {
+        g_free(info);
+        return;
+    }
+
+    if (ctrl->wrong_daemon_idle_id != 0)
+    {
+        g_free(info);
+        return;
+    }
+
     info->ctrl = ctrl;
     info->host = g_strdup(host);
     info->port = port;
 
-    g_idle_add(rot_wrong_daemon_idle, info);
+    ctrl->wrong_daemon_idle_id = g_idle_add(rot_wrong_daemon_idle, info);
+    if (ctrl->wrong_daemon_idle_id == 0)
+    {
+        g_free(info->host);
+        g_free(info);
+    }
 }
 
 typedef struct {
@@ -19530,6 +19547,9 @@ static gboolean rot_cmd_reject_idle(gpointer data)
     if (info == NULL)
         return G_SOURCE_REMOVE;
 
+    if (info->ctrl != NULL)
+        info->ctrl->cmd_reject_idle_id = 0;
+
     if (info->ctrl)
         rot_show_cmd_reject_error(info->ctrl, info->reason);
 
@@ -19553,9 +19573,26 @@ static void G_GNUC_UNUSED rot_schedule_cmd_reject(GtkRotCtrl *ctrl,
 {
     RotCmdRejectInfo *info = g_new0(RotCmdRejectInfo, 1);
 
+    if (ctrl == NULL)
+    {
+        g_free(info);
+        return;
+    }
+
+    if (ctrl->cmd_reject_idle_id != 0)
+    {
+        g_free(info);
+        return;
+    }
+
     info->ctrl = ctrl;
     info->reason = reason ? g_strdup(reason) : NULL;
-    g_idle_add(rot_cmd_reject_idle, info);
+    ctrl->cmd_reject_idle_id = g_idle_add(rot_cmd_reject_idle, info);
+    if (ctrl->cmd_reject_idle_id == 0)
+    {
+        g_free(info->reason);
+        g_free(info);
+    }
 }
 
 /**
@@ -21650,6 +21687,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->ui_updating = FALSE;
     ctrl->pending_ui_refresh_id = 0;
     ctrl->resize_idle_id = 0;
+    ctrl->wrong_daemon_idle_id = 0;
+    ctrl->cmd_reject_idle_id = 0;
     ctrl->rotctld_mgr = NULL;
     ctrl->verbose_logging = FALSE;
     ctrl->selected_child_pid = -1;
@@ -21842,6 +21881,16 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
         g_source_remove(ctrl->pending_ui_refresh_id);
         ctrl->pending_ui_refresh_id = 0;
     }
+    if (ctrl->wrong_daemon_idle_id != 0)
+    {
+        g_source_remove(ctrl->wrong_daemon_idle_id);
+        ctrl->wrong_daemon_idle_id = 0;
+    }
+    if (ctrl->cmd_reject_idle_id != 0)
+    {
+        g_source_remove(ctrl->cmd_reject_idle_id);
+        ctrl->cmd_reject_idle_id = 0;
+    }
 
     while (ctrl->detached_plots != NULL)
     {
@@ -21856,7 +21905,26 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     }
     ctrl->detached_plots = NULL;
 
-    /* free configuration */
+    rotctld_probe_cancel(ctrl);
+
+    /* stop client thread */
+    if (ctrl->client.thread)
+    {
+        /* Signal the thread to stop, then wait for it */
+        rotctld_request_thread_stop(ctrl, TRUE);
+        (void)rotctld_collect_client_thread(ctrl, TRUE, "destroy");
+    }
+    if (ctrl->client.rxbuf != NULL)
+    {
+        g_string_free(ctrl->client.rxbuf, TRUE);
+        ctrl->client.rxbuf = NULL;
+    }
+    if (ctrl->client.client != NULL)
+        rotctld_client_free(&ctrl->client.client);
+
+    rotctld_process_stop(ctrl);
+
+    /* Free configuration only after all probe/worker activity has stopped. */
     if (ctrl->conf != NULL)
     {
         rotor_conf_save(ctrl->conf);
@@ -21874,23 +21942,6 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     g_free(ctrl->rotor_id);
     ctrl->rotor_id = NULL;
 
-    /* stop client thread */
-    if (ctrl->client.thread)
-    {
-        /* Signal the thread to stop, then wait for it */
-        rotctld_request_thread_stop(ctrl, TRUE);
-        (void)rotctld_collect_client_thread(ctrl, TRUE, "destroy");
-    }
-    if (ctrl->client.rxbuf != NULL)
-    {
-        g_string_free(ctrl->client.rxbuf, TRUE);
-        ctrl->client.rxbuf = NULL;
-    }
-    if (ctrl->client.client != NULL)
-        rotctld_client_free(&ctrl->client.client);
-
-    rotctld_probe_cancel(ctrl);
-    rotctld_process_stop(ctrl);
     g_free(ctrl->last_stop_reason);
     ctrl->last_stop_reason = NULL;
 

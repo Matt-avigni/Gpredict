@@ -166,6 +166,7 @@ TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
     rotor-cmd-map.c \
+    azel_mapping.c \
     rotor-trajectory-planner.c
 rotor_cmd_map_test_LDADD = @PACKAGE_LIBS@
 

@@ -851,7 +851,9 @@ gboolean hamlib_transport_connect(HamlibTransport *transport,
         g_string_set_size(transport->rxbuf, 0);
 
     transport->last_err = 0;
+    g_mutex_lock(&transport->io_lock);
     transport->last_rtt_us = 0;
+    g_mutex_unlock(&transport->io_lock);
     return TRUE;
 }
 
@@ -892,7 +894,9 @@ gboolean hamlib_transport_attach_fd(HamlibTransport *transport,
         g_string_set_size(transport->rxbuf, 0);
 
     transport->last_err = 0;
+    g_mutex_lock(&transport->io_lock);
     transport->last_rtt_us = 0;
+    g_mutex_unlock(&transport->io_lock);
     return TRUE;
 }
 
@@ -984,7 +988,9 @@ gboolean hamlib_transport_request(HamlibTransport *transport,
         }
 
         local.rtt_us = g_get_monotonic_time() - start_us;
+        g_mutex_lock(&transport->io_lock);
         transport->last_rtt_us = local.rtt_us;
+        g_mutex_unlock(&transport->io_lock);
 
         if (info)
             *info = local;
@@ -1102,7 +1108,13 @@ gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
 
 gint64 hamlib_transport_last_rtt_us(const HamlibTransport *transport)
 {
+    gint64 last_rtt_us = 0;
+
     if (transport == NULL)
         return 0;
-    return transport->last_rtt_us;
+
+    g_mutex_lock((GMutex *)&transport->io_lock);
+    last_rtt_us = transport->last_rtt_us;
+    g_mutex_unlock((GMutex *)&transport->io_lock);
+    return last_rtt_us;
 }

@@ -58,8 +58,12 @@ gboolean              rotctld_client_connect(RotctldClient *client,
 void                  rotctld_client_close(RotctldClient *client);
 
 rotctld_client_state_t rotctld_client_get_state(const RotctldClient *client);
-const gchar           *rotctld_client_get_state_reason(const RotctldClient *client);
-const RotCaps         *rotctld_client_get_caps(const RotctldClient *client);
+void                  rotctld_client_get_status(const RotctldClient *client,
+                                                rotctld_client_state_t *state_out,
+                                                gchar *reason_out,
+                                                gsize reason_len);
+gboolean              rotctld_client_get_caps_snapshot(const RotctldClient *client,
+                                                       RotCaps *caps_out);
 HamlibTransport       *rotctld_client_get_transport(RotctldClient *client);
 
 gboolean              rotctld_client_probe(RotctldClient *client,
