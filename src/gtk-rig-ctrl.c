@@ -6785,7 +6785,7 @@ static void primary_rig_selected_cb(GtkComboBox * box, gpointer data)
         free_radio_conf(ctrl->conf);
     }
 
-    ctrl->conf = g_try_new(radio_conf_t, 1);
+    ctrl->conf = g_try_new0(radio_conf_t, 1);
     if (ctrl->conf == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -6916,7 +6916,7 @@ static void secondary_rig_selected_cb(GtkComboBox * box, gpointer data)
                              selected_id, FALSE);
 
     /* else load new device */
-    ctrl->conf2 = g_try_new(radio_conf_t, 1);
+    ctrl->conf2 = g_try_new0(radio_conf_t, 1);
     if (ctrl->conf2 == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -7243,7 +7243,7 @@ static gboolean is_rig_tx_capable(const gchar * confname)
     radio_conf_t   *conf = NULL;
     gboolean        cantx = FALSE;
 
-    conf = g_try_new(radio_conf_t, 1);
+    conf = g_try_new0(radio_conf_t, 1);
     if (conf == NULL)
     {
         sat_log_log(SAT_LOG_LEVEL_ERROR,
@@ -8885,7 +8885,7 @@ static gboolean rigctrl_prepare_shared_tx_session(GtkRigCtrl *ctrl)
     RigSession *rx = NULL;
     RigSession *tx = NULL;
     RigctldClient *client = NULL;
-    const RigCaps *caps = NULL;
+    RigCaps *caps = NULL;
 
     if (ctrl == NULL || ctrl->conf == NULL)
         return FALSE;
@@ -8907,11 +8907,12 @@ static gboolean rigctrl_prepare_shared_tx_session(GtkRigCtrl *ctrl)
     rig_session_reset(tx);
 
     client = rigctld_client_for_socket(ctrl, ctrl->sock);
-    caps = client ? rigctld_client_get_caps(client) : NULL;
+    caps = client ? rigctld_client_get_caps_snapshot(client) : NULL;
     if (caps != NULL)
         rig_session_apply_caps(tx, caps);
     else
         rig_session_copy_caps(tx, rx);
+    rigctld_client_caps_snapshot_free(caps);
 
     if (!rig_strategy_supports_explicit_vfo(rx->strategy))
     {
@@ -12620,11 +12621,12 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
                                                 const radio_conf_t *conf)
 {
     RigctldClient *client = rigctld_client_for_socket(ctrl, sock);
-    const RigCaps *caps = NULL;
+    RigCaps *caps = NULL;
     gint64 freq_probe = 0;
     gboolean freq_ok = FALSE;
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
+    gchar reason_buf[128] = { 0 };
 
     if (ctrl == NULL || session == NULL || conf == NULL)
         return FALSE;
@@ -12641,7 +12643,12 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
 
     if (!rigctld_client_probe(client, conf, 500))
     {
-        const gchar *reason = rigctld_client_get_state_reason(client);
+        const gchar *reason = NULL;
+
+        rigctld_client_get_status(client, NULL, reason_buf, sizeof(reason_buf));
+        if (reason_buf[0] != '\0')
+            reason = reason_buf;
+
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "%s: rigctld probe failed (%s); attempting minimal fallback",
                     __func__,
@@ -12684,7 +12691,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         return TRUE;
     }
 
-    caps = rigctld_client_get_caps(client);
+    caps = rigctld_client_get_caps_snapshot(client);
     if (caps == NULL)
     {
         rig_session_set_state(ctrl, session, RIG_SESSION_READY,
@@ -12700,6 +12707,8 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     }
 
     rig_session_apply_caps(session, caps);
+    rigctld_client_caps_snapshot_free(caps);
+    caps = NULL;
 
     if (rigctrl_reject_main_sub_without_vfo_strategy(
             ctrl, session, conf,

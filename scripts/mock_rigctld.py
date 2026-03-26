@@ -154,6 +154,10 @@ class RigctldServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+class SingleClientRigctldServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -164,7 +168,8 @@ def main():
     parser.add_argument("--reject-main-sub-tokenized-retune", action="store_true")
     args = parser.parse_args()
 
-    server = RigctldServer((args.host, args.port), RigctldHandler)
+    server_cls = SingleClientRigctldServer if args.once else RigctldServer
+    server = server_cls((args.host, args.port), RigctldHandler)
     server.state = {
         "freq": 145800000,
         "vfo": "VFOA",

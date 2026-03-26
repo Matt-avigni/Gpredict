@@ -73,8 +73,12 @@ gboolean              rigctld_client_attach_fd(RigctldClient *client,
 void                  rigctld_client_close(RigctldClient *client);
 
 rigctld_client_state_t rigctld_client_get_state(const RigctldClient *client);
-const gchar           *rigctld_client_get_state_reason(const RigctldClient *client);
-const RigCaps         *rigctld_client_get_caps(const RigctldClient *client);
+void                  rigctld_client_get_status(const RigctldClient *client,
+                                                rigctld_client_state_t *state_out,
+                                                gchar *reason_out,
+                                                gsize reason_len);
+RigCaps              *rigctld_client_get_caps_snapshot(const RigctldClient *client);
+void                  rigctld_client_caps_snapshot_free(RigCaps *caps);
 HamlibTransport       *rigctld_client_get_transport(RigctldClient *client);
 
 gboolean              rigctld_client_probe(RigctldClient *client,

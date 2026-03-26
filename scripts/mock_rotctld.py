@@ -130,6 +130,10 @@ class RotctldServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+class SingleClientRotctldServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -142,7 +146,8 @@ def main():
     parser.add_argument("--disconnect-after", type=int, default=0)
     args = parser.parse_args()
 
-    server = RotctldServer((args.host, args.port), RotctldHandler)
+    server_cls = SingleClientRotctldServer if args.once else RotctldServer
+    server = server_cls((args.host, args.port), RotctldHandler)
     server.state = {
         "az": 0.0,
         "el": 0.0,

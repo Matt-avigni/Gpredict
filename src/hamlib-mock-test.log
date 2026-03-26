@@ -1,2 +1,2 @@
-rigctld probe failed
+rotctld post-set pos mismatch: az=12.0 el=8.0
 FAIL hamlib-mock-test (exit status: 1)

@@ -272,7 +272,8 @@ int main(void)
     RotctldClient *rot_split = NULL;
     RotctldClient *rot_drop = NULL;
     radio_conf_t conf;
-    const RigCaps *caps = NULL;
+    RigCaps *caps = NULL;
+    RigCaps *reject_caps = NULL;
     RotCaps rcaps_snapshot = { 0 };
     const RotCaps *rcaps = NULL;
     gint64 freq = 0;
@@ -421,7 +422,7 @@ int main(void)
             goto cleanup;
         }
     }
-    caps = rigctld_client_get_caps(rig);
+    caps = rigctld_client_get_caps_snapshot(rig);
     if (caps == NULL || !caps->has_get_freq || !caps->has_set_freq)
     {
         g_printerr("rigctld caps missing expected frequency support\n");
@@ -643,13 +644,14 @@ int main(void)
             { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
         static const gchar *main_tokens[] =
             { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
-        const RigCaps *reject_caps = rigctld_client_get_caps(rig_reject);
         gboolean saw_bad_tokenized_set = FALSE;
         gint idx_v_sub = -1;
         gint idx_f_set = -1;
         gint idx_v_main = -1;
         gint idx_f_get = -1;
 
+        rigctld_client_caps_snapshot_free(reject_caps);
+        reject_caps = rigctld_client_get_caps_snapshot(rig_reject);
         if (reject_caps == NULL ||
             reject_caps->strategy != RIG_STRATEGY_SELECT_VFO)
         {
@@ -1158,6 +1160,8 @@ int main(void)
     }
 
 cleanup:
+    rigctld_client_caps_snapshot_free(caps);
+    rigctld_client_caps_snapshot_free(reject_caps);
     rigctld_client_close(rig);
     rigctld_client_close(rig_select);
     rigctld_client_close(rig_reject);

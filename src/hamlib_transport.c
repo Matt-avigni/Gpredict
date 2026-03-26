@@ -523,6 +523,13 @@ static gssize hamlib_read_dump_state(GSocket *socket,
         {
             if (saw_rprt)
                 break;
+            if (used > 0 &&
+                (size == 0 || err == EAGAIN ||
+                 err == EWOULDBLOCK || err == ETIMEDOUT))
+            {
+                done = TRUE;
+                break;
+            }
             if (err_out)
                 *err_out = err;
             return -1;

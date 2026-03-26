@@ -3,10 +3,10 @@
 =====================================================
 
 # TOTAL: 10
-# PASS:  8
+# PASS:  9
 # SKIP:  0
 # XFAIL: 0
-# FAIL:  2
+# FAIL:  1
 # XPASS: 0
 # ERROR: 0
 
@@ -14,14 +14,9 @@ System information (uname -a): Darwin 24.6.0 Darwin Kernel Version 24.6.0: Mon J
 
 .. contents:: :depth: 2
 
-FAIL: rigctld-io-test
-=====================
-
-FAIL rigctld-io-test (exit status: 17)
-
 FAIL: hamlib-mock-test
 ======================
 
-rigctld probe failed
+rotctld post-set pos mismatch: az=12.0 el=8.0
 FAIL hamlib-mock-test (exit status: 1)
 

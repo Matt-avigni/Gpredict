@@ -21,8 +21,10 @@
 #ifndef G_OS_WIN32
 typedef struct {
     int server_fd;
-    gboolean stop;
-    gboolean saw_v;
+    gint stop;
+    gint saw_v;
+    GMutex client_lock;
+    GPtrArray *client_threads;
 } RigctldTestServer;
 
 typedef struct {
@@ -31,6 +33,11 @@ typedef struct {
     const gchar *rest;
     gint delay_ms;
 } RigctldDelaySend;
+
+typedef struct {
+    int fd;
+    RigctldTestServer *server;
+} RigctldTestClient;
 
 static gboolean send_all(int fd, const gchar *data, gsize len)
 {
@@ -134,7 +141,7 @@ static void rigctld_serve_client(int fd, RigctldTestServer *server)
         else if (line->str[0] == 'v')
         {
             if (server != NULL)
-                server->saw_v = TRUE;
+                g_atomic_int_set(&server->saw_v, TRUE);
             if (!send_all(fd, vfo_err, strlen(vfo_err)))
                 break;
         }
@@ -188,11 +195,24 @@ static void rigctld_serve_client(int fd, RigctldTestServer *server)
     g_string_free(line, TRUE);
 }
 
+static gpointer rigctld_test_client_thread(gpointer data)
+{
+    RigctldTestClient *client = data;
+
+    if (client == NULL)
+        return NULL;
+
+    rigctld_serve_client(client->fd, client->server);
+    close(client->fd);
+    g_free(client);
+    return NULL;
+}
+
 static gpointer rigctld_test_server_thread(gpointer data)
 {
     RigctldTestServer *server = data;
 
-    while (!server->stop)
+    while (!g_atomic_int_get(&server->stop))
     {
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
@@ -200,13 +220,24 @@ static gpointer rigctld_test_server_thread(gpointer data)
                                (struct sockaddr *)&addr, &addr_len);
         if (client_fd < 0)
         {
-            if (server->stop)
+            if (g_atomic_int_get(&server->stop))
                 break;
             continue;
         }
 
-        rigctld_serve_client(client_fd, server);
-        close(client_fd);
+        {
+            RigctldTestClient *client = g_new0(RigctldTestClient, 1);
+            GThread *thread = NULL;
+
+            client->fd = client_fd;
+            client->server = server;
+            thread = g_thread_new("rigctld-client",
+                                  rigctld_test_client_thread,
+                                  client);
+            g_mutex_lock(&server->client_lock);
+            g_ptr_array_add(server->client_threads, thread);
+            g_mutex_unlock(&server->client_lock);
+        }
     }
 
     return NULL;
@@ -332,10 +363,15 @@ static int run_fake_server_test(void)
 
     memset(&server, 0, sizeof(server));
     server.server_fd = -1;
-    server.stop = FALSE;
+    g_mutex_init(&server.client_lock);
+    server.client_threads = g_ptr_array_new();
 
     if (rigctld_test_server_start(&server, &port) != 0)
+    {
+        g_ptr_array_free(server.client_threads, TRUE);
+        g_mutex_clear(&server.client_lock);
         return -1;
+    }
 
     thread = g_thread_new("rigctld-test", rigctld_test_server_thread, &server);
 
@@ -440,12 +476,20 @@ out:
         close(probe_fd);
     if (main_fd >= 0)
         close(main_fd);
-    server.stop = TRUE;
+    g_atomic_int_set(&server.stop, TRUE);
     if (server.server_fd >= 0)
         close(server.server_fd);
     if (thread != NULL)
         g_thread_join(thread);
-    if (server.saw_v)
+    if (server.client_threads != NULL)
+    {
+        for (guint i = 0; i < server.client_threads->len; i++)
+            g_thread_join(g_ptr_array_index(server.client_threads, i));
+        g_ptr_array_free(server.client_threads, TRUE);
+        server.client_threads = NULL;
+    }
+    g_mutex_clear(&server.client_lock);
+    if (g_atomic_int_get(&server.saw_v))
         return -18;
 
     return rc;
