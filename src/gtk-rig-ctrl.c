@@ -12706,6 +12706,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         return TRUE;
     }
 
+    freq_ok = caps->has_get_freq;
     rig_session_apply_caps(session, caps);
     rigctld_client_caps_snapshot_free(caps);
     caps = NULL;
@@ -12746,7 +12747,6 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         g_string_free(list, TRUE);
     }
 
-    freq_ok = caps->has_get_freq;
     vfo_opt_args_ok = (session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
     vfo_select_ok = (session->strategy == RIG_STRATEGY_SELECT_VFO ||
                      session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
