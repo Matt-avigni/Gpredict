@@ -781,6 +781,9 @@ static void rotctrl_ui_begin_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_ui_end_update(GtkRotCtrl *ctrl, const gchar *reason);
 static void rotctrl_capture_log_closed_height(GtkRotCtrl *ctrl);
 static void rotctrl_restore_log_height(GtkRotCtrl *ctrl);
+static void rotctrl_cancel_pending_motion(GtkRotCtrl *ctrl,
+                                          gboolean request_stop,
+                                          const gchar *reason);
 static void rotctrl_free_sat_list_entry(gpointer data, gpointer user_data);
 static void     rotctrl_set_pass_on_plots(GtkRotCtrl *ctrl, pass_t *pass);
 static void     rotctrl_set_rotor_pos_on_plots(GtkRotCtrl *ctrl,
@@ -10727,6 +10730,7 @@ static void rotctrl_finish_tracking_pass_over(GtkRotCtrl *ctrl,
     ctrl->hold_position_log_emitted = FALSE;
     ctrl->force_next_send = FALSE;
     ctrl->park_requested = FALSE;
+    rotctrl_cancel_pending_motion(ctrl, ctrl->engaged, "pass_over");
     rotctrl_reset_tracking_runtime_state(ctrl, "pass_over");
 
     snap.control_active = ctrl->engaged || ctrl->engage_pending || ctrl->ui_hard_error;
@@ -11039,6 +11043,16 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
 
     locked = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut));
     requested = gtk_toggle_button_get_active(button);
+    if (requested && ctrl->engage_pending)
+    {
+        rotctrl_ui_begin_update(ctrl, "track_while_engaging");
+        gtk_toggle_button_set_active(button, FALSE);
+        rotctrl_ui_end_update(ctrl, "track_while_engaging");
+        rot_term_log(ctrl, "gpredict:warn",
+                     "ignoring Track while rotor engage is still pending");
+        return;
+    }
+
     if (requested && !rotor_apply_ui_settings(ctrl, TRUE))
     {
         rotctrl_ui_begin_update(ctrl, "track_invalid_settings");
@@ -11073,6 +11087,7 @@ static void track_toggle_cb(GtkToggleButton * button, gpointer data)
         ctrl->target_state = ROT_TARGET_STATE_IDLE;
         ctrl->target_state_since_us = 0;
         ctrl->park_requested = FALSE;
+        rotctrl_cancel_pending_motion(ctrl, ctrl->engaged, "track_off");
         rotctrl_reset_tracking_runtime_state(ctrl, "track_off");
         return;
     }
@@ -15125,6 +15140,12 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
 
     if (ctrl == NULL || ctrl->ui_updating)
         return;
+    if (box != NULL && !gtk_widget_get_sensitive(GTK_WIDGET(box)))
+    {
+        rot_term_log_verbose(ctrl, "gpredict:warn",
+                             "ignoring rotor selection change while controller is active");
+        return;
+    }
 
     /* free previous configuration */
     if (ctrl->conf != NULL)
@@ -18203,7 +18224,6 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             if (!thread_done)
             {
                 rotctld_request_thread_stop(ctrl, TRUE);
-                rotctld_socket_close_quiet(ctrl, &ctrl->client.socket);
                 return ROTCTLD_AUTODETECT_STEP_CONTINUE;
             }
 
@@ -20139,6 +20159,34 @@ static void rotctrl_reset_lock_button_visual(GtkRotCtrl *ctrl)
                                  GTK_STATE_FLAG_SELECTED);
 }
 
+static void rotctrl_cancel_pending_motion(GtkRotCtrl *ctrl,
+                                          gboolean request_stop,
+                                          const gchar *reason)
+{
+    if (ctrl == NULL)
+        return;
+
+    g_mutex_lock(&ctrl->client.mutex);
+    if (request_stop)
+        ctrl->client.stop_pending = TRUE;
+    ctrl->client.new_trg = FALSE;
+    ctrl->client.force_pending = FALSE;
+    ctrl->client.desired_valid = FALSE;
+    ctrl->client.desired_allow = FALSE;
+    ctrl->client.desired_tracking = FALSE;
+    ctrl->client.desired_update_us = 0;
+    ctrl->client.allow_send_no_pos = FALSE;
+    ctrl->client.use_setpos = FALSE;
+    ctrl->client.apply_calib = FALSE;
+    g_mutex_unlock(&ctrl->client.mutex);
+
+    if (ctrl->verbose_logging)
+        rot_term_log_verbose(ctrl, "gpredict:state",
+                             "cleared pending rotor motion stop=%d reason=%s",
+                             request_stop ? 1 : 0,
+                             reason ? reason : "(none)");
+}
+
 /**
  * Rotor locked.
  *
@@ -20300,6 +20348,8 @@ static void rot_locked_cb(GtkToggleButton * button, gpointer data)
 
         {
             ctrl->engage_pending = TRUE;
+            if (ctrl->DevSel != NULL)
+                gtk_widget_set_sensitive(ctrl->DevSel, FALSE);
             rot_session_set_state(ctrl, ROT_SESSION_CONNECTING,
                                   "engage requested", FALSE);
             {
@@ -20409,8 +20459,14 @@ static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
 
     ctrl->target = selected;
     (void)rotctrl_sync_sat_copy_from_module(ctrl, ctrl->target);
+    rotctrl_cancel_pending_motion(ctrl,
+                                  ctrl->engaged && ctrl->tracking,
+                                  "target_change");
     rot_plan_reset(&ctrl->trajectory_plan);
     rotctrl_tracking_policy_reset_reason(ctrl, "target_change");
+    ctrl->tracking_active = FALSE;
+    if (ctrl->tracking)
+        ctrl->force_next_send = TRUE;
     ctrl->pretrack_target_valid = FALSE;
     ctrl->pretrack_last_update_us = 0;
     ctrl->pretrack_aos_time = 0.0;

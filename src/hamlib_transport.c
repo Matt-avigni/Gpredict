@@ -29,6 +29,52 @@ struct _HamlibTransport {
     gint64   last_rtt_us;
 };
 
+static gboolean hamlib_transport_is_ready_locked(const HamlibTransport *transport)
+{
+    return (transport != NULL &&
+            transport->socket != NULL &&
+            transport->fd >= 0);
+}
+
+static void hamlib_transport_begin_busy(HamlibTransport *transport)
+{
+    if (transport == NULL)
+        return;
+
+    g_mutex_lock(&transport->io_lock);
+    while (transport->busy)
+        g_cond_wait(&transport->io_cond, &transport->io_lock);
+    transport->busy = TRUE;
+    g_mutex_unlock(&transport->io_lock);
+}
+
+static void hamlib_transport_end_busy(HamlibTransport *transport)
+{
+    if (transport == NULL)
+        return;
+
+    g_mutex_lock(&transport->io_lock);
+    transport->busy = FALSE;
+    g_cond_signal(&transport->io_cond);
+    g_mutex_unlock(&transport->io_lock);
+}
+
+static void hamlib_transport_close_locked(HamlibTransport *transport)
+{
+    if (transport == NULL)
+        return;
+
+    if (transport->socket)
+    {
+        g_socket_close(transport->socket, NULL);
+        g_clear_object(&transport->socket);
+    }
+    transport->fd = -1;
+    transport->last_err = 0;
+    if (transport->rxbuf)
+        g_string_set_size(transport->rxbuf, 0);
+}
+
 #ifdef G_OS_WIN32
 static gint hamlib_gio_error_to_errno(const GError *error)
 {
@@ -823,7 +869,10 @@ gboolean hamlib_transport_connect(HamlibTransport *transport,
         return FALSE;
     }
 
-    hamlib_transport_close(transport);
+    hamlib_transport_begin_busy(transport);
+    g_mutex_lock(&transport->io_lock);
+    hamlib_transport_close_locked(transport);
+    g_mutex_unlock(&transport->io_lock);
 
     client = g_socket_client_new();
     if (timeout_ms > 0)
@@ -844,23 +893,23 @@ gboolean hamlib_transport_connect(HamlibTransport *transport,
         if (error_out)
             *error_out = g_strdup(error ? error->message : "connect failed");
         g_clear_error(&error);
+        hamlib_transport_end_busy(transport);
         return FALSE;
     }
 
+    g_mutex_lock(&transport->io_lock);
     transport->socket = g_socket_connection_get_socket(conn);
     g_object_ref(transport->socket);
     transport->fd = g_socket_get_fd(transport->socket);
-    g_object_unref(conn);
-
     if (transport->rxbuf == NULL)
         transport->rxbuf = g_string_sized_new(128);
     else
         g_string_set_size(transport->rxbuf, 0);
-
     transport->last_err = 0;
-    g_mutex_lock(&transport->io_lock);
     transport->last_rtt_us = 0;
     g_mutex_unlock(&transport->io_lock);
+    g_object_unref(conn);
+    hamlib_transport_end_busy(transport);
     return TRUE;
 }
 
@@ -881,7 +930,10 @@ gboolean hamlib_transport_attach_fd(HamlibTransport *transport,
         return FALSE;
     }
 
-    hamlib_transport_close(transport);
+    hamlib_transport_begin_busy(transport);
+    g_mutex_lock(&transport->io_lock);
+    hamlib_transport_close_locked(transport);
+    g_mutex_unlock(&transport->io_lock);
 
     socket = g_socket_new_from_fd(fd, &error);
     if (socket == NULL)
@@ -889,21 +941,21 @@ gboolean hamlib_transport_attach_fd(HamlibTransport *transport,
         if (error_out)
             *error_out = g_strdup(error ? error->message : "attach failed");
         g_clear_error(&error);
+        hamlib_transport_end_busy(transport);
         return FALSE;
     }
 
+    g_mutex_lock(&transport->io_lock);
     transport->socket = socket;
     transport->fd = g_socket_get_fd(socket);
-
     if (transport->rxbuf == NULL)
         transport->rxbuf = g_string_sized_new(128);
     else
         g_string_set_size(transport->rxbuf, 0);
-
     transport->last_err = 0;
-    g_mutex_lock(&transport->io_lock);
     transport->last_rtt_us = 0;
     g_mutex_unlock(&transport->io_lock);
+    hamlib_transport_end_busy(transport);
     return TRUE;
 }
 
@@ -912,19 +964,24 @@ void hamlib_transport_close(HamlibTransport *transport)
     if (transport == NULL)
         return;
 
-    if (transport->socket)
-    {
-        g_socket_close(transport->socket, NULL);
-        g_clear_object(&transport->socket);
-    }
-    transport->fd = -1;
-    if (transport->rxbuf)
-        g_string_set_size(transport->rxbuf, 0);
+    hamlib_transport_begin_busy(transport);
+    g_mutex_lock(&transport->io_lock);
+    hamlib_transport_close_locked(transport);
+    g_mutex_unlock(&transport->io_lock);
+    hamlib_transport_end_busy(transport);
 }
 
 gboolean hamlib_transport_is_ready(const HamlibTransport *transport)
 {
-    return (transport != NULL && transport->socket != NULL && transport->fd >= 0);
+    gboolean ready = FALSE;
+
+    if (transport == NULL)
+        return FALSE;
+
+    g_mutex_lock((GMutex *)&transport->io_lock);
+    ready = hamlib_transport_is_ready_locked(transport);
+    g_mutex_unlock((GMutex *)&transport->io_lock);
+    return ready;
 }
 
 gboolean hamlib_transport_request(HamlibTransport *transport,
@@ -941,20 +998,19 @@ gboolean hamlib_transport_request(HamlibTransport *transport,
 {
     gint attempt = 0;
     gboolean ok = FALSE;
-    gboolean locked = FALSE;
 
     if (info)
         memset(info, 0, sizeof(*info));
 
-    if (transport == NULL || cmd == NULL || !hamlib_transport_is_ready(transport))
+    if (transport == NULL || cmd == NULL)
         return FALSE;
 
-    g_mutex_lock(&transport->io_lock);
-    while (transport->busy)
-        g_cond_wait(&transport->io_cond, &transport->io_lock);
-    transport->busy = TRUE;
-    locked = TRUE;
-    g_mutex_unlock(&transport->io_lock);
+    hamlib_transport_begin_busy(transport);
+    if (!hamlib_transport_is_ready_locked(transport))
+    {
+        hamlib_transport_end_busy(transport);
+        return FALSE;
+    }
 
     if (out && out_len > 0)
         out[0] = '\0';
@@ -1016,13 +1072,7 @@ gboolean hamlib_transport_request(HamlibTransport *transport,
         break;
     }
 
-    if (locked)
-    {
-        g_mutex_lock(&transport->io_lock);
-        transport->busy = FALSE;
-        g_cond_signal(&transport->io_cond);
-        g_mutex_unlock(&transport->io_lock);
-    }
+    hamlib_transport_end_busy(transport);
 
     return ok;
 }
@@ -1034,12 +1084,18 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
     gssize total = 0;
     gint err = 0;
 
-    /* Caller must ensure no concurrent request owns the transport stream. */
     if (err_out)
         *err_out = 0;
 
-    if (transport == NULL || !hamlib_transport_is_ready(transport))
+    if (transport == NULL)
         return -1;
+
+    hamlib_transport_begin_busy(transport);
+    if (!hamlib_transport_is_ready_locked(transport))
+    {
+        hamlib_transport_end_busy(transport);
+        return -1;
+    }
 
     if (idle_timeout_ms <= 0)
         idle_timeout_ms = 50;
@@ -1072,6 +1128,7 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
         total += size;
     }
 
+    hamlib_transport_end_busy(transport);
     return total;
 }
 
@@ -1079,9 +1136,15 @@ gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
 {
     gssize total = 0;
 
-    /* Caller must ensure no concurrent request owns the transport stream. */
-    if (transport == NULL || !hamlib_transport_is_ready(transport))
+    if (transport == NULL)
         return -1;
+
+    hamlib_transport_begin_busy(transport);
+    if (!hamlib_transport_is_ready_locked(transport))
+    {
+        hamlib_transport_end_busy(transport);
+        return -1;
+    }
 
     if (transport->rxbuf)
         g_string_set_size(transport->rxbuf, 0);
@@ -1110,6 +1173,7 @@ gssize hamlib_transport_clear_rxbuf(HamlibTransport *transport)
         total += size;
     }
 
+    hamlib_transport_end_busy(transport);
     return total;
 }
 
