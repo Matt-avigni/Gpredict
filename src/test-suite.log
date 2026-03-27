@@ -3,20 +3,14 @@
 =====================================================
 
 # TOTAL: 10
-# PASS:  9
+# PASS:  10
 # SKIP:  0
 # XFAIL: 0
-# FAIL:  1
+# FAIL:  0
 # XPASS: 0
 # ERROR: 0
 
 System information (uname -a): Darwin 24.6.0 Darwin Kernel Version 24.6.0: Mon Jan 19 22:00:55 PST 2026; root:xnu-11417.140.69.708.3~1/RELEASE_ARM64_T6000
 
 .. contents:: :depth: 2
-
-FAIL: hamlib-mock-test
-======================
-
-rotctld post-set pos mismatch: az=12.0 el=8.0
-FAIL hamlib-mock-test (exit status: 1)
 

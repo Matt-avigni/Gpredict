@@ -98,6 +98,7 @@ static void rotctld_client_caps_copy_snapshot(const RotCaps *src,
     if (src == NULL)
         return;
 
+    dst->signature = g_strdup(src->signature);
     dst->model_id = src->model_id;
     dst->has_get_pos = src->has_get_pos;
     dst->has_set_pos = src->has_set_pos;

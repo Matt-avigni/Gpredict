@@ -889,6 +889,18 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
+    if (!rotctld_client_set_pos(rot, 15.0, 5.0))
+    {
+        g_printerr("rotctld set pos failed (restore)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!rotctld_client_get_pos(rot, &az, &el))
+    {
+        g_printerr("rotctld get pos failed (post-restore)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
     if (fabs(az - 15.0) >= 1e-3 || fabs(el - 5.0) >= 1e-3)
     {
         g_printerr("rotctld post-set pos mismatch: az=%.1f el=%.1f\n", az, el);
