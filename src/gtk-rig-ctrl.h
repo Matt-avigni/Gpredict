@@ -217,6 +217,7 @@ struct _gtk_rig_ctrl {
     GAsyncQueue    *rigctlq;    /*!< Message queue to indicate something has changed */
     GThread        *rigctl_thread;      /*!< Pointer to current rigctl-thread */
     gboolean        rigctl_thread_done; /*!< TRUE once the rigctl thread has fully exited */
+    gboolean        rigctl_thread_exit_requested; /*!< TRUE only when the worker must exit for window teardown. */
     GThread        *main_thread;        /*!< GTK main thread owning this widget */
 
     RigctldMgr     *rigctld_mgr;        /*!< Auto-started rigctld manager (primary) */

@@ -38,6 +38,7 @@ typedef enum {
     ROT_LIST_COL_DEVICE_MANUAL, /*!< Manual device override */
     ROT_LIST_COL_DEVICE_AUTOPICK, /*!< Auto-pick device */
     ROT_LIST_COL_AUTOSTART,     /*!< Auto-start rotctld */
+    ROT_LIST_COL_CYCLE,         /*!< Cycle period in milliseconds. */
     ROT_LIST_COL_MINAZ,         /*!< Lower Az limit. */
     ROT_LIST_COL_MAXAZ,         /*!< Upper Az limit. */
     ROT_LIST_COL_MINEL,         /*!< Lower El limit. */
@@ -55,12 +56,25 @@ typedef enum {
     ROT_LIST_COL_POLL_PERIOD_MS, /*!< Poll period in milliseconds. */
     ROT_LIST_COL_POS_STALE_MS, /*!< Position stale threshold in milliseconds. */
     ROT_LIST_COL_STALE_DEBOUNCE, /*!< Stale debounce count. */
+    ROT_LIST_COL_STALE_WARN_MS, /*!< Stale warning threshold in milliseconds. */
+    ROT_LIST_COL_STALE_DEGRADED_MS, /*!< Stale degraded threshold in milliseconds. */
+    ROT_LIST_COL_STALE_HOLD_MS, /*!< Stale hold threshold in milliseconds. */
+    ROT_LIST_COL_STALE_PARK_MS, /*!< Stale park threshold in milliseconds. */
+    ROT_LIST_COL_STALE_RESUME_MS, /*!< Stale resume threshold in milliseconds. */
+    ROT_LIST_COL_THRESHOLD,     /*!< Tracking threshold in degrees. */
     ROT_LIST_COL_ANGLE_EPSILON, /*!< Angle epsilon in degrees. */
     ROT_LIST_COL_ELEV_FLOOR,   /*!< Elevation floor in degrees. */
+    ROT_LIST_COL_PRETRACK_SECONDS, /*!< Pretrack lookahead in seconds. */
+    ROT_LIST_COL_PRETRACK_SLEW, /*!< Allow pretrack below horizon. */
+    ROT_LIST_COL_PRETRACK_IMMEDIATE, /*!< Enter pretrack immediately on Track. */
+    ROT_LIST_COL_PRETRACK_MIN_EL, /*!< Pretrack elevation in degrees. */
+    ROT_LIST_COL_DISABLE_POS_FEEDBACK, /*!< Disable feedback checks. */
     ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, /*!< Enable custom elevation overtravel clamp. */
     ROT_LIST_COL_EL_MIN_DEG,   /*!< Overtravel minimum elevation in degrees. */
     ROT_LIST_COL_EL_MAX_DEG,   /*!< Overtravel maximum elevation in degrees. */
     ROT_LIST_COL_HAMLIB_MODEL, /*!< Hamlib model ID. */
+    ROT_LIST_COL_LAST_GOOD_DEVICE, /*!< Last validated serial device. */
+    ROT_LIST_COL_LAST_GOOD_BAUD, /*!< Last validated baud rate. */
     ROT_LIST_COL_NUM            /*!< The number of fields in the list. */
 } rotor_list_col_t;
 

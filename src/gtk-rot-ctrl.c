@@ -7117,6 +7117,231 @@ static void rot_target_state_set(GtkRotCtrl *ctrl,
     ctrl->target_state_since_us = now_us;
 }
 
+static void rotctrl_clear_pretrack_transition_runtime(GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL)
+        return;
+
+    ctrl->pretrack_target_az = 0.0;
+    ctrl->pretrack_target_el = 0.0;
+    ctrl->pretrack_target_valid = FALSE;
+    ctrl->pretrack_aos_time = 0.0;
+    ctrl->pretrack_last_update_us = 0;
+    ctrl->pretrack_wait_log_us = 0;
+    ctrl->pretrack_wrap_valid = FALSE;
+    ctrl->pretrack_wrap_user_az = 0.0;
+    ctrl->pretrack_wrap_raw_az = 0.0;
+    ctrl->pretrack_wrap_k = 0;
+    ctrl->seam_crossing_active = FALSE;
+    ctrl->seam_crossing_sent = FALSE;
+    ctrl->seam_crossing_lane_valid = FALSE;
+    ctrl->seam_crossing_lane_k = 0;
+    ctrl->seam_crossing_target_az360 = 0.0;
+    ctrl->seam_crossing_since_us = 0;
+    ctrl->wrap_acquire_active = FALSE;
+    ctrl->wrap_acquire_sent = FALSE;
+    ctrl->wrap_acquire_target_backend = 0.0;
+    ctrl->wrap_acquire_target_az360 = 0.0;
+    ctrl->wrap_acquire_target_k = 0;
+    ctrl->wrap_acquire_since_us = 0;
+    ctrl->wrap_acquire_last_log_us = 0;
+    ctrl->pending_lane_valid = FALSE;
+    ctrl->pending_lane_since_us = 0;
+    ctrl->seam_valid = FALSE;
+    ctrl->locked_lane_k = 0;
+    ctrl->locked_lane_valid = FALSE;
+}
+
+static void rotctrl_select_safe_hold_target(rot_ui_mode_t ui_mode,
+                                            gboolean rotpos_valid,
+                                            gdouble meas_az360,
+                                            gdouble meas_el,
+                                            gboolean have_last_cmd_backend,
+                                            gdouble last_cmd_backend,
+                                            gdouble last_cmd_el,
+                                            gdouble *raw_az_out,
+                                            gdouble *raw_el_out,
+                                            gdouble *user_az_out,
+                                            gdouble *user_el_out)
+{
+    gdouble safe_raw_az = 0.0;
+    gdouble safe_raw_el = 0.0;
+
+    if (rotpos_valid && isfinite(meas_az360) && isfinite(meas_el))
+    {
+        safe_raw_az = rot_norm360(meas_az360);
+        safe_raw_el = meas_el;
+    }
+    else if (have_last_cmd_backend &&
+             isfinite(last_cmd_backend) &&
+             isfinite(last_cmd_el))
+    {
+        safe_raw_az = rot_backend_pos_to_az360(last_cmd_backend);
+        safe_raw_el = last_cmd_el;
+    }
+
+    if (!isfinite(safe_raw_az))
+        safe_raw_az = 0.0;
+    if (!isfinite(safe_raw_el))
+        safe_raw_el = 0.0;
+
+    if (raw_az_out)
+        *raw_az_out = safe_raw_az;
+    if (raw_el_out)
+        *raw_el_out = safe_raw_el;
+    if (user_az_out)
+        *user_az_out = rot_az360_to_ui(safe_raw_az, ui_mode);
+    if (user_el_out)
+        *user_el_out = safe_raw_el;
+}
+
+static gboolean rotctrl_tracking_command_inputs_valid(
+    GtkRotCtrl *ctrl,
+    const rot_target_caps_t *caps,
+    rot_target_state_t desired_state,
+    gboolean pred_valid,
+    gdouble desired_raw_az,
+    gdouble desired_raw_el,
+    gdouble desired_user_az,
+    gdouble desired_user_el,
+    gdouble backend_az_min,
+    gdouble backend_az_max,
+    gdouble backend_el_min,
+    gdouble backend_el_max,
+    const gchar **reason_out)
+{
+    rot_target_invalid_reason_t invalid_reason = ROT_TARGET_INVALID_NONE;
+    gboolean tracking_state =
+        (desired_state == ROT_TARGET_STATE_PRETRACK ||
+         desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+         desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+
+    if (reason_out)
+        *reason_out = "ok";
+
+    if (!tracking_state)
+        return TRUE;
+
+    if (ctrl == NULL)
+    {
+        if (reason_out)
+            *reason_out = "ctrl_null";
+        return FALSE;
+    }
+
+    if (!pred_valid)
+    {
+        if (reason_out)
+            *reason_out = "pred_invalid";
+        return FALSE;
+    }
+
+    if (ctrl->conf == NULL)
+    {
+        if (reason_out)
+            *reason_out = "conf_null";
+        return FALSE;
+    }
+
+    if (ctrl->target == NULL)
+    {
+        if (reason_out)
+            *reason_out = "target_null";
+        return FALSE;
+    }
+
+    if (ctrl->qth == NULL)
+    {
+        if (reason_out)
+            *reason_out = "qth_null";
+        return FALSE;
+    }
+
+    if (!isfinite(desired_raw_az) || !isfinite(desired_raw_el) ||
+        !isfinite(desired_user_az) || !isfinite(desired_user_el))
+    {
+        if (reason_out)
+            *reason_out = "target_nonfinite";
+        return FALSE;
+    }
+
+    if (!isfinite(backend_az_min) || !isfinite(backend_az_max) ||
+        !isfinite(backend_el_min) || !isfinite(backend_el_max))
+    {
+        if (reason_out)
+            *reason_out = "backend_limits_nonfinite";
+        return FALSE;
+    }
+
+    if (backend_az_min > backend_az_max || backend_el_min > backend_el_max)
+    {
+        if (reason_out)
+            *reason_out = "backend_limits_inverted";
+        return FALSE;
+    }
+
+    if (ctrl->pretrack_wrap_valid &&
+        (!isfinite(ctrl->pretrack_wrap_user_az) ||
+         !isfinite(ctrl->pretrack_wrap_raw_az)))
+    {
+        if (reason_out)
+            *reason_out = "pretrack_wrap_nonfinite";
+        return FALSE;
+    }
+
+    if (ctrl->seam_crossing_active &&
+        !isfinite(ctrl->seam_crossing_target_az360))
+    {
+        if (reason_out)
+            *reason_out = "seam_target_nonfinite";
+        return FALSE;
+    }
+
+    if (ctrl->wrap_acquire_active &&
+        (!isfinite(ctrl->wrap_acquire_target_backend) ||
+         !isfinite(ctrl->wrap_acquire_target_az360)))
+    {
+        if (reason_out)
+            *reason_out = "wrap_acquire_nonfinite";
+        return FALSE;
+    }
+
+    if (caps == NULL)
+    {
+        if (reason_out)
+            *reason_out = "caps_null";
+        return FALSE;
+    }
+
+    if (!rotctrl_target_is_valid(caps,
+                                 desired_user_az,
+                                 desired_user_el,
+                                 NULL,
+                                 &invalid_reason,
+                                 NULL))
+    {
+        if (reason_out)
+            *reason_out = rot_target_invalid_reason_name(invalid_reason);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static gboolean rotctrl_pipeline_values_valid(const RotCmdPipeline *pipeline)
+{
+    if (pipeline == NULL)
+        return FALSE;
+
+    return isfinite(pipeline->az360) &&
+           isfinite(pipeline->el) &&
+           isfinite(pipeline->ui_az) &&
+           isfinite(pipeline->ui_el) &&
+           isfinite(pipeline->cmd_az) &&
+           isfinite(pipeline->cmd_el) &&
+           isfinite(pipeline->lane_ref_backend);
+}
+
 static gboolean G_GNUC_UNUSED rotctrl_find_first_valid_sample(GtkRotCtrl *ctrl,
                                                 const rot_target_caps_t *caps,
                                                 gdouble t_start,
@@ -12400,23 +12625,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             ctrl->wrap_acquire_last_log_us = 0;
         }
 
-        state_changed = (desired_state != ctrl->target_state);
-        force_transition =
-            state_changed &&
-            ctrl->target_state == ROT_TARGET_STATE_PRETRACK &&
-            (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
-             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
-
-        have_target = pred_valid || cal_hold_active ||
-                      (hold_below && !hold_no_target);
-        if (autocal_active && !autocal_direct)
-            have_target = have_target || autocal_active;
-        force_send = cal_force_send || ctrl->force_next_send || force_transition;
-        if (ctrl->seam_crossing_active &&
-            desired_state == ROT_TARGET_STATE_PRETRACK &&
-            !ctrl->seam_crossing_sent)
-            force_send = TRUE;
-
         gdouble ref_backend = fresh_feedback ? meas_backend_az : last_cmd_backend;
         gboolean have_ref_backend = fresh_feedback || have_last_cmd_backend;
 
@@ -12456,6 +12664,79 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         deadband_el = threshold_deg;
 
         rotctrl_build_target_caps(ctrl, &decision_caps);
+
+        {
+            const gchar *command_guard_reason = NULL;
+            rot_target_state_t guarded_state = desired_state;
+            gboolean guarded_transition =
+                (ctrl->target_state == ROT_TARGET_STATE_PRETRACK &&
+                 (guarded_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+                  guarded_state == ROT_TARGET_STATE_TRACKING_DEGRADED));
+
+            if (!rotctrl_tracking_command_inputs_valid(ctrl,
+                                                       &decision_caps,
+                                                       guarded_state,
+                                                       pred_valid,
+                                                       desired_raw_az,
+                                                       desired_raw_el,
+                                                       desired_user_az,
+                                                       desired_user_el,
+                                                       backend_az_min,
+                                                       backend_az_max,
+                                                       backend_el_min,
+                                                       backend_el_max,
+                                                       &command_guard_reason))
+            {
+                rotctrl_clear_pretrack_transition_runtime(ctrl);
+                rotctrl_select_safe_hold_target(ui_mode,
+                                                rotpos_valid,
+                                                meas_az360,
+                                                meas_el,
+                                                have_last_cmd_backend,
+                                                last_cmd_backend,
+                                                last_cmd_el,
+                                                &desired_raw_az,
+                                                &desired_raw_el,
+                                                &desired_user_az,
+                                                &desired_user_el);
+                desired_state = ROT_TARGET_STATE_HOLD;
+                state_reason = guarded_transition
+                                   ? "transition_guard"
+                                   : "tracking_guard";
+                pred_valid = FALSE;
+                wrap_resolve_failed = FALSE;
+
+                sat_log_log(SAT_LOG_LEVEL_WARN,
+                            "rotor %s guard: %s->%s reason=%s fallback=HOLD",
+                            guarded_transition ? "transition" : "tracking",
+                            rot_target_state_name(ctrl->target_state),
+                            rot_target_state_name(guarded_state),
+                            command_guard_reason ? command_guard_reason : "invalid");
+                rot_term_log(ctrl, "gpredict:warn",
+                             "rotor %s guard: %s->%s reason=%s fallback=HOLD",
+                             guarded_transition ? "transition" : "tracking",
+                             rot_target_state_name(ctrl->target_state),
+                             rot_target_state_name(guarded_state),
+                             command_guard_reason ? command_guard_reason : "invalid");
+            }
+        }
+
+        state_changed = (desired_state != ctrl->target_state);
+        force_transition =
+            state_changed &&
+            ctrl->target_state == ROT_TARGET_STATE_PRETRACK &&
+            (desired_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+             desired_state == ROT_TARGET_STATE_TRACKING_DEGRADED);
+
+        have_target = pred_valid || cal_hold_active ||
+                      (hold_below && !hold_no_target);
+        if (autocal_active && !autocal_direct)
+            have_target = have_target || autocal_active;
+        force_send = cal_force_send || ctrl->force_next_send || force_transition;
+        if (ctrl->seam_crossing_active &&
+            desired_state == ROT_TARGET_STATE_PRETRACK &&
+            !ctrl->seam_crossing_sent)
+            force_send = TRUE;
 
         if (have_target && ctrl->tracking &&
             (desired_state == ROT_TARGET_STATE_PRETRACK ||
@@ -12737,6 +13018,76 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             desired_pipeline.cmd_az =
                 rotctrl_normalize_backend_az(0.0, backend_az_min, backend_az_max);
             desired_pipeline.cmd_el = 0.0;
+        }
+
+        if (!rotctrl_pipeline_values_valid(&desired_pipeline))
+        {
+            rot_target_state_t guarded_state = desired_state;
+            gboolean guarded_transition =
+                (ctrl->target_state == ROT_TARGET_STATE_PRETRACK &&
+                 (guarded_state == ROT_TARGET_STATE_TRACKING_NORMAL ||
+                  guarded_state == ROT_TARGET_STATE_TRACKING_DEGRADED));
+            gdouble safe_cmd_az = desired_raw_az;
+            gdouble safe_ref_backend = desired_raw_az;
+
+            rotctrl_clear_pretrack_transition_runtime(ctrl);
+            rotctrl_select_safe_hold_target(ui_mode,
+                                            rotpos_valid,
+                                            meas_az360,
+                                            meas_el,
+                                            have_last_cmd_backend,
+                                            last_cmd_backend,
+                                            last_cmd_el,
+                                            &desired_raw_az,
+                                            &desired_raw_el,
+                                            &desired_user_az,
+                                            &desired_user_el);
+
+            if (have_ref_backend && isfinite(ref_backend))
+            {
+                safe_ref_backend = ref_backend;
+                safe_cmd_az = rotctrl_normalize_backend_az(ref_backend,
+                                                           backend_az_min,
+                                                           backend_az_max);
+            }
+            else
+            {
+                safe_ref_backend = desired_raw_az;
+                safe_cmd_az = desired_raw_az;
+            }
+
+            memset(&desired_pipeline, 0, sizeof(desired_pipeline));
+            desired_pipeline.az360 = rot_norm360(desired_raw_az);
+            desired_pipeline.el = desired_raw_el;
+            desired_pipeline.ui_az = desired_user_az;
+            desired_pipeline.ui_el = desired_user_el;
+            desired_pipeline.cmd_az = isfinite(safe_cmd_az) ? safe_cmd_az : desired_raw_az;
+            desired_pipeline.cmd_el = desired_raw_el;
+            desired_pipeline.lane_k = ctrl->locked_lane_valid ? ctrl->locked_lane_k : 0;
+            desired_pipeline.lane_ref_backend =
+                isfinite(safe_ref_backend) ? safe_ref_backend : desired_raw_az;
+
+            desired_state = ROT_TARGET_STATE_HOLD;
+            state_reason = guarded_transition
+                               ? "transition_pipeline_guard"
+                               : "pipeline_guard";
+            pred_valid = FALSE;
+            wrap_resolve_failed = FALSE;
+            state_changed = (desired_state != ctrl->target_state);
+            force_transition = FALSE;
+            have_target = FALSE;
+            force_send = FALSE;
+            seam_cross_active = FALSE;
+            seam_cmd_valid = FALSE;
+
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "rotor pipeline guard: %s->%s fallback=HOLD",
+                        rot_target_state_name(ctrl->target_state),
+                        rot_target_state_name(guarded_state));
+            rot_term_log(ctrl, "gpredict:warn",
+                         "rotor pipeline guard: %s->%s fallback=HOLD",
+                         rot_target_state_name(ctrl->target_state),
+                         rot_target_state_name(guarded_state));
         }
 
         pipeline = desired_pipeline;

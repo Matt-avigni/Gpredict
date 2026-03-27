@@ -59,6 +59,7 @@ static void rot_pref_store_set(GtkListStore *store,
                        ROT_LIST_COL_DEVICE_MANUAL, conf->device_manual,
                        ROT_LIST_COL_DEVICE_AUTOPICK, conf->device_autopick,
                        ROT_LIST_COL_AUTOSTART, conf->autostart,
+                       ROT_LIST_COL_CYCLE, conf->cycle,
                        ROT_LIST_COL_MINAZ, conf->minaz,
                        ROT_LIST_COL_MAXAZ, conf->maxaz,
                        ROT_LIST_COL_MINEL, conf->minel,
@@ -74,12 +75,26 @@ static void rot_pref_store_set(GtkListStore *store,
                        ROT_LIST_COL_POLL_PERIOD_MS, conf->rotor_poll_period_ms,
                        ROT_LIST_COL_POS_STALE_MS, conf->rotor_position_stale_ms,
                        ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf->rotor_stale_debounce_count,
+                       ROT_LIST_COL_STALE_WARN_MS, conf->rotor_stale_warn_ms,
+                       ROT_LIST_COL_STALE_DEGRADED_MS, conf->rotor_stale_degraded_ms,
+                       ROT_LIST_COL_STALE_HOLD_MS, conf->rotor_stale_hold_ms,
+                       ROT_LIST_COL_STALE_PARK_MS, conf->rotor_stale_park_ms,
+                       ROT_LIST_COL_STALE_RESUME_MS, conf->rotor_stale_resume_ms,
+                       ROT_LIST_COL_THRESHOLD, conf->threshold,
                        ROT_LIST_COL_ANGLE_EPSILON, conf->rotor_angle_epsilon_deg,
                        ROT_LIST_COL_ELEV_FLOOR, conf->rotor_elev_floor_deg,
+                       ROT_LIST_COL_PRETRACK_SECONDS, conf->pretrack_seconds,
+                       ROT_LIST_COL_PRETRACK_SLEW, conf->slew_to_aos_while_below_horizon,
+                       ROT_LIST_COL_PRETRACK_IMMEDIATE, conf->pretrack_immediate,
+                       ROT_LIST_COL_PRETRACK_MIN_EL, conf->pretrack_min_el,
+                       ROT_LIST_COL_DISABLE_POS_FEEDBACK,
+                       conf->disable_pos_feedback_checks,
                        ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, conf->el_overtravel_enable,
                        ROT_LIST_COL_EL_MIN_DEG, conf->el_min_deg,
                        ROT_LIST_COL_EL_MAX_DEG, conf->el_max_deg,
                        ROT_LIST_COL_HAMLIB_MODEL, conf->hamlib_model,
+                       ROT_LIST_COL_LAST_GOOD_DEVICE, conf->last_good_device,
+                       ROT_LIST_COL_LAST_GOOD_BAUD, conf->last_good_baud,
                        -1);
 }
 
@@ -142,6 +157,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .device_manual = NULL,
         .device_autopick = TRUE,
         .autostart = TRUE,
+        .cycle = 1000,
         .minaz = 0,
         .maxaz = 360,
         .minel = -5,
@@ -157,13 +173,21 @@ static void add_cb(GtkWidget * button, gpointer data)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .threshold = 5.0,
         .rotor_poll_period_ms = 1000,
         .rotor_position_stale_ms = 6000,
         .rotor_stale_debounce_count = 2,
+        .rotor_stale_warn_ms = 2500,
+        .rotor_stale_degraded_ms = 5000,
+        .rotor_stale_hold_ms = 7000,
+        .rotor_stale_park_ms = 10000,
+        .rotor_stale_resume_ms = 1000,
         .rotor_angle_epsilon_deg = 1.5,
         .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
+        .pretrack_immediate = TRUE,
+        .pretrack_min_el = 1.0,
         .disable_pos_feedback_checks = FALSE,
         .last_good_device = NULL,
         .last_good_baud = 0,
@@ -239,6 +263,7 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .device_manual = NULL,
         .device_autopick = TRUE,
         .autostart = TRUE,
+        .cycle = 1000,
         .minaz = 0,
         .maxaz = 360,
         .minel = -5,
@@ -254,13 +279,22 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .threshold = 5.0,
         .rotor_poll_period_ms = 1000,
         .rotor_position_stale_ms = 6000,
         .rotor_stale_debounce_count = 2,
+        .rotor_stale_warn_ms = 2500,
+        .rotor_stale_degraded_ms = 5000,
+        .rotor_stale_hold_ms = 7000,
+        .rotor_stale_park_ms = 10000,
+        .rotor_stale_resume_ms = 1000,
         .rotor_angle_epsilon_deg = 1.5,
         .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
+        .pretrack_immediate = TRUE,
+        .pretrack_min_el = 1.0,
+        .disable_pos_feedback_checks = FALSE,
         .last_good_device = NULL,
         .last_good_baud = 0,
     };
@@ -279,6 +313,7 @@ static void edit_cb(GtkWidget * button, gpointer data)
                        ROT_LIST_COL_DEVICE_MANUAL, &conf->device_manual,
                        ROT_LIST_COL_DEVICE_AUTOPICK, &conf->device_autopick,
                        ROT_LIST_COL_AUTOSTART, &conf->autostart,
+                       ROT_LIST_COL_CYCLE, &conf->cycle,
                        ROT_LIST_COL_MINAZ, &conf->minaz,
                        ROT_LIST_COL_MAXAZ, &conf->maxaz,
                        ROT_LIST_COL_MINEL, &conf->minel,
@@ -297,8 +332,22 @@ static void edit_cb(GtkWidget * button, gpointer data)
                        ROT_LIST_COL_POLL_PERIOD_MS, &conf->rotor_poll_period_ms,
                        ROT_LIST_COL_POS_STALE_MS, &conf->rotor_position_stale_ms,
                        ROT_LIST_COL_STALE_DEBOUNCE, &conf->rotor_stale_debounce_count,
+                       ROT_LIST_COL_STALE_WARN_MS, &conf->rotor_stale_warn_ms,
+                       ROT_LIST_COL_STALE_DEGRADED_MS, &conf->rotor_stale_degraded_ms,
+                       ROT_LIST_COL_STALE_HOLD_MS, &conf->rotor_stale_hold_ms,
+                       ROT_LIST_COL_STALE_PARK_MS, &conf->rotor_stale_park_ms,
+                       ROT_LIST_COL_STALE_RESUME_MS, &conf->rotor_stale_resume_ms,
+                       ROT_LIST_COL_THRESHOLD, &conf->threshold,
                        ROT_LIST_COL_ANGLE_EPSILON, &conf->rotor_angle_epsilon_deg,
                        ROT_LIST_COL_ELEV_FLOOR, &conf->rotor_elev_floor_deg,
+                       ROT_LIST_COL_PRETRACK_SECONDS, &conf->pretrack_seconds,
+                       ROT_LIST_COL_PRETRACK_SLEW, &conf->slew_to_aos_while_below_horizon,
+                       ROT_LIST_COL_PRETRACK_IMMEDIATE, &conf->pretrack_immediate,
+                       ROT_LIST_COL_PRETRACK_MIN_EL, &conf->pretrack_min_el,
+                       ROT_LIST_COL_DISABLE_POS_FEEDBACK,
+                       &conf->disable_pos_feedback_checks,
+                       ROT_LIST_COL_LAST_GOOD_DEVICE, &conf->last_good_device,
+                       ROT_LIST_COL_LAST_GOOD_BAUD, &conf->last_good_baud,
                        -1);
 
     ctx = g_new0(RotPrefEditorContext, 1);
@@ -386,6 +435,7 @@ static GtkTreeModel *create_and_fill_model(void)
                                    G_TYPE_STRING,       // manual device
                                    G_TYPE_BOOLEAN,      // device autopick
                                    G_TYPE_BOOLEAN,      // autostart
+                                   G_TYPE_INT,          // cycle
                                    G_TYPE_DOUBLE,       // Min Az
                                    G_TYPE_DOUBLE,       // Max Az
                                    G_TYPE_DOUBLE,       // Min El
@@ -401,12 +451,25 @@ static GtkTreeModel *create_and_fill_model(void)
                                    G_TYPE_INT,          // Poll period ms
                                    G_TYPE_INT,          // Position stale ms
                                    G_TYPE_INT,          // Stale debounce
+                                   G_TYPE_INT,          // Stale warn
+                                   G_TYPE_INT,          // Stale degraded
+                                   G_TYPE_INT,          // Stale hold
+                                   G_TYPE_INT,          // Stale park
+                                   G_TYPE_INT,          // Stale resume
+                                   G_TYPE_DOUBLE,       // Threshold
                                    G_TYPE_DOUBLE,       // Angle epsilon
                                    G_TYPE_DOUBLE,       // Elevation floor
+                                   G_TYPE_DOUBLE,       // Pretrack seconds
+                                   G_TYPE_BOOLEAN,      // Pretrack slew
+                                   G_TYPE_BOOLEAN,      // Pretrack immediate
+                                   G_TYPE_DOUBLE,       // Pretrack min el
+                                   G_TYPE_BOOLEAN,      // Disable pos feedback
                                    G_TYPE_BOOLEAN,      // Elevation overtravel enable
                                    G_TYPE_DOUBLE,       // Elevation overtravel min
                                    G_TYPE_DOUBLE,       // Elevation overtravel max
-                                   G_TYPE_INT           // Hamlib model
+                                   G_TYPE_INT,          // Hamlib model
+                                   G_TYPE_STRING,       // Last good device
+                                   G_TYPE_INT           // Last good baud
         );
     gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(liststore),
                                          ROT_LIST_COL_NAME,
@@ -439,6 +502,7 @@ static GtkTreeModel *create_and_fill_model(void)
                                        ROT_LIST_COL_DEVICE_MANUAL, conf.device_manual,
                                        ROT_LIST_COL_DEVICE_AUTOPICK, conf.device_autopick,
                                        ROT_LIST_COL_AUTOSTART, conf.autostart,
+                                       ROT_LIST_COL_CYCLE, conf.cycle,
                                        ROT_LIST_COL_MINAZ, conf.minaz,
                                        ROT_LIST_COL_MAXAZ, conf.maxaz,
                                        ROT_LIST_COL_MINEL, conf.minel,
@@ -457,9 +521,26 @@ static GtkTreeModel *create_and_fill_model(void)
                                        ROT_LIST_COL_POLL_PERIOD_MS, conf.rotor_poll_period_ms,
                                        ROT_LIST_COL_POS_STALE_MS, conf.rotor_position_stale_ms,
                                        ROT_LIST_COL_STALE_DEBOUNCE, (gint)conf.rotor_stale_debounce_count,
+                                       ROT_LIST_COL_STALE_WARN_MS, conf.rotor_stale_warn_ms,
+                                       ROT_LIST_COL_STALE_DEGRADED_MS, conf.rotor_stale_degraded_ms,
+                                       ROT_LIST_COL_STALE_HOLD_MS, conf.rotor_stale_hold_ms,
+                                       ROT_LIST_COL_STALE_PARK_MS, conf.rotor_stale_park_ms,
+                                       ROT_LIST_COL_STALE_RESUME_MS, conf.rotor_stale_resume_ms,
+                                       ROT_LIST_COL_THRESHOLD, conf.threshold,
                                        ROT_LIST_COL_ANGLE_EPSILON, conf.rotor_angle_epsilon_deg,
                                        ROT_LIST_COL_ELEV_FLOOR, conf.rotor_elev_floor_deg,
+                                       ROT_LIST_COL_PRETRACK_SECONDS, conf.pretrack_seconds,
+                                       ROT_LIST_COL_PRETRACK_SLEW,
+                                       conf.slew_to_aos_while_below_horizon,
+                                       ROT_LIST_COL_PRETRACK_IMMEDIATE,
+                                       conf.pretrack_immediate,
+                                       ROT_LIST_COL_PRETRACK_MIN_EL,
+                                       conf.pretrack_min_el,
+                                       ROT_LIST_COL_DISABLE_POS_FEEDBACK,
+                                       conf.disable_pos_feedback_checks,
                                        ROT_LIST_COL_HAMLIB_MODEL, conf.hamlib_model,
+                                       ROT_LIST_COL_LAST_GOOD_DEVICE, conf.last_good_device,
+                                       ROT_LIST_COL_LAST_GOOD_BAUD, conf.last_good_baud,
                                        -1);
 
                     sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -756,6 +837,7 @@ void sat_pref_rot_ok(void)
         .device_manual = NULL,
         .device_autopick = TRUE,
         .autostart = TRUE,
+        .cycle = 1000,
         .minaz = 0,
         .maxaz = 360,
         .minel = -5,
@@ -771,13 +853,22 @@ void sat_pref_rot_ok(void)
         .el_offset = 0.0,
         .invert_az = FALSE,
         .invert_el = FALSE,
+        .threshold = 5.0,
         .rotor_poll_period_ms = 1000,
         .rotor_position_stale_ms = 6000,
         .rotor_stale_debounce_count = 2,
+        .rotor_stale_warn_ms = 2500,
+        .rotor_stale_degraded_ms = 5000,
+        .rotor_stale_hold_ms = 7000,
+        .rotor_stale_park_ms = 10000,
+        .rotor_stale_resume_ms = 1000,
         .rotor_angle_epsilon_deg = 1.5,
         .rotor_elev_floor_deg = 1.0,
         .pretrack_seconds = 300.0,
         .slew_to_aos_while_below_horizon = TRUE,
+        .pretrack_immediate = TRUE,
+        .pretrack_min_el = 1.0,
+        .disable_pos_feedback_checks = FALSE,
         .last_good_device = NULL,
         .last_good_baud = 0,
     };
@@ -831,6 +922,7 @@ void sat_pref_rot_ok(void)
                                ROT_LIST_COL_DEVICE_MANUAL, &conf.device_manual,
                                ROT_LIST_COL_DEVICE_AUTOPICK, &conf.device_autopick,
                                ROT_LIST_COL_AUTOSTART, &conf.autostart,
+                               ROT_LIST_COL_CYCLE, &conf.cycle,
                                ROT_LIST_COL_MINAZ, &conf.minaz,
                                ROT_LIST_COL_MAXAZ, &conf.maxaz,
                                ROT_LIST_COL_MINEL, &conf.minel,
@@ -847,6 +939,42 @@ void sat_pref_rot_ok(void)
                                ROT_LIST_COL_EL_OFFSET, &conf.el_offset,
                                ROT_LIST_COL_AZ_INVERT, &conf.invert_az,
                                ROT_LIST_COL_EL_INVERT, &conf.invert_el,
+                               ROT_LIST_COL_POLL_PERIOD_MS,
+                               &conf.rotor_poll_period_ms,
+                               ROT_LIST_COL_POS_STALE_MS,
+                               &conf.rotor_position_stale_ms,
+                               ROT_LIST_COL_STALE_DEBOUNCE,
+                               &conf.rotor_stale_debounce_count,
+                               ROT_LIST_COL_STALE_WARN_MS,
+                               &conf.rotor_stale_warn_ms,
+                               ROT_LIST_COL_STALE_DEGRADED_MS,
+                               &conf.rotor_stale_degraded_ms,
+                               ROT_LIST_COL_STALE_HOLD_MS,
+                               &conf.rotor_stale_hold_ms,
+                               ROT_LIST_COL_STALE_PARK_MS,
+                               &conf.rotor_stale_park_ms,
+                               ROT_LIST_COL_STALE_RESUME_MS,
+                               &conf.rotor_stale_resume_ms,
+                               ROT_LIST_COL_THRESHOLD, &conf.threshold,
+                               ROT_LIST_COL_ANGLE_EPSILON,
+                               &conf.rotor_angle_epsilon_deg,
+                               ROT_LIST_COL_ELEV_FLOOR,
+                               &conf.rotor_elev_floor_deg,
+                               ROT_LIST_COL_PRETRACK_SECONDS,
+                               &conf.pretrack_seconds,
+                               ROT_LIST_COL_PRETRACK_SLEW,
+                               &conf.slew_to_aos_while_below_horizon,
+                               ROT_LIST_COL_PRETRACK_IMMEDIATE,
+                               &conf.pretrack_immediate,
+                               ROT_LIST_COL_PRETRACK_MIN_EL,
+                               &conf.pretrack_min_el,
+                               ROT_LIST_COL_DISABLE_POS_FEEDBACK,
+                               &conf.disable_pos_feedback_checks,
+                               ROT_LIST_COL_HAMLIB_MODEL, &conf.hamlib_model,
+                               ROT_LIST_COL_LAST_GOOD_DEVICE,
+                               &conf.last_good_device,
+                               ROT_LIST_COL_LAST_GOOD_BAUD,
+                               &conf.last_good_baud,
                                -1);
             rotor_conf_save(&conf);
 

@@ -999,6 +999,8 @@ void gtk_rig_ctrl_request_close(GtkRigCtrl *ctrl)
     if (!IS_GTK_RIG_CTRL(ctrl) || ctrl->destroying)
         return;
 
+    ctrl->rigctl_thread_exit_requested = TRUE;
+
     if (ctrl->LockBut != NULL &&
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
     {
@@ -1053,6 +1055,15 @@ static gboolean rigctrl_collect_thread(GtkRigCtrl *ctrl,
     if (context != NULL && *context != '\0')
         rig_term_log(ctrl, "gpredict", "rigctl thread collected (%s)", context);
     return TRUE;
+}
+
+static void rigctrl_reap_worker_thread(GtkRigCtrl *ctrl,
+                                       const gchar *context)
+{
+    if (!IS_GTK_RIG_CTRL(ctrl) || ctrl->rigctl_thread == NULL)
+        return;
+
+    (void)rigctrl_collect_thread(ctrl, FALSE, context);
 }
 
 gboolean gtk_rig_ctrl_can_destroy(GtkRigCtrl *ctrl)
@@ -3661,6 +3672,7 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(widget);
 
     ctrl->destroying = TRUE;
+    ctrl->rigctl_thread_exit_requested = TRUE;
     rigctrl_cancel_open_task(ctrl);
     rigctrl_cancel_probe_confirmation(ctrl);
     g_clear_object(&ctrl->open_task);
@@ -3685,6 +3697,11 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         if (ctrl->rigctlq != NULL)
             setconfig(ctrl);
         (void)rigctrl_collect_thread(ctrl, TRUE, "destroy");
+    }
+    if (ctrl->rigctlq != NULL)
+    {
+        g_async_queue_unref(ctrl->rigctlq);
+        ctrl->rigctlq = NULL;
     }
 
     rigctrl_close_internal(ctrl);
@@ -3813,6 +3830,7 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->destroying = FALSE;
     ctrl->main_thread = g_thread_self();
     ctrl->rigctl_thread_done = TRUE;
+    ctrl->rigctl_thread_exit_requested = FALSE;
     ctrl->reconnect_backoff_ms = 0;
     ctrl->reconnect_backoff_ms2 = 0;
     ctrl->reconnect_next_us = 0;
@@ -6963,7 +6981,7 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         rigctrl_bump_engage_generation(ctrl);
         rigctrl_autodetect_reservations_reset(ctrl);
 
-        /* Disengage: close socket / stop worker thread */
+        /* Disengage: close sockets and leave the worker idle for reuse. */
         if (ctrl->DevSel != NULL)
             gtk_widget_set_sensitive(ctrl->DevSel, TRUE);
         if (ctrl->DevSel2 != NULL)
@@ -6997,6 +7015,8 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
     {
         rigctrl_bump_engage_generation(ctrl);
         rigctrl_autodetect_reservations_reset(ctrl);
+        ctrl->rigctl_thread_exit_requested = FALSE;
+        rigctrl_reap_worker_thread(ctrl, "engage");
 
         /* Apply UI settings before starting any worker activity. */
         if (!radio_apply_ui_settings(ctrl, TRUE))
@@ -7053,7 +7073,8 @@ static void rig_engaged_cb(GtkToggleButton * button, gpointer data)
         /* Start worker thread if not already running */
         if (ctrl->rigctl_thread == NULL)
         {
-            ctrl->rigctlq = g_async_queue_new();
+            if (ctrl->rigctlq == NULL)
+                ctrl->rigctlq = g_async_queue_new();
             ctrl->rigctl_thread_done = FALSE;
             ctrl->rigctl_thread =
                 g_thread_new("rigctl_run", rigctl_run, ctrl);
@@ -12779,6 +12800,9 @@ static gboolean close_rigctld_socket(GtkRigCtrl *ctrl, gint * sock,
     if (sock == NULL || *sock == -1)
         return TRUE;
 
+    /* Serialize teardown with in-flight rigctld commands. */
+    rigctld_io_lock_acquire();
+
     client = rigctld_client_for_socket(ctrl, *sock);
     transport = client ? rigctld_client_get_transport(client) : NULL;
     if (transport != NULL)
@@ -12800,6 +12824,7 @@ static gboolean close_rigctld_socket(GtkRigCtrl *ctrl, gint * sock,
         rigctld_close_fd(*sock);
 
     *sock = -1;
+    rigctld_io_lock_release();
     return TRUE;
 }
 
@@ -15427,6 +15452,13 @@ gpointer rigctl_run(gpointer data)
             continue;
         }
 
+        if (t_ctrl->destroying || t_ctrl->rigctl_thread_exit_requested)
+        {
+            if (t_ctrl->sock != -1 || t_ctrl->sock2 != -1)
+                rigctrl_close(t_ctrl);
+            break;
+        }
+
         if (t_ctrl->engaged)
         {
             if (t_ctrl->conn_state != RIGCTRL_CONN_CONNECTED ||
@@ -15437,7 +15469,7 @@ gpointer rigctl_run(gpointer data)
         {
             if (t_ctrl->sock != -1 || t_ctrl->sock2 != -1)
                 rigctrl_close(t_ctrl);
-            break;
+            continue;
         }
 
         check_aos_los(t_ctrl);
