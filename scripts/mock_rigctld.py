@@ -86,6 +86,10 @@ class RigctldHandler(socketserver.StreamRequestHandler):
             state["cmd_log"].append(cmd)
 
             if cmd == "f" or cmd.startswith("f "):
+                if state["fail_get_freq"]:
+                    self.wfile.write(b"RPRT -1\n")
+                    self.wfile.flush()
+                    continue
                 self.wfile.write(("%d\nRPRT 0\n" % state["freq"]).encode("ascii"))
                 self.wfile.flush()
                 continue
@@ -190,6 +194,7 @@ def main():
     parser.add_argument("--reject-sub-select", action="store_true")
     parser.add_argument("--reject-vfo-token", action="append", default=[])
     parser.add_argument("--fail-vfo-select-count", type=int, default=0)
+    parser.add_argument("--fail-get-freq", action="store_true")
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
@@ -212,6 +217,7 @@ def main():
         "reject_vfo_tokens": reject_vfo_tokens,
         "fail_vfo_select_count": max(0, args.fail_vfo_select_count),
         "vfo_select_failures": {},
+        "fail_get_freq": args.fail_get_freq,
         "selected_since_set": False,
         "cmd_log": [],
     }

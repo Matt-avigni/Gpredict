@@ -564,6 +564,26 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
     return FALSE;
 }
 
+static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client,
+                                                           gint timeout_ms)
+{
+    gchar reply[128];
+    gint64 freq = 0;
+
+    if (client == NULL)
+        return FALSE;
+
+    if (!rigctld_client_try_get_freq_retry(client, "f\n",
+                                           &freq, reply, sizeof(reply),
+                                           timeout_ms, 0))
+    {
+        return FALSE;
+    }
+
+    client->caps.has_get_freq = TRUE;
+    return TRUE;
+}
+
 static const gchar *rigctld_client_find_vfo_token_in_table(vfo_t vfo,
                                                            GHashTable *table)
 {
@@ -615,7 +635,8 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
                                                       gint timeout_ms,
                                                       gint attempts,
                                                       gulong settle_us,
-                                                      gboolean allow_unlisted)
+                                                      gboolean allow_unlisted,
+                                                      gboolean require_readback)
 {
     RigCaps *caps = NULL;
 
@@ -649,6 +670,18 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
 
         if (settle_us > 0)
             g_usleep(settle_us);
+
+        if (require_readback &&
+            !rigctld_client_probe_selected_vfo_readback(client, timeout_ms))
+        {
+            continue;
+        }
+
+        if (require_readback)
+        {
+            g_hash_table_replace(caps->vfo_working, g_strdup(token),
+                                 GINT_TO_POINTER(1));
+        }
         g_hash_table_replace(vfo_selectable, g_strdup(token),
                              GINT_TO_POINTER(1));
         return token;
@@ -1053,6 +1086,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   timeout_ms,
                                                   select_attempts,
                                                   select_settle_us,
+                                                  TRUE,
                                                   TRUE);
             const gchar *sub_token = NULL;
 
@@ -1066,6 +1100,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   timeout_ms,
                                                   select_attempts,
                                                   select_settle_us,
+                                                  TRUE,
                                                   TRUE);
 
             if (main_token != NULL && sub_token != NULL)

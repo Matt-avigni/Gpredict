@@ -11864,6 +11864,30 @@ static gboolean rigctld_try_autodetect_restart(GtkRigCtrl *ctrl,
     return TRUE;
 }
 
+static gboolean rigctld_probe_failure_should_restart(const radio_conf_t *conf,
+                                                     gboolean stale_device)
+{
+    if (conf == NULL)
+        return FALSE;
+
+    if (stale_device)
+        return TRUE;
+
+    if (conf->rigctld_conn != RIGCTLD_CONN_SERIAL)
+        return FALSE;
+
+    if (!rigctld_mgr_host_is_local(conf->host))
+        return FALSE;
+
+    if (conf->rigctld_device == NULL || *conf->rigctld_device == '\0')
+        return TRUE;
+
+    if (!rigctld_serial_device_exists(conf->rigctld_device))
+        return TRUE;
+
+    return FALSE;
+}
+
 static void rigctld_persist_device(GtkRigCtrl *ctrl, radio_conf_t *conf,
                                    const gchar *reason)
 {
@@ -12766,6 +12790,17 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
                     __func__,
                     reason ? reason : "unknown");
 
+        if (is_full_duplex_main_sub_configured(conf))
+        {
+            session->strategy = RIG_STRATEGY_PLAIN_FREQ;
+            session->strategy_logged = FALSE;
+            session->rig_model = rigctld_expected_model(conf);
+            (void)rigctrl_reject_main_sub_without_vfo_strategy(
+                ctrl, session, conf,
+                "probe failed; Main/Sub requires rigctld VFO support");
+            return FALSE;
+        }
+
         if (rigctld_client_get_freq(client, VFO_MAIN, &freq_probe))
         {
             rig_session_set_state(ctrl, session, RIG_SESSION_READY,
@@ -12806,15 +12841,22 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     caps = rigctld_client_get_caps_snapshot(client);
     if (caps == NULL)
     {
+        if (is_full_duplex_main_sub_configured(conf))
+        {
+            session->strategy = RIG_STRATEGY_PLAIN_FREQ;
+            session->strategy_logged = FALSE;
+            session->rig_model = rigctld_expected_model(conf);
+            (void)rigctrl_reject_main_sub_without_vfo_strategy(
+                ctrl, session, conf,
+                "caps missing; Main/Sub requires rigctld VFO support");
+            return FALSE;
+        }
+
         rig_session_set_state(ctrl, session, RIG_SESSION_READY,
                               "caps missing; fallback plain freq");
         session->strategy = RIG_STRATEGY_PLAIN_FREQ;
         session->strategy_logged = FALSE;
         session->rig_model = rigctld_expected_model(conf);
-        if (rigctrl_reject_main_sub_without_vfo_strategy(
-                ctrl, session, conf,
-                "caps missing; Main/Sub requires rigctld VFO support"))
-            return FALSE;
         return TRUE;
     }
 
@@ -15180,8 +15222,8 @@ open_receiver_retry:
                 close_rigctld_socket(ctrl, &(ctrl->sock), FALSE);
                 if (ctrl->rigctld_mgr != NULL &&
                     rigctld_spawned_by_us(ctrl, FALSE) &&
-                    ctrl->conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
-                    rigctld_mgr_host_is_local(ctrl->conf->host) &&
+                    rigctld_probe_failure_should_restart(ctrl->conf,
+                                                         stale_device) &&
                     rigctld_try_autodetect_restart(
                         ctrl, ctrl->conf, &ctrl->rigctld_mgr, FALSE,
                         _("receiver"), &error_reported,
@@ -15332,8 +15374,8 @@ open_uplink_retry:
                     close_rigctld_socket(ctrl, &(ctrl->sock2), FALSE);
                     if (ctrl->rigctld_mgr2 != NULL &&
                         rigctld_spawned_by_us(ctrl, TRUE) &&
-                        ctrl->conf2->rigctld_conn == RIGCTLD_CONN_SERIAL &&
-                        rigctld_mgr_host_is_local(ctrl->conf2->host) &&
+                        rigctld_probe_failure_should_restart(ctrl->conf2,
+                                                             stale_device) &&
                         rigctld_try_autodetect_restart(
                             ctrl, ctrl->conf2, &ctrl->rigctld_mgr2, TRUE,
                             _("uplink"), &error_reported,
