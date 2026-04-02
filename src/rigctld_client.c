@@ -982,6 +982,16 @@ gboolean rigctld_client_probe(RigctldClient *client,
             continue;
         g_hash_table_replace(vfo_selectable, g_strdup(token),
                              GINT_TO_POINTER(1));
+        if (client->caps.default_vfo_token == NULL)
+            client->caps.default_vfo_token = g_strdup(token);
+
+        /* Fragile shared Main/Sub rigs can accept VFO selection while
+           timing out or rejecting immediate per-VFO readback during probe.
+           For that class, validate the handshake on V selection itself and
+           defer frequency verification to real set/get operations. */
+        if (fragile_main_sub && client->caps.prefer_main_sub_tokens)
+            continue;
+
         if (select_settle_us > 0)
             g_usleep(select_settle_us);
 
@@ -993,8 +1003,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
             g_hash_table_replace(client->caps.vfo_working,
                                  g_strdup(token),
                                  GINT_TO_POINTER(1));
-            if (client->caps.default_vfo_token == NULL)
-                client->caps.default_vfo_token = g_strdup(token);
         }
     }
 
