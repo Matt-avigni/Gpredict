@@ -313,6 +313,61 @@ static gboolean rigctld_client_parse_frequency(const gchar *text,
     return FALSE;
 }
 
+static gboolean rigctld_client_parse_vfo_reply(const gchar *text,
+                                               gchar *token_out,
+                                               gsize token_len)
+{
+    gchar **lines = NULL;
+    gboolean ok = FALSE;
+
+    if (token_out != NULL && token_len > 0)
+        token_out[0] = '\0';
+
+    if (text == NULL || *text == '\0' || token_out == NULL || token_len == 0)
+        return FALSE;
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *line = g_strstrip(lines[i]);
+
+        if (line[0] == '\0')
+            continue;
+
+        g_strlcpy(token_out, line, token_len);
+        ok = TRUE;
+        break;
+    }
+
+    g_strfreev(lines);
+    return ok;
+}
+
+static vfo_t rigctld_client_classify_vfo_token(const gchar *token)
+{
+    static const gchar *main_tokens[] =
+        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_tokens[] =
+        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+
+    if (token == NULL || *token == '\0')
+        return VFO_NONE;
+
+    for (gint i = 0; main_tokens[i] != NULL; i++)
+    {
+        if (g_ascii_strcasecmp(token, main_tokens[i]) == 0)
+            return VFO_MAIN;
+    }
+
+    for (gint i = 0; sub_tokens[i] != NULL; i++)
+    {
+        if (g_ascii_strcasecmp(token, sub_tokens[i]) == 0)
+            return VFO_SUB;
+    }
+
+    return VFO_NONE;
+}
+
 static gint rigctld_client_expected_model(const radio_conf_t *conf)
 {
     gint model = 0;
@@ -564,6 +619,39 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
     return FALSE;
 }
 
+static gboolean rigctld_client_try_get_vfo(RigctldClient *client,
+                                           gchar *token_out,
+                                           gsize token_len,
+                                           gint timeout_ms)
+{
+    HamlibResponseInfo info = { 0 };
+    gchar reply[128];
+    gboolean ok = FALSE;
+
+    if (token_out != NULL && token_len > 0)
+        token_out[0] = '\0';
+
+    if (client == NULL || token_out == NULL || token_len == 0)
+        return FALSE;
+
+    ok = hamlib_transport_request(client->transport,
+                                  "v\n",
+                                  HAMLIB_READ_MULTILINE_RPRT,
+                                  HAMLIB_TERM_RPRT,
+                                  timeout_ms,
+                                  50,
+                                  0, 0,
+                                  reply, sizeof(reply),
+                                  &info);
+    if (!ok)
+        return FALSE;
+
+    if (info.saw_rprt && info.rprt_code != 0)
+        return FALSE;
+
+    return rigctld_client_parse_vfo_reply(reply, token_out, token_len);
+}
+
 static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client,
                                                            gint timeout_ms)
 {
@@ -582,6 +670,36 @@ static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client
 
     client->caps.has_get_freq = TRUE;
     return TRUE;
+}
+
+static gboolean rigctld_client_probe_selected_vfo_matches(RigctldClient *client,
+                                                          const gchar *token,
+                                                          gint timeout_ms,
+                                                          gboolean *available_out)
+{
+    gchar current[128];
+    vfo_t expected_vfo = VFO_NONE;
+    vfo_t current_vfo = VFO_NONE;
+
+    if (available_out != NULL)
+        *available_out = FALSE;
+
+    if (client == NULL || token == NULL || *token == '\0')
+        return FALSE;
+
+    if (!rigctld_client_try_get_vfo(client, current, sizeof(current), timeout_ms))
+        return FALSE;
+
+    if (available_out != NULL)
+        *available_out = TRUE;
+    client->caps.has_get_vfo = TRUE;
+    if (g_ascii_strcasecmp(current, token) == 0)
+        return TRUE;
+
+    expected_vfo = rigctld_client_classify_vfo_token(token);
+    current_vfo = rigctld_client_classify_vfo_token(current);
+
+    return (expected_vfo != VFO_NONE && expected_vfo == current_vfo);
 }
 
 static const gchar *rigctld_client_find_vfo_token_in_table(vfo_t vfo,
@@ -636,7 +754,7 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
                                                       gint attempts,
                                                       gulong settle_us,
                                                       gboolean allow_unlisted,
-                                                      gboolean require_readback)
+                                                      gboolean require_validation)
 {
     RigCaps *caps = NULL;
 
@@ -671,14 +789,22 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
         if (settle_us > 0)
             g_usleep(settle_us);
 
-        if (require_readback &&
-            !rigctld_client_probe_selected_vfo_readback(client, timeout_ms))
+        if (require_validation)
         {
-            continue;
-        }
+            gboolean validated = FALSE;
+            gboolean vfo_readback_available = FALSE;
 
-        if (require_readback)
-        {
+            if (caps->has_get_vfo)
+                validated = rigctld_client_probe_selected_vfo_matches(client,
+                                                                      token,
+                                                                      timeout_ms,
+                                                                      &vfo_readback_available);
+            if (!validated && !vfo_readback_available)
+                validated = rigctld_client_probe_selected_vfo_readback(client,
+                                                                       timeout_ms);
+            if (!validated)
+                continue;
+
             g_hash_table_replace(caps->vfo_working, g_strdup(token),
                                  GINT_TO_POINTER(1));
         }
@@ -1190,10 +1316,10 @@ gboolean rigctld_client_probe(RigctldClient *client,
             if (client->caps.default_vfo_token == NULL)
                 client->caps.default_vfo_token = g_strdup(main_token);
 
-            /* Some IC-9700/rigctld paths accept VFO selection and set
-               frequency, but fail or stall on per-VFO readback during probe.
-               Treat "both sides selectable", or one side readable plus the
-               other side selectable, as usable SELECT_VFO support. */
+            /* Some IC-9700/rigctld paths accept VFO selection but stall on
+               immediate per-VFO frequency readback during probe. Once both
+               sides are proven by selection plus current-VFO identity, keep
+               the simpler SELECT_VFO strategy. */
             vfo_select_ok = TRUE;
         }
         else

@@ -296,6 +296,7 @@ int main(void)
     radio_conf_t conf;
     RigCaps *caps = NULL;
     RigCaps *reject_caps = NULL;
+    RigCaps *select_only_caps = NULL;
     RotCaps rcaps_snapshot = { 0 };
     const RotCaps *rcaps = NULL;
     gint64 freq = 0;
@@ -392,7 +393,7 @@ int main(void)
     }
 
     rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE,
-                                  FALSE, FALSE, FALSE, FALSE, 0);
+                                  FALSE, FALSE, FALSE, 0);
     rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select,
                                          TRUE, FALSE, FALSE, FALSE, TRUE, 2);
     rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
@@ -498,9 +499,31 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
-    if (rigctld_client_probe(rig_select_only, &conf, 500))
+    if (!rigctld_client_probe(rig_select_only, &conf, 500))
     {
-        g_printerr("rigctld probe should fail when Main/Sub can select VFOs but cannot read frequency\n");
+        g_printerr("rigctld probe should accept Main/Sub when current-VFO readback validates selection\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    select_only_caps = rigctld_client_get_caps_snapshot(rig_select_only);
+    if (select_only_caps == NULL ||
+        select_only_caps->strategy != RIG_STRATEGY_SELECT_VFO)
+    {
+        g_printerr("rigctld select-only probe should settle on SELECT_VFO strategy\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!select_only_caps->has_get_vfo)
+    {
+        g_printerr("rigctld select-only probe should validate VFO selection via current-VFO readback\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (select_only_caps->vfo_working == NULL ||
+        !g_hash_table_contains(select_only_caps->vfo_working, "VFOA") ||
+        !g_hash_table_contains(select_only_caps->vfo_working, "VFOB"))
+    {
+        g_printerr("rigctld select-only probe did not cache expected validated VFO tokens\n");
         ok = FALSE;
         goto cleanup;
     }
@@ -1362,6 +1385,7 @@ int main(void)
 cleanup:
     rigctld_client_caps_snapshot_free(caps);
     rigctld_client_caps_snapshot_free(reject_caps);
+    rigctld_client_caps_snapshot_free(select_only_caps);
     rigctld_client_close(rig);
     rigctld_client_close(rig_select);
     rigctld_client_close(rig_reject);

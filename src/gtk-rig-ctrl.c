@@ -12908,10 +12908,11 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     if (!session->strategy_logged)
     {
         rig_term_log(ctrl, "gpredict",
-                     "rig session (%s) strategy=%s freq_ok=%d vfo_select_ok=%d vfo_opt_args_ok=%d",
+                     "rig session (%s) strategy=%s freq_ok=%d get_vfo_ok=%d vfo_select_ok=%d vfo_opt_args_ok=%d",
                      session->label ? session->label : "rig",
                      rig_strategy_name(session->strategy),
                      freq_ok ? 1 : 0,
+                     session->has_get_vfo ? 1 : 0,
                      vfo_select_ok ? 1 : 0,
                      vfo_opt_args_ok ? 1 : 0);
         session->strategy_logged = TRUE;
