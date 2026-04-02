@@ -2205,6 +2205,22 @@ static void rotctrl_reset_tracking_runtime_state(GtkRotCtrl *ctrl,
     if (ctrl == NULL)
         return;
 
+    /* Keep the worker-side command history in sync with the controller-side
+     * reset so a new pass in the same window cannot inherit the previous
+     * pass's command/reference cache.
+     */
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.last_cmd_us = 0;
+    ctrl->client.last_cmd_ok_az = 0.0;
+    ctrl->client.last_cmd_ok_el = 0.0;
+    ctrl->client.last_cmd_ok_us = 0;
+    ctrl->client.last_cmd_backend_az = 0.0;
+    ctrl->client.last_cmd_backend_el = 0.0;
+    ctrl->client.last_cmd_backend_valid = FALSE;
+    ctrl->client.last_set_attempt_us = 0;
+    ctrl->client.stall_since_us = 0;
+    g_mutex_unlock(&ctrl->client.mutex);
+
     ctrl->target_valid_since_us = 0;
     ctrl->target_invalid_since_us = 0;
     ctrl->last_target_update_us = 0;

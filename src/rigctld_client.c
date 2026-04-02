@@ -15,6 +15,8 @@
 #include "sat-log.h"
 
 #define RIGCTLD_PROBE_RETRY_DELAY_MS 50
+#define RIGCTLD_REPLY_IDLE_TIMEOUT_MS 150
+#define RIGCTLD_REPLY_RECOVERY_DRAIN_MS 200
 #define RIGCTLD_VFO_TOKEN_MAX 64
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 3
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US 350000
@@ -623,7 +625,7 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
                                 HAMLIB_READ_MULTILINE_RPRT,
                                 HAMLIB_TERM_RPRT,
                                 timeout_ms,
-                                50,
+                                RIGCTLD_REPLY_IDLE_TIMEOUT_MS,
                                 0, 0,
                                 reply, reply_len,
                                 &info,
@@ -631,7 +633,10 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
     if (!ok)
         return FALSE;
 
-    if (info.saw_rprt && info.rprt_code != 0)
+    if (!info.saw_rprt)
+        return FALSE;
+
+    if (info.rprt_code != 0)
         return FALSE;
 
     ok = rigctld_client_parse_frequency(reply, freq_out);
@@ -666,7 +671,8 @@ static gboolean rigctld_client_try_get_freq_retry(RigctldClient *client,
                                         wire_log))
             return TRUE;
 
-        (void)hamlib_transport_drain(client->transport, 50, NULL);
+        (void)hamlib_transport_drain(client->transport,
+                                     RIGCTLD_REPLY_RECOVERY_DRAIN_MS, NULL);
         if (attempt < retries)
         {
             if (wire_log)
@@ -699,7 +705,7 @@ static gboolean rigctld_client_try_set_ok(RigctldClient *client,
                                 HAMLIB_READ_MULTILINE_RPRT,
                                 HAMLIB_TERM_RPRT,
                                 timeout_ms,
-                                50,
+                                RIGCTLD_REPLY_IDLE_TIMEOUT_MS,
                                 0, 0,
                                 reply, reply_len,
                                 &info,
@@ -707,7 +713,10 @@ static gboolean rigctld_client_try_set_ok(RigctldClient *client,
     if (!ok)
         return FALSE;
 
-    if (info.saw_rprt && info.rprt_code != 0)
+    if (!info.saw_rprt)
+        return FALSE;
+
+    if (info.rprt_code != 0)
         return FALSE;
 
     return TRUE;
@@ -752,7 +761,8 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
     {
         if (attempt > 0)
         {
-            (void)hamlib_transport_drain(client->transport, 50, NULL);
+            (void)hamlib_transport_drain(client->transport,
+                                         RIGCTLD_REPLY_RECOVERY_DRAIN_MS, NULL);
             if (settle_us > 0)
                 g_usleep(settle_us);
         }
@@ -795,7 +805,7 @@ static gboolean rigctld_client_try_get_vfo(RigctldClient *client,
                                 HAMLIB_READ_MULTILINE_RPRT,
                                 HAMLIB_TERM_RPRT,
                                 timeout_ms,
-                                50,
+                                RIGCTLD_REPLY_IDLE_TIMEOUT_MS,
                                 0, 0,
                                 reply, sizeof(reply),
                                 &info,
@@ -803,7 +813,10 @@ static gboolean rigctld_client_try_get_vfo(RigctldClient *client,
     if (!ok)
         return FALSE;
 
-    if (info.saw_rprt && info.rprt_code != 0)
+    if (!info.saw_rprt)
+        return FALSE;
+
+    if (info.rprt_code != 0)
         return FALSE;
 
     ok = rigctld_client_parse_vfo_reply(reply, token_out, token_len);
@@ -818,6 +831,37 @@ static gboolean rigctld_client_try_get_vfo(RigctldClient *client,
     }
 
     return ok;
+}
+
+static gboolean rigctld_client_try_get_vfo_retry(RigctldClient *client,
+                                                 gchar *token_out,
+                                                 gsize token_len,
+                                                 gint timeout_ms,
+                                                 gint retries,
+                                                 gboolean wire_log)
+{
+    gint attempt = 0;
+
+    for (attempt = 0; attempt <= retries; attempt++)
+    {
+        if (rigctld_client_try_get_vfo(client, token_out, token_len,
+                                       timeout_ms, wire_log))
+            return TRUE;
+
+        (void)hamlib_transport_drain(client->transport,
+                                     RIGCTLD_REPLY_RECOVERY_DRAIN_MS, NULL);
+        if (attempt < retries)
+        {
+            if (wire_log)
+                rigctld_client_emit_logf(client, "gpredict",
+                                         "retrying cmd=v attempt=%d/%d",
+                                         attempt + 2,
+                                         retries + 1);
+            g_usleep((gulong)RIGCTLD_PROBE_RETRY_DELAY_MS * 1000);
+        }
+    }
+
+    return FALSE;
 }
 
 static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client,
@@ -858,8 +902,8 @@ static gboolean rigctld_client_probe_selected_vfo_matches(RigctldClient *client,
     if (client == NULL || token == NULL || *token == '\0')
         return FALSE;
 
-    if (!rigctld_client_try_get_vfo(client, current, sizeof(current),
-                                    timeout_ms, wire_log))
+    if (!rigctld_client_try_get_vfo_retry(client, current, sizeof(current),
+                                          timeout_ms, 1, wire_log))
         return FALSE;
 
     if (available_out != NULL)
@@ -2037,7 +2081,7 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
                                 mode,
                                 HAMLIB_TERM_RPRT,
                                 request_timeout_ms,
-                                50,
+                                RIGCTLD_REPLY_IDLE_TIMEOUT_MS,
                                 0, 0,
                                 out, out_len,
                                 &local,

@@ -17,6 +17,7 @@
 
 #define HAMLIB_RXBUF_CHUNK 512
 #define HAMLIB_LINE_BUF 512
+#define HAMLIB_TIMEOUT_RECOVERY_DRAIN_MS 200
 
 struct _HamlibTransport {
     GSocket *socket;
@@ -28,6 +29,11 @@ struct _HamlibTransport {
     gint     last_err;
     gint64   last_rtt_us;
 };
+
+static gint hamlib_poll_readable(GSocket *socket, gint fd, gint timeout_ms,
+                                 gint *err_out);
+static gssize hamlib_socket_recv(GSocket *socket, gint fd, gchar *chunk,
+                                 gsize chunk_len, gint *err_out);
 
 static gboolean hamlib_transport_is_ready_locked(const HamlibTransport *transport)
 {
@@ -57,6 +63,53 @@ static void hamlib_transport_end_busy(HamlibTransport *transport)
     transport->busy = FALSE;
     g_cond_signal(&transport->io_cond);
     g_mutex_unlock(&transport->io_lock);
+}
+
+static gssize hamlib_transport_drain_locked(HamlibTransport *transport,
+                                            gint idle_timeout_ms,
+                                            gint *err_out)
+{
+    gssize total = 0;
+    gint err = 0;
+
+    if (err_out)
+        *err_out = 0;
+
+    if (transport == NULL || !hamlib_transport_is_ready_locked(transport))
+        return -1;
+
+    if (idle_timeout_ms <= 0)
+        idle_timeout_ms = 50;
+
+    if (transport->rxbuf)
+        g_string_set_size(transport->rxbuf, 0);
+
+    for (;;)
+    {
+        gint poll_rc;
+        gchar chunk[HAMLIB_RXBUF_CHUNK];
+        gssize size;
+
+        poll_rc = hamlib_poll_readable(transport->socket, transport->fd,
+                                       idle_timeout_ms, &err);
+        if (poll_rc == 0)
+            break;
+        if (poll_rc < 0)
+        {
+            if (err_out)
+                *err_out = err;
+            return -1;
+        }
+
+        size = hamlib_socket_recv(transport->socket, transport->fd, chunk,
+                                  sizeof(chunk), &err);
+        if (size <= 0)
+            break;
+
+        total += size;
+    }
+
+    return total;
 }
 
 static void hamlib_transport_close_locked(HamlibTransport *transport)
@@ -1044,9 +1097,9 @@ gboolean hamlib_transport_request(HamlibTransport *transport,
                                                &local);
             if (size >= 0)
             {
+                local.bytes = (gsize)size;
                 ok = TRUE;
                 transport->last_err = 0;
-                local.bytes = (gsize)size;
             }
         }
 
@@ -1065,9 +1118,20 @@ gboolean hamlib_transport_request(HamlibTransport *transport,
         if (attempt < retries &&
             (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT))
         {
+            (void)hamlib_transport_drain_locked(transport,
+                                                MAX(idle_timeout_ms,
+                                                    HAMLIB_TIMEOUT_RECOVERY_DRAIN_MS),
+                                                NULL);
             if (retry_delay_ms > 0)
                 g_usleep((gulong)retry_delay_ms * 1000);
             continue;
+        }
+        if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT)
+        {
+            (void)hamlib_transport_drain_locked(transport,
+                                                MAX(idle_timeout_ms,
+                                                    HAMLIB_TIMEOUT_RECOVERY_DRAIN_MS),
+                                                NULL);
         }
         break;
     }
@@ -1082,7 +1146,6 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
                               gint *err_out)
 {
     gssize total = 0;
-    gint err = 0;
 
     if (err_out)
         *err_out = 0;
@@ -1097,37 +1160,9 @@ gssize hamlib_transport_drain(HamlibTransport *transport,
         return -1;
     }
 
-    if (idle_timeout_ms <= 0)
-        idle_timeout_ms = 50;
-
-    if (transport->rxbuf)
-        g_string_set_size(transport->rxbuf, 0);
-
-    for (;;)
-    {
-        gint poll_rc;
-        gchar chunk[HAMLIB_RXBUF_CHUNK];
-        gssize size;
-
-        poll_rc = hamlib_poll_readable(transport->socket, transport->fd,
-                                       idle_timeout_ms, &err);
-        if (poll_rc == 0)
-            break;
-        if (poll_rc < 0)
-        {
-            if (err_out)
-                *err_out = err;
-            return -1;
-        }
-
-        size = hamlib_socket_recv(transport->socket, transport->fd, chunk,
-                                  sizeof(chunk), &err);
-        if (size <= 0)
-            break;
-
-        total += size;
-    }
-
+    total = hamlib_transport_drain_locked(transport,
+                                          idle_timeout_ms,
+                                          err_out);
     hamlib_transport_end_busy(transport);
     return total;
 }

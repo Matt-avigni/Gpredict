@@ -10,6 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef G_OS_WIN32
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <gio/gio.h>
 #include <glib.h>
 
@@ -282,6 +287,237 @@ static void rig_log_capture_dump(const RigLogCapture *capture,
         g_printerr("  %s\n", line ? line : "(null)");
     }
 }
+
+#ifndef G_OS_WIN32
+typedef struct {
+    gint fd;
+    gint first_freq_term_delay_ms;
+    gint vfo_select_delay_ms;
+    gchar current_vfo[32];
+} RigProbeLateReplyCtx;
+
+static gboolean socket_test_write_all(gint fd, const gchar *text)
+{
+    gsize offset = 0;
+    gsize len = 0;
+
+    if (fd < 0 || text == NULL)
+        return FALSE;
+
+    len = strlen(text);
+    while (offset < len)
+    {
+        gssize written = write(fd, text + offset, len - offset);
+
+        if (written < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return FALSE;
+        }
+        if (written == 0)
+            return FALSE;
+
+        offset += (gsize) written;
+    }
+
+    return TRUE;
+}
+
+static gboolean socket_test_read_line(gint fd, gchar *out, gsize out_len)
+{
+    gsize used = 0;
+
+    if (fd < 0 || out == NULL || out_len == 0)
+        return FALSE;
+
+    out[0] = '\0';
+    while (used + 1 < out_len)
+    {
+        gchar ch = '\0';
+        gssize size = read(fd, &ch, 1);
+
+        if (size < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return FALSE;
+        }
+        if (size == 0)
+            return used > 0;
+        if (ch == '\r')
+            continue;
+        if (ch == '\n')
+            break;
+
+        out[used++] = ch;
+    }
+
+    out[used] = '\0';
+    return TRUE;
+}
+
+static gpointer rig_probe_late_reply_server(gpointer data)
+{
+    RigProbeLateReplyCtx *ctx = data;
+    gchar line[128];
+    gboolean first_freq = TRUE;
+
+    if (ctx == NULL || ctx->fd < 0)
+        return NULL;
+
+    g_strlcpy(ctx->current_vfo, "VFOA", sizeof(ctx->current_vfo));
+    while (socket_test_read_line(ctx->fd, line, sizeof(line)))
+    {
+        if (g_strcmp0(line, "\\dump_state") == 0)
+        {
+            if (!socket_test_write_all(ctx->fd,
+                                       "1\n"
+                                       "3081\n"
+                                       "Hamlib Mock rigctld\n"
+                                       "has_get_vfo: 1\n"
+                                       "has_set_vfo: 1\n"
+                                       "has_set_vfo_opt: 0\n"
+                                       "vfo list: VFOA VFOB Main Sub currVFO\n"))
+                break;
+            continue;
+        }
+
+        if (g_strcmp0(line, "f") == 0)
+        {
+            if (!socket_test_write_all(ctx->fd, "145800000\n"))
+                break;
+            if (first_freq)
+            {
+                g_usleep((gulong) ctx->first_freq_term_delay_ms * 1000);
+                first_freq = FALSE;
+            }
+            if (!socket_test_write_all(ctx->fd, "RPRT 0\n"))
+                break;
+            continue;
+        }
+
+        if (g_strcmp0(line, "v") == 0)
+        {
+            gchar reply[64];
+
+            g_snprintf(reply, sizeof(reply), "%s\nRPRT 0\n", ctx->current_vfo);
+            if (!socket_test_write_all(ctx->fd, reply))
+                break;
+            continue;
+        }
+
+        if (g_str_has_prefix(line, "V "))
+        {
+            const gchar *token = line + 2;
+
+            g_strlcpy(ctx->current_vfo, token, sizeof(ctx->current_vfo));
+            g_usleep((gulong) ctx->vfo_select_delay_ms * 1000);
+            if (!socket_test_write_all(ctx->fd, "RPRT 0\n"))
+                break;
+            continue;
+        }
+
+        if (g_str_has_prefix(line, "F "))
+        {
+            if (!socket_test_write_all(ctx->fd, "RPRT 0\n"))
+                break;
+            continue;
+        }
+
+        if (g_strcmp0(line, "q") == 0)
+            break;
+
+        if (!socket_test_write_all(ctx->fd, "RPRT 0\n"))
+            break;
+    }
+
+    close(ctx->fd);
+    ctx->fd = -1;
+    return NULL;
+}
+
+static gboolean rigctld_probe_late_reply_test(void)
+{
+    gint fds[2] = { -1, -1 };
+    RigProbeLateReplyCtx ctx = { .fd = -1,
+                                 .first_freq_term_delay_ms = 120,
+                                 .vfo_select_delay_ms = 150 };
+    GThread *server_thread = NULL;
+    RigctldClient *client = NULL;
+    RigCaps *caps = NULL;
+    gchar *attach_error = NULL;
+    radio_conf_t conf;
+    gboolean ok = FALSE;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+    {
+        g_printerr("socketpair failed for rigctld late-reply probe test: %s\n",
+                   g_strerror(errno));
+        goto cleanup;
+    }
+
+    client = rigctld_client_new("mock-rig-late-reply");
+    if (client == NULL)
+    {
+        g_printerr("rigctld client allocation failed\n");
+        goto cleanup;
+    }
+
+    if (!rigctld_client_attach_fd(client, fds[0], &attach_error))
+    {
+        g_printerr("rigctld attach fd failed: %s\n",
+                   attach_error ? attach_error : "unknown");
+        goto cleanup;
+    }
+    fds[0] = -1;
+
+    ctx.fd = fds[1];
+    fds[1] = -1;
+    server_thread = g_thread_new("rig-probe-late-reply",
+                                 rig_probe_late_reply_server, &ctx);
+
+    memset(&conf, 0, sizeof(conf));
+    conf.rigctld_model = 3081;
+    conf.radio_mode = RADIO_MODE_FULL_DUPLEX_MAIN_SUB;
+    if (!rigctld_client_probe(client, &conf, 500))
+    {
+        g_printerr("rigctld probe failed when first freq reply terminator arrived late\n");
+        goto cleanup;
+    }
+    caps = rigctld_client_get_caps_snapshot(client);
+    if (caps == NULL || caps->strategy != RIG_STRATEGY_SELECT_VFO)
+    {
+        g_printerr("rigctld late-reply probe should settle on SELECT_VFO strategy\n");
+        goto cleanup;
+    }
+    if (!caps->has_get_vfo ||
+        caps->vfo_token_main == NULL ||
+        caps->vfo_token_sub == NULL)
+    {
+        g_printerr("rigctld late-reply probe did not retain explicit Main/Sub token mapping\n");
+        goto cleanup;
+    }
+
+    ok = TRUE;
+
+cleanup:
+    rigctld_client_caps_snapshot_free(caps);
+    rigctld_client_close(client);
+    rigctld_client_free(&client);
+    if (fds[0] >= 0)
+        close(fds[0]);
+    if (fds[1] >= 0)
+        close(fds[1]);
+    if (server_thread != NULL)
+        g_thread_join(server_thread);
+    if (ctx.fd >= 0)
+        close(ctx.fd);
+    g_free(attach_error);
+
+    return ok;
+}
+#endif
 
 static gpointer rot_thread_getpos(gpointer data)
 {
@@ -601,6 +837,13 @@ int main(void)
         ok = FALSE;
         goto cleanup;
     }
+#ifndef G_OS_WIN32
+    if (!rigctld_probe_late_reply_test())
+    {
+        ok = FALSE;
+        goto cleanup;
+    }
+#endif
     if (!select_only_caps->has_get_vfo)
     {
         g_printerr("rigctld select-only probe should validate VFO selection via current-VFO readback\n");
