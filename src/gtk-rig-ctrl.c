@@ -8556,6 +8556,8 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     gboolean *logged_ptr = NULL;
     gchar **target_ptr = NULL;
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
+    rig_strategy_t strategy =
+        (session != NULL) ? session->strategy : RIG_STRATEGY_PLAIN_FREQ;
     gboolean prefer_main_sub = rigctld_prefer_main_sub_tokens(ctrl);
     gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
     gboolean allow_unlisted = force_main_sub;
@@ -8582,7 +8584,9 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
 
     if (vfo == VFO_MAIN)
     {
-        if (force_main_sub)
+        if (strategy == RIG_STRATEGY_SELECT_VFO)
+            candidates = main_candidates_default;
+        else if (force_main_sub)
             candidates = main_candidates_strict;
         else if (prefer_main_sub)
             candidates = main_candidates_prefer;
@@ -8594,7 +8598,9 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     }
     else
     {
-        if (force_main_sub)
+        if (strategy == RIG_STRATEGY_SELECT_VFO)
+            candidates = sub_candidates_default;
+        else if (force_main_sub)
             candidates = sub_candidates_strict;
         else if (prefer_main_sub)
             candidates = sub_candidates_prefer;
@@ -8712,7 +8718,8 @@ static gboolean rigctld_select_vfo_cached(GtkRigCtrl *ctrl, gint sock,
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
 
-    if (session != NULL &&
+    if (!fragile_shared &&
+        session != NULL &&
         session->strategy == RIG_STRATEGY_SELECT_VFO &&
         session->last_selected_vfo_valid &&
         session->last_selected_vfo == vfo)
@@ -8763,7 +8770,8 @@ static gboolean rigctld_select_vfo_cached_locked(GtkRigCtrl *ctrl, gint sock,
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
 
-    if (session != NULL &&
+    if (!fragile_shared &&
+        session != NULL &&
         session->strategy == RIG_STRATEGY_SELECT_VFO &&
         session->last_selected_vfo_valid &&
         session->last_selected_vfo == vfo)

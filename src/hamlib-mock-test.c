@@ -65,7 +65,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        const gchar *script,
                                        guint16 port,
                                        gboolean no_vfo_opt,
-                                       gboolean reject_main_sub_tokenized_retune)
+                                       gboolean reject_main_sub_tokenized_retune,
+                                       gboolean require_vfo_before_set)
 {
     GSubprocess *proc = NULL;
     GError *error = NULL;
@@ -86,6 +87,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
         g_ptr_array_add(argv, g_strdup("--no-vfo-opt"));
     if (reject_main_sub_tokenized_retune)
         g_ptr_array_add(argv, g_strdup("--reject-main-sub-tokenized-retune"));
+    if (require_vfo_before_set)
+        g_ptr_array_add(argv, g_strdup("--require-vfo-before-set"));
     g_ptr_array_add(argv, NULL);
 
     proc = g_subprocess_newv((const gchar *const *)argv->pdata,
@@ -338,11 +341,12 @@ int main(void)
         goto cleanup;
     }
 
-    rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE);
+    rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE,
+                                  FALSE);
     rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select, TRUE,
-                                         FALSE);
-    rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
                                          FALSE, TRUE);
+    rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
+                                         FALSE, TRUE, FALSE);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
                                   FALSE, FALSE, FALSE, FALSE, 0, TRUE);
     if (rig_proc == NULL || rig_select_proc == NULL ||
@@ -629,6 +633,91 @@ int main(void)
         {
             g_printerr("rigctld VFO token mismatch: sub=%s main=%s\n",
                        lines[idx_v_sub], lines[idx_v_main]);
+            ok = FALSE;
+            g_strfreev(lines);
+            goto cleanup;
+        }
+
+        g_strfreev(lines);
+    }
+    {
+        HamlibResponseInfo info = { 0 };
+        gchar reply[512] = { 0 };
+        gchar **lines = NULL;
+        static const gchar *sub_tokens[] =
+            { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+        gint idx_v_first = -1;
+        gint idx_f_first = -1;
+        gint idx_v_second = -1;
+        gint idx_f_second = -1;
+
+        if (!rigctld_client_request_raw(rig_select, "\\reset_cmd_log",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld cmd log reset failed (repeat select-vfo)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_set_freq(rig_select, VFO_SUB, 145930000) ||
+            !rigctld_client_set_freq(rig_select, VFO_SUB, 145930010))
+        {
+            g_printerr("rigctld repeated set freq failed (select-vfo)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_request_raw(rig_select, "\\get_cmd_log",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld cmd log query failed (repeat select-vfo)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        lines = g_strsplit(reply, "\n", -1);
+        for (gint i = 0; lines[i] != NULL; i++)
+        {
+            const gchar *line = lines[i];
+
+            if (line[0] == '\0' || g_str_has_prefix(line, "RPRT"))
+                continue;
+
+            if (g_str_has_prefix(line, "V "))
+            {
+                if (idx_v_first == -1)
+                    idx_v_first = i;
+                else if (idx_v_second == -1)
+                    idx_v_second = i;
+                continue;
+            }
+
+            if (g_str_has_prefix(line, "F ") && idx_f_first == -1)
+            {
+                idx_f_first = i;
+                continue;
+            }
+            if (g_str_has_prefix(line, "F ") && idx_f_second == -1)
+            {
+                idx_f_second = i;
+                continue;
+            }
+        }
+
+        if (idx_v_first < 0 || idx_f_first < idx_v_first ||
+            idx_v_second < 0 || idx_f_second < idx_v_second ||
+            idx_v_second < idx_f_first)
+        {
+            g_printerr("rigctld repeated SELECT_VFO sequence mismatch\n");
+            ok = FALSE;
+            g_strfreev(lines);
+            goto cleanup;
+        }
+        if (!command_matches_any_token(lines[idx_v_first], sub_tokens) ||
+            !command_matches_any_token(lines[idx_v_second], sub_tokens))
+        {
+            g_printerr("rigctld repeated SELECT_VFO token mismatch: first=%s second=%s\n",
+                       lines[idx_v_first], lines[idx_v_second]);
             ok = FALSE;
             g_strfreev(lines);
             goto cleanup;

@@ -93,6 +93,10 @@ class RigctldHandler(socketserver.StreamRequestHandler):
             if cmd.startswith("F"):
                 parts = cmd.split()
                 token = parts[1] if len(parts) >= 3 else None
+                if (state["require_vfo_before_set"]
+                    and token is None
+                    and not state["selected_since_set"]):
+                    continue
                 if token is not None and token in {
                     "Main", "Sub", "MainA", "SubA", "VFO_MAIN", "VFO_SUB"
                 }:
@@ -121,6 +125,7 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                         state["freq"] = int(float(freq_str))
                     except ValueError:
                         pass
+                state["selected_since_set"] = False
                 state["set_freq_count"] += 1
                 self.wfile.write(b"RPRT 0\n")
                 self.wfile.flush()
@@ -133,6 +138,7 @@ class RigctldHandler(socketserver.StreamRequestHandler):
 
             if cmd.startswith("V "):
                 state["vfo"] = cmd.split(None, 1)[1]
+                state["selected_since_set"] = True
                 self.wfile.write(b"RPRT 0\n")
                 self.wfile.flush()
                 continue
@@ -166,6 +172,7 @@ def main():
     parser.add_argument("--no-vfo-opt", action="store_true")
     parser.add_argument("--reject-main-sub-tokenized-set", action="store_true")
     parser.add_argument("--reject-main-sub-tokenized-retune", action="store_true")
+    parser.add_argument("--require-vfo-before-set", action="store_true")
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
@@ -178,6 +185,8 @@ def main():
         "has_set_vfo_opt": not args.no_vfo_opt,
         "reject_main_sub_tokenized_set": args.reject_main_sub_tokenized_set,
         "reject_main_sub_tokenized_retune": args.reject_main_sub_tokenized_retune,
+        "require_vfo_before_set": args.require_vfo_before_set,
+        "selected_since_set": False,
         "cmd_log": [],
     }
     server.conn_lock = threading.Lock()

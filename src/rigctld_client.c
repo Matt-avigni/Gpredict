@@ -559,7 +559,10 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
     if (vfo == VFO_SUB && caps->vfo_token_sub)
         return caps->vfo_token_sub;
 
-    if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
+    if (caps->strategy == RIG_STRATEGY_SELECT_VFO)
+        candidates = (vfo == VFO_MAIN) ? main_candidates_default
+                                       : sub_candidates_default;
+    else if (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB)
         candidates = (vfo == VFO_MAIN) ? main_candidates_strict
                                        : sub_candidates_strict;
     else if (caps->prefer_main_sub_tokens)
@@ -1089,6 +1092,7 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
     RigCaps *caps = NULL;
     const gchar *token = NULL;
     gboolean ok = FALSE;
+    gboolean force_reselect = FALSE;
 
     if (client == NULL)
         return FALSE;
@@ -1107,7 +1111,11 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
         return TRUE;
     }
 
-    if (client->last_selected_vfo == vfo)
+    force_reselect = (caps->strategy == RIG_STRATEGY_SELECT_VFO &&
+                      caps->prefer_main_sub_tokens &&
+                      (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
+
+    if (!force_reselect && client->last_selected_vfo == vfo)
     {
         g_rec_mutex_unlock(rigctld_client_meta_lock(client));
         return TRUE;
