@@ -16,6 +16,8 @@
 
 #define RIGCTLD_PROBE_RETRY_DELAY_MS 50
 #define RIGCTLD_VFO_TOKEN_MAX 64
+#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 3
+#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US 350000
 
 static gint rig_log_level = RIG_LOG_QUIET;
 
@@ -527,6 +529,68 @@ static gboolean rigctld_client_try_select_vfo(RigctldClient *client,
                                      timeout_ms);
 }
 
+static gboolean rigctld_client_caps_fragile_main_sub(const RigCaps *caps)
+{
+    return caps != NULL &&
+        caps->prefer_main_sub_tokens &&
+        (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0;
+}
+
+static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
+                                                    const gchar *token,
+                                                    gint timeout_ms,
+                                                    gint attempts,
+                                                    gulong settle_us)
+{
+    gint max_attempts = (attempts > 0) ? attempts : 1;
+
+    if (client == NULL || token == NULL || *token == '\0')
+        return FALSE;
+
+    for (gint attempt = 0; attempt < max_attempts; attempt++)
+    {
+        if (attempt > 0)
+        {
+            (void)hamlib_transport_drain(client->transport, 50, NULL);
+            if (settle_us > 0)
+                g_usleep(settle_us);
+        }
+
+        if (rigctld_client_try_select_vfo(client, token, timeout_ms))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static const gchar *rigctld_client_find_working_vfo_token(const RigCaps *caps,
+                                                          vfo_t vfo)
+{
+    static const gchar *main_candidates[] =
+        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates[] =
+        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+    const gchar * const *candidates = NULL;
+
+    if (caps == NULL || caps->vfo_working == NULL)
+        return NULL;
+
+    if (vfo == VFO_MAIN)
+        candidates = main_candidates;
+    else if (vfo == VFO_SUB)
+        candidates = sub_candidates;
+    else
+        return NULL;
+
+    for (gint i = 0; candidates[i] != NULL; i++)
+    {
+        if (g_hash_table_contains(caps->vfo_working, candidates[i]))
+            return candidates[i];
+    }
+
+    return NULL;
+}
+
 static const gchar *rigctld_client_vfo_token(RigctldClient *client,
                                              vfo_t vfo)
 {
@@ -810,6 +874,9 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
     gboolean vfo_opt_set = FALSE;
+    gboolean fragile_main_sub = FALSE;
+    gint select_attempts = 1;
+    gulong select_settle_us = 0;
     HamlibResponseInfo info = { 0 };
     gint expected_model = rigctld_client_expected_model(conf);
     gint64 now_us = g_get_monotonic_time();
@@ -877,6 +944,11 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     client->caps.prefer_main_sub_tokens =
         (conf != NULL && conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
+    fragile_main_sub = rigctld_client_caps_fragile_main_sub(&client->caps);
+    select_attempts = fragile_main_sub ?
+        RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1;
+    select_settle_us = fragile_main_sub ?
+        RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0;
 
     if (client->caps.vfo_candidates->len == 0)
     {
@@ -899,8 +971,13 @@ gboolean rigctld_client_probe(RigctldClient *client,
         const gchar *token =
             g_ptr_array_index(client->caps.vfo_candidates, i);
 
-        if (!rigctld_client_try_select_vfo(client, token, timeout_ms))
+        if (!rigctld_client_try_select_vfo_retry(client, token,
+                                                 timeout_ms,
+                                                 select_attempts,
+                                                 select_settle_us))
             continue;
+        if (select_settle_us > 0)
+            g_usleep(select_settle_us);
 
         if (rigctld_client_try_get_freq_retry(client, "f\n",
                                               &freq, reply, sizeof(reply),
@@ -913,6 +990,25 @@ gboolean rigctld_client_probe(RigctldClient *client,
             if (client->caps.default_vfo_token == NULL)
                 client->caps.default_vfo_token = g_strdup(token);
         }
+    }
+
+    if (client->caps.prefer_main_sub_tokens && vfo_select_ok)
+    {
+        const gchar *main_token =
+            rigctld_client_find_working_vfo_token(&client->caps, VFO_MAIN);
+        const gchar *sub_token =
+            rigctld_client_find_working_vfo_token(&client->caps, VFO_SUB);
+
+        g_free(client->caps.vfo_token_main);
+        client->caps.vfo_token_main =
+            main_token ? g_strdup(main_token) : NULL;
+        g_free(client->caps.vfo_token_sub);
+        client->caps.vfo_token_sub =
+            sub_token ? g_strdup(sub_token) : NULL;
+
+        /* Shared Main/Sub control is only usable when both sides map to a
+           proven working token; otherwise SELECT_VFO is a false positive. */
+        vfo_select_ok = (main_token != NULL && sub_token != NULL);
     }
 
     if (client->caps.has_set_vfo_opt || (conf != NULL && conf->vfo_opt))
@@ -1074,6 +1170,8 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return FALSE;
         }
+        if (rigctld_client_caps_fragile_main_sub(caps))
+            g_usleep(RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US);
     }
 
     g_snprintf(cmd, sizeof(cmd), "f\x0a");
@@ -1093,6 +1191,7 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
     const gchar *token = NULL;
     gboolean ok = FALSE;
     gboolean force_reselect = FALSE;
+    gboolean fragile_main_sub = FALSE;
 
     if (client == NULL)
         return FALSE;
@@ -1114,6 +1213,7 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
     force_reselect = (caps->strategy == RIG_STRATEGY_SELECT_VFO &&
                       caps->prefer_main_sub_tokens &&
                       (caps->quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
+    fragile_main_sub = rigctld_client_caps_fragile_main_sub(caps);
 
     if (!force_reselect && client->last_selected_vfo == vfo)
     {
@@ -1122,7 +1222,10 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
     }
 
     token = rigctld_client_vfo_token(client, vfo);
-    ok = rigctld_client_try_select_vfo(client, token, 500);
+    ok = rigctld_client_try_select_vfo_retry(
+        client, token, 500,
+        fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1,
+        fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0);
     if (ok)
         client->last_selected_vfo = vfo;
 
@@ -1139,12 +1242,14 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
     const gchar *token = NULL;
     RigCaps *caps = NULL;
     gboolean ok = FALSE;
+    gboolean fragile_main_sub = FALSE;
 
     if (client == NULL)
         return FALSE;
 
     g_rec_mutex_lock(rigctld_client_meta_lock(client));
     caps = &client->caps;
+    fragile_main_sub = rigctld_client_caps_fragile_main_sub(caps);
 
     if (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
@@ -1168,6 +1273,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return FALSE;
         }
+        if (can_select && fragile_main_sub)
+            g_usleep(RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US);
 
         g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
         ok = rigctld_client_try_set_ok(client, cmd,
@@ -1179,12 +1286,17 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
         }
 
         token = rigctld_client_vfo_token(client, vfo);
-        if (!rigctld_client_try_select_vfo(client, token, 500))
+        if (!rigctld_client_try_select_vfo_retry(
+                client, token, 500,
+                fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1,
+                fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0))
         {
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return FALSE;
         }
         client->last_selected_vfo = vfo;
+        if (fragile_main_sub)
+            g_usleep(RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US);
         {
             gboolean retry_ok = rigctld_client_try_set_ok(client, cmd,
                                                           reply,

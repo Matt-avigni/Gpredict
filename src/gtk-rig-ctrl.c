@@ -125,6 +125,7 @@ static gboolean winsock_ensure_init(void)
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
 #define RIGCTLD_MAIN_SUB_SELECT_SETTLE_US 100000
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US 350000
+#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 3
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 #define RIGCTLD_DUMP_STATE_IDLE_MS 100
 #define RIGCTLD_FOLLOW_IDLE_MS 50
@@ -654,6 +655,12 @@ static void     apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
 static void     update_rit_xit_offsets(GtkRigCtrl * ctrl);
 static gint64   rigctrl_round_hz(gdouble hz);
 static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
+static vfo_t    rigctld_vfo_hint_from_token(const gchar *token);
+static gboolean rigctld_select_vfo_with_retry(GtkRigCtrl *ctrl, gint sock,
+                                              RigSession *session,
+                                              vfo_t vfo,
+                                              const gchar *token,
+                                              gboolean locked);
 static vfo_t    rigctrl_target_vfo_for_role(const radio_conf_t *conf,
                                             vfo_role_t role);
 static vfo_t    rigctrl_vfo_for_side(GtkRigCtrl *ctrl, gboolean downlink);
@@ -8291,10 +8298,8 @@ static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
                                       RigSession *session,
                                       const gchar *token)
 {
-    gchar *buff = NULL;
-    gchar buffback[128];
-    gboolean retcode = FALSE;
     gint64 verify = 0;
+    vfo_t vfo = rigctld_vfo_hint_from_token(token);
 
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
@@ -8308,12 +8313,8 @@ static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
     }
     else
     {
-        buff = g_strdup_printf("V %s\x0a", token);
-        retcode = send_rigctld_command(ctrl, sock, buff, buffback,
-                                       sizeof(buffback));
-        g_free(buff);
-        retcode = check_set_response(buffback, retcode, __func__);
-        if (!retcode)
+        if (!rigctld_select_vfo_with_retry(ctrl, sock, session, vfo, token,
+                                           FALSE))
             return FALSE;
 
         /* Avoid writing a probe frequency while mapping tokens. */
@@ -8385,6 +8386,83 @@ static gulong rigctrl_shared_main_sub_select_settle_us(GtkRigCtrl *ctrl,
         return RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US;
 
     return RIGCTLD_MAIN_SUB_SELECT_SETTLE_US;
+}
+
+static vfo_t rigctld_vfo_hint_from_token(const gchar *token)
+{
+    if (token == NULL || *token == '\0')
+        return VFO_NONE;
+
+    if (g_ascii_strcasecmp(token, "VFOA") == 0 ||
+        g_ascii_strcasecmp(token, "Main") == 0 ||
+        g_ascii_strcasecmp(token, "MainA") == 0 ||
+        g_ascii_strcasecmp(token, "VFO_MAIN") == 0)
+        return VFO_MAIN;
+
+    if (g_ascii_strcasecmp(token, "VFOB") == 0 ||
+        g_ascii_strcasecmp(token, "Sub") == 0 ||
+        g_ascii_strcasecmp(token, "SubA") == 0 ||
+        g_ascii_strcasecmp(token, "VFO_SUB") == 0)
+        return VFO_SUB;
+
+    return VFO_NONE;
+}
+
+static gboolean rigctld_select_vfo_with_retry(GtkRigCtrl *ctrl, gint sock,
+                                              RigSession *session,
+                                              vfo_t vfo,
+                                              const gchar *token,
+                                              gboolean locked)
+{
+    gboolean fragile_shared = (rigctrl_fragile_shared_main_sub_session(ctrl,
+                                                                       sock,
+                                                                       vfo) != NULL);
+    gint attempts = fragile_shared ?
+        RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1;
+    gchar vcmd[64];
+    gchar buffback[128];
+    gboolean retcode = FALSE;
+
+    if (ctrl == NULL || token == NULL || *token == '\0')
+        return FALSE;
+
+    g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
+
+    for (gint attempt = 0; attempt < attempts; attempt++)
+    {
+        if (attempt > 0)
+            g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock, vfo));
+
+        retcode = locked ?
+            _send_rigctld_command(ctrl, sock, vcmd, buffback, sizeof(buffback)) :
+            send_rigctld_command(ctrl, sock, vcmd, buffback, sizeof(buffback));
+        retcode = check_set_response(buffback, retcode, __func__);
+        if (retcode)
+            break;
+    }
+
+    if (!retcode)
+        return FALSE;
+
+    if (session != NULL)
+    {
+        session->last_selected_vfo = vfo;
+        session->last_selected_vfo_valid = TRUE;
+    }
+    if (ctrl != NULL &&
+        ctrl->conf2 == NULL &&
+        is_full_duplex_main_sub_configured(ctrl->conf) &&
+        ctrl->rig_session2 != NULL &&
+        vfo != VFO_NONE)
+    {
+        RigSession *other = (session == ctrl->rig_session)
+                                ? ctrl->rig_session2
+                                : ctrl->rig_session;
+        if (other != NULL)
+            other->last_selected_vfo_valid = FALSE;
+    }
+
+    return TRUE;
 }
 
 static gboolean rigctrl_skip_shared_main_sub_readback(GtkRigCtrl *ctrl,
@@ -8708,104 +8786,38 @@ static gboolean rigctld_select_vfo_cached(GtkRigCtrl *ctrl, gint sock,
                                           vfo_t vfo, const gchar *token)
 {
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
-    gboolean fragile_shared = (rigctrl_fragile_shared_main_sub_session(ctrl,
-                                                                       sock,
-                                                                       vfo) != NULL);
-    gchar vcmd[64];
-    gchar buffback[128];
-    gboolean retcode = FALSE;
 
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
 
-    if (!fragile_shared &&
+    if (rigctrl_fragile_shared_main_sub_session(ctrl, sock, vfo) == NULL &&
         session != NULL &&
         session->strategy == RIG_STRATEGY_SELECT_VFO &&
         session->last_selected_vfo_valid &&
         session->last_selected_vfo == vfo)
         return TRUE;
 
-    g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
-    retcode = send_rigctld_command(ctrl, sock, vcmd, buffback, 128);
-    retcode = check_set_response(buffback, retcode, __func__);
-    if (!retcode && fragile_shared)
-    {
-        g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock, vfo));
-        retcode = send_rigctld_command(ctrl, sock, vcmd, buffback,
-                                       sizeof(buffback));
-        retcode = check_set_response(buffback, retcode, __func__);
-    }
-    if (retcode && session != NULL)
-    {
-        session->last_selected_vfo = vfo;
-        session->last_selected_vfo_valid = TRUE;
-    }
-    if (retcode && ctrl != NULL &&
-        ctrl->conf2 == NULL &&
-        is_full_duplex_main_sub_configured(ctrl->conf) &&
-        ctrl->rig_session2 != NULL &&
-        vfo != VFO_NONE)
-    {
-        RigSession *other = (session == ctrl->rig_session)
-                                ? ctrl->rig_session2
-                                : ctrl->rig_session;
-        if (other != NULL)
-            other->last_selected_vfo_valid = FALSE;
-    }
-
-    return retcode;
+    return rigctld_select_vfo_with_retry(ctrl, sock, session, vfo, token,
+                                         FALSE);
 }
 
 static gboolean rigctld_select_vfo_cached_locked(GtkRigCtrl *ctrl, gint sock,
                                                  vfo_t vfo, const gchar *token)
 {
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
-    gboolean fragile_shared = (rigctrl_fragile_shared_main_sub_session(ctrl,
-                                                                       sock,
-                                                                       vfo) != NULL);
-    gchar vcmd[64];
-    gchar buffback[128];
-    gboolean retcode = FALSE;
 
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
 
-    if (!fragile_shared &&
+    if (rigctrl_fragile_shared_main_sub_session(ctrl, sock, vfo) == NULL &&
         session != NULL &&
         session->strategy == RIG_STRATEGY_SELECT_VFO &&
         session->last_selected_vfo_valid &&
         session->last_selected_vfo == vfo)
         return TRUE;
 
-    g_snprintf(vcmd, sizeof(vcmd), "V %s\x0a", token);
-    retcode = _send_rigctld_command(ctrl, sock, vcmd, buffback, sizeof(buffback));
-    retcode = check_set_response(buffback, retcode, __func__);
-    if (!retcode && fragile_shared)
-    {
-        g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock, vfo));
-        retcode = _send_rigctld_command(ctrl, sock, vcmd, buffback,
-                                        sizeof(buffback));
-        retcode = check_set_response(buffback, retcode, __func__);
-    }
-    if (retcode && session != NULL)
-    {
-        session->last_selected_vfo = vfo;
-        session->last_selected_vfo_valid = TRUE;
-    }
-    if (retcode && ctrl != NULL &&
-        ctrl->conf2 == NULL &&
-        is_full_duplex_main_sub_configured(ctrl->conf) &&
-        ctrl->rig_session2 != NULL &&
-        vfo != VFO_NONE)
-    {
-        RigSession *other = (session == ctrl->rig_session)
-                                ? ctrl->rig_session2
-                                : ctrl->rig_session;
-        if (other != NULL)
-            other->last_selected_vfo_valid = FALSE;
-    }
-
-    return retcode;
+    return rigctld_select_vfo_with_retry(ctrl, sock, session, vfo, token,
+                                         TRUE);
 }
 
 static void rigctrl_log_config(GtkRigCtrl *ctrl,

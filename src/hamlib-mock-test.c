@@ -66,7 +66,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        guint16 port,
                                        gboolean no_vfo_opt,
                                        gboolean reject_main_sub_tokenized_retune,
-                                       gboolean require_vfo_before_set)
+                                       gboolean require_vfo_before_set,
+                                       gint fail_vfo_select_count)
 {
     GSubprocess *proc = NULL;
     GError *error = NULL;
@@ -89,6 +90,12 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
         g_ptr_array_add(argv, g_strdup("--reject-main-sub-tokenized-retune"));
     if (require_vfo_before_set)
         g_ptr_array_add(argv, g_strdup("--require-vfo-before-set"));
+    if (fail_vfo_select_count > 0)
+    {
+        g_ptr_array_add(argv, g_strdup("--fail-vfo-select-count"));
+        g_ptr_array_add(argv,
+                        g_strdup_printf("%d", fail_vfo_select_count));
+    }
     g_ptr_array_add(argv, NULL);
 
     proc = g_subprocess_newv((const gchar *const *)argv->pdata,
@@ -342,11 +349,11 @@ int main(void)
     }
 
     rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE,
-                                  FALSE);
-    rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select, TRUE,
-                                         FALSE, TRUE);
+                                  FALSE, 0);
+    rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select,
+                                         TRUE, FALSE, TRUE, 2);
     rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
-                                         FALSE, TRUE, FALSE);
+                                         FALSE, TRUE, FALSE, 0);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
                                   FALSE, FALSE, FALSE, FALSE, 0, TRUE);
     if (rig_proc == NULL || rig_select_proc == NULL ||

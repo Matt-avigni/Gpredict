@@ -142,6 +142,14 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                     self.wfile.write(b"RPRT -9\n")
                     self.wfile.flush()
                     continue
+                fail_count = state["fail_vfo_select_count"]
+                if fail_count > 0:
+                    attempts = state["vfo_select_failures"].get(token, 0)
+                    if attempts < fail_count:
+                        state["vfo_select_failures"][token] = attempts + 1
+                        self.wfile.write(b"RPRT -9\n")
+                        self.wfile.flush()
+                        continue
                 state["vfo"] = token
                 state["selected_since_set"] = True
                 self.wfile.write(b"RPRT 0\n")
@@ -181,6 +189,7 @@ def main():
     parser.add_argument("--reject-main-select", action="store_true")
     parser.add_argument("--reject-sub-select", action="store_true")
     parser.add_argument("--reject-vfo-token", action="append", default=[])
+    parser.add_argument("--fail-vfo-select-count", type=int, default=0)
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
@@ -201,6 +210,8 @@ def main():
         "reject_main_sub_tokenized_retune": args.reject_main_sub_tokenized_retune,
         "require_vfo_before_set": args.require_vfo_before_set,
         "reject_vfo_tokens": reject_vfo_tokens,
+        "fail_vfo_select_count": max(0, args.fail_vfo_select_count),
+        "vfo_select_failures": {},
         "selected_since_set": False,
         "cmd_log": [],
     }
