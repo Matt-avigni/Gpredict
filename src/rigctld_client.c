@@ -563,8 +563,8 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
     return FALSE;
 }
 
-static const gchar *rigctld_client_find_working_vfo_token(const RigCaps *caps,
-                                                          vfo_t vfo)
+static const gchar *rigctld_client_find_vfo_token_in_table(vfo_t vfo,
+                                                           GHashTable *table)
 {
     static const gchar *main_candidates[] =
         { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
@@ -572,7 +572,7 @@ static const gchar *rigctld_client_find_working_vfo_token(const RigCaps *caps,
         { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
     const gchar * const *candidates = NULL;
 
-    if (caps == NULL || caps->vfo_working == NULL)
+    if (table == NULL)
         return NULL;
 
     if (vfo == VFO_MAIN)
@@ -584,7 +584,7 @@ static const gchar *rigctld_client_find_working_vfo_token(const RigCaps *caps,
 
     for (gint i = 0; candidates[i] != NULL; i++)
     {
-        if (g_hash_table_contains(caps->vfo_working, candidates[i]))
+        if (g_hash_table_contains(table, candidates[i]))
             return candidates[i];
     }
 
@@ -877,6 +877,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean fragile_main_sub = FALSE;
     gint select_attempts = 1;
     gulong select_settle_us = 0;
+    GHashTable *vfo_selectable = NULL;
     HamlibResponseInfo info = { 0 };
     gint expected_model = rigctld_client_expected_model(conf);
     gint64 now_us = g_get_monotonic_time();
@@ -898,6 +899,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
     rigctld_client_set_state(client, RIGCTLD_CLIENT_PROBING, "probe start");
 
     rigctld_client_caps_clear(&client->caps);
+    vfo_selectable = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                           NULL);
     if (!hamlib_transport_request(client->transport,
                                   "\\dump_state\n",
                                   HAMLIB_READ_MULTILINE_IDLE,
@@ -937,6 +940,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
             rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                      "model mismatch expected=%d got=%d",
                                      expected_model, client->caps.rig_model);
+            g_hash_table_destroy(vfo_selectable);
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return FALSE;
         }
@@ -976,6 +980,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                  select_attempts,
                                                  select_settle_us))
             continue;
+        g_hash_table_replace(vfo_selectable, g_strdup(token),
+                             GINT_TO_POINTER(1));
         if (select_settle_us > 0)
             g_usleep(select_settle_us);
 
@@ -995,9 +1001,11 @@ gboolean rigctld_client_probe(RigctldClient *client,
     if (client->caps.prefer_main_sub_tokens && vfo_select_ok)
     {
         const gchar *main_token =
-            rigctld_client_find_working_vfo_token(&client->caps, VFO_MAIN);
+            rigctld_client_find_vfo_token_in_table(VFO_MAIN,
+                                                   client->caps.vfo_working);
         const gchar *sub_token =
-            rigctld_client_find_working_vfo_token(&client->caps, VFO_SUB);
+            rigctld_client_find_vfo_token_in_table(VFO_SUB,
+                                                   client->caps.vfo_working);
 
         g_free(client->caps.vfo_token_main);
         client->caps.vfo_token_main =
@@ -1009,6 +1017,50 @@ gboolean rigctld_client_probe(RigctldClient *client,
         /* Shared Main/Sub control is only usable when both sides map to a
            proven working token; otherwise SELECT_VFO is a false positive. */
         vfo_select_ok = (main_token != NULL && sub_token != NULL);
+    }
+    else if (client->caps.prefer_main_sub_tokens)
+    {
+        const gchar *main_token =
+            rigctld_client_find_vfo_token_in_table(VFO_MAIN,
+                                                   client->caps.vfo_working);
+        const gchar *sub_token =
+            rigctld_client_find_vfo_token_in_table(VFO_SUB,
+                                                   client->caps.vfo_working);
+
+        if (main_token == NULL)
+            main_token = rigctld_client_find_vfo_token_in_table(VFO_MAIN,
+                                                                vfo_selectable);
+        if (sub_token == NULL)
+            sub_token = rigctld_client_find_vfo_token_in_table(VFO_SUB,
+                                                               vfo_selectable);
+
+        if (main_token != NULL && sub_token != NULL)
+        {
+            if (!g_hash_table_contains(client->caps.vfo_working, main_token))
+            {
+                g_hash_table_replace(client->caps.vfo_working,
+                                     g_strdup(main_token),
+                                     GINT_TO_POINTER(1));
+            }
+            if (!g_hash_table_contains(client->caps.vfo_working, sub_token))
+            {
+                g_hash_table_replace(client->caps.vfo_working,
+                                     g_strdup(sub_token),
+                                     GINT_TO_POINTER(1));
+            }
+
+            g_free(client->caps.vfo_token_main);
+            client->caps.vfo_token_main = g_strdup(main_token);
+            g_free(client->caps.vfo_token_sub);
+            client->caps.vfo_token_sub = g_strdup(sub_token);
+            if (client->caps.default_vfo_token == NULL)
+                client->caps.default_vfo_token = g_strdup(main_token);
+
+            /* Some IC-9700/rigctld paths accept VFO selection and set
+               frequency, but fail or stall on per-VFO readback during probe.
+               Treat "both sides selectable" as usable SELECT_VFO support. */
+            vfo_select_ok = TRUE;
+        }
     }
 
     if (client->caps.has_set_vfo_opt || (conf != NULL && conf->vfo_opt))
@@ -1105,6 +1157,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "no usable control strategy");
+        g_hash_table_destroy(vfo_selectable);
         g_rec_mutex_unlock(rigctld_client_meta_lock(client));
         return FALSE;
     }
@@ -1122,12 +1175,14 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "probe failed");
+        g_hash_table_destroy(vfo_selectable);
         g_rec_mutex_unlock(rigctld_client_meta_lock(client));
         return FALSE;
     }
 
     rigctld_client_set_state(client, RIGCTLD_CLIENT_READY,
                              "strategy=%d", client->caps.strategy);
+    g_hash_table_destroy(vfo_selectable);
     g_rec_mutex_unlock(rigctld_client_meta_lock(client));
     return TRUE;
 }

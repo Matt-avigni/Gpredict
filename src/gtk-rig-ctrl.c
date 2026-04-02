@@ -15582,7 +15582,17 @@ gpointer rigctl_run(gpointer data)
         {
             if (is_full_duplex_main_sub_configured(t_ctrl->conf))
             {
-                exec_full_duplex_main_sub_cycle(t_ctrl, FALSE);
+                if (t_ctrl->conn_state2 == RIGCTRL_CONN_CONNECTED)
+                {
+                    exec_full_duplex_main_sub_cycle(t_ctrl, FALSE);
+                }
+                else if (rigctrl_log_throttled(t_ctrl,
+                                               &t_ctrl->last_probe_log_us,
+                                               RIGCTRL_PROBE_LOG_INTERVAL_US))
+                {
+                    rig_term_log(t_ctrl, "gpredict:err",
+                                 "Main/Sub engage incomplete; shared uplink not ready");
+                }
             }
             else
             {
