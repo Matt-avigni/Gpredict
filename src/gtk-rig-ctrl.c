@@ -140,6 +140,7 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTLD_STARTUP_POLL_MS 25
 #define RIGCTLD_AUTOSTART_TIMEOUT_MS 2000
 #define RIGCTLD_AUTOSTART_POLL_MS 20
+#define RIGCTLD_AUTOSTART_SERIAL_GRACE_MS 10000
 #define RIGCTLD_HEALTH_TIMEOUT_MS 200
 #define RIGCTLD_HEALTH_RETRIES 3
 #define RIGCTLD_HEALTH_RETRY_DELAY_MS 50
@@ -14163,42 +14164,58 @@ retry_autostart:
         rig_term_log(ctrl, "gpredict",
                      "connecting to %s:%d (autostart)", host, conf->port);
         {
-            gint64 start_us = g_get_monotonic_time();
             gint waited_ms = 0;
             gboolean session_connected = FALSE;
+            gboolean listen_ready = FALSE;
             gchar *exit_detail = NULL;
             gchar *stderr_text = NULL;
 
-            while (waited_ms < RIGCTLD_AUTOSTART_TIMEOUT_MS)
+            listen_ready =
+                rigctld_wait_tcp_listen(ctrl,
+                                        mgr ? *mgr : NULL,
+                                        host, conf->port,
+                                        RIGCTLD_AUTOSTART_TIMEOUT_MS,
+                                        RIGCTLD_AUTOSTART_POLL_MS,
+                                        &waited_ms, &exit_detail);
+
+            if (!listen_ready &&
+                exit_detail == NULL &&
+                conf->rigctld_conn == RIGCTLD_CONN_SERIAL &&
+                rigctld_mgr_host_is_local(conf->host))
             {
-                if (mgr && *mgr && !rigctld_mgr_is_running(*mgr))
-                {
-                    gboolean exited = FALSE;
-                    gint status = -1;
-                    gint signal = 0;
+                gint grace_waited_ms = 0;
 
-                    (void)rigctld_mgr_get_exit_info(*mgr, &exited,
-                                                    &status, &signal);
-                    if (signal > 0)
-                        exit_detail =
-                            g_strdup_printf("rigctld exited via signal %d", signal);
-                    else if (status >= 0)
-                        exit_detail =
-                            g_strdup_printf("rigctld exit status %d", status);
-                    else
-                        exit_detail = g_strdup("rigctld exited");
-                    break;
-                }
+                rig_term_log(ctrl, "gpredict",
+                             "rigctld still starting after %d ms; extending local serial startup wait by %d ms",
+                             waited_ms,
+                             RIGCTLD_AUTOSTART_SERIAL_GRACE_MS);
+                listen_ready =
+                    rigctld_wait_tcp_listen(ctrl,
+                                            mgr ? *mgr : NULL,
+                                            host, conf->port,
+                                            RIGCTLD_AUTOSTART_SERIAL_GRACE_MS,
+                                            RIGCTLD_AUTOSTART_POLL_MS,
+                                            &grace_waited_ms,
+                                            &exit_detail);
+                waited_ms += grace_waited_ms;
+            }
 
+            if (listen_ready)
+            {
                 if (open_rigctld_socket_host(host, conf->port, sock,
                                              &err, &so_err, FALSE))
                 {
                     session_connected = TRUE;
-                    break;
                 }
-
-                g_usleep((gulong)RIGCTLD_AUTOSTART_POLL_MS * 1000);
-                waited_ms = (gint)((g_get_monotonic_time() - start_us) / 1000);
+                else
+                {
+                    rig_term_log(ctrl, "gpredict:err",
+                                 "rigctld started listening on %s:%d but session connect failed (errno=%d so_error=%d)",
+                                 host, conf->port, err, so_err);
+                    exit_detail = g_strdup_printf(
+                        "rigctld listen ok but session connect failed (errno=%d so_error=%d)",
+                        err, so_err);
+                }
             }
 
             if (!session_connected)
