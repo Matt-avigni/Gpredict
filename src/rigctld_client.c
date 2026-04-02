@@ -28,6 +28,8 @@ struct _RigctldClient {
     rigctld_client_state_t state;
     gchar                 *state_reason;
     gchar                 *label;
+    RigctldClientLogFunc   log_cb;
+    gpointer               log_cb_data;
     gint64                 last_probe_us;
     vfo_t                  last_selected_vfo;
     RigCaps                caps;
@@ -64,10 +66,128 @@ rig_log_level_t rigctld_client_get_log_level(void)
     return (rig_log_level_t)g_atomic_int_get(&rig_log_level);
 }
 
+void rigctld_client_set_log_callback(RigctldClient *client,
+                                     RigctldClientLogFunc cb,
+                                     gpointer user_data)
+{
+    if (client == NULL)
+        return;
+
+    g_rec_mutex_lock(rigctld_client_meta_lock(client));
+    client->log_cb = cb;
+    client->log_cb_data = user_data;
+    g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+}
+
+static gchar *rigctld_client_dup_trimmed(const gchar *text)
+{
+    gchar *copy = NULL;
+
+    if (text == NULL)
+        return g_strdup("");
+
+    copy = g_strdup(text);
+    g_strchomp(copy);
+    g_strstrip(copy);
+    return copy;
+}
+
+static void rigctld_client_emit_log_line(RigctldClient *client,
+                                         const gchar *prefix,
+                                         const gchar *line)
+{
+    RigctldClientLogFunc cb = NULL;
+    gpointer user_data = NULL;
+    gchar *label = NULL;
+    gchar *msg = NULL;
+
+    if (client == NULL || prefix == NULL || line == NULL || *line == '\0')
+        return;
+
+    g_rec_mutex_lock(rigctld_client_meta_lock(client));
+    cb = client->log_cb;
+    user_data = client->log_cb_data;
+    label = g_strdup(client->label ? client->label : "rig");
+    g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+
+    if (cb == NULL)
+    {
+        g_free(label);
+        return;
+    }
+
+    msg = g_strdup_printf("[%s] %s", label ? label : "rig", line);
+    cb(client, prefix, msg, user_data);
+    g_free(msg);
+    g_free(label);
+}
+
+static void rigctld_client_emit_log_lines(RigctldClient *client,
+                                          const gchar *prefix,
+                                          const gchar *text)
+{
+    gchar **lines = NULL;
+
+    if (client == NULL || prefix == NULL || text == NULL || *text == '\0')
+        return;
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *trimmed = g_strdup(lines[i]);
+
+        g_strstrip(trimmed);
+        if (*trimmed != '\0')
+            rigctld_client_emit_log_line(client, prefix, trimmed);
+        g_free(trimmed);
+    }
+    g_strfreev(lines);
+}
+
+static void rigctld_client_emit_logf(RigctldClient *client,
+                                     const gchar *prefix,
+                                     const gchar *fmt,
+                                     ...)
+    G_GNUC_PRINTF(3, 4);
+
+static void rigctld_client_emit_logf(RigctldClient *client,
+                                     const gchar *prefix,
+                                     const gchar *fmt,
+                                     ...)
+{
+    va_list args;
+    gchar *msg = NULL;
+
+    if (client == NULL || prefix == NULL || fmt == NULL)
+        return;
+
+    va_start(args, fmt);
+    msg = g_strdup_vprintf(fmt, args);
+    va_end(args);
+
+    if (msg == NULL)
+        return;
+
+    rigctld_client_emit_log_lines(client, prefix, msg);
+    g_free(msg);
+}
+
 static void rigctld_client_set_state(RigctldClient *client,
                                      rigctld_client_state_t state,
                                      const gchar *fmt,
                                      ...) G_GNUC_PRINTF(3, 4);
+static gboolean rigctld_client_request(RigctldClient *client,
+                                       const gchar *cmd,
+                                       hamlib_read_mode_t mode,
+                                       hamlib_term_t term,
+                                       gint timeout_ms,
+                                       gint idle_timeout_ms,
+                                       gint retries,
+                                       gint retry_delay_ms,
+                                       gchar *reply,
+                                       gsize reply_len,
+                                       HamlibResponseInfo *info,
+                                       gboolean wire_log);
 
 static void rigctld_client_caps_clear(RigCaps *caps)
 {
@@ -488,7 +608,8 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
                                             gint64 *freq_out,
                                             gchar *reply,
                                             gsize reply_len,
-                                            gint timeout_ms)
+                                            gint timeout_ms,
+                                            gboolean wire_log)
 {
     HamlibResponseInfo info = { 0 };
     gboolean ok = FALSE;
@@ -498,22 +619,33 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
     if (reply && reply_len > 0)
         reply[0] = '\0';
 
-    ok = hamlib_transport_request(client->transport,
-                                  cmd,
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT,
-                                  timeout_ms,
-                                  50,
-                                  0, 0,
-                                  reply, reply_len,
-                                  &info);
+    ok = rigctld_client_request(client, cmd,
+                                HAMLIB_READ_MULTILINE_RPRT,
+                                HAMLIB_TERM_RPRT,
+                                timeout_ms,
+                                50,
+                                0, 0,
+                                reply, reply_len,
+                                &info,
+                                wire_log);
     if (!ok)
         return FALSE;
 
     if (info.saw_rprt && info.rprt_code != 0)
         return FALSE;
 
-    return rigctld_client_parse_frequency(reply, freq_out);
+    ok = rigctld_client_parse_frequency(reply, freq_out);
+    if (!ok && wire_log)
+    {
+        gchar *trim_reply = rigctld_client_dup_trimmed(reply);
+
+        rigctld_client_emit_logf(client, "gpredict:err",
+                                 "frequency parse failed reply=%s",
+                                 (trim_reply && *trim_reply) ? trim_reply : "(empty)");
+        g_free(trim_reply);
+    }
+
+    return ok;
 }
 
 static gboolean rigctld_client_try_get_freq_retry(RigctldClient *client,
@@ -522,19 +654,29 @@ static gboolean rigctld_client_try_get_freq_retry(RigctldClient *client,
                                                   gchar *reply,
                                                   gsize reply_len,
                                                   gint timeout_ms,
-                                                  gint retries)
+                                                  gint retries,
+                                                  gboolean wire_log)
 {
     gint attempt = 0;
 
     for (attempt = 0; attempt <= retries; attempt++)
     {
         if (rigctld_client_try_get_freq(client, cmd, freq_out,
-                                        reply, reply_len, timeout_ms))
+                                        reply, reply_len, timeout_ms,
+                                        wire_log))
             return TRUE;
 
         (void)hamlib_transport_drain(client->transport, 50, NULL);
         if (attempt < retries)
+        {
+            if (wire_log)
+                rigctld_client_emit_logf(client, "gpredict",
+                                         "retrying cmd=%s attempt=%d/%d",
+                                         cmd,
+                                         attempt + 2,
+                                         retries + 1);
             g_usleep((gulong)RIGCTLD_PROBE_RETRY_DELAY_MS * 1000);
+        }
     }
 
     return FALSE;
@@ -544,7 +686,8 @@ static gboolean rigctld_client_try_set_ok(RigctldClient *client,
                                           const gchar *cmd,
                                           gchar *reply,
                                           gsize reply_len,
-                                          gint timeout_ms)
+                                          gint timeout_ms,
+                                          gboolean wire_log)
 {
     HamlibResponseInfo info = { 0 };
     gboolean ok = FALSE;
@@ -552,15 +695,15 @@ static gboolean rigctld_client_try_set_ok(RigctldClient *client,
     if (reply && reply_len > 0)
         reply[0] = '\0';
 
-    ok = hamlib_transport_request(client->transport,
-                                  cmd,
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT,
-                                  timeout_ms,
-                                  50,
-                                  0, 0,
-                                  reply, reply_len,
-                                  &info);
+    ok = rigctld_client_request(client, cmd,
+                                HAMLIB_READ_MULTILINE_RPRT,
+                                HAMLIB_TERM_RPRT,
+                                timeout_ms,
+                                50,
+                                0, 0,
+                                reply, reply_len,
+                                &info,
+                                wire_log);
     if (!ok)
         return FALSE;
 
@@ -572,7 +715,8 @@ static gboolean rigctld_client_try_set_ok(RigctldClient *client,
 
 static gboolean rigctld_client_try_select_vfo(RigctldClient *client,
                                               const gchar *token,
-                                              gint timeout_ms)
+                                              gint timeout_ms,
+                                              gboolean wire_log)
 {
     gchar cmd[RIGCTLD_VFO_TOKEN_MAX];
     gchar reply[128];
@@ -582,7 +726,7 @@ static gboolean rigctld_client_try_select_vfo(RigctldClient *client,
 
     g_snprintf(cmd, sizeof(cmd), "V %s\x0a", token);
     return rigctld_client_try_set_ok(client, cmd, reply, sizeof(reply),
-                                     timeout_ms);
+                                     timeout_ms, wire_log);
 }
 
 static gboolean rigctld_client_caps_fragile_main_sub(const RigCaps *caps)
@@ -596,7 +740,8 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
                                                     const gchar *token,
                                                     gint timeout_ms,
                                                     gint attempts,
-                                                    gulong settle_us)
+                                                    gulong settle_us,
+                                                    gboolean wire_log)
 {
     gint max_attempts = (attempts > 0) ? attempts : 1;
 
@@ -612,9 +757,20 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
                 g_usleep(settle_us);
         }
 
-        if (rigctld_client_try_select_vfo(client, token, timeout_ms))
+        if (rigctld_client_try_select_vfo(client, token, timeout_ms, wire_log))
+        {
+            if (wire_log && max_attempts > 1)
+                rigctld_client_emit_logf(client, "gpredict",
+                                         "select VFO %s ok attempt=%d/%d",
+                                         token, attempt + 1, max_attempts);
             return TRUE;
+        }
     }
+
+    if (wire_log)
+        rigctld_client_emit_logf(client, "gpredict:err",
+                                 "select VFO %s failed after %d attempt(s)",
+                                 token, max_attempts);
 
     return FALSE;
 }
@@ -622,7 +778,8 @@ static gboolean rigctld_client_try_select_vfo_retry(RigctldClient *client,
 static gboolean rigctld_client_try_get_vfo(RigctldClient *client,
                                            gchar *token_out,
                                            gsize token_len,
-                                           gint timeout_ms)
+                                           gint timeout_ms,
+                                           gboolean wire_log)
 {
     HamlibResponseInfo info = { 0 };
     gchar reply[128];
@@ -634,26 +791,38 @@ static gboolean rigctld_client_try_get_vfo(RigctldClient *client,
     if (client == NULL || token_out == NULL || token_len == 0)
         return FALSE;
 
-    ok = hamlib_transport_request(client->transport,
-                                  "v\n",
-                                  HAMLIB_READ_MULTILINE_RPRT,
-                                  HAMLIB_TERM_RPRT,
-                                  timeout_ms,
-                                  50,
-                                  0, 0,
-                                  reply, sizeof(reply),
-                                  &info);
+    ok = rigctld_client_request(client, "v\n",
+                                HAMLIB_READ_MULTILINE_RPRT,
+                                HAMLIB_TERM_RPRT,
+                                timeout_ms,
+                                50,
+                                0, 0,
+                                reply, sizeof(reply),
+                                &info,
+                                wire_log);
     if (!ok)
         return FALSE;
 
     if (info.saw_rprt && info.rprt_code != 0)
         return FALSE;
 
-    return rigctld_client_parse_vfo_reply(reply, token_out, token_len);
+    ok = rigctld_client_parse_vfo_reply(reply, token_out, token_len);
+    if (!ok && wire_log)
+    {
+        gchar *trim_reply = rigctld_client_dup_trimmed(reply);
+
+        rigctld_client_emit_logf(client, "gpredict:err",
+                                 "VFO parse failed reply=%s",
+                                 (trim_reply && *trim_reply) ? trim_reply : "(empty)");
+        g_free(trim_reply);
+    }
+
+    return ok;
 }
 
 static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client,
-                                                           gint timeout_ms)
+                                                           gint timeout_ms,
+                                                           gboolean wire_log)
 {
     gchar reply[128];
     gint64 freq = 0;
@@ -663,7 +832,8 @@ static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client
 
     if (!rigctld_client_try_get_freq_retry(client, "f\n",
                                            &freq, reply, sizeof(reply),
-                                           timeout_ms, 0))
+                                           timeout_ms, 0,
+                                           wire_log))
     {
         return FALSE;
     }
@@ -675,6 +845,7 @@ static gboolean rigctld_client_probe_selected_vfo_readback(RigctldClient *client
 static gboolean rigctld_client_probe_selected_vfo_matches(RigctldClient *client,
                                                           const gchar *token,
                                                           gint timeout_ms,
+                                                          gboolean wire_log,
                                                           gboolean *available_out)
 {
     gchar current[128];
@@ -687,7 +858,8 @@ static gboolean rigctld_client_probe_selected_vfo_matches(RigctldClient *client,
     if (client == NULL || token == NULL || *token == '\0')
         return FALSE;
 
-    if (!rigctld_client_try_get_vfo(client, current, sizeof(current), timeout_ms))
+    if (!rigctld_client_try_get_vfo(client, current, sizeof(current),
+                                    timeout_ms, wire_log))
         return FALSE;
 
     if (available_out != NULL)
@@ -754,7 +926,8 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
                                                       gint attempts,
                                                       gulong settle_us,
                                                       gboolean allow_unlisted,
-                                                      gboolean require_validation)
+                                                      gboolean require_validation,
+                                                      gboolean wire_log)
 {
     RigCaps *caps = NULL;
 
@@ -781,7 +954,8 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
         if (!rigctld_client_try_select_vfo_retry(client, token,
                                                  timeout_ms,
                                                  attempts,
-                                                 settle_us))
+                                                 settle_us,
+                                                 wire_log))
         {
             continue;
         }
@@ -797,10 +971,12 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
             validated = rigctld_client_probe_selected_vfo_matches(client,
                                                                   token,
                                                                   timeout_ms,
+                                                                  wire_log,
                                                                   &vfo_readback_available);
             if (!validated && !vfo_readback_available)
                 validated = rigctld_client_probe_selected_vfo_readback(client,
-                                                                       timeout_ms);
+                                                                       timeout_ms,
+                                                                       wire_log);
             if (!validated)
                 continue;
 
@@ -912,6 +1088,104 @@ RigctldClient *rigctld_client_new(const gchar *label)
     rigctld_client_caps_init(&client->caps);
 
     return client;
+}
+
+static gboolean rigctld_client_request(RigctldClient *client,
+                                       const gchar *cmd,
+                                       hamlib_read_mode_t mode,
+                                       hamlib_term_t term,
+                                       gint timeout_ms,
+                                       gint idle_timeout_ms,
+                                       gint retries,
+                                       gint retry_delay_ms,
+                                       gchar *reply,
+                                       gsize reply_len,
+                                       HamlibResponseInfo *info,
+                                       gboolean wire_log)
+{
+    HamlibResponseInfo local = { 0 };
+    gboolean ok = FALSE;
+    gint err = 0;
+
+    if (info)
+        memset(info, 0, sizeof(*info));
+    if (reply && reply_len > 0)
+        reply[0] = '\0';
+
+    if (client == NULL || client->transport == NULL || cmd == NULL)
+        return FALSE;
+
+    if (wire_log && rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
+        rigctld_client_emit_log_lines(client, "gpredict:tx", cmd);
+
+    ok = hamlib_transport_request(client->transport,
+                                  cmd,
+                                  mode,
+                                  term,
+                                  timeout_ms,
+                                  idle_timeout_ms,
+                                  retries,
+                                  retry_delay_ms,
+                                  reply, reply_len,
+                                  &local);
+
+    if (info)
+        *info = local;
+
+    if (!ok)
+    {
+        if (wire_log && rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
+        {
+            gchar *trim_cmd = rigctld_client_dup_trimmed(cmd);
+
+            err = local.err ? local.err : EIO;
+            rigctld_client_emit_logf(client, "gpredict:err",
+                                     "request failed cmd=%s err=%d (%s)",
+                                     (trim_cmd && *trim_cmd) ? trim_cmd : "(empty)",
+                                     err,
+                                     g_strerror(err));
+            g_free(trim_cmd);
+        }
+        return FALSE;
+    }
+
+    if (wire_log &&
+        rigctld_client_get_log_level() >= RIG_LOG_VERBOSE &&
+        reply != NULL && reply_len > 0 && reply[0] != '\0')
+    {
+        rigctld_client_emit_log_lines(client, "gpredict:rx", reply);
+    }
+
+    if (wire_log && rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
+    {
+        if (local.saw_done &&
+            (reply == NULL || g_strrstr(reply, "done") == NULL))
+        {
+            rigctld_client_emit_log_line(client, "gpredict:rx", "done");
+        }
+
+        if (local.saw_rprt &&
+            (reply == NULL || g_strrstr(reply, "RPRT") == NULL))
+        {
+            rigctld_client_emit_logf(client, "gpredict:rx",
+                                     "RPRT %d", local.rprt_code);
+        }
+    }
+
+    if (wire_log &&
+        rigctld_client_get_log_level() >= RIG_LOG_VERBOSE &&
+        local.saw_rprt && local.rprt_code != 0)
+    {
+        gchar *trim_cmd = rigctld_client_dup_trimmed(cmd);
+
+        rigctld_client_emit_logf(client, "gpredict:err",
+                                 "request rejected cmd=%s rprt=%d",
+                                 (trim_cmd && *trim_cmd) ? trim_cmd : "(empty)",
+                                 local.rprt_code);
+        g_free(trim_cmd);
+    }
+
+    return TRUE;
 }
 
 void rigctld_client_free(RigctldClient **client)
@@ -1128,15 +1402,16 @@ gboolean rigctld_client_probe(RigctldClient *client,
     rigctld_client_caps_clear(&client->caps);
     vfo_selectable = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                            NULL);
-    if (!hamlib_transport_request(client->transport,
-                                  "\\dump_state\n",
-                                  HAMLIB_READ_MULTILINE_IDLE,
-                                  HAMLIB_TERM_RPRT_OR_DONE,
-                                  timeout_ms,
-                                  50,
-                                  1, RIGCTLD_PROBE_RETRY_DELAY_MS,
-                                  dump_state, sizeof(dump_state),
-                                  &info))
+    if (!rigctld_client_request(client,
+                                "\\dump_state\n",
+                                HAMLIB_READ_MULTILINE_IDLE,
+                                HAMLIB_TERM_RPRT_OR_DONE,
+                                timeout_ms,
+                                50,
+                                1, RIGCTLD_PROBE_RETRY_DELAY_MS,
+                                dump_state, sizeof(dump_state),
+                                &info,
+                                TRUE))
     {
         if (rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
@@ -1193,7 +1468,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     freq_ok = rigctld_client_try_get_freq_retry(client, "f\n",
                                                 &freq, reply, sizeof(reply),
-                                                timeout_ms, 1);
+                                                timeout_ms, 1,
+                                                TRUE);
     client->caps.has_get_freq = freq_ok;
 
     if (client->caps.prefer_main_sub_tokens)
@@ -1212,6 +1488,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   select_attempts,
                                                   select_settle_us,
                                                   TRUE,
+                                                  TRUE,
                                                   TRUE);
             const gchar *sub_token = NULL;
 
@@ -1225,6 +1502,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   timeout_ms,
                                                   select_attempts,
                                                   select_settle_us,
+                                                  TRUE,
                                                   TRUE,
                                                   TRUE);
 
@@ -1248,7 +1526,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
             if (!rigctld_client_try_select_vfo_retry(client, token,
                                                      timeout_ms,
                                                      select_attempts,
-                                                     select_settle_us))
+                                                     select_settle_us,
+                                                     TRUE))
                 continue;
             g_hash_table_replace(vfo_selectable, g_strdup(token),
                                  GINT_TO_POINTER(1));
@@ -1260,7 +1539,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
             if (rigctld_client_try_get_freq_retry(client, "f\n",
                                                   &freq, reply, sizeof(reply),
-                                                  timeout_ms, 1))
+                                                  timeout_ms, 1,
+                                                  TRUE))
             {
                 vfo_select_ok = TRUE;
                 g_hash_table_replace(client->caps.vfo_working,
@@ -1334,18 +1614,21 @@ gboolean rigctld_client_probe(RigctldClient *client,
         vfo_opt_set = rigctld_client_try_set_ok(client,
                                                 "\\set_vfo_opt 1\x0a",
                                                 reply, sizeof(reply),
-                                                timeout_ms);
+                                                timeout_ms,
+                                                TRUE);
         if (vfo_opt_set)
         {
             client->caps.vfo_opt_enabled = TRUE;
             if (!rigctld_client_try_get_freq_retry(client, "f\n",
                                                    &freq, reply, sizeof(reply),
-                                                   timeout_ms, 1))
+                                                   timeout_ms, 1,
+                                                   TRUE))
             {
                 client->caps.vfo_opt_unsafe = TRUE;
                 rigctld_client_try_set_ok(client, "\\set_vfo_opt 0\x0a",
                                           reply, sizeof(reply),
-                                          timeout_ms);
+                                          timeout_ms,
+                                          TRUE);
                 client->caps.vfo_opt_enabled = FALSE;
             }
             else
@@ -1360,7 +1643,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
                     if (!rigctld_client_try_get_freq_retry(client, cmd,
                                                            &freq, reply,
                                                            sizeof(reply),
-                                                           timeout_ms, 1))
+                                                           timeout_ms, 1,
+                                                           TRUE))
                         continue;
 
                     g_free(client->caps.default_vfo_token);
@@ -1369,7 +1653,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                token, freq);
                     if (rigctld_client_try_set_ok(client, cmd,
                                                   reply, sizeof(reply),
-                                                  timeout_ms))
+                                                  timeout_ms,
+                                                  TRUE))
                     {
                         vfo_opt_args_ok = TRUE;
                         break;
@@ -1401,7 +1686,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
         if (client->caps.vfo_opt_enabled)
         {
             rigctld_client_try_set_ok(client, "\\set_vfo_opt 0\x0a",
-                                      reply, sizeof(reply), timeout_ms);
+                                      reply, sizeof(reply), timeout_ms,
+                                      TRUE);
             client->caps.vfo_opt_enabled = FALSE;
         }
     }
@@ -1411,7 +1697,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
         if (client->caps.vfo_opt_enabled)
         {
             rigctld_client_try_set_ok(client, "\\set_vfo_opt 0\x0a",
-                                      reply, sizeof(reply), timeout_ms);
+                                      reply, sizeof(reply), timeout_ms,
+                                      TRUE);
             client->caps.vfo_opt_enabled = FALSE;
         }
     }
@@ -1446,7 +1733,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
         g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq);
         client->caps.has_set_freq =
             rigctld_client_try_set_ok(client, cmd,
-                                      reply, sizeof(reply), timeout_ms);
+                                      reply, sizeof(reply), timeout_ms,
+                                      TRUE);
     }
 
     if (!dump_ok && !freq_ok && !vfo_select_ok && !vfo_opt_args_ok)
@@ -1490,7 +1778,8 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
         {
             gboolean ok = rigctld_client_try_get_freq(client, cmd,
                                                       freq_out, reply,
-                                                      sizeof(reply), 500);
+                                                      sizeof(reply), 500,
+                                                      FALSE);
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return ok;
         }
@@ -1511,7 +1800,8 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
     {
         gboolean ok = rigctld_client_try_get_freq(client, cmd,
                                                   freq_out, reply,
-                                                  sizeof(reply), 500);
+                                                  sizeof(reply), 500,
+                                                  FALSE);
         g_rec_mutex_unlock(rigctld_client_meta_lock(client));
         return ok;
     }
@@ -1558,7 +1848,8 @@ gboolean rigctld_client_ensure_vfo(RigctldClient *client,
     ok = rigctld_client_try_select_vfo_retry(
         client, token, 500,
         fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1,
-        fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0);
+        fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0,
+        TRUE);
     if (ok)
         client->last_selected_vfo = vfo;
 
@@ -1591,7 +1882,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
                    token, freq_hz);
         {
             gboolean ok = rigctld_client_try_set_ok(client, cmd,
-                                                    reply, sizeof(reply), 500);
+                                                    reply, sizeof(reply), 500,
+                                                    TRUE);
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return ok;
         }
@@ -1611,7 +1903,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
 
         g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
         ok = rigctld_client_try_set_ok(client, cmd,
-                                       reply, sizeof(reply), 500);
+                                       reply, sizeof(reply), 500,
+                                       TRUE);
         if (ok || !can_select)
         {
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
@@ -1622,7 +1915,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
         if (!rigctld_client_try_select_vfo_retry(
                 client, token, 500,
                 fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1,
-                fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0))
+                fragile_main_sub ? RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0,
+                TRUE))
         {
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return FALSE;
@@ -1633,7 +1927,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
         {
             gboolean retry_ok = rigctld_client_try_set_ok(client, cmd,
                                                           reply,
-                                                          sizeof(reply), 500);
+                                                          sizeof(reply), 500,
+                                                          TRUE);
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
             return retry_ok;
         }
@@ -1642,7 +1937,8 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
     g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
     {
         gboolean ok = rigctld_client_try_set_ok(client, cmd,
-                                                reply, sizeof(reply), 500);
+                                                reply, sizeof(reply), 500,
+                                                TRUE);
         g_rec_mutex_unlock(rigctld_client_meta_lock(client));
         return ok;
     }
@@ -1659,7 +1955,8 @@ gboolean rigctld_client_set_vfo(RigctldClient *client,
 
     g_snprintf(cmd, sizeof(cmd), "V %s\x0a", token);
     return rigctld_client_try_set_ok(client, cmd,
-                                     reply, sizeof(reply), 500);
+                                     reply, sizeof(reply), 500,
+                                     TRUE);
 }
 
 gboolean rigctld_client_set_vfo_opt(RigctldClient *client,
@@ -1674,7 +1971,8 @@ gboolean rigctld_client_set_vfo_opt(RigctldClient *client,
     if (enable)
     {
         if (rigctld_client_try_set_ok(client, "\\set_vfo_opt 1\x0a",
-                                      reply, sizeof(reply), 500))
+                                      reply, sizeof(reply), 500,
+                                      TRUE))
         {
             client->caps.vfo_opt_enabled = TRUE;
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
@@ -1684,7 +1982,8 @@ gboolean rigctld_client_set_vfo_opt(RigctldClient *client,
     else
     {
         if (rigctld_client_try_set_ok(client, "\\set_vfo_opt 0\x0a",
-                                      reply, sizeof(reply), 500))
+                                      reply, sizeof(reply), 500,
+                                      TRUE))
         {
             client->caps.vfo_opt_enabled = FALSE;
             g_rec_mutex_unlock(rigctld_client_meta_lock(client));
@@ -1733,15 +2032,16 @@ gboolean rigctld_client_request_raw(RigctldClient *client,
              g_str_has_prefix(send_cmd, "I "))
         request_timeout_ms = 3000;
 
-    ok = hamlib_transport_request(client->transport,
-                                  send_cmd,
-                                  mode,
-                                  HAMLIB_TERM_RPRT,
-                                  request_timeout_ms,
-                                  50,
-                                  0, 0,
-                                  out, out_len,
-                                  &local);
+    ok = rigctld_client_request(client,
+                                send_cmd,
+                                mode,
+                                HAMLIB_TERM_RPRT,
+                                request_timeout_ms,
+                                50,
+                                0, 0,
+                                out, out_len,
+                                &local,
+                                FALSE);
     g_free(tmp_cmd);
     if (info)
         *info = local;

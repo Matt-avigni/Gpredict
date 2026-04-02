@@ -2469,6 +2469,19 @@ static void rigctld_log_cb(RigctldMgr *mgr, const gchar *prefix,
     rig_term_log(ctrl, prefix, "%s", line);
 }
 
+static void rigctld_client_log_cb(RigctldClient *client, const gchar *prefix,
+                                  const gchar *line, gpointer user_data)
+{
+    GtkRigCtrl *ctrl = GTK_RIG_CTRL(user_data);
+
+    (void)client;
+
+    if (ctrl == NULL || prefix == NULL || line == NULL)
+        return;
+
+    rig_term_log(ctrl, prefix, "%s", line);
+}
+
 static void rig_logs_toggle_cb(GtkToggleButton *button, gpointer data)
 {
     GtkRigCtrl *ctrl = GTK_RIG_CTRL(data);
@@ -3867,6 +3880,8 @@ static void gtk_rig_ctrl_init(GtkRigCtrl * ctrl,
     ctrl->rigctld_rxbuf2 = NULL;
     ctrl->rig_client = rigctld_client_new(_("receiver"));
     ctrl->rig_client2 = rigctld_client_new(_("uplink"));
+    rigctld_client_set_log_callback(ctrl->rig_client, rigctld_client_log_cb, ctrl);
+    rigctld_client_set_log_callback(ctrl->rig_client2, rigctld_client_log_cb, ctrl);
     ctrl->rig_session = rig_session_new(_("receiver"));
     ctrl->rig_session2 = rig_session_new(_("uplink"));
     ctrl->rigctld_vfo_main_token = NULL;
@@ -14346,6 +14361,10 @@ retry_autostart:
 
         if (*client_ptr == NULL)
             *client_ptr = rigctld_client_new(role ? role : "rig");
+        if (*client_ptr != NULL)
+            rigctld_client_set_log_callback(*client_ptr,
+                                            rigctld_client_log_cb,
+                                            ctrl);
 
         if (!rigctld_client_attach_fd(*client_ptr, *sock, &client_err))
         {

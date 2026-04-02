@@ -220,6 +220,69 @@ typedef struct {
     gint loops;
 } RotThreadCtx;
 
+typedef struct {
+    GPtrArray *lines;
+} RigLogCapture;
+
+static void rig_log_capture_cb(RigctldClient *client,
+                               const gchar *prefix,
+                               const gchar *line,
+                               gpointer user_data)
+{
+    RigLogCapture *capture = user_data;
+
+    (void)client;
+
+    if (capture == NULL || capture->lines == NULL ||
+        prefix == NULL || line == NULL)
+        return;
+
+    g_ptr_array_add(capture->lines,
+                    g_strdup_printf("%s %s", prefix, line));
+}
+
+static gboolean rig_log_capture_contains(const RigLogCapture *capture,
+                                         const gchar *needle)
+{
+    if (capture == NULL || capture->lines == NULL || needle == NULL)
+        return FALSE;
+
+    for (guint i = 0; i < capture->lines->len; i++)
+    {
+        const gchar *line = g_ptr_array_index(capture->lines, i);
+
+        if (line != NULL && g_strrstr(line, needle) != NULL)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void rig_log_capture_clear(RigLogCapture *capture)
+{
+    if (capture == NULL || capture->lines == NULL)
+        return;
+
+    g_ptr_array_set_size(capture->lines, 0);
+}
+
+static void rig_log_capture_dump(const RigLogCapture *capture,
+                                 const gchar *label)
+{
+    if (capture == NULL || capture->lines == NULL)
+        return;
+
+    g_printerr("%s (%u lines):\n",
+               label ? label : "rig log capture",
+               capture->lines->len);
+    for (guint i = 0; i < capture->lines->len; i++)
+    {
+        const gchar *line = g_ptr_array_index(capture->lines, i);
+
+        g_printerr("  %s\n", line ? line : "(null)");
+    }
+}
+
 static gpointer rot_thread_getpos(gpointer data)
 {
     RotThreadCtx *ctx = data;
@@ -307,6 +370,8 @@ int main(void)
     gdouble el = 0.0;
     GError *error = NULL;
     gboolean ok = TRUE;
+    RigLogCapture rig_probe_log = { 0 };
+    RigLogCapture rig_select_log = { 0 };
 
     python = find_python();
     if (python == NULL)
@@ -418,6 +483,10 @@ int main(void)
         goto cleanup;
     }
 
+    rig_probe_log.lines = g_ptr_array_new_with_free_func(g_free);
+    rig_select_log.lines = g_ptr_array_new_with_free_func(g_free);
+    rigctld_client_set_log_level(RIG_LOG_VERBOSE);
+
     rig = rigctld_client_new("mock-rig");
     rig_select = rigctld_client_new("mock-rig-select");
     rig_reject = rigctld_client_new("mock-rig-reject");
@@ -431,6 +500,10 @@ int main(void)
         goto cleanup;
     }
 
+    rigctld_client_set_log_callback(rig, rig_log_capture_cb, &rig_probe_log);
+    rigctld_client_set_log_callback(rig_select, rig_log_capture_cb,
+                                    &rig_select_log);
+
     if (!connect_rigctld_with_retry(rig, "127.0.0.1", rig_port))
     {
         g_printerr("failed to connect to rigctld mock\n");
@@ -443,6 +516,18 @@ int main(void)
     if (!rigctld_client_probe(rig, &conf, 500))
     {
         g_printerr("rigctld probe failed\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!rig_log_capture_contains(&rig_probe_log,
+                                  "gpredict:tx [mock-rig] \\dump_state") ||
+        !rig_log_capture_contains(&rig_probe_log,
+                                  "gpredict:tx [mock-rig] V ") ||
+        !rig_log_capture_contains(&rig_probe_log,
+                                  "gpredict:rx [mock-rig] RPRT 0"))
+    {
+        g_printerr("rigctld probe logging missing expected tx/rx lines\n");
+        rig_log_capture_dump(&rig_probe_log, "probe log");
         ok = FALSE;
         goto cleanup;
     }
@@ -694,9 +779,23 @@ int main(void)
             goto cleanup;
         }
 
+        rig_log_capture_clear(&rig_select_log);
+
         if (!rigctld_client_set_freq(rig_select, VFO_SUB, 145910000))
         {
             g_printerr("rigctld set freq failed (select-vfo)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+        if (!rig_log_capture_contains(&rig_select_log,
+                                      "gpredict:tx [mock-rig-select] V ") ||
+            !rig_log_capture_contains(&rig_select_log,
+                                      "gpredict:tx [mock-rig-select] F 145910000") ||
+            !rig_log_capture_contains(&rig_select_log,
+                                      "gpredict:rx [mock-rig-select] RPRT 0"))
+        {
+            g_printerr("rigctld internal select/set logging missing expected tx/rx lines\n");
+            rig_log_capture_dump(&rig_select_log, "select/set log");
             ok = FALSE;
             goto cleanup;
         }
@@ -1536,6 +1635,10 @@ cleanup:
     g_clear_object(&rot_fail_proc);
     g_clear_object(&rot_split_proc);
     g_clear_object(&rot_drop_proc);
+    if (rig_probe_log.lines != NULL)
+        g_ptr_array_free(rig_probe_log.lines, TRUE);
+    if (rig_select_log.lines != NULL)
+        g_ptr_array_free(rig_select_log.lines, TRUE);
     g_free(python);
     g_free(rig_script);
     g_free(rot_script);
