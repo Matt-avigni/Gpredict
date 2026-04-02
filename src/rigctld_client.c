@@ -998,27 +998,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
         }
     }
 
-    if (client->caps.prefer_main_sub_tokens && vfo_select_ok)
-    {
-        const gchar *main_token =
-            rigctld_client_find_vfo_token_in_table(VFO_MAIN,
-                                                   client->caps.vfo_working);
-        const gchar *sub_token =
-            rigctld_client_find_vfo_token_in_table(VFO_SUB,
-                                                   client->caps.vfo_working);
-
-        g_free(client->caps.vfo_token_main);
-        client->caps.vfo_token_main =
-            main_token ? g_strdup(main_token) : NULL;
-        g_free(client->caps.vfo_token_sub);
-        client->caps.vfo_token_sub =
-            sub_token ? g_strdup(sub_token) : NULL;
-
-        /* Shared Main/Sub control is only usable when both sides map to a
-           proven working token; otherwise SELECT_VFO is a false positive. */
-        vfo_select_ok = (main_token != NULL && sub_token != NULL);
-    }
-    else if (client->caps.prefer_main_sub_tokens)
+    if (client->caps.prefer_main_sub_tokens)
     {
         const gchar *main_token =
             rigctld_client_find_vfo_token_in_table(VFO_MAIN,
@@ -1033,6 +1013,13 @@ gboolean rigctld_client_probe(RigctldClient *client,
         if (sub_token == NULL)
             sub_token = rigctld_client_find_vfo_token_in_table(VFO_SUB,
                                                                vfo_selectable);
+
+        g_free(client->caps.vfo_token_main);
+        client->caps.vfo_token_main =
+            main_token ? g_strdup(main_token) : NULL;
+        g_free(client->caps.vfo_token_sub);
+        client->caps.vfo_token_sub =
+            sub_token ? g_strdup(sub_token) : NULL;
 
         if (main_token != NULL && sub_token != NULL)
         {
@@ -1058,8 +1045,15 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
             /* Some IC-9700/rigctld paths accept VFO selection and set
                frequency, but fail or stall on per-VFO readback during probe.
-               Treat "both sides selectable" as usable SELECT_VFO support. */
+               Treat "both sides selectable", or one side readable plus the
+               other side selectable, as usable SELECT_VFO support. */
             vfo_select_ok = TRUE;
+        }
+        else
+        {
+            /* Shared Main/Sub control is only usable when both sides resolve
+               to a real token. */
+            vfo_select_ok = FALSE;
         }
     }
 
