@@ -18,6 +18,7 @@
 #define RIGCTLD_VFO_TOKEN_MAX 64
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 3
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US 350000
+#define RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS 2
 
 static gint rig_log_level = RIG_LOG_QUIET;
 
@@ -591,6 +592,71 @@ static const gchar *rigctld_client_find_vfo_token_in_table(vfo_t vfo,
     return NULL;
 }
 
+static gboolean rigctld_client_has_vfo_candidate(const RigCaps *caps,
+                                                 const gchar *token)
+{
+    if (caps == NULL || token == NULL || caps->vfo_candidates == NULL)
+        return FALSE;
+
+    for (guint i = 0; i < caps->vfo_candidates->len; i++)
+    {
+        const gchar *entry = g_ptr_array_index(caps->vfo_candidates, i);
+
+        if (entry != NULL && g_ascii_strcasecmp(entry, token) == 0)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
+                                                      const gchar * const *candidates,
+                                                      GHashTable *vfo_selectable,
+                                                      gint timeout_ms,
+                                                      gint attempts,
+                                                      gulong settle_us,
+                                                      gboolean allow_unlisted)
+{
+    RigCaps *caps = NULL;
+
+    if (client == NULL || candidates == NULL || vfo_selectable == NULL)
+        return NULL;
+
+    caps = &client->caps;
+
+    for (gint i = 0; candidates[i] != NULL; i++)
+    {
+        const gchar *token = candidates[i];
+
+        if (g_hash_table_contains(vfo_selectable, token))
+            return token;
+
+        if (!allow_unlisted &&
+            caps->vfo_candidates != NULL &&
+            caps->vfo_candidates->len > 0 &&
+            !rigctld_client_has_vfo_candidate(caps, token))
+        {
+            continue;
+        }
+
+        if (!rigctld_client_try_select_vfo_retry(client, token,
+                                                 timeout_ms,
+                                                 attempts,
+                                                 settle_us))
+        {
+            continue;
+        }
+
+        if (settle_us > 0)
+            g_usleep(settle_us);
+        g_hash_table_replace(vfo_selectable, g_strdup(token),
+                             GINT_TO_POINTER(1));
+        return token;
+    }
+
+    return NULL;
+}
+
 static const gchar *rigctld_client_vfo_token(RigctldClient *client,
                                              vfo_t vfo)
 {
@@ -866,6 +932,10 @@ gboolean rigctld_client_probe(RigctldClient *client,
                               const radio_conf_t *conf,
                               gint timeout_ms)
 {
+    static const gchar *main_candidates[] =
+        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates[] =
+        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
     gchar dump_state[4096];
     gchar reply[256];
     gint64 freq = 0;
@@ -970,39 +1040,71 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                 timeout_ms, 1);
     client->caps.has_get_freq = freq_ok;
 
-    for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
+    if (fragile_main_sub && client->caps.prefer_main_sub_tokens)
     {
-        const gchar *token =
-            g_ptr_array_index(client->caps.vfo_candidates, i);
-
-        if (!rigctld_client_try_select_vfo_retry(client, token,
-                                                 timeout_ms,
-                                                 select_attempts,
-                                                 select_settle_us))
-            continue;
-        g_hash_table_replace(vfo_selectable, g_strdup(token),
-                             GINT_TO_POINTER(1));
-        if (client->caps.default_vfo_token == NULL)
-            client->caps.default_vfo_token = g_strdup(token);
-
-        /* Fragile shared Main/Sub rigs can accept VFO selection while
-           timing out or rejecting immediate per-VFO readback during probe.
-           For that class, validate the handshake on V selection itself and
-           defer frequency verification to real set/get operations. */
-        if (fragile_main_sub && client->caps.prefer_main_sub_tokens)
-            continue;
-
-        if (select_settle_us > 0)
-            g_usleep(select_settle_us);
-
-        if (rigctld_client_try_get_freq_retry(client, "f\n",
-                                              &freq, reply, sizeof(reply),
-                                              timeout_ms, 1))
+        for (gint round = 0; round < RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS; round++)
         {
-            vfo_select_ok = TRUE;
-            g_hash_table_replace(client->caps.vfo_working,
-                                 g_strdup(token),
+            const gchar *main_token =
+                rigctld_client_probe_select_token(client,
+                                                  main_candidates,
+                                                  vfo_selectable,
+                                                  timeout_ms,
+                                                  select_attempts,
+                                                  select_settle_us,
+                                                  TRUE);
+            const gchar *sub_token = NULL;
+
+            if (main_token != NULL && client->caps.default_vfo_token == NULL)
+                client->caps.default_vfo_token = g_strdup(main_token);
+
+            sub_token =
+                rigctld_client_probe_select_token(client,
+                                                  sub_candidates,
+                                                  vfo_selectable,
+                                                  timeout_ms,
+                                                  select_attempts,
+                                                  select_settle_us,
+                                                  TRUE);
+
+            if (main_token != NULL && sub_token != NULL)
+                break;
+
+            if ((round + 1) < RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS &&
+                select_settle_us > 0)
+            {
+                g_usleep(select_settle_us);
+            }
+        }
+    }
+    else
+    {
+        for (guint i = 0; i < client->caps.vfo_candidates->len; i++)
+        {
+            const gchar *token =
+                g_ptr_array_index(client->caps.vfo_candidates, i);
+
+            if (!rigctld_client_try_select_vfo_retry(client, token,
+                                                     timeout_ms,
+                                                     select_attempts,
+                                                     select_settle_us))
+                continue;
+            g_hash_table_replace(vfo_selectable, g_strdup(token),
                                  GINT_TO_POINTER(1));
+            if (client->caps.default_vfo_token == NULL)
+                client->caps.default_vfo_token = g_strdup(token);
+
+            if (select_settle_us > 0)
+                g_usleep(select_settle_us);
+
+            if (rigctld_client_try_get_freq_retry(client, "f\n",
+                                                  &freq, reply, sizeof(reply),
+                                                  timeout_ms, 1))
+            {
+                vfo_select_ok = TRUE;
+                g_hash_table_replace(client->caps.vfo_working,
+                                     g_strdup(token),
+                                     GINT_TO_POINTER(1));
+            }
         }
     }
 
