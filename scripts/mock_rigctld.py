@@ -137,7 +137,12 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                 continue
 
             if cmd.startswith("V "):
-                state["vfo"] = cmd.split(None, 1)[1]
+                token = cmd.split(None, 1)[1]
+                if token in state["reject_vfo_tokens"]:
+                    self.wfile.write(b"RPRT -9\n")
+                    self.wfile.flush()
+                    continue
+                state["vfo"] = token
                 state["selected_since_set"] = True
                 self.wfile.write(b"RPRT 0\n")
                 self.wfile.flush()
@@ -173,9 +178,18 @@ def main():
     parser.add_argument("--reject-main-sub-tokenized-set", action="store_true")
     parser.add_argument("--reject-main-sub-tokenized-retune", action="store_true")
     parser.add_argument("--require-vfo-before-set", action="store_true")
+    parser.add_argument("--reject-main-select", action="store_true")
+    parser.add_argument("--reject-sub-select", action="store_true")
+    parser.add_argument("--reject-vfo-token", action="append", default=[])
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
+    reject_vfo_tokens = set(args.reject_vfo_token)
+    if args.reject_main_select:
+        reject_vfo_tokens.update({"VFOA", "Main", "MainA", "VFO_MAIN"})
+    if args.reject_sub_select:
+        reject_vfo_tokens.update({"VFOB", "Sub", "SubA", "VFO_SUB"})
+
     server = server_cls((args.host, args.port), RigctldHandler)
     server.state = {
         "freq": 145800000,
@@ -186,6 +200,7 @@ def main():
         "reject_main_sub_tokenized_set": args.reject_main_sub_tokenized_set,
         "reject_main_sub_tokenized_retune": args.reject_main_sub_tokenized_retune,
         "require_vfo_before_set": args.require_vfo_before_set,
+        "reject_vfo_tokens": reject_vfo_tokens,
         "selected_since_set": False,
         "cmd_log": [],
     }
