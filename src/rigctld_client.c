@@ -609,6 +609,42 @@ static gboolean rigctld_client_has_vfo_candidate(const RigCaps *caps,
     return FALSE;
 }
 
+static const gchar *rigctld_client_find_vfo_token_in_candidates(vfo_t vfo,
+                                                                const RigCaps *caps)
+{
+    static const gchar *main_candidates[] =
+        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+    static const gchar *sub_candidates[] =
+        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+    const gchar * const *candidates = NULL;
+
+    if (caps == NULL || caps->vfo_candidates == NULL)
+        return NULL;
+
+    if (vfo == VFO_MAIN)
+        candidates = main_candidates;
+    else if (vfo == VFO_SUB)
+        candidates = sub_candidates;
+    else
+        return NULL;
+
+    for (gint i = 0; candidates[i] != NULL; i++)
+    {
+        for (guint j = 0; j < caps->vfo_candidates->len; j++)
+        {
+            const gchar *entry = g_ptr_array_index(caps->vfo_candidates, j);
+
+            if (entry != NULL &&
+                g_ascii_strcasecmp(entry, candidates[i]) == 0)
+            {
+                return entry;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
                                                       const gchar * const *candidates,
                                                       GHashTable *vfo_selectable,
@@ -944,7 +980,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
     gboolean vfo_opt_set = FALSE;
-    gboolean fragile_main_sub = FALSE;
     gint select_attempts = 1;
     gulong select_settle_us = 0;
     GHashTable *vfo_selectable = NULL;
@@ -1018,10 +1053,9 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     client->caps.prefer_main_sub_tokens =
         (conf != NULL && conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
-    fragile_main_sub = rigctld_client_caps_fragile_main_sub(&client->caps);
-    select_attempts = fragile_main_sub ?
+    select_attempts = client->caps.prefer_main_sub_tokens ?
         RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1;
-    select_settle_us = fragile_main_sub ?
+    select_settle_us = client->caps.prefer_main_sub_tokens ?
         RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0;
 
     if (client->caps.vfo_candidates->len == 0)
@@ -1040,8 +1074,12 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                 timeout_ms, 1);
     client->caps.has_get_freq = freq_ok;
 
-    if (fragile_main_sub && client->caps.prefer_main_sub_tokens)
+    if (client->caps.prefer_main_sub_tokens)
     {
+        /* Probe shared Main/Sub rigs with a conservative pair handshake
+           regardless of model identity. Some backends twitch during startup,
+           and a full token sweep can perturb a radio that would otherwise be
+           usable once both sides are selected cleanly. */
         for (gint round = 0; round < RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS; round++)
         {
             const gchar *main_token =
@@ -1123,6 +1161,17 @@ gboolean rigctld_client_probe(RigctldClient *client,
         if (sub_token == NULL)
             sub_token = rigctld_client_find_vfo_token_in_table(VFO_SUB,
                                                                vfo_selectable);
+
+        if (main_token == NULL && client->caps.has_set_vfo)
+        {
+            main_token = rigctld_client_find_vfo_token_in_candidates(
+                VFO_MAIN, &client->caps);
+        }
+        if (sub_token == NULL && client->caps.has_set_vfo)
+        {
+            sub_token = rigctld_client_find_vfo_token_in_candidates(
+                VFO_SUB, &client->caps);
+        }
 
         g_free(client->caps.vfo_token_main);
         client->caps.vfo_token_main =
