@@ -12775,7 +12775,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
             if (rigctrl_reject_main_sub_without_vfo_strategy(
                     ctrl, session, conf,
                     "probe failed; Main/Sub requires rigctld VFO support"))
-                return TRUE;
+                return FALSE;
             if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
                                       RIGCTRL_PROBE_LOG_INTERVAL_US))
                 rig_term_log_verbose(ctrl, "gpredict",
@@ -12793,7 +12793,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         if (rigctrl_reject_main_sub_without_vfo_strategy(
                 ctrl, session, conf,
                 "probe failed; Main/Sub requires rigctld VFO support"))
-            return TRUE;
+            return FALSE;
         if (rigctrl_log_throttled(ctrl, &ctrl->last_probe_log_us,
                                   RIGCTRL_PROBE_LOG_INTERVAL_US))
             rig_term_log_verbose(ctrl, "gpredict",
@@ -12813,7 +12813,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         if (rigctrl_reject_main_sub_without_vfo_strategy(
                 ctrl, session, conf,
                 "caps missing; Main/Sub requires rigctld VFO support"))
-            return TRUE;
+            return FALSE;
         return TRUE;
     }
 
@@ -12825,7 +12825,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     if (rigctrl_reject_main_sub_without_vfo_strategy(
             ctrl, session, conf,
             "probe succeeded without a usable Main/Sub VFO strategy"))
-        return TRUE;
+        return FALSE;
 
     rig_term_log(ctrl, "gpredict",
                  "rig session (%s) dump_state model=%d backend=%s signature=%s vfo_candidates=%u",
@@ -15122,6 +15122,13 @@ open_receiver_retry:
                 rigctrl_fail_engage(ctrl, "receiver open/probe failed");
                 rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                        "open failed");
+                if (is_full_duplex_main_sub_configured(ctrl->conf) &&
+                    ctrl->conf2 == NULL)
+                {
+                    rigctrl_set_conn_state(ctrl, TRUE,
+                                           RIGCTRL_CONN_DISCONNECTED,
+                                           "shared rig unavailable");
+                }
                 ctrl->opening = FALSE;
                 ctrl->opening2 = FALSE;
                 return FALSE;
@@ -15190,6 +15197,13 @@ open_receiver_retry:
                 rigctrl_fail_engage(ctrl, "receiver session probe failed");
                 rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                        "open failed");
+                if (is_full_duplex_main_sub_configured(ctrl->conf) &&
+                    ctrl->conf2 == NULL)
+                {
+                    rigctrl_set_conn_state(ctrl, TRUE,
+                                           RIGCTRL_CONN_DISCONNECTED,
+                                           "shared rig unavailable");
+                }
                 ctrl->opening = FALSE;
                 ctrl->opening2 = FALSE;
                 return FALSE;
@@ -15223,7 +15237,28 @@ open_receiver_retry:
             ctrl->conf2 == NULL)
         {
             if (rigctrl_prepare_shared_tx_session(ctrl))
+            {
                 tx_opened = TRUE;
+            }
+            else
+            {
+                sat_log_log(SAT_LOG_LEVEL_ERROR,
+                            "%s: shared Main/Sub uplink session not ready after probe",
+                            __func__);
+                rig_term_log(ctrl, "gpredict:err",
+                             "shared Main/Sub probe failed; explicit uplink session unavailable");
+                close_rigctld_socket(ctrl, &(ctrl->sock), FALSE);
+                rigctrl_fail_engage(ctrl, "shared Main/Sub probe failed");
+                rigctrl_set_conn_state(ctrl, FALSE,
+                                       RIGCTRL_CONN_DISCONNECTED,
+                                       "open failed");
+                rigctrl_set_conn_state(ctrl, TRUE,
+                                       RIGCTRL_CONN_DISCONNECTED,
+                                       "shared rig unavailable");
+                ctrl->opening = FALSE;
+                ctrl->opening2 = FALSE;
+                return FALSE;
+            }
         }
     }
 
@@ -15364,6 +15399,13 @@ open_uplink_retry:
         rigctrl_fail_engage(ctrl, "uplink open/probe failed");
         rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED,
                                "open failed");
+        if (is_full_duplex_main_sub_configured(ctrl->conf) &&
+            ctrl->conf2 == NULL)
+        {
+            rigctrl_set_conn_state(ctrl, TRUE,
+                                   RIGCTRL_CONN_DISCONNECTED,
+                                   "shared rig unavailable");
+        }
         ctrl->opening = FALSE;
         ctrl->opening2 = FALSE;
         return FALSE;

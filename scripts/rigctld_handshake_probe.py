@@ -125,7 +125,7 @@ def main():
     print("explicit_main_ok=%d" % (1 if explicit_main_ok else 0))
     print("explicit_sub_ok=%d" % (1 if explicit_sub_ok else 0))
 
-    if (main_plain["ok"] or explicit_main_ok) and explicit_sub_ok:
+    if explicit_main_ok and explicit_sub_ok:
         return 0
     return 1
 

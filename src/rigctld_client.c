@@ -609,42 +609,6 @@ static gboolean rigctld_client_has_vfo_candidate(const RigCaps *caps,
     return FALSE;
 }
 
-static const gchar *rigctld_client_find_vfo_token_in_candidates(vfo_t vfo,
-                                                                const RigCaps *caps)
-{
-    static const gchar *main_candidates[] =
-        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
-    static const gchar *sub_candidates[] =
-        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
-    const gchar * const *candidates = NULL;
-
-    if (caps == NULL || caps->vfo_candidates == NULL)
-        return NULL;
-
-    if (vfo == VFO_MAIN)
-        candidates = main_candidates;
-    else if (vfo == VFO_SUB)
-        candidates = sub_candidates;
-    else
-        return NULL;
-
-    for (gint i = 0; candidates[i] != NULL; i++)
-    {
-        for (guint j = 0; j < caps->vfo_candidates->len; j++)
-        {
-            const gchar *entry = g_ptr_array_index(caps->vfo_candidates, j);
-
-            if (entry != NULL &&
-                g_ascii_strcasecmp(entry, candidates[i]) == 0)
-            {
-                return entry;
-            }
-        }
-    }
-
-    return NULL;
-}
-
 static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
                                                       const gchar * const *candidates,
                                                       GHashTable *vfo_selectable,
@@ -1162,17 +1126,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
             sub_token = rigctld_client_find_vfo_token_in_table(VFO_SUB,
                                                                vfo_selectable);
 
-        if (main_token == NULL && client->caps.has_set_vfo)
-        {
-            main_token = rigctld_client_find_vfo_token_in_candidates(
-                VFO_MAIN, &client->caps);
-        }
-        if (sub_token == NULL && client->caps.has_set_vfo)
-        {
-            sub_token = rigctld_client_find_vfo_token_in_candidates(
-                VFO_SUB, &client->caps);
-        }
-
         g_free(client->caps.vfo_token_main);
         client->caps.vfo_token_main =
             main_token ? g_strdup(main_token) : NULL;
@@ -1310,6 +1263,18 @@ gboolean rigctld_client_probe(RigctldClient *client,
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
                                  "no usable control strategy");
+        g_hash_table_destroy(vfo_selectable);
+        g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+        return FALSE;
+    }
+
+    if (conf != NULL &&
+        conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB &&
+        client->caps.strategy != RIG_STRATEGY_SELECT_VFO &&
+        client->caps.strategy != RIG_STRATEGY_VFO_OPT_ARGS)
+    {
+        rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
+                                 "shared Main/Sub requires explicit VFO control");
         g_hash_table_destroy(vfo_selectable);
         g_rec_mutex_unlock(rigctld_client_meta_lock(client));
         return FALSE;

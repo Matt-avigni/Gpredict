@@ -66,6 +66,7 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        guint16 port,
                                        gboolean no_vfo_opt,
                                        gboolean reject_main_sub_tokenized_retune,
+                                       gboolean reject_sub_select,
                                        gboolean require_vfo_before_set,
                                        gint fail_vfo_select_count)
 {
@@ -88,6 +89,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
         g_ptr_array_add(argv, g_strdup("--no-vfo-opt"));
     if (reject_main_sub_tokenized_retune)
         g_ptr_array_add(argv, g_strdup("--reject-main-sub-tokenized-retune"));
+    if (reject_sub_select)
+        g_ptr_array_add(argv, g_strdup("--reject-sub-select"));
     if (require_vfo_before_set)
         g_ptr_array_add(argv, g_strdup("--require-vfo-before-set"));
     if (fail_vfo_select_count > 0)
@@ -263,6 +266,7 @@ int main(void)
     guint16 rig_port = 0;
     guint16 rig_port_select = 0;
     guint16 rig_port_reject = 0;
+    guint16 rig_port_missing_sub = 0;
     guint16 rot_port = 0;
     guint16 rot_fail_port = 0;
     guint16 rot_split_port = 0;
@@ -270,6 +274,7 @@ int main(void)
     GSubprocess *rig_proc = NULL;
     GSubprocess *rig_select_proc = NULL;
     GSubprocess *rig_reject_proc = NULL;
+    GSubprocess *rig_missing_sub_proc = NULL;
     GSubprocess *rot_proc = NULL;
     GSubprocess *rot_fail_proc = NULL;
     GSubprocess *rot_split_proc = NULL;
@@ -277,6 +282,7 @@ int main(void)
     RigctldClient *rig = NULL;
     RigctldClient *rig_select = NULL;
     RigctldClient *rig_reject = NULL;
+    RigctldClient *rig_missing_sub = NULL;
     RotctldClient *rot = NULL;
     RotctldClient *rot_fail = NULL;
     RotctldClient *rot_split = NULL;
@@ -316,6 +322,7 @@ int main(void)
     rot_port = pick_free_port();
     rig_port_select = pick_free_port();
     rig_port_reject = pick_free_port();
+    rig_port_missing_sub = pick_free_port();
     for (gint attempt = 0; attempt < 5 && rot_port == rig_port; attempt++)
         rot_port = pick_free_port();
     for (gint attempt = 0;
@@ -333,15 +340,28 @@ int main(void)
           rig_port_reject == rig_port_select);
          attempt++)
         rig_port_reject = pick_free_port();
+    for (gint attempt = 0;
+         attempt < 5 &&
+         (rig_port_missing_sub == 0 ||
+          rig_port_missing_sub == rig_port ||
+          rig_port_missing_sub == rot_port ||
+          rig_port_missing_sub == rig_port_select ||
+          rig_port_missing_sub == rig_port_reject);
+         attempt++)
+        rig_port_missing_sub = pick_free_port();
     if (rig_port == 0 || rot_port == 0 || rig_port_select == 0 ||
-        rig_port_reject == 0)
+        rig_port_reject == 0 || rig_port_missing_sub == 0)
     {
         ok = FALSE;
         goto cleanup;
     }
     if (rot_port == rig_port || rig_port_select == rig_port ||
         rig_port_select == rot_port || rig_port_reject == rig_port ||
-        rig_port_reject == rot_port || rig_port_reject == rig_port_select)
+        rig_port_reject == rot_port || rig_port_reject == rig_port_select ||
+        rig_port_missing_sub == rig_port ||
+        rig_port_missing_sub == rot_port ||
+        rig_port_missing_sub == rig_port_select ||
+        rig_port_missing_sub == rig_port_reject)
     {
         g_printerr("failed to select distinct mock ports\n");
         ok = FALSE;
@@ -349,15 +369,19 @@ int main(void)
     }
 
     rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE,
-                                  FALSE, 0);
+                                  FALSE, FALSE, 0);
     rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select,
-                                         TRUE, FALSE, TRUE, 2);
+                                         TRUE, FALSE, FALSE, TRUE, 2);
     rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
-                                         FALSE, TRUE, FALSE, 0);
+                                         FALSE, TRUE, FALSE, FALSE, 0);
+    rig_missing_sub_proc = spawn_rigctld_mock(python, rig_script,
+                                              rig_port_missing_sub,
+                                              TRUE, FALSE, TRUE, FALSE, 0);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
                                   FALSE, FALSE, FALSE, FALSE, 0, TRUE);
     if (rig_proc == NULL || rig_select_proc == NULL ||
-        rig_reject_proc == NULL || rot_proc == NULL)
+        rig_reject_proc == NULL || rig_missing_sub_proc == NULL ||
+        rot_proc == NULL)
     {
         ok = FALSE;
         goto cleanup;
@@ -366,8 +390,10 @@ int main(void)
     rig = rigctld_client_new("mock-rig");
     rig_select = rigctld_client_new("mock-rig-select");
     rig_reject = rigctld_client_new("mock-rig-reject");
+    rig_missing_sub = rigctld_client_new("mock-rig-missing-sub");
     rot = rotctld_client_new("mock-rot");
-    if (rig == NULL || rig_select == NULL || rig_reject == NULL || rot == NULL)
+    if (rig == NULL || rig_select == NULL || rig_reject == NULL ||
+        rig_missing_sub == NULL || rot == NULL)
     {
         ok = FALSE;
         goto cleanup;
@@ -409,6 +435,31 @@ int main(void)
     if (!rigctld_client_probe(rig_reject, &conf, 500))
     {
         g_printerr("rigctld probe failed (tokenized Main/Sub retune reject)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!connect_rigctld_with_retry(rig_missing_sub, "127.0.0.1",
+                                    rig_port_missing_sub))
+    {
+        g_printerr("failed to connect to rigctld mock (missing Sub control)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (rigctld_client_probe(rig_missing_sub, &conf, 500))
+    {
+        rigctld_client_state_t state = RIGCTLD_CLIENT_STOPPED;
+        gchar reason[128] = { 0 };
+        RigCaps *missing_sub_caps =
+            rigctld_client_get_caps_snapshot(rig_missing_sub);
+
+        rigctld_client_get_status(rig_missing_sub, &state,
+                                  reason, sizeof(reason));
+        g_printerr("rigctld probe should fail when shared Main/Sub lacks explicit Sub control"
+                   " (state=%d strategy=%d reason=%s)\n",
+                   (gint) state,
+                   missing_sub_caps ? (gint) missing_sub_caps->strategy : -1,
+                   reason[0] != '\0' ? reason : "(none)");
+        rigctld_client_caps_snapshot_free(missing_sub_caps);
         ok = FALSE;
         goto cleanup;
     }
@@ -1273,6 +1324,7 @@ cleanup:
     rigctld_client_close(rig);
     rigctld_client_close(rig_select);
     rigctld_client_close(rig_reject);
+    rigctld_client_close(rig_missing_sub);
     rotctld_client_close(rot);
     rotctld_client_close(rot_fail);
     rotctld_client_close(rot_split);
@@ -1280,6 +1332,7 @@ cleanup:
     rigctld_client_free(&rig);
     rigctld_client_free(&rig_select);
     rigctld_client_free(&rig_reject);
+    rigctld_client_free(&rig_missing_sub);
     rotctld_client_free(&rot);
     rotctld_client_free(&rot_fail);
     rotctld_client_free(&rot_split);
@@ -1305,6 +1358,14 @@ cleanup:
         !g_subprocess_wait_check(rig_reject_proc, NULL, &error))
     {
         g_printerr("rigctld mock (tokenized Main/Sub reject) exit error: %s\n",
+                   error ? error->message : "unknown");
+        ok = FALSE;
+        g_clear_error(&error);
+    }
+    if (rig_missing_sub_proc != NULL && ok &&
+        !g_subprocess_wait_check(rig_missing_sub_proc, NULL, &error))
+    {
+        g_printerr("rigctld mock (missing Sub control) exit error: %s\n",
                    error ? error->message : "unknown");
         ok = FALSE;
         g_clear_error(&error);
@@ -1357,6 +1418,11 @@ cleanup:
         g_subprocess_force_exit(rig_reject_proc);
         (void)g_subprocess_wait(rig_reject_proc, NULL, NULL);
     }
+    if (rig_missing_sub_proc != NULL && !ok)
+    {
+        g_subprocess_force_exit(rig_missing_sub_proc);
+        (void)g_subprocess_wait(rig_missing_sub_proc, NULL, NULL);
+    }
     if (rot_proc != NULL && !ok)
     {
         g_subprocess_force_exit(rot_proc);
@@ -1381,6 +1447,7 @@ cleanup:
     g_clear_object(&rig_proc);
     g_clear_object(&rig_select_proc);
     g_clear_object(&rig_reject_proc);
+    g_clear_object(&rig_missing_sub_proc);
     g_clear_object(&rot_proc);
     g_clear_object(&rot_fail_proc);
     g_clear_object(&rot_split_proc);
