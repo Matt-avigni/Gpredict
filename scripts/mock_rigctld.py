@@ -30,7 +30,7 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                     "1",
                     "3081",
                     "Hamlib Mock rigctld",
-                    "has_get_vfo: 1",
+                    "has_get_vfo: %d" % (1 if state["advertise_get_vfo"] else 0),
                     "has_set_vfo: 1",
                     "has_set_vfo_opt: %d" % (1 if state["has_set_vfo_opt"] else 0),
                     "vfo list: VFOA VFOB Main Sub currVFO",
@@ -195,6 +195,7 @@ def main():
     parser.add_argument("--reject-vfo-token", action="append", default=[])
     parser.add_argument("--fail-vfo-select-count", type=int, default=0)
     parser.add_argument("--fail-get-freq", action="store_true")
+    parser.add_argument("--no-get-vfo-advertise", action="store_true")
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
@@ -210,6 +211,7 @@ def main():
         "vfo": "VFOA",
         "set_freq_count": 0,
         "conn_count": 0,
+        "advertise_get_vfo": not args.no_get_vfo_advertise,
         "has_set_vfo_opt": not args.no_vfo_opt,
         "reject_main_sub_tokenized_set": args.reject_main_sub_tokenized_set,
         "reject_main_sub_tokenized_retune": args.reject_main_sub_tokenized_retune,

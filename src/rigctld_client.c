@@ -794,11 +794,10 @@ static const gchar *rigctld_client_probe_select_token(RigctldClient *client,
             gboolean validated = FALSE;
             gboolean vfo_readback_available = FALSE;
 
-            if (caps->has_get_vfo)
-                validated = rigctld_client_probe_selected_vfo_matches(client,
-                                                                      token,
-                                                                      timeout_ms,
-                                                                      &vfo_readback_available);
+            validated = rigctld_client_probe_selected_vfo_matches(client,
+                                                                  token,
+                                                                  timeout_ms,
+                                                                  &vfo_readback_available);
             if (!validated && !vfo_readback_available)
                 validated = rigctld_client_probe_selected_vfo_readback(client,
                                                                        timeout_ms);
