@@ -74,6 +74,9 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        gboolean reject_sub_select,
                                        gboolean fail_get_freq,
                                        gboolean no_get_vfo_advertise,
+                                       gboolean no_vfo_opt_advertise,
+                                       gboolean fail_plain_get_freq,
+                                       gboolean fail_get_vfo,
                                        gboolean require_vfo_before_set,
                                        gint fail_vfo_select_count)
 {
@@ -102,6 +105,12 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
         g_ptr_array_add(argv, g_strdup("--fail-get-freq"));
     if (no_get_vfo_advertise)
         g_ptr_array_add(argv, g_strdup("--no-get-vfo-advertise"));
+    if (no_vfo_opt_advertise)
+        g_ptr_array_add(argv, g_strdup("--no-vfo-opt-advertise"));
+    if (fail_plain_get_freq)
+        g_ptr_array_add(argv, g_strdup("--fail-plain-get-freq"));
+    if (fail_get_vfo)
+        g_ptr_array_add(argv, g_strdup("--fail-get-vfo"));
     if (require_vfo_before_set)
         g_ptr_array_add(argv, g_strdup("--require-vfo-before-set"));
     if (fail_vfo_select_count > 0)
@@ -573,6 +582,7 @@ int main(void)
     guint16 rig_port_reject = 0;
     guint16 rig_port_missing_sub = 0;
     guint16 rig_port_select_only = 0;
+    guint16 rig_port_vfo_opt_hidden = 0;
     guint16 rot_port = 0;
     guint16 rot_fail_port = 0;
     guint16 rot_split_port = 0;
@@ -582,6 +592,7 @@ int main(void)
     GSubprocess *rig_reject_proc = NULL;
     GSubprocess *rig_missing_sub_proc = NULL;
     GSubprocess *rig_select_only_proc = NULL;
+    GSubprocess *rig_vfo_opt_hidden_proc = NULL;
     GSubprocess *rot_proc = NULL;
     GSubprocess *rot_fail_proc = NULL;
     GSubprocess *rot_split_proc = NULL;
@@ -591,6 +602,7 @@ int main(void)
     RigctldClient *rig_reject = NULL;
     RigctldClient *rig_missing_sub = NULL;
     RigctldClient *rig_select_only = NULL;
+    RigctldClient *rig_vfo_opt_hidden = NULL;
     RotctldClient *rot = NULL;
     RotctldClient *rot_fail = NULL;
     RotctldClient *rot_split = NULL;
@@ -599,6 +611,7 @@ int main(void)
     RigCaps *caps = NULL;
     RigCaps *reject_caps = NULL;
     RigCaps *select_only_caps = NULL;
+    RigCaps *vfo_opt_hidden_caps = NULL;
     RotCaps rcaps_snapshot = { 0 };
     const RotCaps *rcaps = NULL;
     gint64 freq = 0;
@@ -635,6 +648,7 @@ int main(void)
     rig_port_reject = pick_free_port();
     rig_port_missing_sub = pick_free_port();
     rig_port_select_only = pick_free_port();
+    rig_port_vfo_opt_hidden = pick_free_port();
     for (gint attempt = 0; attempt < 5 && rot_port == rig_port; attempt++)
         rot_port = pick_free_port();
     for (gint attempt = 0;
@@ -671,9 +685,20 @@ int main(void)
           rig_port_select_only == rig_port_missing_sub);
          attempt++)
         rig_port_select_only = pick_free_port();
+    for (gint attempt = 0;
+         attempt < 5 &&
+         (rig_port_vfo_opt_hidden == 0 ||
+          rig_port_vfo_opt_hidden == rig_port ||
+          rig_port_vfo_opt_hidden == rot_port ||
+          rig_port_vfo_opt_hidden == rig_port_select ||
+          rig_port_vfo_opt_hidden == rig_port_reject ||
+          rig_port_vfo_opt_hidden == rig_port_missing_sub ||
+          rig_port_vfo_opt_hidden == rig_port_select_only);
+         attempt++)
+        rig_port_vfo_opt_hidden = pick_free_port();
     if (rig_port == 0 || rot_port == 0 || rig_port_select == 0 ||
         rig_port_reject == 0 || rig_port_missing_sub == 0 ||
-        rig_port_select_only == 0)
+        rig_port_select_only == 0 || rig_port_vfo_opt_hidden == 0)
     {
         ok = FALSE;
         goto cleanup;
@@ -689,7 +714,13 @@ int main(void)
         rig_port_select_only == rot_port ||
         rig_port_select_only == rig_port_select ||
         rig_port_select_only == rig_port_reject ||
-        rig_port_select_only == rig_port_missing_sub)
+        rig_port_select_only == rig_port_missing_sub ||
+        rig_port_vfo_opt_hidden == rig_port ||
+        rig_port_vfo_opt_hidden == rot_port ||
+        rig_port_vfo_opt_hidden == rig_port_select ||
+        rig_port_vfo_opt_hidden == rig_port_reject ||
+        rig_port_vfo_opt_hidden == rig_port_missing_sub ||
+        rig_port_vfo_opt_hidden == rig_port_select_only)
     {
         g_printerr("failed to select distinct mock ports\n");
         ok = FALSE;
@@ -697,22 +728,32 @@ int main(void)
     }
 
     rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE,
-                                  FALSE, FALSE, FALSE, FALSE, 0);
+                                  FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
+                                  FALSE, 0);
     rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select,
-                                         TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, 2);
+                                         TRUE, FALSE, FALSE, FALSE, FALSE,
+                                         FALSE, FALSE, FALSE, TRUE, 2);
     rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
-                                         FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, 0);
+                                         FALSE, TRUE, FALSE, FALSE, FALSE,
+                                         FALSE, FALSE, FALSE, FALSE, 0);
     rig_missing_sub_proc = spawn_rigctld_mock(python, rig_script,
                                               rig_port_missing_sub,
-                                              TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, 0);
+                                              TRUE, FALSE, TRUE, FALSE, FALSE,
+                                              FALSE, FALSE, FALSE, FALSE, 0);
     rig_select_only_proc = spawn_rigctld_mock(python, rig_script,
                                               rig_port_select_only,
-                                              TRUE, FALSE, FALSE, TRUE, TRUE, FALSE, 0);
+                                              TRUE, FALSE, FALSE, TRUE, TRUE,
+                                              FALSE, FALSE, FALSE, FALSE, 0);
+    rig_vfo_opt_hidden_proc = spawn_rigctld_mock(python, rig_script,
+                                                 rig_port_vfo_opt_hidden,
+                                                 FALSE, FALSE, FALSE, FALSE,
+                                                 TRUE, TRUE, TRUE, TRUE,
+                                                 FALSE, 0);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
                                   FALSE, FALSE, FALSE, FALSE, 0, TRUE);
     if (rig_proc == NULL || rig_select_proc == NULL ||
         rig_reject_proc == NULL || rig_missing_sub_proc == NULL ||
-        rig_select_only_proc == NULL ||
+        rig_select_only_proc == NULL || rig_vfo_opt_hidden_proc == NULL ||
         rot_proc == NULL)
     {
         ok = FALSE;
@@ -728,9 +769,11 @@ int main(void)
     rig_reject = rigctld_client_new("mock-rig-reject");
     rig_missing_sub = rigctld_client_new("mock-rig-missing-sub");
     rig_select_only = rigctld_client_new("mock-rig-select-only");
+    rig_vfo_opt_hidden = rigctld_client_new("mock-rig-vfo-opt-hidden");
     rot = rotctld_client_new("mock-rot");
     if (rig == NULL || rig_select == NULL || rig_reject == NULL ||
-        rig_missing_sub == NULL || rig_select_only == NULL || rot == NULL)
+        rig_missing_sub == NULL || rig_select_only == NULL ||
+        rig_vfo_opt_hidden == NULL || rot == NULL)
     {
         ok = FALSE;
         goto cleanup;
@@ -857,6 +900,96 @@ int main(void)
         g_printerr("rigctld select-only probe did not cache expected validated VFO tokens\n");
         ok = FALSE;
         goto cleanup;
+    }
+    if (!connect_rigctld_with_retry(rig_vfo_opt_hidden, "127.0.0.1",
+                                    rig_port_vfo_opt_hidden))
+    {
+        g_printerr("failed to connect to rigctld mock (hidden vfo-opt)\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!rigctld_client_probe(rig_vfo_opt_hidden, &conf, 500))
+    {
+        g_printerr("rigctld probe should discover tokenized Main/Sub VFO args when set_vfo_opt works but is not advertised\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    vfo_opt_hidden_caps = rigctld_client_get_caps_snapshot(rig_vfo_opt_hidden);
+    if (vfo_opt_hidden_caps == NULL ||
+        vfo_opt_hidden_caps->strategy != RIG_STRATEGY_VFO_OPT_ARGS ||
+        !vfo_opt_hidden_caps->has_get_freq ||
+        !vfo_opt_hidden_caps->has_set_freq)
+    {
+        g_printerr("rigctld hidden vfo-opt probe should settle on VFO_OPT_ARGS with frequency support\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    {
+        HamlibResponseInfo info = { 0 };
+        gchar reply[512] = { 0 };
+        gchar **lines = NULL;
+        static const gchar *main_tokens[] =
+            { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
+        static const gchar *sub_tokens[] =
+            { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+        gint idx_f_get = -1;
+        gint idx_f_set = -1;
+
+        if (!rigctld_client_request_raw(rig_vfo_opt_hidden, "\\reset_cmd_log",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld cmd log reset failed (hidden vfo-opt)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_get_freq(rig_vfo_opt_hidden, VFO_MAIN, &freq) ||
+            !rigctld_client_set_freq(rig_vfo_opt_hidden, VFO_SUB, 145920000))
+        {
+            g_printerr("rigctld hidden vfo-opt runtime commands failed\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        if (!rigctld_client_request_raw(rig_vfo_opt_hidden, "\\get_cmd_log",
+                                        reply, sizeof(reply), &info))
+        {
+            g_printerr("rigctld cmd log query failed (hidden vfo-opt)\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+
+        lines = g_strsplit(reply, "\n", -1);
+        for (gint i = 0; lines[i] != NULL; i++)
+        {
+            const gchar *line = lines[i];
+
+            if (line[0] == '\0' || g_str_has_prefix(line, "RPRT"))
+                continue;
+
+            if (g_str_has_prefix(line, "f ") && idx_f_get == -1)
+            {
+                idx_f_get = i;
+                continue;
+            }
+            if (g_str_has_prefix(line, "F ") && idx_f_set == -1)
+            {
+                idx_f_set = i;
+                continue;
+            }
+        }
+
+        if (idx_f_get < 0 || idx_f_set < 0 ||
+            !command_matches_any_token(lines[idx_f_get], main_tokens) ||
+            !command_matches_any_token(lines[idx_f_set], sub_tokens))
+        {
+            g_printerr("rigctld hidden vfo-opt runtime token mapping mismatch\n");
+            ok = FALSE;
+            g_strfreev(lines);
+            goto cleanup;
+        }
+
+        g_strfreev(lines);
     }
     {
         HamlibResponseInfo info = { 0 };
@@ -1731,11 +1864,13 @@ cleanup:
     rigctld_client_caps_snapshot_free(caps);
     rigctld_client_caps_snapshot_free(reject_caps);
     rigctld_client_caps_snapshot_free(select_only_caps);
+    rigctld_client_caps_snapshot_free(vfo_opt_hidden_caps);
     rigctld_client_close(rig);
     rigctld_client_close(rig_select);
     rigctld_client_close(rig_reject);
     rigctld_client_close(rig_missing_sub);
     rigctld_client_close(rig_select_only);
+    rigctld_client_close(rig_vfo_opt_hidden);
     rotctld_client_close(rot);
     rotctld_client_close(rot_fail);
     rotctld_client_close(rot_split);
@@ -1745,6 +1880,7 @@ cleanup:
     rigctld_client_free(&rig_reject);
     rigctld_client_free(&rig_missing_sub);
     rigctld_client_free(&rig_select_only);
+    rigctld_client_free(&rig_vfo_opt_hidden);
     rotctld_client_free(&rot);
     rotctld_client_free(&rot_fail);
     rotctld_client_free(&rot_split);
@@ -1786,6 +1922,14 @@ cleanup:
         !g_subprocess_wait_check(rig_select_only_proc, NULL, &error))
     {
         g_printerr("rigctld mock (select-only) exit error: %s\n",
+                   error ? error->message : "unknown");
+        ok = FALSE;
+        g_clear_error(&error);
+    }
+    if (rig_vfo_opt_hidden_proc != NULL && ok &&
+        !g_subprocess_wait_check(rig_vfo_opt_hidden_proc, NULL, &error))
+    {
+        g_printerr("rigctld mock (hidden vfo-opt) exit error: %s\n",
                    error ? error->message : "unknown");
         ok = FALSE;
         g_clear_error(&error);

@@ -32,7 +32,8 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                     "Hamlib Mock rigctld",
                     "has_get_vfo: %d" % (1 if state["advertise_get_vfo"] else 0),
                     "has_set_vfo: 1",
-                    "has_set_vfo_opt: %d" % (1 if state["has_set_vfo_opt"] else 0),
+                    "has_set_vfo_opt: %d"
+                    % (1 if state["advertise_set_vfo_opt"] else 0),
                     "vfo list: VFOA VFOB Main Sub currVFO",
                     "",
                 ]
@@ -86,7 +87,9 @@ class RigctldHandler(socketserver.StreamRequestHandler):
             state["cmd_log"].append(cmd)
 
             if cmd == "f" or cmd.startswith("f "):
-                if state["fail_get_freq"]:
+                if state["fail_get_freq"] or (
+                    cmd == "f" and state["fail_plain_get_freq"]
+                ):
                     self.wfile.write(b"RPRT -1\n")
                     self.wfile.flush()
                     continue
@@ -136,6 +139,10 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                 continue
 
             if cmd == "v":
+                if state["fail_get_vfo"]:
+                    self.wfile.write(b"RPRT -11\n")
+                    self.wfile.flush()
+                    continue
                 self.wfile.write((state["vfo"] + "\nRPRT 0\n").encode("ascii"))
                 self.wfile.flush()
                 continue
@@ -195,7 +202,10 @@ def main():
     parser.add_argument("--reject-vfo-token", action="append", default=[])
     parser.add_argument("--fail-vfo-select-count", type=int, default=0)
     parser.add_argument("--fail-get-freq", action="store_true")
+    parser.add_argument("--fail-plain-get-freq", action="store_true")
+    parser.add_argument("--fail-get-vfo", action="store_true")
     parser.add_argument("--no-get-vfo-advertise", action="store_true")
+    parser.add_argument("--no-vfo-opt-advertise", action="store_true")
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
@@ -206,13 +216,17 @@ def main():
         reject_vfo_tokens.update({"VFOB", "Sub", "SubA", "VFO_SUB"})
 
     server = server_cls((args.host, args.port), RigctldHandler)
+    has_set_vfo_opt = not args.no_vfo_opt
     server.state = {
         "freq": 145800000,
         "vfo": "VFOA",
         "set_freq_count": 0,
         "conn_count": 0,
         "advertise_get_vfo": not args.no_get_vfo_advertise,
-        "has_set_vfo_opt": not args.no_vfo_opt,
+        "has_set_vfo_opt": has_set_vfo_opt,
+        "advertise_set_vfo_opt": (
+            has_set_vfo_opt and not args.no_vfo_opt_advertise
+        ),
         "reject_main_sub_tokenized_set": args.reject_main_sub_tokenized_set,
         "reject_main_sub_tokenized_retune": args.reject_main_sub_tokenized_retune,
         "require_vfo_before_set": args.require_vfo_before_set,
@@ -220,6 +234,8 @@ def main():
         "fail_vfo_select_count": max(0, args.fail_vfo_select_count),
         "vfo_select_failures": {},
         "fail_get_freq": args.fail_get_freq,
+        "fail_plain_get_freq": args.fail_plain_get_freq,
+        "fail_get_vfo": args.fail_get_vfo,
         "selected_since_set": False,
         "cmd_log": [],
     }
