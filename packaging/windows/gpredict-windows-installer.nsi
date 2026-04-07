@@ -24,6 +24,10 @@ ShowUnInstDetails show
 !define OUT_FILE "gpredict-setup.exe"
 !endif
 
+!define REPO_ROOT "${__FILEDIR__}\..\.."
+!define APP_ICON "${REPO_ROOT}\win32\icons\gpredict-icon.ico"
+!define LICENSE_FILE "${REPO_ROOT}\COPYING"
+
 !define COMPANY_NAME "Alexandru Csete, OZ9AEC / Matteo Avigni"
 !define PRODUCT_PUBLISHER "Alexandru Csete, OZ9AEC / Matteo Avigni"
 !define PRODUCT_URL "https://community.libre.space/c/gpredict"
@@ -35,13 +39,13 @@ InstallDir "$ProgramFiles64\Gpredict"
 InstallDirRegKey HKLM "Software\Gpredict" "InstallDir"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "win32\icons\gpredict-icon.ico"
-!define MUI_UNICON "win32\icons\gpredict-icon.ico"
+!define MUI_ICON "${APP_ICON}"
+!define MUI_UNICON "${APP_ICON}"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\gpredict.cmd"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Gpredict"
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "COPYING"
+!insertmacro MUI_PAGE_LICENSE "${LICENSE_FILE}"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
