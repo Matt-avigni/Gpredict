@@ -33,6 +33,24 @@ copy_optional_file() {
     install -m 0644 "$src" "$dest"
 }
 
+apply_hamlib_patches() {
+    local patch_dir="$REPO_ROOT/packaging/windows/patches"
+    local patch_file
+
+    [[ -d "$patch_dir" ]] || return 0
+
+    while IFS= read -r -d '' patch_file; do
+        if git -C "$HAMLIB_SRC_DIR" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+            log "skipping $(basename "$patch_file") (already applied)"
+            continue
+        fi
+
+        log "applying $(basename "$patch_file")"
+        git -C "$HAMLIB_SRC_DIR" apply --check "$patch_file"
+        git -C "$HAMLIB_SRC_DIR" apply "$patch_file"
+    done < <(find "$patch_dir" -type f -name '*.patch' -print0 | sort -z)
+}
+
 normalize_path() {
     local raw="$1"
 
@@ -149,6 +167,8 @@ stage_runtime_layout() {
 }
 
 build_hamlib() {
+    apply_hamlib_patches
+
     log "bootstrapping Hamlib"
     pushd "$HAMLIB_SRC_DIR" >/dev/null
     ./bootstrap

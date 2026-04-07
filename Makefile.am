@@ -27,6 +27,7 @@ EXTRA_DIST = \
 	packaging/windows/gpredict-launcher.cmd.in \
 	packaging/windows/gpredict-windows-installer.nsi \
 	packaging/windows/hamlib-source.env \
+	packaging/windows/patches/0001-hamlib-fix-spid-windows-build.patch \
 	snap/snapcraft.yaml   \
 	win32/README          \
 	win32/config.mk       \

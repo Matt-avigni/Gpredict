@@ -11,6 +11,10 @@ The pinned Hamlib source lives in [`packaging/windows/hamlib-source.env`](./haml
 Update that file whenever the Windows installer should follow a different fork,
 branch, or exact commit.
 
+Packaging-specific Hamlib fixes that are needed to keep the Windows installer
+reproducible live in [`packaging/windows/patches/`](./patches). Those patches
+are applied automatically before the Hamlib build starts.
+
 ## CI
 
 GitHub Actions builds the installer with
