@@ -2,6 +2,11 @@
 
 # Phil Ashby, Dec 2017 - Jan 2018
 
+These legacy notes describe the old cross-build ZIP flow.
+The current installer path lives under `packaging/windows/` and is wired to
+`.github/workflows/windows-installer.yml`, which builds a staged MSYS2/UCRT64
+bundle and wraps it in an NSIS installer.
+
 At present, MSYS2 on a Windows system is required to gather dependencies
 before building a Win32 version of gpredict using this build system.
 

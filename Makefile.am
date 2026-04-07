@@ -15,14 +15,21 @@ install-data-local:
 	$(INSTALL_DATA) $(top_srcdir)/COPYING $(DESTDIR)$(pkgdatadir)
 
 EXTRA_DIST = \
+	.github/workflows/windows-installer.yml \
 	autogen.sh            \
 	git-version-gen       \
 	intltool-extract.in   \
 	intltool-merge.in     \
 	intltool-update.in    \
+	packaging/windows/README.md \
+	packaging/windows/build-installer.sh \
+	packaging/windows/gpredict-launcher.cmd.in \
+	packaging/windows/gpredict-windows-installer.nsi \
+	packaging/windows/hamlib-source.env \
 	snap/snapcraft.yaml   \
+	win32/README          \
 	win32/config.mk       \
-	win32/goocanvasprivate.h \
 	win32/gpredict.rc        \
-	win32/Makefile           \
+	win32/loaders.cache   \
+	win32/resource.h      \
 	win32/icons/gpredict-icon.ico

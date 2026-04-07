@@ -1,0 +1,16 @@
+@echo off
+setlocal
+set "APPDIR=%~dp0"
+
+if exist "%APPDIR%curl-ca-bundle.crt" set "CURL_CA_BUNDLE=%APPDIR%curl-ca-bundle.crt"
+set "GTK_DATA_PREFIX=%APPDIR%"
+set "GTK_EXE_PREFIX=%APPDIR%"
+set "XDG_DATA_DIRS=%APPDIR%share"
+set "GIO_MODULE_DIR=%APPDIR%lib\gio\modules"
+set "GSETTINGS_SCHEMA_DIR=%APPDIR%share\glib-2.0\schemas"
+set "GDK_PIXBUF_MODULEDIR=%APPDIR%lib\@GDK_PIXBUF_SUBDIR@\loaders"
+set "GDK_PIXBUF_MODULE_FILE=%APPDIR%lib\@GDK_PIXBUF_SUBDIR@\loaders.cache"
+set "PATH=%APPDIR%;%APPDIR%lib\gio\modules;%PATH%"
+
+"%APPDIR%gpredict.exe" %*
+endlocal

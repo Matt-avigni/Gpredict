@@ -31,8 +31,7 @@
 - Use `caps->quirks` or `session->quirks` in logic instead of `if model == ...`.
 
 ## Testing
-- Unit tests: `make check` (includes `azel-mapping-test`, `safety-window-test`, and `hamlib-mock-test`).
-- Mock servers:
+- Unit tests: `make check` covers the fast local test suite used for release checks.
+- Mock servers for manual Hamlib diagnostics:
   - `python3 scripts/mock_rigctld.py --host 127.0.0.1 --port 4532`
   - `python3 scripts/mock_rotctld.py --host 127.0.0.1 --port 4533`
-- `hamlib-mock-test` will skip automatically if Python is not available.

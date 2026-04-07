@@ -3,13 +3,20 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/gpredict-install}"
+BUILD_DIR="${BUILD_DIR:-$ROOT/build-latest}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
 
-cd "$ROOT"
-
 echo "repo: $ROOT"
-echo "git:  $(git rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
+echo "build: $BUILD_DIR"
+echo "git:  $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
 echo "prefix: $PREFIX"
+
+if [[ ! -x "$ROOT/configure" ]]; then
+  (cd "$ROOT" && autoreconf -fi)
+fi
+
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
 
 CURRENT_PREFIX=""
 if [[ -f Makefile ]]; then
@@ -17,12 +24,7 @@ if [[ -f Makefile ]]; then
 fi
 
 if [[ ! -f Makefile || "$CURRENT_PREFIX" != "$PREFIX" ]]; then
-  ./configure --prefix="$PREFIX"
-  if [[ -n "$CURRENT_PREFIX" && "$CURRENT_PREFIX" != "$PREFIX" ]]; then
-    # The install prefix is compiled into PACKAGE_* paths, so switch prefixes
-    # by forcing a rebuild of object files without touching tracked test files.
-    find src -type f \( -name '*.o' -o -name '*.lo' -o -name 'gpredict' \) -delete
-  fi
+  "$ROOT/configure" --prefix="$PREFIX"
 fi
 
 make -j"$JOBS"

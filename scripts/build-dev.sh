@@ -2,27 +2,23 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PREFIX="$HOME/gpredict-dev"
+PREFIX="${PREFIX:-$HOME/gpredict-dev}"
+BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build-dev}"
+JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
 
 cd "$REPO_DIR"
 
-# Force the correct branch name
-git rev-parse --verify Dev >/dev/null 2>&1 || {
-  echo "ERROR: branch 'Dev' does not exist. Run: git branch"
-  exit 1
-}
-git checkout Dev
+if [[ ! -x configure ]]; then
+  autoreconf -fi
+fi
 
-# Clean + rebuild in a dedicated build dir
-rm -rf build
-mkdir build
-cd build
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
 
-# Configure from build dir (never in source dir)
 ../configure --prefix="$PREFIX" --disable-maintainer-mode
 
-make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+make -j"$JOBS"
 make install
 
-# Run the newly installed binary (not whatever is in PATH)
 exec "$PREFIX/bin/gpredict"

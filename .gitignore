@@ -42,6 +42,17 @@ GPATH
 *.lo
 *.la
 .libs/
+__pycache__/
 src/*/.DS_Store
+build/
+build-latest/
+build-dev/
+_build/
+_build-gpredict/
+src/gpredict
+src/*-test
+src/*.log
+src/*.trs
+src/test-suite.log
 _install/
 _install/**

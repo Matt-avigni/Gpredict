@@ -1,0 +1,71 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - GpredictV2-V3
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Export pinned Hamlib source
+        shell: bash
+        run: cat packaging/windows/hamlib-source.env >> "$GITHUB_ENV"
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            autoconf
+            automake-wrapper
+            intltool
+            libtool
+            make
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-goocanvas
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-gsettings-desktop-schemas
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-hicolor-icon-theme
+            mingw-w64-ucrt-x86_64-ntldd
+            mingw-w64-ucrt-x86_64-nsis
+
+      - name: Clone pinned Hamlib fork
+        run: |
+          git clone --depth 1 --branch "$HAMLIB_REF" "https://github.com/${HAMLIB_REPOSITORY}.git" hamlib-src
+          actual="$(git -C hamlib-src rev-parse HEAD)"
+          if [[ "$actual" != "$HAMLIB_EXPECTED_COMMIT" ]]; then
+            echo "Expected Hamlib commit $HAMLIB_EXPECTED_COMMIT from ${HAMLIB_REPOSITORY}/${HAMLIB_REF}, got $actual" >&2
+            exit 1
+          fi
+
+      - name: Build installer
+        run: packaging/windows/build-installer.sh
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpredict-windows-installer
+          path: build/windows-ucrt64/artifacts/*
+          if-no-files-found: error

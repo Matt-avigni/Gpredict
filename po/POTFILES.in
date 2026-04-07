@@ -2,6 +2,8 @@
 src/about.c
 src/compat.c
 src/first-time.c
+src/gp-debug-terminal.c
+src/gp-term-view.c
 src/gpredict-help.c
 src/gpredict-utils.c
 src/gtk-azel-plot.c
@@ -45,6 +47,7 @@ src/qth-data.c
 src/qth-editor.c
 src/radio-conf.c
 src/rotor-conf.c
+src/rotor_calibration.c
 src/sat-cfg.c
 src/sat-info.c
 src/sat-log-browser.c
@@ -84,6 +87,7 @@ src/sgpsdp/sgp_obs.c
 src/sgpsdp/sgp_time.c
 src/sgpsdp/solar.c
 src/time-tools.c
+src/tle-autoupdate.c
 src/tle-tools.c
 src/tle-update.c
 src/trsp-conf.c
