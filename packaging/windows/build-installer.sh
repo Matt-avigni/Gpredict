@@ -33,6 +33,25 @@ copy_optional_file() {
     install -m 0644 "$src" "$dest"
 }
 
+normalize_file_line_endings() {
+    local file="$1"
+
+    [[ -f "$file" ]] || return 0
+    sed -i 's/\r$//' "$file"
+}
+
+normalize_patch_targets() {
+    local patch_file="$1"
+    local rel
+
+    normalize_file_line_endings "$patch_file"
+
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        normalize_file_line_endings "$HAMLIB_SRC_DIR/$rel"
+    done < <(sed -n -E 's#^\+\+\+ b/(.*)$#\1#p' "$patch_file")
+}
+
 apply_hamlib_patches() {
     local patch_dir="$REPO_ROOT/packaging/windows/patches"
     local patch_file
@@ -40,14 +59,19 @@ apply_hamlib_patches() {
     [[ -d "$patch_dir" ]] || return 0
 
     while IFS= read -r -d '' patch_file; do
-        if git -C "$HAMLIB_SRC_DIR" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+        normalize_patch_targets "$patch_file"
+
+        if git -C "$HAMLIB_SRC_DIR" apply --reverse --check \
+            --ignore-space-change --ignore-whitespace "$patch_file" >/dev/null 2>&1; then
             log "skipping $(basename "$patch_file") (already applied)"
             continue
         fi
 
         log "applying $(basename "$patch_file")"
-        git -C "$HAMLIB_SRC_DIR" apply --check "$patch_file"
-        git -C "$HAMLIB_SRC_DIR" apply "$patch_file"
+        git -C "$HAMLIB_SRC_DIR" apply --check \
+            --ignore-space-change --ignore-whitespace "$patch_file"
+        git -C "$HAMLIB_SRC_DIR" apply \
+            --ignore-space-change --ignore-whitespace "$patch_file"
     done < <(find "$patch_dir" -type f -name '*.patch' -print0 | sort -z)
 }
 
