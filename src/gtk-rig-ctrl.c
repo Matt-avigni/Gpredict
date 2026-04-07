@@ -125,7 +125,7 @@ static gboolean winsock_ensure_init(void)
 #define WR_DEL 5000             /* delay in usec to wait between write and read commands */
 #define RIGCTLD_MAIN_SUB_SELECT_SETTLE_US 100000
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US 350000
-#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 3
+#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 1
 #define RIGCTLD_SOCKET_TIMEOUT_MS 3000
 #define RIGCTLD_DUMP_STATE_IDLE_MS 100
 #define RIGCTLD_FOLLOW_IDLE_MS 50
@@ -244,6 +244,10 @@ typedef struct _RigSession {
     gchar *signature;
     gint rig_model;
     guint quirks;
+    gboolean has_get_freq;
+    gboolean has_set_freq;
+    gboolean has_tokenized_get_freq;
+    gboolean has_tokenized_set_freq;
     gboolean has_get_vfo;
     gboolean has_set_vfo;
     gboolean has_set_vfo_opt;
@@ -272,6 +276,8 @@ typedef struct _RigSession {
 
 static void rig_term_log(GtkRigCtrl *ctrl, const gchar *prefix,
                          const gchar *fmt, ...) G_GNUC_PRINTF(3, 4);
+static radio_conf_t *get_conf_for_socket(GtkRigCtrl * ctrl, gint sock);
+
 static const gchar *rigctld_probe_result_name(rigctld_probe_result_t result)
 {
     switch (result)
@@ -295,6 +301,10 @@ static RigSession *rig_session_new(const gchar *label)
     session->strategy = RIG_STRATEGY_PLAIN_FREQ;
     session->rig_model = 0;
     session->quirks = RIG_QUIRK_NONE;
+    session->has_get_freq = FALSE;
+    session->has_set_freq = FALSE;
+    session->has_tokenized_get_freq = FALSE;
+    session->has_tokenized_set_freq = FALSE;
     session->has_get_vfo = FALSE;
     session->has_set_vfo = FALSE;
     session->has_set_vfo_opt = FALSE;
@@ -350,6 +360,10 @@ static void rig_session_reset(RigSession *session)
     session->signature = NULL;
     session->rig_model = 0;
     session->quirks = RIG_QUIRK_NONE;
+    session->has_get_freq = FALSE;
+    session->has_set_freq = FALSE;
+    session->has_tokenized_get_freq = FALSE;
+    session->has_tokenized_set_freq = FALSE;
     session->has_get_vfo = FALSE;
     session->has_set_vfo = FALSE;
     session->has_set_vfo_opt = FALSE;
@@ -519,6 +533,10 @@ static void rig_session_apply_caps(RigSession *session, const RigCaps *caps)
     session->signature = g_strdup(caps->signature);
     session->rig_model = caps->rig_model;
     session->quirks = caps->quirks;
+    session->has_get_freq = caps->has_get_freq;
+    session->has_set_freq = caps->has_set_freq;
+    session->has_tokenized_get_freq = caps->has_tokenized_get_freq;
+    session->has_tokenized_set_freq = caps->has_tokenized_set_freq;
     session->has_get_vfo = caps->has_get_vfo;
     session->has_set_vfo = caps->has_set_vfo;
     session->has_set_vfo_opt = caps->has_set_vfo_opt;
@@ -568,6 +586,10 @@ static void rig_session_copy_caps(RigSession *dst, const RigSession *src)
     dst->strategy = src->strategy;
     dst->rig_model = src->rig_model;
     dst->quirks = src->quirks;
+    dst->has_get_freq = src->has_get_freq;
+    dst->has_set_freq = src->has_set_freq;
+    dst->has_tokenized_get_freq = src->has_tokenized_get_freq;
+    dst->has_tokenized_set_freq = src->has_tokenized_set_freq;
     dst->has_get_vfo = src->has_get_vfo;
     dst->has_set_vfo = src->has_set_vfo;
     dst->has_set_vfo_opt = src->has_set_vfo_opt;
@@ -656,7 +678,10 @@ static void     apply_rit_xit_offsets(GtkRigCtrl * ctrl, gdouble rit,
 static void     update_rit_xit_offsets(GtkRigCtrl * ctrl);
 static gint64   rigctrl_round_hz(gdouble hz);
 static gboolean is_full_duplex_main_sub_configured(const radio_conf_t *conf);
-static vfo_t    rigctld_vfo_hint_from_token(const gchar *token);
+static vfo_t    rigctld_vfo_hint_from_token(const radio_conf_t *conf,
+                                            const gchar *token);
+static const gchar *rigctld_role_alias_for_vfo(const radio_conf_t *conf,
+                                               vfo_t vfo);
 static gboolean rigctld_select_vfo_with_retry(GtkRigCtrl *ctrl, gint sock,
                                               RigSession *session,
                                               vfo_t vfo,
@@ -681,6 +706,9 @@ static gboolean rigctrl_get_freq_for_role(GtkRigCtrl *ctrl,
                                           gboolean strict,
                                           gint64 *freq_out,
                                           vfo_t *vfo_out);
+static gboolean rigctrl_use_split_uplink_path(GtkRigCtrl *ctrl,
+                                              gint sock,
+                                              gboolean downlink);
 static const radio_conf_t *rigctrl_conf_for_role(const GtkRigCtrl *ctrl,
                                                  gboolean downlink);
 static RigSession *rigctrl_session_for_role(GtkRigCtrl *ctrl, gboolean downlink);
@@ -3702,6 +3730,22 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(widget);
 
+    if (g_object_get_data(G_OBJECT(widget), "gpredict-rigctrl-destroyed"))
+    {
+        sat_log_forensic(SAT_LOG_LEVEL_WARN,
+                         "rigctrl destroy qdata re-entered ctrl=%p; skipping duplicate teardown",
+                         (void *) ctrl);
+        return;
+    }
+
+    if (ctrl->destroying)
+    {
+        sat_log_forensic(SAT_LOG_LEVEL_WARN,
+                         "rigctrl destroy re-entered ctrl=%p; skipping duplicate teardown",
+                         (void *) ctrl);
+        return;
+    }
+
     sat_log_forensic(SAT_LOG_LEVEL_INFO,
                      "rigctrl destroy begin ctrl=%p sock=%d sock2=%d open_task=%p close_pending_id=%u thread=%p",
                      (void *) ctrl,
@@ -3711,6 +3755,8 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
                      ctrl->close_pending_id,
                      (void *) ctrl->rigctl_thread);
 
+    g_object_set_data(G_OBJECT(widget), "gpredict-rigctrl-destroyed",
+                      GINT_TO_POINTER(1));
     ctrl->destroying = TRUE;
     ctrl->rigctl_thread_exit_requested = TRUE;
     rigctrl_cancel_open_task(ctrl);
@@ -8245,6 +8291,14 @@ static gboolean rigctld_vfo_map_refs(GtkRigCtrl *ctrl, gint sock,
     return FALSE;
 }
 
+static gboolean rigctld_vfo_token_matches(const gchar *lhs,
+                                          const gchar *rhs)
+{
+    return lhs != NULL &&
+        rhs != NULL &&
+        g_ascii_strcasecmp(lhs, rhs) == 0;
+}
+
 static void rigctld_clear_vfo_map_for_socket(GtkRigCtrl *ctrl, gint sock)
 {
     gchar **main_ptr = NULL;
@@ -8260,6 +8314,32 @@ static void rigctld_clear_vfo_map_for_socket(GtkRigCtrl *ctrl, gint sock)
     *sub_ptr = NULL;
     if (logged_ptr)
         *logged_ptr = FALSE;
+}
+
+static void rig_session_remove_vfo_token(RigSession *session,
+                                         const gchar *token)
+{
+    GHashTableIter iter;
+    gpointer key = NULL;
+    gpointer value = NULL;
+
+    if (session == NULL || token == NULL || *token == '\0' ||
+        session->vfo_working == NULL)
+        return;
+
+    g_hash_table_iter_init(&iter, session->vfo_working);
+    while (g_hash_table_iter_next(&iter, &key, &value))
+    {
+        const gchar *entry = key;
+
+        (void)value;
+
+        if (rigctld_vfo_token_matches(entry, token))
+        {
+            g_hash_table_iter_remove(&iter);
+            return;
+        }
+    }
 }
 
 static void rigctld_reset_offset_state_for_socket(GtkRigCtrl *ctrl, gint sock)
@@ -8283,6 +8363,49 @@ static void rigctld_reset_offset_state_for_socket(GtkRigCtrl *ctrl, gint sock)
     }
 }
 
+static void rigctld_invalidate_vfo_token(GtkRigCtrl *ctrl, gint sock,
+                                         RigSession *session,
+                                         vfo_t vfo,
+                                         const gchar *token)
+{
+    gchar **main_ptr = NULL;
+    gchar **sub_ptr = NULL;
+    gboolean *logged_ptr = NULL;
+    gchar **target_ptr = NULL;
+
+    if (session != NULL)
+    {
+        rig_session_remove_vfo_token(session, token);
+        if (session->last_selected_vfo == vfo)
+            session->last_selected_vfo = VFO_NONE;
+        session->last_selected_vfo_valid = FALSE;
+    }
+
+    if (ctrl == NULL)
+        return;
+
+    rigctrl_clear_cached_freq(sock, "f", (gint)vfo);
+    rigctrl_clear_cached_freq(sock, "i", (gint)vfo);
+
+    if (!rigctld_vfo_map_refs(ctrl, sock, &main_ptr, &sub_ptr, &logged_ptr))
+        return;
+
+    if (vfo == VFO_MAIN)
+        target_ptr = main_ptr;
+    else if (vfo == VFO_SUB)
+        target_ptr = sub_ptr;
+
+    if (target_ptr != NULL &&
+        *target_ptr != NULL &&
+        rigctld_vfo_token_matches(*target_ptr, token))
+    {
+        g_free(*target_ptr);
+        *target_ptr = NULL;
+        if (logged_ptr != NULL)
+            *logged_ptr = FALSE;
+    }
+}
+
 static gboolean rigctld_fetch_frequency_token(GtkRigCtrl *ctrl, gint sock,
                                               const gchar *token,
                                               gint64 *freq_out)
@@ -8292,6 +8415,7 @@ static gboolean rigctld_fetch_frequency_token(GtkRigCtrl *ctrl, gint sock,
     gchar **vbuff = NULL;
     gint64 freq = 0;
     gchar *cmd = NULL;
+    radio_conf_t *conf = NULL;
 
     if (freq_out)
         *freq_out = 0;
@@ -8299,8 +8423,12 @@ static gboolean rigctld_fetch_frequency_token(GtkRigCtrl *ctrl, gint sock,
     if (ctrl == NULL)
         return FALSE;
 
+    conf = get_conf_for_socket(ctrl, sock);
+
     if (token != NULL && *token != '\0')
         cmd = g_strdup_printf("f %s\x0a", token);
+    else if (conf != NULL && conf->vfo_opt)
+        cmd = g_strdup("f currVFO\x0a");
     else
         cmd = g_strdup("f\x0a");
 
@@ -8315,7 +8443,7 @@ static gboolean rigctld_fetch_frequency_token(GtkRigCtrl *ctrl, gint sock,
     {
         gchar *endptr = NULL;
         freq = g_ascii_strtoll(vbuff[0], &endptr, 10);
-        if (endptr == vbuff[0])
+        if (endptr == vbuff[0] || freq <= 0)
             freq = 0;
     }
     g_strfreev(vbuff);
@@ -8337,7 +8465,9 @@ static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
                                       const gchar *token)
 {
     gint64 verify = 0;
-    vfo_t vfo = rigctld_vfo_hint_from_token(token);
+    vfo_t vfo = rigctld_vfo_hint_from_token(get_conf_for_socket(ctrl, sock),
+                                            token);
+    gboolean selection_only = FALSE;
 
     if (ctrl == NULL || token == NULL || *token == '\0')
         return FALSE;
@@ -8351,13 +8481,25 @@ static gboolean rigctld_try_vfo_token(GtkRigCtrl *ctrl, gint sock,
     }
     else
     {
+        selection_only = (session != NULL &&
+                          session->strategy == RIG_STRATEGY_SELECT_VFO &&
+                          ctrl->conf != NULL &&
+                          ctrl->conf2 == NULL &&
+                          is_full_duplex_main_sub_configured(ctrl->conf));
         if (!rigctld_select_vfo_with_retry(ctrl, sock, session, vfo, token,
                                            FALSE))
             return FALSE;
 
-        /* Avoid writing a probe frequency while mapping tokens. */
-        if (!rigctld_fetch_frequency(ctrl, sock, &verify))
-            return FALSE;
+        if (selection_only)
+        {
+            verify = 1;
+        }
+        else
+        {
+            /* Avoid writing a probe frequency while mapping tokens. */
+            if (!rigctld_fetch_frequency(ctrl, sock, &verify))
+                return FALSE;
+        }
     }
 
     if (verify > 0 && session != NULL && session->vfo_working != NULL)
@@ -8426,10 +8568,32 @@ static gulong rigctrl_shared_main_sub_select_settle_us(GtkRigCtrl *ctrl,
     return RIGCTLD_MAIN_SUB_SELECT_SETTLE_US;
 }
 
-static vfo_t rigctld_vfo_hint_from_token(const gchar *token)
+static const gchar *rigctld_role_alias_for_vfo(const radio_conf_t *conf,
+                                               vfo_t vfo)
+{
+    if (!is_full_duplex_main_sub_configured(conf))
+        return NULL;
+
+    if (conf->downlink_vfo == vfo)
+        return "RX";
+
+    if (conf->uplink_vfo == vfo)
+        return "TX";
+
+    return NULL;
+}
+
+static vfo_t rigctld_vfo_hint_from_token(const radio_conf_t *conf,
+                                         const gchar *token)
 {
     if (token == NULL || *token == '\0')
         return VFO_NONE;
+
+    if (g_ascii_strcasecmp(token, "RX") == 0)
+        return (conf != NULL) ? conf->downlink_vfo : VFO_NONE;
+
+    if (g_ascii_strcasecmp(token, "TX") == 0)
+        return (conf != NULL) ? conf->uplink_vfo : VFO_NONE;
 
     if (g_ascii_strcasecmp(token, "VFOA") == 0 ||
         g_ascii_strcasecmp(token, "Main") == 0 ||
@@ -8480,10 +8644,19 @@ static gboolean rigctld_select_vfo_with_retry(GtkRigCtrl *ctrl, gint sock,
     }
 
     if (!retcode)
+    {
+        rigctld_invalidate_vfo_token(ctrl, sock, session, vfo, token);
         return FALSE;
+    }
 
     if (session != NULL)
     {
+        if (session->vfo_working != NULL && token != NULL && *token != '\0')
+        {
+            g_hash_table_replace(session->vfo_working,
+                                 g_strdup(token),
+                                 GINT_TO_POINTER(1));
+        }
         session->last_selected_vfo = vfo;
         session->last_selected_vfo_valid = TRUE;
     }
@@ -8549,24 +8722,12 @@ static void rigctld_force_select_vfo_strategy(GtkRigCtrl *ctrl,
                                               RigSession *session,
                                               const gchar *reason)
 {
-    gint sock = -1;
-
     if (session == NULL)
         return;
-
-    if (ctrl != NULL)
-    {
-        if (session == ctrl->rig_session2)
-            sock = ctrl->sock2;
-        else if (session == ctrl->rig_session)
-            sock = ctrl->sock;
-    }
 
     if (session->strategy == RIG_STRATEGY_SELECT_VFO)
     {
         session->last_selected_vfo_valid = FALSE;
-        if (ctrl != NULL && sock >= 0)
-            rigctld_clear_vfo_map_for_socket(ctrl, sock);
         return;
     }
 
@@ -8577,18 +8738,16 @@ static void rigctld_force_select_vfo_strategy(GtkRigCtrl *ctrl,
     session->last_selected_vfo_valid = FALSE;
     session->strategy_logged = FALSE;
 
-    if (ctrl != NULL && sock >= 0)
-        rigctld_clear_vfo_map_for_socket(ctrl, sock);
-
     rig_term_log(ctrl, "gpredict",
                  "rig session (%s) strategy fallback=SELECT_VFO reason=%s",
                  session->label ? session->label : "rig",
                  reason ? reason : "tokenized Main/Sub rejected");
 }
 
-static void rigctld_downgrade_main_sub_to_select_vfo(GtkRigCtrl *ctrl,
-                                                      gint sock,
-                                                      const gchar *reason)
+static void G_GNUC_UNUSED
+rigctld_downgrade_main_sub_to_select_vfo(GtkRigCtrl *ctrl,
+                                         gint sock,
+                                         const gchar *reason)
 {
     RigSession *session = NULL;
 
@@ -8652,21 +8811,29 @@ static const gchar *rigctld_find_known_vfo_token(const RigSession *session,
 
 static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
 {
-    static const gchar *main_candidates_default[] =
+    static const gchar *main_candidates_default_physical[] =
         { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
-    static const gchar *sub_candidates_default[] =
+    static const gchar *sub_candidates_default_physical[] =
         { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
-    static const gchar *main_candidates_prefer[] =
+    static const gchar *main_candidates_prefer_physical[] =
         { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
-    static const gchar *sub_candidates_prefer[] =
+    static const gchar *sub_candidates_prefer_physical[] =
         { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
-    static const gchar *main_candidates_strict[] =
+    static const gchar *main_candidates_strict_physical[] =
         { "Main", "MainA", "VFO_MAIN", NULL };
-    static const gchar *sub_candidates_strict[] =
+    static const gchar *sub_candidates_strict_physical[] =
         { "Sub", "SubA", "VFO_SUB", NULL };
+    const radio_conf_t *conf = get_conf_for_socket(ctrl, sock);
     const gchar *fallback = vfo_name(vfo);
     const gchar * const *candidates = NULL;
     const gchar * const *fallback_candidates = NULL;
+    const gchar * const *default_physical = NULL;
+    const gchar * const *prefer_physical = NULL;
+    const gchar * const *strict_physical = NULL;
+    const gchar *role_alias = NULL;
+    const gchar *default_candidates_buf[8] = { NULL };
+    const gchar *prefer_candidates_buf[8] = { NULL };
+    const gchar *strict_candidates_buf[8] = { NULL };
     gchar **main_ptr = NULL;
     gchar **sub_ptr = NULL;
     gboolean *logged_ptr = NULL;
@@ -8674,6 +8841,7 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     RigSession *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
     rig_strategy_t strategy =
         (session != NULL) ? session->strategy : RIG_STRATEGY_PLAIN_FREQ;
+    gboolean use_role_alias = (strategy != RIG_STRATEGY_SELECT_VFO);
     gboolean prefer_main_sub = rigctld_prefer_main_sub_tokens(ctrl);
     gboolean force_main_sub = rigctld_force_main_sub_tokens(ctrl, session);
     gboolean allow_unlisted = force_main_sub;
@@ -8690,6 +8858,44 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     if (vfo != VFO_MAIN && vfo != VFO_SUB)
         return fallback;
 
+    default_physical = (vfo == VFO_MAIN) ? main_candidates_default_physical
+                                         : sub_candidates_default_physical;
+    prefer_physical = (vfo == VFO_MAIN) ? main_candidates_prefer_physical
+                                        : sub_candidates_prefer_physical;
+    strict_physical = (vfo == VFO_MAIN) ? main_candidates_strict_physical
+                                        : sub_candidates_strict_physical;
+    role_alias = rigctld_role_alias_for_vfo(conf, vfo);
+
+    {
+        guint idx = 0;
+
+        if (use_role_alias && role_alias != NULL)
+            default_candidates_buf[idx++] = role_alias;
+        for (guint i = 0; default_physical[i] != NULL &&
+                          idx < G_N_ELEMENTS(default_candidates_buf) - 1; i++)
+            default_candidates_buf[idx++] = default_physical[i];
+    }
+
+    {
+        guint idx = 0;
+
+        if (use_role_alias && role_alias != NULL)
+            prefer_candidates_buf[idx++] = role_alias;
+        for (guint i = 0; prefer_physical[i] != NULL &&
+                          idx < G_N_ELEMENTS(prefer_candidates_buf) - 1; i++)
+            prefer_candidates_buf[idx++] = prefer_physical[i];
+    }
+
+    {
+        guint idx = 0;
+
+        if (use_role_alias && role_alias != NULL)
+            strict_candidates_buf[idx++] = role_alias;
+        for (guint i = 0; strict_physical[i] != NULL &&
+                          idx < G_N_ELEMENTS(strict_candidates_buf) - 1; i++)
+            strict_candidates_buf[idx++] = strict_physical[i];
+    }
+
     if (!rigctld_vfo_map_refs(ctrl, sock, &main_ptr, &sub_ptr, &logged_ptr))
         return fallback;
 
@@ -8701,29 +8907,29 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
     if (vfo == VFO_MAIN)
     {
         if (strategy == RIG_STRATEGY_SELECT_VFO)
-            candidates = main_candidates_default;
+            candidates = default_candidates_buf;
         else if (force_main_sub)
-            candidates = main_candidates_strict;
+            candidates = strict_candidates_buf;
         else if (prefer_main_sub)
-            candidates = main_candidates_prefer;
+            candidates = prefer_candidates_buf;
         else
-            candidates = main_candidates_default;
+            candidates = default_candidates_buf;
         if (force_main_sub)
-            fallback_candidates = main_candidates_default;
+            fallback_candidates = default_candidates_buf;
         target_ptr = main_ptr;
     }
     else
     {
         if (strategy == RIG_STRATEGY_SELECT_VFO)
-            candidates = sub_candidates_default;
+            candidates = default_candidates_buf;
         else if (force_main_sub)
-            candidates = sub_candidates_strict;
+            candidates = strict_candidates_buf;
         else if (prefer_main_sub)
-            candidates = sub_candidates_prefer;
+            candidates = prefer_candidates_buf;
         else
-            candidates = sub_candidates_default;
+            candidates = default_candidates_buf;
         if (force_main_sub)
-            fallback_candidates = sub_candidates_default;
+            fallback_candidates = default_candidates_buf;
         target_ptr = sub_ptr;
     }
 
@@ -8736,6 +8942,14 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
             g_free(*target_ptr);
             *target_ptr = NULL;
         }
+        else if (session != NULL &&
+                 !rig_session_vfo_token_working(session, *target_ptr))
+        {
+            g_free(*target_ptr);
+            *target_ptr = NULL;
+            if (logged_ptr != NULL)
+                *logged_ptr = FALSE;
+        }
         else
         {
             return *target_ptr;
@@ -8747,11 +8961,27 @@ static const gchar *rigctld_vfo_token(GtkRigCtrl *ctrl, gint sock, vfo_t vfo)
         const gchar *known_token =
             rigctld_find_known_vfo_token(session, candidates);
 
+        if (use_role_alias &&
+            role_alias != NULL &&
+            (known_token == NULL ||
+             g_ascii_strcasecmp(known_token, role_alias) != 0))
+        {
+            if ((allow_unlisted ||
+                 session == NULL ||
+                 session->vfo_candidates->len == 0 ||
+                 rig_session_vfo_candidate_exists(session, role_alias)) &&
+                rigctld_try_vfo_token(ctrl, sock, session, role_alias))
+            {
+                *target_ptr = g_strdup(role_alias);
+                mapped = TRUE;
+            }
+        }
+
         if (known_token == NULL && fallback_candidates != NULL)
             known_token = rigctld_find_known_vfo_token(session,
                                                        fallback_candidates);
 
-        if (known_token != NULL)
+        if (!mapped && known_token != NULL)
         {
             *target_ptr = g_strdup(known_token);
             mapped = TRUE;
@@ -9071,6 +9301,22 @@ static vfo_t rigctrl_target_vfo_for_role(const radio_conf_t *conf,
     return (role == VFO_ROLE_DOWNLINK) ? conf->downlink_vfo : conf->uplink_vfo;
 }
 
+static gboolean rigctrl_use_split_uplink_path(GtkRigCtrl *ctrl,
+                                              gint sock,
+                                              gboolean downlink)
+{
+    (void)ctrl;
+    (void)sock;
+    (void)downlink;
+
+    /*
+     * Shared Main/Sub rigs are more stable when uplink is addressed via
+     * targetable VFO tokens (for example "TX") rather than split I/i
+     * commands. The IC-9700 + rigctld path can hang on I/i.
+     */
+    return FALSE;
+}
+
 static vfo_t rigctrl_vfo_for_side(GtkRigCtrl *ctrl, gboolean downlink)
 {
     const radio_conf_t *conf = rigctrl_conf_for_role(ctrl, downlink);
@@ -9103,7 +9349,9 @@ static gboolean rigctrl_set_freq_for_role(GtkRigCtrl *ctrl,
                                           vfo_t *vfo_out)
 {
     vfo_t vfo = rigctrl_vfo_for_side(ctrl, downlink);
-    const gchar *cmd = toggle_mode ? "I" : "F";
+    gboolean use_split_uplink =
+        rigctrl_use_split_uplink_path(ctrl, sock, downlink);
+    const gchar *cmd = (toggle_mode || use_split_uplink) ? "I" : "F";
 
     if (vfo_out)
         *vfo_out = vfo;
@@ -9112,12 +9360,12 @@ static gboolean rigctrl_set_freq_for_role(GtkRigCtrl *ctrl,
 
     if (vfo != VFO_NONE)
     {
-        return toggle_mode ?
+        return (toggle_mode || use_split_uplink) ?
             set_freq_toggle_vfo(ctrl, sock, freq_hz, vfo) :
             set_freq_simplex_vfo(ctrl, sock, freq_hz, vfo);
     }
 
-    return toggle_mode ?
+    return (toggle_mode || use_split_uplink) ?
         set_freq_toggle(ctrl, sock, freq_hz) :
         set_freq_simplex(ctrl, sock, freq_hz);
 }
@@ -9131,7 +9379,9 @@ static gboolean rigctrl_get_freq_for_role(GtkRigCtrl *ctrl,
                                           vfo_t *vfo_out)
 {
     vfo_t vfo = rigctrl_vfo_for_side(ctrl, downlink);
-    const gchar *cmd = toggle_mode ? "i" : "f";
+    gboolean use_split_uplink =
+        rigctrl_use_split_uplink_path(ctrl, sock, downlink);
+    const gchar *cmd = (toggle_mode || use_split_uplink) ? "i" : "f";
     const gchar *tag = toggle_mode ? "i" : "f";
     gint cache_key = (vfo != VFO_NONE) ? (gint) vfo : (toggle_mode ? -2 : -1);
     gboolean ok = FALSE;
@@ -9141,7 +9391,7 @@ static gboolean rigctrl_get_freq_for_role(GtkRigCtrl *ctrl,
 
     if (vfo != VFO_NONE)
     {
-        if (toggle_mode)
+        if (toggle_mode || use_split_uplink)
         {
             ok = strict ?
                 get_freq_toggle_vfo_strict(ctrl, sock, freq_out, vfo) :
@@ -9154,7 +9404,7 @@ static gboolean rigctrl_get_freq_for_role(GtkRigCtrl *ctrl,
                 get_freq_simplex_vfo(ctrl, sock, freq_out, vfo);
         }
     }
-    else if (toggle_mode)
+    else if (toggle_mode || use_split_uplink)
     {
         ok = strict ?
             get_freq_toggle_strict(ctrl, sock, freq_out) :
@@ -9338,25 +9588,23 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
     const gchar    *token = NULL;
     rig_strategy_t  strategy = rig_session_strategy_for_vfo(ctrl, sock, vfo);
     RigSession     *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
     gchar           freq_str[32];
     gchar          *freq_cmd = NULL;
+    const gchar    *set_token = NULL;
     gint            rprt_code = 0;
     gboolean        has_rprt = FALSE;
+    gboolean        used_tokenized_set = FALSE;
 
     if (session != NULL && session->state != RIG_SESSION_READY)
         return FALSE;
-
-    if (!ctrl->conf->vfo_opt)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; sending explicit VFO");
-    }
 
     token = rigctld_vfo_token(ctrl, sock, vfo);
     if (token == NULL)
         return FALSE;
 
     hz_to_rigctld_string(freq, freq_str, sizeof(freq_str));
+    set_token = token;
 
     g_mutex_lock(&ctrl->writelock);
 
@@ -9372,18 +9620,42 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
             g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
                                                               vfo));
         }
-        freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
+        freq_cmd = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("F currVFO %s\x0a", freq_str) :
+            g_strdup_printf("F %s\x0a", freq_str);
     }
     else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
-        freq_cmd = g_strdup_printf("F %s %s\x0a", token, freq_str);
+        if (set_token != NULL && *set_token != '\0')
+        {
+            freq_cmd = g_strdup_printf("F %s %s\x0a", set_token, freq_str);
+            used_tokenized_set = TRUE;
+        }
+        else
+        {
+            if (!rigctld_select_vfo_cached_locked(ctrl, sock, vfo, token))
+            {
+                g_mutex_unlock(&ctrl->writelock);
+                return FALSE;
+            }
+            if (is_full_duplex_main_sub_configured(ctrl->conf))
+            {
+                g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
+                                                                  vfo));
+            }
+            freq_cmd = (conf != NULL && conf->vfo_opt) ?
+                g_strdup_printf("F currVFO %s\x0a", freq_str) :
+                g_strdup_printf("F %s\x0a", freq_str);
+        }
     }
     else
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
                     "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
                     rig_strategy_name(strategy));
-        freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
+        freq_cmd = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("F currVFO %s\x0a", freq_str) :
+            g_strdup_printf("F %s\x0a", freq_str);
     }
 
     if (freq_cmd != NULL)
@@ -9393,7 +9665,7 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "FULL-DUPLEX MAIN/SUB: send freq cmd='%s' request=%s token=%s",
                     cmd_log, vfo_name(vfo),
-                    token ? token : "(null)");
+                    set_token ? set_token : "(null)");
         g_free(cmd_log);
     }
 
@@ -9403,14 +9675,24 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
                 vfo_name(vfo), freq, buffback);
     has_rprt = rig_parse_rprt_code_any(buffback, &rprt_code);
 
-    if (has_rprt &&
+    if (used_tokenized_set &&
+        has_rprt &&
         rigctld_should_retry_main_sub(ctrl, session, vfo, rprt_code))
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
-                    "FULL-DUPLEX MAIN/SUB: set %s rejected (RPRT %d); downgrading to explicit VFO",
+                    "FULL-DUPLEX MAIN/SUB: set %s rejected (RPRT %d); falling back to V + F",
                     vfo_name(vfo), rprt_code);
-        rigctld_downgrade_main_sub_to_select_vfo(
-            ctrl, sock, "Main/Sub tokenized set rejected");
+        if (session != NULL)
+            session->has_tokenized_set_freq = FALSE;
+        rigctld_downgrade_main_sub_to_select_vfo(ctrl, sock,
+                                                 "tokenized Main/Sub set rejected");
+        token = rigctld_vfo_token(ctrl, sock, vfo);
+        if (token == NULL)
+        {
+            g_free(freq_cmd);
+            g_mutex_unlock(&ctrl->writelock);
+            return FALSE;
+        }
         if (!rigctld_select_vfo_cached_locked(ctrl, sock, vfo, token))
         {
             g_free(freq_cmd);
@@ -9419,7 +9701,9 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
         }
 
         g_free(freq_cmd);
-        freq_cmd = g_strdup_printf("F %s\x0a", freq_str);
+        freq_cmd = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("F currVFO %s\x0a", freq_str) :
+            g_strdup_printf("F %s\x0a", freq_str);
 
         if (freq_cmd != NULL)
         {
@@ -9428,7 +9712,7 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                         "FULL-DUPLEX MAIN/SUB: retry freq cmd='%s' request=%s token=%s",
                         cmd_log, vfo_name(vfo),
-                        token ? token : "(null)");
+                        set_token ? set_token : "(null)");
             g_free(cmd_log);
         }
         retcode = _send_rigctld_command(ctrl, sock, freq_cmd, buffback, 128);
@@ -9440,6 +9724,8 @@ static gboolean set_freq_simplex_vfo(GtkRigCtrl *ctrl, gint sock,
 
     g_free(freq_cmd);
     retcode = check_set_response(buffback, retcode, __func__);
+    if (used_tokenized_set && retcode && session != NULL)
+        session->has_tokenized_set_freq = TRUE;
     g_mutex_unlock(&ctrl->writelock);
     return retcode;
 }
@@ -9455,12 +9741,8 @@ static gboolean get_freq_simplex_vfo_internal(GtkRigCtrl *ctrl, gint sock,
     gchar         **vbuff;
     const gchar    *token = NULL;
     rig_strategy_t  strategy = rig_session_strategy_for_vfo(ctrl, sock, vfo);
-
-    if (!ctrl->conf->vfo_opt)
-    {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; requesting explicit VFO");
-    }
+    RigSession     *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
 
     token = rigctld_vfo_token(ctrl, sock, vfo);
     if (token == NULL)
@@ -9473,18 +9755,36 @@ static gboolean get_freq_simplex_vfo_internal(GtkRigCtrl *ctrl, gint sock,
         if (is_full_duplex_main_sub_configured(ctrl->conf))
             g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
                                                               vfo));
-        buff = g_strdup_printf("f\x0a");
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup("f currVFO\x0a") :
+            g_strdup("f\x0a");
     }
     else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
-        buff = g_strdup_printf("f %s\x0a", token);
+        if (session != NULL && session->has_tokenized_get_freq)
+        {
+            buff = g_strdup_printf("f %s\x0a", token);
+        }
+        else
+        {
+            if (!rigctld_select_vfo_cached(ctrl, sock, vfo, token))
+                return FALSE;
+            if (is_full_duplex_main_sub_configured(ctrl->conf))
+                g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
+                                                                  vfo));
+            buff = (conf != NULL && conf->vfo_opt) ?
+                g_strdup("f currVFO\x0a") :
+                g_strdup("f\x0a");
+        }
     }
     else
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
                     "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
                     rig_strategy_name(strategy));
-        buff = g_strdup_printf("f\x0a");
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup("f currVFO\x0a") :
+            g_strdup("f\x0a");
     }
 
     if (buff != NULL)
@@ -9510,7 +9810,7 @@ static gboolean get_freq_simplex_vfo_internal(GtkRigCtrl *ctrl, gint sock,
         {
             gchar *endptr = NULL;
             *freq = g_ascii_strtoll(vbuff[0], &endptr, 10);
-            if (endptr == vbuff[0])
+            if (endptr == vbuff[0] || *freq <= 0)
                 retval = FALSE;
         }
         else
@@ -9563,19 +9863,33 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
     gboolean        retcode;
     const gchar    *token = NULL;
     rig_strategy_t  strategy = rig_session_strategy_for_vfo(ctrl, sock, vfo);
+    RigSession     *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
     gchar           freq_str[32];
+    const gchar    *set_token = NULL;
+    gint            rprt_code = 0;
+    gboolean        has_rprt = FALSE;
+    gboolean        used_tokenized_set = FALSE;
 
-    if (!ctrl->conf->vfo_opt)
+    hz_to_rigctld_string(freq, freq_str, sizeof(freq_str));
+
+    if (rigctrl_use_split_uplink_path(ctrl, sock, FALSE))
     {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; sending explicit VFO");
+        buff = g_strdup_printf("I %s\x0a", freq_str);
+        retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: set %s (split) %" G_GINT64_FORMAT
+                    " -> %s",
+                    vfo_name(vfo), freq, buffback);
+        g_free(buff);
+        return check_set_response(buffback, retcode, __func__);
     }
 
     token = rigctld_vfo_token(ctrl, sock, vfo);
     if (token == NULL)
         return FALSE;
 
-    hz_to_rigctld_string(freq, freq_str, sizeof(freq_str));
+    set_token = token;
 
     if (strategy == RIG_STRATEGY_SELECT_VFO)
     {
@@ -9584,27 +9898,79 @@ static gboolean set_freq_toggle_vfo(GtkRigCtrl *ctrl, gint sock,
         if (is_full_duplex_main_sub_configured(ctrl->conf))
             g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
                                                               vfo));
-        buff = g_strdup_printf("I %s\x0a", freq_str);
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("I currVFO %s\x0a", freq_str) :
+            g_strdup_printf("I %s\x0a", freq_str);
     }
     else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
-        buff = g_strdup_printf("I %s %s\x0a", token, freq_str);
+        if (set_token != NULL && *set_token != '\0')
+        {
+            buff = g_strdup_printf("I %s %s\x0a", set_token, freq_str);
+            used_tokenized_set = TRUE;
+        }
+        else
+        {
+            if (!rigctld_select_vfo_cached(ctrl, sock, vfo, token))
+                return FALSE;
+            if (is_full_duplex_main_sub_configured(ctrl->conf))
+                g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
+                                                                  vfo));
+            buff = (conf != NULL && conf->vfo_opt) ?
+                g_strdup_printf("I currVFO %s\x0a", freq_str) :
+                g_strdup_printf("I %s\x0a", freq_str);
+        }
     }
     else
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
                     "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
                     rig_strategy_name(strategy));
-        buff = g_strdup_printf("I %s\x0a", freq_str);
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("I currVFO %s\x0a", freq_str) :
+            g_strdup_printf("I %s\x0a", freq_str);
     }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 "FULL-DUPLEX MAIN/SUB: set %s (toggle) %" G_GINT64_FORMAT " -> %s",
                 vfo_name(vfo), freq, buffback);
+    has_rprt = rig_parse_rprt_code_any(buffback, &rprt_code);
     g_free(buff);
 
-    return check_set_response(buffback, retcode, __func__);
+    if (used_tokenized_set &&
+        has_rprt &&
+        rigctld_should_retry_main_sub(ctrl, session, vfo, rprt_code))
+    {
+        if (session != NULL)
+            session->has_tokenized_set_freq = FALSE;
+        rigctld_downgrade_main_sub_to_select_vfo(ctrl, sock,
+                                                 "tokenized Main/Sub set rejected");
+        token = rigctld_vfo_token(ctrl, sock, vfo);
+        if (token == NULL)
+            return FALSE;
+        if (!rigctld_select_vfo_cached(ctrl, sock, vfo, token))
+            return FALSE;
+        if (is_full_duplex_main_sub_configured(ctrl->conf))
+            g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
+                                                              vfo));
+
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("I currVFO %s\x0a", freq_str) :
+            g_strdup_printf("I %s\x0a", freq_str);
+        retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: retry %s (toggle) %" G_GINT64_FORMAT
+                    " -> %s",
+                    vfo_name(vfo), freq, buffback);
+        g_free(buff);
+    }
+
+    retcode = check_set_response(buffback, retcode, __func__);
+    if (used_tokenized_set && retcode && session != NULL)
+        session->has_tokenized_set_freq = TRUE;
+
+    return retcode;
 }
 
 static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
@@ -9618,6 +9984,8 @@ static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
     gchar         **vbuff;
     const gchar    *token = NULL;
     rig_strategy_t  strategy = rig_session_strategy_for_vfo(ctrl, sock, vfo);
+    RigSession     *session = rig_session_for_socket_vfo(ctrl, sock, vfo);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
 
     if (freq == NULL)
     {
@@ -9626,10 +9994,44 @@ static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
         return FALSE;
     }
 
-    if (!ctrl->conf->vfo_opt)
+    if (rigctrl_use_split_uplink_path(ctrl, sock, FALSE))
     {
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "FULL-DUPLEX MAIN/SUB: vfo_opt disabled; requesting explicit VFO");
+        buff = g_strdup("i\x0a");
+        retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
+        retcode = check_get_response(buffback, retcode, __func__);
+        sat_log_log(SAT_LOG_LEVEL_DEBUG,
+                    "FULL-DUPLEX MAIN/SUB: get %s (split) -> %s",
+                    vfo_name(vfo), buffback);
+        if (retcode)
+        {
+            vbuff = g_strsplit(buffback, "\n", 3);
+            if (vbuff[0])
+            {
+                gchar *endptr = NULL;
+                *freq = g_ascii_strtoll(vbuff[0], &endptr, 10);
+                if (endptr == vbuff[0] || *freq <= 0)
+                    retval = FALSE;
+            }
+            else
+                retval = FALSE;
+            g_strfreev(vbuff);
+        }
+        else
+        {
+            retval = FALSE;
+        }
+
+        g_free(buff);
+        if (retval)
+        {
+            rigctrl_cache_freq(sock, "i", (gint)vfo, *freq);
+            return TRUE;
+        }
+
+        if (allow_cache && rigctrl_get_cached_freq(sock, "i", (gint)vfo, freq))
+            return TRUE;
+
+        return FALSE;
     }
 
     token = rigctld_vfo_token(ctrl, sock, vfo);
@@ -9643,18 +10045,36 @@ static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
         if (is_full_duplex_main_sub_configured(ctrl->conf))
             g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
                                                               vfo));
-        buff = g_strdup_printf("i\x0a");
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup("i currVFO\x0a") :
+            g_strdup("i\x0a");
     }
     else if (strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
-        buff = g_strdup_printf("i %s\x0a", token);
+        if (session != NULL && session->has_tokenized_get_freq)
+        {
+            buff = g_strdup_printf("i %s\x0a", token);
+        }
+        else
+        {
+            if (!rigctld_select_vfo_cached(ctrl, sock, vfo, token))
+                return FALSE;
+            if (is_full_duplex_main_sub_configured(ctrl->conf))
+                g_usleep(rigctrl_shared_main_sub_select_settle_us(ctrl, sock,
+                                                                  vfo));
+            buff = (conf != NULL && conf->vfo_opt) ?
+                g_strdup("i currVFO\x0a") :
+                g_strdup("i\x0a");
+        }
     }
     else
     {
         sat_log_log(SAT_LOG_LEVEL_WARN,
                     "FULL-DUPLEX MAIN/SUB: strategy %s; falling back to single VFO",
                     rig_strategy_name(strategy));
-        buff = g_strdup_printf("i\x0a");
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup("i currVFO\x0a") :
+            g_strdup("i\x0a");
     }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
@@ -9669,7 +10089,7 @@ static gboolean get_freq_toggle_vfo_internal(GtkRigCtrl *ctrl, gint sock,
         {
             gchar *endptr = NULL;
             *freq = g_ascii_strtoll(vbuff[0], &endptr, 10);
-            if (endptr == vbuff[0])
+            if (endptr == vbuff[0] || *freq <= 0)
                 retval = FALSE;
         }
         else
@@ -11312,6 +11732,7 @@ static gboolean set_freq_simplex(GtkRigCtrl * ctrl, gint sock, gint64 freq)
     gboolean        retcode;
     RigSession     *session = rig_session_for_socket(ctrl, sock);
     rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
     gchar           freq_str[32];
 
     if (strategy == RIG_STRATEGY_SELECT_VFO)
@@ -11334,7 +11755,9 @@ static gboolean set_freq_simplex(GtkRigCtrl * ctrl, gint sock, gint64 freq)
     }
     else
     {
-        buff = g_strdup_printf("F %s\x0a", freq_str);
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("F currVFO %s\x0a", freq_str) :
+            g_strdup_printf("F %s\x0a", freq_str);
     }
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     g_free(buff);
@@ -11355,6 +11778,7 @@ static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gint64 freq)
     gboolean        retcode;
     RigSession     *session = rig_session_for_socket(ctrl, sock);
     rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
     gchar           freq_str[32];
 
     /* send command */
@@ -11380,7 +11804,9 @@ static gboolean set_freq_toggle(GtkRigCtrl * ctrl, gint sock, gint64 freq)
     }
     else
     {
-        buff = g_strdup_printf("I %s\x0a", freq_str);
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup_printf("I currVFO %s\x0a", freq_str) :
+            g_strdup_printf("I %s\x0a", freq_str);
     }
 
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
@@ -11445,10 +11871,14 @@ static gboolean get_freq_simplex_internal(GtkRigCtrl * ctrl, gint sock,
     gchar           buffback[128];
     gboolean        retcode;
     gboolean        retval = TRUE;
-    const gchar    *label = ctrl->conf->vfo_opt ? "currVFO" : "default";
+    const gchar    *label = "default";
     const gint      cache_key = -1;
     RigSession     *session = rig_session_for_socket(ctrl, sock);
     rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
+
+    if (conf != NULL && conf->vfo_opt)
+        label = "currVFO";
 
     if (strategy == RIG_STRATEGY_SELECT_VFO)
     {
@@ -11468,7 +11898,9 @@ static gboolean get_freq_simplex_internal(GtkRigCtrl * ctrl, gint sock,
     }
     else
     {
-        buff = g_strdup_printf("f\x0a");
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup("f currVFO\x0a") :
+            g_strdup("f\x0a");
     }
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
@@ -11479,7 +11911,7 @@ static gboolean get_freq_simplex_internal(GtkRigCtrl * ctrl, gint sock,
         {
             gchar *endptr = NULL;
             *freq = g_ascii_strtoll(vbuff[0], &endptr, 10);
-            if (endptr == vbuff[0])
+            if (endptr == vbuff[0] || *freq <= 0)
                 retval = FALSE;
         }
         else
@@ -11537,10 +11969,14 @@ static gboolean get_freq_toggle_internal(GtkRigCtrl * ctrl, gint sock,
     gchar           buffback[128];
     gboolean        retcode;
     gboolean        retval = TRUE;
-    const gchar    *label = ctrl->conf->vfo_opt ? "currVFO" : "default";
+    const gchar    *label = "default";
     const gint      cache_key = -2;
     RigSession     *session = rig_session_for_socket(ctrl, sock);
     rig_strategy_t  strategy = rig_session_strategy(ctrl, sock);
+    radio_conf_t   *conf = get_conf_for_socket(ctrl, sock);
+
+    if (conf != NULL && conf->vfo_opt)
+        label = "currVFO";
 
     if (freq == NULL)
     {
@@ -11568,7 +12004,9 @@ static gboolean get_freq_toggle_internal(GtkRigCtrl * ctrl, gint sock,
     }
     else
     {
-        buff = g_strdup_printf("i\x0a");
+        buff = (conf != NULL && conf->vfo_opt) ?
+            g_strdup("i currVFO\x0a") :
+            g_strdup("i\x0a");
     }
     retcode = send_rigctld_command(ctrl, sock, buff, buffback, 128);
     retcode = check_get_response(buffback, retcode, __func__);
@@ -11579,7 +12017,7 @@ static gboolean get_freq_toggle_internal(GtkRigCtrl * ctrl, gint sock,
         {
             gchar *endptr = NULL;
             *freq = g_ascii_strtoll(vbuff[0], &endptr, 10);
-            if (endptr == vbuff[0])
+            if (endptr == vbuff[0] || *freq <= 0)
                 retval = FALSE;
         }
         else
@@ -15377,7 +15815,7 @@ open_receiver_retry:
         }
 
         ctrl->conf->vfo_opt = (ctrl->rig_session &&
-                               ctrl->rig_session->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
+                               ctrl->rig_session->vfo_opt_enabled);
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 _("%s:%s: VFO opt=%d"), __FILE__,
                 __func__, ctrl->conf->vfo_opt);
@@ -15530,7 +15968,7 @@ open_uplink_retry:
                                                   ctrl->conf2->rigctld_device);
             }
             ctrl->conf2->vfo_opt = (ctrl->rig_session2 &&
-                                    ctrl->rig_session2->strategy == RIG_STRATEGY_VFO_OPT_ARGS);
+                                    ctrl->rig_session2->vfo_opt_enabled);
             sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     _("%s:%s: VFO opt2=%d"), __FILE__,
                     __func__, ctrl->conf2->vfo_opt);
@@ -15570,6 +16008,24 @@ open_uplink_retry:
     }
     ctrl->engage_pending = FALSE;
     rigctrl_seed_user_base_from_ui(ctrl, "engage");
+
+    if (is_full_duplex_main_sub_configured(ctrl->conf) &&
+        ctrl->conf2 == NULL &&
+        ctrl->sock >= 0)
+    {
+        if (!setup_split(ctrl))
+        {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "FULL-DUPLEX MAIN/SUB: failed to configure split TX VFO from radio config");
+            rig_term_log(ctrl, "gpredict:err",
+                         "shared Main/Sub split setup failed; continuing with existing rig state");
+        }
+        else
+        {
+            rig_term_log(ctrl, "gpredict",
+                         "shared Main/Sub split setup applied from config");
+        }
+    }
 
     if ((rx_opened || tx_opened))
     {

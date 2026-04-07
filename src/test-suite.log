@@ -2,8 +2,8 @@
    gpredict 2.3.326-4a74-dirty: src/test-suite.log
 =====================================================
 
-# TOTAL: 2
-# PASS:  1
+# TOTAL: 11
+# PASS:  10
 # SKIP:  0
 # XFAIL: 0
 # FAIL:  1
@@ -17,5 +17,6 @@ System information (uname -a): Darwin 24.6.0 Darwin Kernel Version 24.6.0: Mon J
 FAIL: hamlib-mock-test
 ======================
 
+2026/04/07 13:17:13|3|sat_log_cleanup_dir: retention disabled; preserving previous session logs
 FAIL hamlib-mock-test (exit status: 1)
 

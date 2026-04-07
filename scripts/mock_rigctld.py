@@ -93,7 +93,10 @@ class RigctldHandler(socketserver.StreamRequestHandler):
                     self.wfile.write(b"RPRT -1\n")
                     self.wfile.flush()
                     continue
-                self.wfile.write(("%d\nRPRT 0\n" % state["freq"]).encode("ascii"))
+                if cmd.startswith("f ") and state["omit_rprt_tokenized_freq"]:
+                    self.wfile.write(("%d\n" % state["freq"]).encode("ascii"))
+                else:
+                    self.wfile.write(("%d\nRPRT 0\n" % state["freq"]).encode("ascii"))
                 self.wfile.flush()
                 continue
 
@@ -206,6 +209,7 @@ def main():
     parser.add_argument("--fail-get-vfo", action="store_true")
     parser.add_argument("--no-get-vfo-advertise", action="store_true")
     parser.add_argument("--no-vfo-opt-advertise", action="store_true")
+    parser.add_argument("--omit-rprt-tokenized-freq", action="store_true")
     args = parser.parse_args()
 
     server_cls = SingleClientRigctldServer if args.once else RigctldServer
@@ -236,6 +240,7 @@ def main():
         "fail_get_freq": args.fail_get_freq,
         "fail_plain_get_freq": args.fail_plain_get_freq,
         "fail_get_vfo": args.fail_get_vfo,
+        "omit_rprt_tokenized_freq": args.omit_rprt_tokenized_freq,
         "selected_since_set": False,
         "cmd_log": [],
     }

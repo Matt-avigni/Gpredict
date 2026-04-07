@@ -38,6 +38,8 @@ typedef struct RigCaps {
     gint           rig_model;
     gboolean       has_get_freq;
     gboolean       has_set_freq;
+    gboolean       has_tokenized_get_freq;
+    gboolean       has_tokenized_set_freq;
     gboolean       has_get_vfo;
     gboolean       has_set_vfo;
     gboolean       has_set_vfo_opt;

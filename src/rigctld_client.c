@@ -18,9 +18,11 @@
 #define RIGCTLD_REPLY_IDLE_TIMEOUT_MS 150
 #define RIGCTLD_REPLY_RECOVERY_DRAIN_MS 200
 #define RIGCTLD_VFO_TOKEN_MAX 64
-#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 3
+#define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS 1
 #define RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US 350000
-#define RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS 2
+#define RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS 1
+#define RIGCTLD_MIN_VALID_FREQ_HZ 100
+#define RIGCTLD_MAX_VALID_FREQ_HZ G_GINT64_CONSTANT(1000000000000)
 
 static gint rig_log_level = RIG_LOG_QUIET;
 
@@ -111,6 +113,12 @@ static gchar *rigctld_client_dup_trimmed(const gchar *text)
     g_strchomp(copy);
     g_strstrip(copy);
     return copy;
+}
+
+static gboolean rigctld_client_frequency_usable(gint64 freq_hz)
+{
+    return freq_hz >= RIGCTLD_MIN_VALID_FREQ_HZ &&
+        freq_hz <= RIGCTLD_MAX_VALID_FREQ_HZ;
 }
 
 static void rigctld_client_forensic_line(RigctldClient *client,
@@ -278,6 +286,8 @@ static void rigctld_client_caps_clear(RigCaps *caps)
     caps->rig_model = 0;
     caps->has_get_freq = FALSE;
     caps->has_set_freq = FALSE;
+    caps->has_tokenized_get_freq = FALSE;
+    caps->has_tokenized_set_freq = FALSE;
     caps->has_get_vfo = FALSE;
     caps->has_set_vfo = FALSE;
     caps->has_set_vfo_opt = FALSE;
@@ -329,6 +339,8 @@ static void rigctld_client_caps_copy_snapshot(const RigCaps *src,
     dst->rig_model = src->rig_model;
     dst->has_get_freq = src->has_get_freq;
     dst->has_set_freq = src->has_set_freq;
+    dst->has_tokenized_get_freq = src->has_tokenized_get_freq;
+    dst->has_tokenized_set_freq = src->has_tokenized_set_freq;
     dst->has_get_vfo = src->has_get_vfo;
     dst->has_set_vfo = src->has_set_vfo;
     dst->has_set_vfo_opt = src->has_set_vfo_opt;
@@ -531,9 +543,9 @@ static gboolean rigctld_client_parse_vfo_reply(const gchar *text,
 static vfo_t rigctld_client_classify_vfo_token(const gchar *token)
 {
     static const gchar *main_tokens[] =
-        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+        { "VFOA", "Main", "MainA", "VFO_MAIN", "RX", NULL };
     static const gchar *sub_tokens[] =
-        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+        { "VFOB", "Sub", "SubA", "VFO_SUB", "TX", NULL };
 
     if (token == NULL || *token == '\0')
         return VFO_NONE;
@@ -668,6 +680,81 @@ static void rigctld_client_parse_dump_state(RigCaps *caps, const gchar *text)
     g_strfreev(lines);
 }
 
+static gboolean rigctld_client_parse_int_reply(const gchar *reply,
+                                               gint64 *value_out)
+{
+    gchar **lines = NULL;
+    gchar *trimmed = NULL;
+    gchar *endptr = NULL;
+    gint64 value = 0;
+    gboolean ok = FALSE;
+
+    if (value_out != NULL)
+        *value_out = 0;
+
+    if (reply == NULL || *reply == '\0')
+        return FALSE;
+
+    lines = g_strsplit(reply, "\n", 2);
+    if (lines == NULL || lines[0] == NULL)
+        goto done;
+
+    trimmed = g_strstrip(lines[0]);
+    if (trimmed == NULL || *trimmed == '\0')
+        goto done;
+
+    value = g_ascii_strtoll(trimmed, &endptr, 10);
+    if (endptr == trimmed)
+        goto done;
+
+    if (value_out != NULL)
+        *value_out = value;
+    ok = TRUE;
+
+done:
+    g_strfreev(lines);
+    return ok;
+}
+
+static gboolean rigctld_client_try_chk_vfo(RigctldClient *client,
+                                           gboolean *enabled_out,
+                                           gint timeout_ms,
+                                           gboolean wire_log)
+{
+    gchar reply[128];
+    HamlibResponseInfo info = { 0 };
+    gint64 status = 0;
+    gboolean ok = FALSE;
+
+    if (enabled_out != NULL)
+        *enabled_out = FALSE;
+
+    if (client == NULL)
+        return FALSE;
+
+    reply[0] = '\0';
+    ok = rigctld_client_request(client,
+                                "\\chk_vfo\n",
+                                HAMLIB_READ_MULTILINE_RPRT,
+                                HAMLIB_TERM_RPRT,
+                                timeout_ms,
+                                RIGCTLD_REPLY_IDLE_TIMEOUT_MS,
+                                0, 0,
+                                reply, sizeof(reply),
+                                &info,
+                                wire_log);
+    if (!ok || (info.saw_rprt && info.rprt_code != 0))
+        return FALSE;
+
+    if (!rigctld_client_parse_int_reply(reply, &status))
+        return FALSE;
+
+    if (enabled_out != NULL)
+        *enabled_out = (status != 0);
+
+    return TRUE;
+}
+
 static gboolean rigctld_client_try_get_freq(RigctldClient *client,
                                             const gchar *cmd,
                                             gint64 *freq_out,
@@ -678,6 +765,8 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
 {
     HamlibResponseInfo info = { 0 };
     gboolean ok = FALSE;
+    gboolean parsed = FALSE;
+    gint64 freq = 0;
 
     if (freq_out)
         *freq_out = 0;
@@ -696,14 +785,11 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
     if (!ok)
         return FALSE;
 
-    if (!info.saw_rprt)
+    if (info.saw_rprt && info.rprt_code != 0)
         return FALSE;
 
-    if (info.rprt_code != 0)
-        return FALSE;
-
-    ok = rigctld_client_parse_frequency(reply, freq_out);
-    if (!ok && wire_log)
+    parsed = rigctld_client_parse_frequency(reply, &freq);
+    if (!parsed && wire_log)
     {
         gchar *trim_reply = rigctld_client_dup_trimmed(reply);
 
@@ -713,7 +799,40 @@ static gboolean rigctld_client_try_get_freq(RigctldClient *client,
         g_free(trim_reply);
     }
 
-    return ok;
+    if (!parsed)
+        return FALSE;
+
+    if (!rigctld_client_frequency_usable(freq))
+    {
+        if (wire_log)
+        {
+            gchar *trim_reply = rigctld_client_dup_trimmed(reply);
+
+            rigctld_client_emit_logf(client, "gpredict:err",
+                                     "frequency reply unusable value=%" G_GINT64_FORMAT
+                                     " reply=%s",
+                                     freq,
+                                     (trim_reply && *trim_reply) ? trim_reply : "(empty)");
+            g_free(trim_reply);
+        }
+        return FALSE;
+    }
+
+    if (freq_out)
+        *freq_out = freq;
+
+    if (!info.saw_rprt && wire_log)
+    {
+        gchar *trim_cmd = rigctld_client_dup_trimmed(cmd);
+
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "gpredict:rx: [%s] accepted frequency reply without RPRT cmd=%s",
+                         client->label ? client->label : "rig",
+                         (trim_cmd && *trim_cmd) ? trim_cmd : "(empty)");
+        g_free(trim_cmd);
+    }
+
+    return TRUE;
 }
 
 static gboolean rigctld_client_try_get_freq_retry(RigctldClient *client,
@@ -954,38 +1073,42 @@ static gboolean rigctld_client_has_vfo_candidate(const RigCaps *caps,
 
 static gboolean rigctld_client_probe_tokenized_freq_token(RigctldClient *client,
                                                           const gchar *token,
+                                                          gint64 *reference_freq_hz,
                                                           gint timeout_ms,
                                                           gboolean wire_log)
 {
     gchar cmd[96];
     gchar reply[256];
+    HamlibResponseInfo info = { 0 };
     gint64 freq = 0;
+    gboolean parsed = FALSE;
+    gboolean ok = FALSE;
 
     if (client == NULL || token == NULL || *token == '\0')
         return FALSE;
 
     g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
-    if (!rigctld_client_try_get_freq_retry(client, cmd,
-                                           &freq, reply, sizeof(reply),
-                                           timeout_ms, 1,
-                                           wire_log))
-    {
+    ok = rigctld_client_request(client, cmd,
+                                HAMLIB_READ_MULTILINE_RPRT,
+                                HAMLIB_TERM_RPRT,
+                                timeout_ms,
+                                RIGCTLD_REPLY_IDLE_TIMEOUT_MS,
+                                0, 0,
+                                reply, sizeof(reply),
+                                &info,
+                                wire_log);
+    if (!ok || (info.saw_rprt && info.rprt_code != 0))
         return FALSE;
-    }
+
+    parsed = rigctld_client_parse_frequency(reply, &freq);
+    if (!parsed || !rigctld_client_frequency_usable(freq))
+        return FALSE;
 
     client->caps.has_get_freq = TRUE;
+    client->caps.has_tokenized_get_freq = TRUE;
+    if (reference_freq_hz != NULL)
+        *reference_freq_hz = freq;
 
-    g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
-               token, freq);
-    if (!rigctld_client_try_set_ok(client, cmd,
-                                   reply, sizeof(reply),
-                                   timeout_ms,
-                                   wire_log))
-    {
-        return FALSE;
-    }
-
-    client->caps.has_set_freq = TRUE;
     g_hash_table_replace(client->caps.vfo_working, g_strdup(token),
                          GINT_TO_POINTER(1));
     return TRUE;
@@ -995,6 +1118,7 @@ static const gchar *rigctld_client_probe_tokenized_vfo_token(
     RigctldClient *client,
     const gchar * const *candidates,
     gboolean allow_unlisted,
+    gint64 *reference_freq_hz,
     gint timeout_ms,
     gboolean wire_log)
 {
@@ -1017,6 +1141,7 @@ static const gchar *rigctld_client_probe_tokenized_vfo_token(
         }
 
         if (rigctld_client_probe_tokenized_freq_token(client, token,
+                                                      reference_freq_hz,
                                                       timeout_ms, wire_log))
             return token;
     }
@@ -1041,7 +1166,7 @@ static gboolean rigctld_client_probe_selected_vfo_matches(RigctldClient *client,
         return FALSE;
 
     if (!rigctld_client_try_get_vfo_retry(client, current, sizeof(current),
-                                          timeout_ms, 1, wire_log))
+                                          timeout_ms, 0, wire_log))
         return FALSE;
 
     if (available_out != NULL)
@@ -1060,9 +1185,9 @@ static const gchar *rigctld_client_find_vfo_token_in_table(vfo_t vfo,
                                                            GHashTable *table)
 {
     static const gchar *main_candidates[] =
-        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+        { "VFOA", "Main", "MainA", "VFO_MAIN", "RX", NULL };
     static const gchar *sub_candidates[] =
-        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+        { "VFOB", "Sub", "SubA", "VFO_SUB", "TX", NULL };
     const gchar * const *candidates = NULL;
 
     if (table == NULL)
@@ -1177,17 +1302,17 @@ static const gchar *rigctld_client_vfo_token(RigctldClient *client,
                                              vfo_t vfo)
 {
     static const gchar *main_candidates_default[] =
-        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+        { "VFOA", "Main", "MainA", "VFO_MAIN", "RX", NULL };
     static const gchar *sub_candidates_default[] =
-        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+        { "VFOB", "Sub", "SubA", "VFO_SUB", "TX", NULL };
     static const gchar *main_candidates_prefer[] =
-        { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
+        { "Main", "MainA", "VFO_MAIN", "RX", "VFOA", NULL };
     static const gchar *sub_candidates_prefer[] =
-        { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+        { "Sub", "SubA", "VFO_SUB", "TX", "VFOB", NULL };
     static const gchar *main_candidates_strict[] =
-        { "Main", "MainA", "VFO_MAIN", NULL };
+        { "Main", "MainA", "VFO_MAIN", "RX", NULL };
     static const gchar *sub_candidates_strict[] =
-        { "Sub", "SubA", "VFO_SUB", NULL };
+        { "Sub", "SubA", "VFO_SUB", "TX", NULL };
     const gchar *fallback = (vfo == VFO_SUB) ? "Sub" : "Main";
     const gchar * const *candidates = NULL;
     RigCaps *caps = NULL;
@@ -1591,17 +1716,17 @@ gboolean rigctld_client_probe(RigctldClient *client,
                               gint timeout_ms)
 {
     static const gchar *main_candidates[] =
-        { "VFOA", "Main", "MainA", "VFO_MAIN", NULL };
+        { "VFOA", "Main", "MainA", "VFO_MAIN", "RX", NULL };
     static const gchar *sub_candidates[] =
-        { "VFOB", "Sub", "SubA", "VFO_SUB", NULL };
+        { "VFOB", "Sub", "SubA", "VFO_SUB", "TX", NULL };
     static const gchar *main_candidates_prefer[] =
-        { "Main", "MainA", "VFO_MAIN", "VFOA", NULL };
+        { "Main", "MainA", "VFO_MAIN", "RX", "VFOA", NULL };
     static const gchar *sub_candidates_prefer[] =
-        { "Sub", "SubA", "VFO_SUB", "VFOB", NULL };
+        { "Sub", "SubA", "VFO_SUB", "TX", "VFOB", NULL };
     static const gchar *main_candidates_strict[] =
-        { "Main", "MainA", "VFO_MAIN", NULL };
+        { "Main", "MainA", "VFO_MAIN", "RX", NULL };
     static const gchar *sub_candidates_strict[] =
-        { "Sub", "SubA", "VFO_SUB", NULL };
+        { "Sub", "SubA", "VFO_SUB", "TX", NULL };
     gchar dump_state[4096];
     gchar reply[256];
     gint64 freq = 0;
@@ -1612,6 +1737,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean vfo_opt_set = FALSE;
     gboolean force_main_sub = FALSE;
     gboolean selection_only_main_sub_ok = FALSE;
+    gboolean daemon_vfo_mode = FALSE;
+    gint64 token_probe_freq = 0;
     gint select_attempts = 1;
     gulong select_settle_us = 0;
     GHashTable *vfo_selectable = NULL;
@@ -1684,13 +1811,15 @@ gboolean rigctld_client_probe(RigctldClient *client,
         }
     }
 
+    if (rigctld_client_try_chk_vfo(client, &daemon_vfo_mode,
+                                   timeout_ms, TRUE))
+        client->caps.vfo_opt_enabled = daemon_vfo_mode;
+
     client->caps.prefer_main_sub_tokens =
         (conf != NULL && conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
     force_main_sub = ((client->caps.quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
-    select_attempts = client->caps.prefer_main_sub_tokens ?
-        RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1;
-    select_settle_us = client->caps.prefer_main_sub_tokens ?
-        RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US : 0;
+    select_attempts = 1;
+    select_settle_us = 0;
 
     if (client->caps.vfo_candidates->len == 0)
     {
@@ -1700,14 +1829,21 @@ gboolean rigctld_client_probe(RigctldClient *client,
         rigctld_client_add_vfo_candidate(&client->caps, "MainA");
         rigctld_client_add_vfo_candidate(&client->caps, "Sub");
         rigctld_client_add_vfo_candidate(&client->caps, "SubA");
+        rigctld_client_add_vfo_candidate(&client->caps, "RX");
+        rigctld_client_add_vfo_candidate(&client->caps, "TX");
         rigctld_client_add_vfo_candidate(&client->caps, "currVFO");
     }
 
-    freq_ok = rigctld_client_try_get_freq_retry(client, "f\n",
+    freq_ok = rigctld_client_try_get_freq_retry(client,
+                                                client->caps.vfo_opt_enabled
+                                                    ? "f currVFO\n"
+                                                    : "f\n",
                                                 &freq, reply, sizeof(reply),
-                                                timeout_ms, 1,
+                                                timeout_ms, 0,
                                                 TRUE);
     client->caps.has_get_freq = freq_ok;
+    if (freq_ok)
+        token_probe_freq = freq;
 
     if (client->caps.prefer_main_sub_tokens)
     {
@@ -1725,7 +1861,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   select_attempts,
                                                   select_settle_us,
                                                   TRUE,
-                                                  TRUE,
+                                                  FALSE,
                                                   TRUE);
             const gchar *sub_token = NULL;
 
@@ -1740,7 +1876,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
                                                   select_attempts,
                                                   select_settle_us,
                                                   TRUE,
-                                                  TRUE,
+                                                  FALSE,
                                                   TRUE);
 
             if (main_token != NULL && sub_token != NULL)
@@ -1805,6 +1941,100 @@ gboolean rigctld_client_probe(RigctldClient *client,
                 }
             }
         }
+
+        if (client->caps.vfo_opt_enabled)
+        {
+            const gchar *main_token =
+                rigctld_client_find_vfo_token_in_table(VFO_MAIN,
+                                                       vfo_selectable);
+            const gchar *sub_token =
+                rigctld_client_find_vfo_token_in_table(VFO_SUB,
+                                                       vfo_selectable);
+
+            if ((main_token == NULL || sub_token == NULL) &&
+                rigctld_client_try_set_ok(client,
+                                          "\\set_vfo_opt 0\x0a",
+                                          reply, sizeof(reply),
+                                          timeout_ms,
+                                          TRUE))
+            {
+                client->caps.vfo_opt_enabled = FALSE;
+                sat_log_log(SAT_LOG_LEVEL_INFO,
+                            "rigctld probe: retrying Main/Sub selection with vfo_opt disabled");
+
+                for (gint round = 0;
+                     round < RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS &&
+                     (main_token == NULL || sub_token == NULL);
+                     round++)
+                {
+                    if (main_token == NULL)
+                    {
+                        main_token =
+                            rigctld_client_probe_select_token(client,
+                                                              main_candidates,
+                                                              vfo_selectable,
+                                                              timeout_ms,
+                                                              select_attempts,
+                                                              select_settle_us,
+                                                              TRUE,
+                                                              FALSE,
+                                                              TRUE);
+                    }
+                    if (sub_token == NULL)
+                    {
+                        sub_token =
+                            rigctld_client_probe_select_token(client,
+                                                              sub_candidates,
+                                                              vfo_selectable,
+                                                              timeout_ms,
+                                                              select_attempts,
+                                                              select_settle_us,
+                                                              TRUE,
+                                                              FALSE,
+                                                              TRUE);
+                    }
+                }
+
+                if (force_main_sub &&
+                    (main_token == NULL || sub_token == NULL))
+                {
+                    for (gint round = 0;
+                         round < RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS &&
+                         (main_token == NULL || sub_token == NULL);
+                         round++)
+                    {
+                        if (main_token == NULL)
+                        {
+                            main_token =
+                                rigctld_client_probe_select_token(
+                                    client,
+                                    main_candidates_strict,
+                                    vfo_selectable,
+                                    timeout_ms,
+                                    select_attempts,
+                                    select_settle_us,
+                                    TRUE,
+                                    FALSE,
+                                    TRUE);
+                        }
+                        if (sub_token == NULL)
+                        {
+                            sub_token =
+                                rigctld_client_probe_select_token(
+                                    client,
+                                    sub_candidates_strict,
+                                    vfo_selectable,
+                                    timeout_ms,
+                                    select_attempts,
+                                    select_settle_us,
+                                    TRUE,
+                                    FALSE,
+                                    TRUE);
+                        }
+                    }
+                }
+            }
+        }
     }
     else
     {
@@ -1829,7 +2059,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
             if (rigctld_client_try_get_freq_retry(client, "f\n",
                                                   &freq, reply, sizeof(reply),
-                                                  timeout_ms, 1,
+                                                  timeout_ms, 0,
                                                   TRUE))
             {
                 vfo_select_ok = TRUE;
@@ -1884,9 +2114,10 @@ gboolean rigctld_client_probe(RigctldClient *client,
         }
     }
 
-    if (client->caps.has_set_vfo_opt ||
-        (conf != NULL && conf->vfo_opt) ||
-        (client->caps.prefer_main_sub_tokens && !vfo_select_ok))
+    if ((client->caps.has_set_vfo_opt ||
+         (conf != NULL && conf->vfo_opt) ||
+         (client->caps.prefer_main_sub_tokens && !vfo_select_ok)) &&
+        !(client->caps.prefer_main_sub_tokens && vfo_select_ok))
     {
         vfo_opt_set = rigctld_client_try_set_ok(client,
                                                 "\\set_vfo_opt 1\x0a",
@@ -1927,23 +2158,22 @@ gboolean rigctld_client_probe(RigctldClient *client,
                 main_token = rigctld_client_probe_tokenized_vfo_token(
                     client, main_vfo_opt_candidates,
                     allow_unlisted,
+                    &token_probe_freq,
                     timeout_ms,
                     TRUE);
                 sub_token = rigctld_client_probe_tokenized_vfo_token(
                     client, sub_vfo_opt_candidates,
                     allow_unlisted,
+                    &token_probe_freq,
                     timeout_ms,
                     TRUE);
 
-                g_free(client->caps.vfo_token_main);
-                client->caps.vfo_token_main =
-                    main_token ? g_strdup(main_token) : NULL;
-                g_free(client->caps.vfo_token_sub);
-                client->caps.vfo_token_sub =
-                    sub_token ? g_strdup(sub_token) : NULL;
-
                 if (main_token != NULL && sub_token != NULL)
                 {
+                    g_free(client->caps.vfo_token_main);
+                    client->caps.vfo_token_main = g_strdup(main_token);
+                    g_free(client->caps.vfo_token_sub);
+                    client->caps.vfo_token_sub = g_strdup(sub_token);
                     vfo_opt_args_ok = TRUE;
                     g_free(client->caps.default_vfo_token);
                     client->caps.default_vfo_token = g_strdup(main_token);
@@ -1958,6 +2188,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
                     if (!rigctld_client_probe_tokenized_freq_token(client,
                                                                    token,
+                                                                   &token_probe_freq,
                                                                    timeout_ms,
                                                                    TRUE))
                         continue;
@@ -1983,21 +2214,15 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     if (conf != NULL &&
         conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB &&
-        vfo_select_ok)
-    {
-        /* Shared Main/Sub rigs should stay on the simpler V + F path when
-           both sides already prove selectable. The failing logs are on the
-           tokenized F <vfo> <freq> path, so do not promote that strategy. */
-        vfo_opt_args_ok = FALSE;
-    }
-
-    if (!vfo_select_ok &&
-        selection_only_main_sub_ok &&
-        !vfo_opt_args_ok &&
         client->caps.vfo_token_main != NULL &&
         client->caps.vfo_token_sub != NULL)
     {
         vfo_select_ok = TRUE;
+        selection_only_main_sub_ok = TRUE;
+        /* Shared Main/Sub rigs should stay on the simpler V + F path once
+           both sides resolve to selectable tokens. Tokenized F <vfo> <freq>
+           support is not reliable enough here. */
+        vfo_opt_args_ok = FALSE;
         if (!g_hash_table_contains(client->caps.vfo_working,
                                    client->caps.vfo_token_main))
         {
@@ -2031,13 +2256,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
     else if (vfo_select_ok)
     {
         client->caps.strategy = RIG_STRATEGY_SELECT_VFO;
-        if (client->caps.vfo_opt_enabled)
-        {
-            rigctld_client_try_set_ok(client, "\\set_vfo_opt 0\x0a",
-                                      reply, sizeof(reply), timeout_ms,
-                                      TRUE);
-            client->caps.vfo_opt_enabled = FALSE;
-        }
     }
     else if (freq_ok)
     {
@@ -2075,16 +2293,6 @@ gboolean rigctld_client_probe(RigctldClient *client,
         return FALSE;
     }
 
-    if (freq_ok)
-    {
-        gchar cmd[96];
-        g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq);
-        client->caps.has_set_freq =
-            rigctld_client_try_set_ok(client, cmd,
-                                      reply, sizeof(reply), timeout_ms,
-                                      TRUE);
-    }
-
     if (!dump_ok && !freq_ok && !vfo_select_ok && !vfo_opt_args_ok)
     {
         rigctld_client_set_state(client, RIGCTLD_CLIENT_DEGRADED,
@@ -2120,16 +2328,19 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
 
     if (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
-        const gchar *token = NULL;
-        token = rigctld_client_vfo_token(client, vfo);
-        g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
+        if (caps->has_tokenized_get_freq)
         {
-            gboolean ok = rigctld_client_try_get_freq(client, cmd,
-                                                      freq_out, reply,
-                                                      sizeof(reply), 500,
-                                                      FALSE);
-            g_rec_mutex_unlock(rigctld_client_meta_lock(client));
-            return ok;
+            const gchar *token = NULL;
+            token = rigctld_client_vfo_token(client, vfo);
+            g_snprintf(cmd, sizeof(cmd), "f %s\x0a", token);
+            {
+                gboolean ok = rigctld_client_try_get_freq(client, cmd,
+                                                          freq_out, reply,
+                                                          sizeof(reply), 500,
+                                                          FALSE);
+                g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+                return ok;
+            }
         }
     }
 
@@ -2144,7 +2355,8 @@ gboolean rigctld_client_get_freq(RigctldClient *client,
             g_usleep(RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US);
     }
 
-    g_snprintf(cmd, sizeof(cmd), "f\x0a");
+    g_snprintf(cmd, sizeof(cmd), "%s",
+               caps->vfo_opt_enabled ? "f currVFO\x0a" : "f\x0a");
     {
         gboolean ok = rigctld_client_try_get_freq(client, cmd,
                                                   freq_out, reply,
@@ -2225,16 +2437,47 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
 
     if (caps->strategy == RIG_STRATEGY_VFO_OPT_ARGS)
     {
+        gboolean can_select = (vfo == VFO_MAIN || vfo == VFO_SUB);
+
         token = rigctld_client_vfo_token(client, vfo);
-        g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
-                   token, freq_hz);
+        if (token != NULL && *token != '\0')
         {
-            gboolean ok = rigctld_client_try_set_ok(client, cmd,
-                                                    reply, sizeof(reply), 500,
-                                                    TRUE);
-            g_rec_mutex_unlock(rigctld_client_meta_lock(client));
-            return ok;
+            g_snprintf(cmd, sizeof(cmd), "F %s %" G_GINT64_FORMAT "\x0a",
+                       token, freq_hz);
+            ok = rigctld_client_try_set_ok(client, cmd,
+                                           reply, sizeof(reply), 500,
+                                           TRUE);
+            if (ok)
+                caps->has_tokenized_set_freq = TRUE;
+            if (ok || !can_select)
+            {
+                g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+                return ok;
+            }
         }
+
+        if (can_select)
+        {
+            if (!rigctld_client_ensure_vfo(client, vfo))
+            {
+                g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+                return FALSE;
+            }
+            if (fragile_main_sub)
+                g_usleep(RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US);
+        }
+
+        g_snprintf(cmd, sizeof(cmd),
+                   caps->vfo_opt_enabled ? "F currVFO %" G_GINT64_FORMAT "\x0a"
+                                         : "F %" G_GINT64_FORMAT "\x0a",
+                   freq_hz);
+        ok = rigctld_client_try_set_ok(client, cmd,
+                                       reply, sizeof(reply), 500,
+                                       TRUE);
+        if (ok)
+            caps->has_set_freq = TRUE;
+        g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+        return ok;
     }
 
     if (caps->strategy == RIG_STRATEGY_SELECT_VFO)
@@ -2249,7 +2492,10 @@ gboolean rigctld_client_set_freq(RigctldClient *client,
         if (can_select && fragile_main_sub)
             g_usleep(RIGCTLD_MAIN_SUB_FRAGILE_SELECT_SETTLE_US);
 
-        g_snprintf(cmd, sizeof(cmd), "F %" G_GINT64_FORMAT "\x0a", freq_hz);
+        g_snprintf(cmd, sizeof(cmd),
+                   caps->vfo_opt_enabled ? "F currVFO %" G_GINT64_FORMAT "\x0a"
+                                         : "F %" G_GINT64_FORMAT "\x0a",
+                   freq_hz);
         ok = rigctld_client_try_set_ok(client, cmd,
                                        reply, sizeof(reply), 500,
                                        TRUE);

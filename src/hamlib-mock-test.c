@@ -163,7 +163,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
                                        gboolean fail_plain_get_freq,
                                        gboolean fail_get_vfo,
                                        gboolean require_vfo_before_set,
-                                       gint fail_vfo_select_count)
+                                       gint fail_vfo_select_count,
+                                       gboolean omit_rprt_tokenized_freq)
 {
     GSubprocess *proc = NULL;
     GError *error = NULL;
@@ -196,6 +197,8 @@ static GSubprocess *spawn_rigctld_mock(const gchar *python,
         g_ptr_array_add(argv, g_strdup("--fail-plain-get-freq"));
     if (fail_get_vfo)
         g_ptr_array_add(argv, g_strdup("--fail-get-vfo"));
+    if (omit_rprt_tokenized_freq)
+        g_ptr_array_add(argv, g_strdup("--omit-rprt-tokenized-freq"));
     if (require_vfo_before_set)
         g_ptr_array_add(argv, g_strdup("--require-vfo-before-set"));
     if (fail_vfo_select_count > 0)
@@ -841,26 +844,28 @@ int main(void)
 
     rig_proc = spawn_rigctld_mock(python, rig_script, rig_port, FALSE, FALSE,
                                   FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
-                                  FALSE, 0);
+                                  FALSE, 0, FALSE);
     rig_select_proc = spawn_rigctld_mock(python, rig_script, rig_port_select,
                                          TRUE, FALSE, FALSE, FALSE, FALSE,
-                                         FALSE, FALSE, FALSE, TRUE, 2);
+                                         FALSE, FALSE, FALSE, TRUE, 2, FALSE);
     rig_reject_proc = spawn_rigctld_mock(python, rig_script, rig_port_reject,
                                          FALSE, TRUE, FALSE, FALSE, FALSE,
-                                         FALSE, FALSE, FALSE, FALSE, 0);
+                                         FALSE, FALSE, FALSE, FALSE, 0, FALSE);
     rig_missing_sub_proc = spawn_rigctld_mock(python, rig_script,
                                               rig_port_missing_sub,
                                               TRUE, FALSE, TRUE, FALSE, FALSE,
-                                              FALSE, FALSE, FALSE, FALSE, 0);
+                                              FALSE, FALSE, FALSE, FALSE, 0,
+                                              FALSE);
     rig_select_only_proc = spawn_rigctld_mock(python, rig_script,
                                               rig_port_select_only,
                                               TRUE, FALSE, FALSE, TRUE, TRUE,
-                                              FALSE, FALSE, FALSE, FALSE, 0);
+                                              FALSE, FALSE, FALSE, FALSE, 0,
+                                              FALSE);
     rig_vfo_opt_hidden_proc = spawn_rigctld_mock(python, rig_script,
                                                  rig_port_vfo_opt_hidden,
                                                  FALSE, FALSE, FALSE, FALSE,
                                                  TRUE, TRUE, TRUE, TRUE,
-                                                 FALSE, 0);
+                                                 FALSE, 0, TRUE);
     rot_proc = spawn_rotctld_mock(python, rot_script, rot_port,
                                   FALSE, FALSE, FALSE, FALSE, 0, TRUE);
     if (rig_proc == NULL || rig_select_proc == NULL ||

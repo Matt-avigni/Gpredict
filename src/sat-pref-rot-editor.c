@@ -90,6 +90,7 @@ static void update_el_limits_sensitivity(RotPrefUi *ui);
 static void update_el_overtravel_visibility(RotPrefUi *ui, gboolean az_el);
 static void axismode_changed_cb(GtkComboBox *box, gpointer data);
 static void el_overtravel_toggled_cb(GtkToggleButton *button, gpointer data);
+static void disable_pos_feedback_toggled_cb(GtkToggleButton *button, gpointer data);
 static void name_changed(GtkWidget *widget, gpointer data);
 static gboolean rot_pref_form_is_valid(RotPrefUi *ui);
 static void rot_pref_update_ok_button(RotPrefUi *ui);
@@ -319,21 +320,56 @@ static gboolean rot_pref_is_other_id(const gchar *id)
     return g_strcmp0(id, ROT_DEVICE_OTHER_ID) == 0;
 }
 
+static gboolean rot_pref_no_encoder_enabled(RotPrefUi *ui)
+{
+    if (ui == NULL || ui->disable_pos_feedback == NULL)
+        return FALSE;
+
+    return gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(ui->disable_pos_feedback));
+}
+
 static void rot_pref_update_device_ui_state(RotPrefUi *ui)
 {
     gboolean autopick = FALSE;
+    gboolean no_encoder = FALSE;
     const gchar *active_id = NULL;
     gboolean show_manual = FALSE;
 
     if (ui == NULL)
         return;
 
+    no_encoder = rot_pref_no_encoder_enabled(ui);
+
     if (ui->device_autopick)
+    {
+        if (no_encoder &&
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->device_autopick)))
+        {
+            g_signal_handlers_block_by_func(ui->device_autopick,
+                                            (gpointer)G_CALLBACK(device_autopick_toggled_cb),
+                                            ui);
+            g_signal_handlers_block_by_func(ui->device_autopick,
+                                            (gpointer)G_CALLBACK(rot_pref_on_field_changed),
+                                            ui);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->device_autopick), FALSE);
+            g_signal_handlers_unblock_by_func(ui->device_autopick,
+                                              (gpointer)G_CALLBACK(rot_pref_on_field_changed),
+                                              ui);
+            g_signal_handlers_unblock_by_func(ui->device_autopick,
+                                              (gpointer)G_CALLBACK(device_autopick_toggled_cb),
+                                              ui);
+        }
         autopick = gtk_toggle_button_get_active(
             GTK_TOGGLE_BUTTON(ui->device_autopick));
+        gtk_widget_set_sensitive(ui->device_autopick, !no_encoder);
+    }
 
     if (ui->device_combo)
         active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->device_combo));
+
+    if (no_encoder)
+        autopick = FALSE;
 
     if (!autopick)
     {
@@ -1126,6 +1162,17 @@ static void device_autopick_toggled_cb(GtkToggleButton *button, gpointer data)
     rot_pref_schedule_device_combo_refresh(ui);
 }
 
+static void disable_pos_feedback_toggled_cb(GtkToggleButton *button, gpointer data)
+{
+    RotPrefUi *ui = data;
+
+    if (ui != NULL && ui->ui_updating)
+        return;
+
+    rot_pref_update_device_ui_state(ui);
+    rot_pref_on_field_changed(GTK_WIDGET(button), data);
+}
+
 static void device_combo_changed_cb(GtkComboBox *box, gpointer data)
 {
     RotPrefUi *ui = data;
@@ -1591,7 +1638,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback), FALSE);
     gtk_grid_attach(GTK_GRID(table), ui->disable_pos_feedback, 0, 20, 4, 1);
     g_signal_connect(ui->disable_pos_feedback, "toggled",
-                     G_CALLBACK(rot_pref_on_field_changed), ui);
+                     G_CALLBACK(disable_pos_feedback_toggled_cb), ui);
 
 
     if (conf->name != NULL)
@@ -1657,6 +1704,9 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
             GTK_TOGGLE_BUTTON(ui->device_autopick));
         const gchar *active_id = NULL;
         const gchar *manual_text = NULL;
+
+        if (rot_pref_no_encoder_enabled(ui))
+            autopick = FALSE;
 
         if (ui->device_combo)
             active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->device_combo));

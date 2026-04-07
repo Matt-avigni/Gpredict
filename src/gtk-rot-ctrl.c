@@ -917,6 +917,7 @@ static double   rotctrl_az_abs_error(double measured_abs,
                                      AzSpan span_mode,
                                      gboolean span_extended);
 static gboolean rotctrl_get_pos_valid(GtkRotCtrl *ctrl, gint64 *last_pos_us);
+static gboolean rotctrl_no_encoder_mode(const GtkRotCtrl *ctrl);
 static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
                                    gint64 window_us,
                                    gint64 *last_pos_us);
@@ -1072,6 +1073,10 @@ static void     rotctrl_map_mech_to_user(GtkRotCtrl *ctrl,
                                          gdouble mech_el,
                                          gdouble *user_az,
                                          gdouble *user_el);
+static void     rotctrl_synthesize_feedback_from_command(GtkRotCtrl *ctrl,
+                                                         gdouble mech_az,
+                                                         gdouble mech_el,
+                                                         gint64 sample_us);
 static void     rot_transform_snapshot_defaults(RotTransformSnapshot *transform);
 static void     rot_transform_snapshot_state_init(RotTransformSnapshotState *state);
 static void     rot_transform_snapshot_publish(GtkRotCtrl *ctrl, gboolean ready);
@@ -2459,7 +2464,7 @@ static void rotctrl_update_session_state(GtkRotCtrl *ctrl,
     if (ctrl == NULL)
         return;
 
-    feedback_disabled = (ctrl->conf && ctrl->conf->disable_pos_feedback_checks);
+    feedback_disabled = rotctrl_no_encoder_mode(ctrl);
 
     (void)pos_unknown;
     (void)pos_cmd_ok;
@@ -5494,6 +5499,13 @@ static gboolean rotctrl_refresh_user_position(GtkRotCtrl *ctrl,
     return have;
 }
 
+static gboolean rotctrl_no_encoder_mode(const GtkRotCtrl *ctrl)
+{
+    return (ctrl != NULL &&
+            ctrl->conf != NULL &&
+            ctrl->conf->disable_pos_feedback_checks);
+}
+
 static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
                                    gint64 window_us,
                                    gint64 *last_pos_us)
@@ -5525,7 +5537,7 @@ static gboolean rotctrl_session_ready(GtkRotCtrl *ctrl,
 
     return ctrl->engaged &&
            (ctrl->session_state == ROT_SESSION_READY) &&
-           pos_recent;
+           (pos_recent || rotctrl_no_encoder_mode(ctrl));
 }
 
 static gboolean rotctrl_manual_override_active(GtkRotCtrl *ctrl)
@@ -6735,7 +6747,7 @@ static gboolean rotctrl_stale_suppressed(const GtkRotCtrl *ctrl)
     if (ctrl == NULL)
         return TRUE;
 
-    if (ctrl->conf && ctrl->conf->disable_pos_feedback_checks)
+    if (rotctrl_no_encoder_mode(ctrl))
         return TRUE;
 
     if (ctrl->cal_active || ctrl->cal_hold_active)
@@ -7701,6 +7713,46 @@ static void rotctrl_map_mech_to_user(GtkRotCtrl *ctrl,
         *user_az = az_conf;
     if (user_el)
         *user_el = el_conf;
+}
+
+static void rotctrl_synthesize_feedback_from_command(GtkRotCtrl *ctrl,
+                                                     gdouble mech_az,
+                                                     gdouble mech_el,
+                                                     gint64 sample_us)
+{
+    gdouble user_az = 0.0;
+    gdouble user_el = 0.0;
+
+    if (ctrl == NULL)
+        return;
+
+    if (sample_us <= 0)
+        sample_us = g_get_monotonic_time();
+
+    rotctrl_map_mech_to_user(ctrl, mech_az, mech_el, &user_az, &user_el);
+
+    g_mutex_lock(&ctrl->client.mutex);
+    ctrl->client.azi_mech_in = mech_az;
+    ctrl->client.ele_mech_in = mech_el;
+    ctrl->client.azi_in = user_az;
+    ctrl->client.azi_az360 = gp_backend_to_az360(mech_az);
+    ctrl->client.ele_in = user_el;
+    ctrl->client.last_pos_user_az = user_az;
+    ctrl->client.last_pos_user_el = user_el;
+    ctrl->client.last_pos_sample_us = sample_us;
+    ctrl->client.last_pos_us = sample_us;
+    ctrl->client.pos_valid = TRUE;
+    ctrl->client.pos_invalid = FALSE;
+    ctrl->client.pos_unknown = FALSE;
+    ctrl->client.pos_cmd_ok = TRUE;
+    ctrl->client.handshake_pos_ok = TRUE;
+    ctrl->client.first_pos_deadline_us = 0;
+    ctrl->client.pos_failures = 0;
+    ctrl->client.pos_degraded = FALSE;
+    ctrl->client.pos_backoff_until_us = 0;
+    ctrl->client.pos_backoff_sec = 0.5;
+    ctrl->client.last_pos_error[0] = '\0';
+    g_mutex_unlock(&ctrl->client.mutex);
 }
 
 static gboolean rot_manual_input_event(GtkWidget *widget, GdkEvent *event,
@@ -9371,7 +9423,7 @@ static gpointer rotctld_client_thread(gpointer data)
         ctrl->client.stop_pending = FALSE;
         g_mutex_unlock(&ctrl->client.mutex);
 
-        feedback_disabled = (ctrl->conf && ctrl->conf->disable_pos_feedback_checks);
+        feedback_disabled = rotctrl_no_encoder_mode(ctrl);
         if (feedback_disabled && !ctrl->client.feedback_disabled_logged)
         {
             rot_term_log(ctrl, "gpredict:rx",
@@ -9471,6 +9523,9 @@ static gpointer rotctld_client_thread(gpointer data)
                 (last_attempt_us == 0 ||
                  since_cmd_us >= ((gint64)ROT_CMD_MIN_PERIOD_MS * 1000));
             gboolean trigger_send = (new_trg || force_pending);
+
+            if (feedback_disabled && desired_tracking)
+                min_period_ok = TRUE;
 
             if (!desired_allow && !force_pending)
             {
@@ -9872,6 +9927,8 @@ static gpointer rotctld_client_thread(gpointer data)
                 if (clear_trg)
                     ctrl->client.apply_calib = FALSE;
                 g_mutex_unlock(&ctrl->client.mutex);
+                if (set_res == ROT_SET_OK && feedback_disabled)
+                    rotctrl_synthesize_feedback_from_command(ctrl, azi, ele, now_us);
                 clear_trg = FALSE;
             }
 
@@ -9896,7 +9953,10 @@ static gpointer rotctld_client_thread(gpointer data)
                                  azs, els);
         }
 
-        if (!io_error && !send_cmd && ctrl->client.client != NULL)
+        if (!feedback_disabled &&
+            !io_error &&
+            !send_cmd &&
+            ctrl->client.client != NULL)
         {
             gdouble cur_az = 0.0;
             gdouble cur_el = 0.0;
@@ -10549,18 +10609,7 @@ get_pos_done:
             g_mutex_unlock(&ctrl->client.mutex);
         }
 
-        /* Encoder-less mode fallback: when feedback checks are explicitly
-         * disabled, mirror the commanded point as measured state.
-         */
         g_mutex_lock(&ctrl->client.mutex);
-        if (feedback_disabled &&
-            !io_error &&
-            send_cmd &&
-            !ctrl->client.cmd_rejected)
-        {
-            ctrl->client.azi_in = rot_az_to_conf(ctrl->conf, ctrl->client.azi_out);
-            ctrl->client.ele_in = ctrl->client.ele_out;
-        }
         ctrl->client.io_error = io_error;
         g_mutex_unlock(&ctrl->client.mutex);
 
@@ -11362,11 +11411,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean plan_active = rot_plan_matches_pass(ctrl);
     gboolean session_ready = FALSE;
     gchar last_pos_error[64] = { 0 };
-        gboolean autocal_active = FALSE;
-        gboolean autocal_direct = FALSE;
+    gboolean autocal_active = FALSE;
+    gboolean autocal_direct = FALSE;
     gboolean cal_hold_active = FALSE;
     gboolean cal_force_send = FALSE;
     gboolean park_active = FALSE;
+    gboolean no_encoder = rotctrl_no_encoder_mode(ctrl);
 
     pos_recent = rotctrl_pos_recent(ctrl,
                                     (gint64)rotctrl_stale_ms(ctrl) * 1000,
@@ -12401,7 +12451,14 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             target_age_ms = (now_us - ctrl->last_target_update_us) / 1000;
 
         ctrl->stale_recovered_pulse = FALSE;
-        if (ctrl->cal_active)
+        if (no_encoder)
+        {
+            pos_fresh = TRUE;
+            ctrl->stale_hold_active = FALSE;
+            ctrl->stale_hold_since_us = 0;
+            ctrl->stale_resume_since_us = 0;
+        }
+        else if (ctrl->cal_active)
         {
             ctrl->stale_hold_active = FALSE;
             ctrl->stale_hold_since_us = 0;
@@ -12480,6 +12537,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         }
 
         pos_stale_now = ctrl->tracking && ctrl->engaged && !pos_recent;
+        if (no_encoder)
+            pos_stale_now = FALSE;
         if (ctrl->cal_active)
             pos_stale_now = FALSE;
 
@@ -13475,8 +13534,9 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
 
         manual_override = rotctrl_manual_override_active(ctrl);
         allow_no_pos_manual =
-            (!ctrl->tracking) &&
-            (manual_override || ctrl->have_user_command);
+            no_encoder ||
+            ((!ctrl->tracking) &&
+             (manual_override || ctrl->have_user_command || ctrl->park_requested));
         {
             gboolean user_cmd_allowed =
                 ctrl->have_user_command ||
@@ -13955,6 +14015,20 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                 gate = ROT_CMD_ACTION_SUPPRESS;
                 reason = ROT_CMD_REASON_MIN_STEP;
             }
+        }
+
+        if (no_encoder &&
+            ctrl->tracking &&
+            allow_send &&
+            have_target &&
+            reason != ROT_CMD_REASON_RANGE)
+        {
+            send_ok = TRUE;
+            gate = ROT_CMD_ACTION_SEND;
+            reason = ctrl->setpoint_valid ? ROT_CMD_REASON_RESEND
+                                          : ROT_CMD_REASON_INITIAL;
+            resend_due = TRUE;
+            min_step_exceeded = TRUE;
         }
 
         g_mutex_lock(&ctrl->client.mutex);
@@ -19196,6 +19270,18 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
             return G_SOURCE_REMOVE;
         }
 
+        if (rotctrl_no_encoder_mode(ctrl))
+        {
+            g_free(first_line);
+            g_free(full_text);
+            g_free(line1);
+            g_free(line2);
+            rotctld_probe_state_detach(state);
+            rotctld_finish_engage(ctrl);
+            rotctld_probe_state_unref(state);
+            return G_SOURCE_REMOVE;
+        }
+
         {
             gint validate_timeout_ms = ROTCTLD_AUTODETECT_VALIDATE_TIMEOUT_MS;
             const gchar *device_hint = NULL;
@@ -19304,6 +19390,8 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
     {
         rotctld_log_exit(ctrl, state, "probe_exit");
 
+        if (rotctrl_no_encoder_mode(ctrl))
+            rot_show_no_rotor_dialog(ctrl);
         g_free(first_line);
         g_free(full_text);
         rotctld_probe_state_detach(state);
@@ -19374,6 +19462,8 @@ static gboolean rotctld_probe_retry_cb(gpointer data)
                          ctrl->conf->name ? ctrl->conf->name : "(unnamed)");
         }
 
+        if (rotctrl_no_encoder_mode(ctrl))
+            rot_show_no_rotor_dialog(ctrl);
         g_free(first_line);
         g_free(full_text);
         rotctld_probe_state_detach(state);
@@ -19761,7 +19851,8 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
     state->delay_ms = 50;
     state->ref_count = 1;
     state->cancelled = FALSE;
-    if (ctrl->conf->host && *ctrl->conf->host &&
+    if (!rotctrl_no_encoder_mode(ctrl) &&
+        ctrl->conf->host && *ctrl->conf->host &&
         !rotctld_mgr_host_is_local(ctrl->conf->host))
     {
         rot_term_log(ctrl, "gpredict:err",
@@ -19772,7 +19863,7 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
         return ROTCTLD_ENSURE_FAILED;
     }
 
-    state->autodetect_enabled = TRUE;
+    state->autodetect_enabled = !rotctrl_no_encoder_mode(ctrl);
     state->autodetect_state = ROTCTLD_AUTODETECT_IDLE;
     state->autodetect_generation = 0;
     state->autodetect_state_since_us = 0;
@@ -19996,10 +20087,18 @@ static void G_GNUC_UNUSED rot_schedule_cmd_reject(GtkRotCtrl *ctrl,
  */
 static void rot_show_no_rotor_dialog(GtkRotCtrl *ctrl)
 {
+    const gchar *message = _("Unable to find a rotor!");
+
+    if (rotctrl_no_encoder_mode(ctrl))
+    {
+        message = _("No encoder mode active. Could not verify rotctld on the configured "
+                    "host/port. Check port, device path, and baud.");
+    }
+
     rot_show_message(ctrl,
                      GTK_MESSAGE_ERROR,
                      _("Rotor error"),
-                     _("Unable to find a rotor!"));
+                     message);
 }
 
 static void rot_show_conf_error(GtkRotCtrl *ctrl, const gchar *reason)

@@ -106,12 +106,7 @@ RadioUiStatus radio_compute_ui_status(const RigStateSnapshot *s)
         return RADIO_UI_STATUS_ERROR;
     if (s->link_lost)
         return RADIO_UI_STATUS_LINK_LOST;
-    if (!s->active_flow)
-        return RADIO_UI_STATUS_STABLE;
-    if (s->consecutive_link_failures >= 2u ||
-        s->link_fail_count_in_window >= 3u)
-        return RADIO_UI_STATUS_LINK_LOST;
-    if (s->degraded || s->total_fail_count_in_window >= 2u)
+    if (s->degraded)
         return RADIO_UI_STATUS_DEGRADED;
     return RADIO_UI_STATUS_STABLE;
 }

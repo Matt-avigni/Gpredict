@@ -96,7 +96,7 @@ static void run_rig_tests(void)
                              RADIO_UI_STATUS_STABLE,
                              "rig stable with 5 OK");
 
-    /* b) 2 rejects in window while active => DEGRADED */
+    /* b) command rejects alone do not flip connection state */
     rig_ui_command_window_init(&window);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 100000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_COMMAND_REJECT, t0 + 200000);
@@ -104,10 +104,10 @@ static void run_rig_tests(void)
     rig_ui_command_window_record(&window, RIG_UI_CMD_COMMAND_REJECT, t0 + 400000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 500000);
     expect_radio_from_window(&window, t0 + 600000, TRUE, FALSE, FALSE, FALSE, FALSE,
-                             RADIO_UI_STATUS_DEGRADED,
-                             "rig degraded with 2 rejects");
+                             RADIO_UI_STATUS_STABLE,
+                             "rig stable with command rejects only");
 
-    /* c) 2 consecutive timeouts/link fails => LINK LOST */
+    /* c) reliability window alone does not mark link lost */
     rig_ui_command_window_init(&window);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 100000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 200000);
@@ -115,10 +115,10 @@ static void run_rig_tests(void)
     rig_ui_command_window_record(&window, RIG_UI_CMD_LINK_FAIL, t0 + 400000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_LINK_FAIL, t0 + 500000);
     expect_radio_from_window(&window, t0 + 600000, TRUE, FALSE, FALSE, FALSE, FALSE,
-                             RADIO_UI_STATUS_LINK_LOST,
-                             "rig link lost with 2 consecutive link failures");
+                             RADIO_UI_STATUS_STABLE,
+                             "rig stable until link state is actually lost");
 
-    /* d) 3 link fails in last 5 => LINK LOST */
+    /* d) explicit degraded flag still wins */
     rig_ui_command_window_init(&window);
     rig_ui_command_window_record(&window, RIG_UI_CMD_LINK_FAIL, t0 + 100000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 200000);
@@ -126,8 +126,18 @@ static void run_rig_tests(void)
     rig_ui_command_window_record(&window, RIG_UI_CMD_OK, t0 + 400000);
     rig_ui_command_window_record(&window, RIG_UI_CMD_LINK_FAIL, t0 + 500000);
     expect_radio_from_window(&window, t0 + 600000, TRUE, FALSE, FALSE, FALSE, FALSE,
+                             RADIO_UI_STATUS_STABLE,
+                             "rig stable with stale link failures only");
+
+    rig_ui_command_window_init(&window);
+    expect_radio_from_window(&window, t0 + 600000, TRUE, FALSE, FALSE, FALSE, TRUE,
+                             RADIO_UI_STATUS_DEGRADED,
+                             "rig degraded on explicit degraded flag");
+
+    rig_ui_command_window_init(&window);
+    expect_radio_from_window(&window, t0 + 600000, TRUE, FALSE, FALSE, TRUE, FALSE,
                              RADIO_UI_STATUS_LINK_LOST,
-                             "rig link lost with 3 link fails in window");
+                             "rig link lost on explicit link-lost flag");
 
     /* e) inactive (connected) but engaged => STABLE */
     rig_ui_command_window_init(&window);

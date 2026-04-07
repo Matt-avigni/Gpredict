@@ -248,6 +248,26 @@ static gboolean rigctld_conf_needs_vfo_switch(const radio_conf_t *conf)
     return model_id == RIGCTLD_MODEL_IC9700;
 }
 
+static gint rigctld_conf_uplink_option(const radio_conf_t *conf)
+{
+    if (conf == NULL || conf->radio_mode != RADIO_MODE_FULL_DUPLEX_MAIN_SUB)
+        return 0;
+
+    switch (conf->uplink_vfo)
+    {
+    case VFO_B:
+    case VFO_SUB:
+        return 1;
+
+    case VFO_A:
+    case VFO_MAIN:
+        return 2;
+
+    default:
+        return 0;
+    }
+}
+
 static void rigctld_mgr_emit_log(RigctldMgr *mgr, const gchar *prefix,
                                  const gchar *line)
 {
@@ -948,6 +968,8 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         gboolean extra_verbose = FALSE;
         gboolean want_vfo_switch = rigctld_conf_needs_vfo_switch(conf);
         gboolean have_vfo_switch = FALSE;
+        gint uplink_option = rigctld_conf_uplink_option(conf);
+        gboolean have_uplink_option = FALSE;
         gboolean want_verbose = (conf != NULL &&
                                  conf->rig_log_level >= RIG_LOG_VERBOSE);
         gchar **extra_argv = NULL;
@@ -976,6 +998,9 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
 
             have_vfo_switch = rigctld_argv_has_flag(extra_argv, extra_argc,
                                                     "--vfo");
+            have_uplink_option =
+                rigctld_argv_has_flag(extra_argv, extra_argc, "--uplink") ||
+                rigctld_argv_has_flag(extra_argv, extra_argc, "-x");
         }
 
         if (!extra_verbose && want_verbose)
@@ -986,6 +1011,12 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
          */
         if (want_vfo_switch && !have_vfo_switch)
             g_ptr_array_add(argv, g_strdup("--vfo"));
+
+        if (uplink_option > 0 && !have_uplink_option)
+        {
+            g_ptr_array_add(argv, g_strdup("--uplink"));
+            g_ptr_array_add(argv, g_strdup_printf("%d", uplink_option));
+        }
 
         if (extra_argv != NULL)
         {
