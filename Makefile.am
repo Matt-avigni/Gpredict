@@ -15,6 +15,7 @@ install-data-local:
 	$(INSTALL_DATA) $(top_srcdir)/COPYING $(DESTDIR)$(pkgdatadir)
 
 EXTRA_DIST = \
+	.gitattributes \
 	.github/workflows/windows-installer.yml \
 	autogen.sh            \
 	git-version-gen       \

@@ -11,6 +11,8 @@ on:
 jobs:
   build-windows-installer:
     runs-on: windows-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     defaults:
       run:
@@ -18,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -55,7 +57,7 @@ jobs:
       - name: Verify MSYS2 build tools
         run: |
           set -euo pipefail
-          for tool in bash git autoreconf pkg-config gcc make ntldd makensis; do
+          for tool in bash git autoreconf pkg-config gcc make ntldd makensis zip glib-compile-schemas nproc; do
             command -v "$tool"
           done
           git --version
@@ -72,10 +74,13 @@ jobs:
           fi
 
       - name: Build installer
-        run: packaging/windows/build-installer.sh
+        run: |
+          set -euo pipefail
+          sed -i 's/\r$//' packaging/windows/build-installer.sh packaging/windows/hamlib-source.env
+          bash ./packaging/windows/build-installer.sh
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: gpredict-windows-installer
           path: build/windows-ucrt64/artifacts/*
