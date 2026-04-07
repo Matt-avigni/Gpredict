@@ -4,6 +4,11 @@ desktop_DATA = $(desktop_in_files:.desktop.in=.desktop)
 
 @INTLTOOL_DESKTOP_RULE@
 
+# intltool's desktop rule is not consistently materialized in out-of-tree
+# MinGW builds, so provide an explicit fallback.
+gpredict.desktop: $(srcdir)/gpredict.desktop.in
+	$(AM_V_GEN)cp $(srcdir)/gpredict.desktop.in $@
+
 EXTRA_DIST = $(desktop_in_files) $(desktop_DATA)
 
 DISTCLEANFILES = gpredict.desktop
