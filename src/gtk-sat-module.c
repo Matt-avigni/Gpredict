@@ -161,6 +161,13 @@ static void gtk_sat_module_destroy(GtkWidget * widget)
     guint           i;
     GCancellable   *cancellable;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module destroy begin name=%s state=%d rigctrlwin=%p rotctrlwin=%p",
+                     module->name ? module->name : "(unnamed)",
+                     (gint) module->state,
+                     (void *) module->rigctrlwin,
+                     (void *) module->rotctrlwin);
+
     /*save the configuration */
     mod_cfg_save(module->name, module->cfgdata);
 
@@ -180,6 +187,9 @@ static void gtk_sat_module_destroy(GtkWidget * widget)
     /* destroy time controller */
     if (module->tmgActive)
     {
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "module destroy name=%s destroying time manager window",
+                         module->name ? module->name : "(unnamed)");
         gtk_widget_destroy(module->tmgWin);
         module->tmgActive = FALSE;
     }
@@ -187,16 +197,25 @@ static void gtk_sat_module_destroy(GtkWidget * widget)
     /* destroy radio and rotator controllers */
     if (module->rigctrlwin)
     {
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "module destroy name=%s destroying radio control window",
+                         module->name ? module->name : "(unnamed)");
         gtk_widget_destroy(module->rigctrlwin);
     }
     if (module->rotctrlwin)
     {
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "module destroy name=%s destroying rotator control window",
+                         module->name ? module->name : "(unnamed)");
         gtk_widget_destroy(module->rotctrlwin);
     }
 
     /* destroy sky at a glance window */
     if (module->skgwin)
     {
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "module destroy name=%s destroying sky-at-glance window",
+                         module->name ? module->name : "(unnamed)");
         gtk_widget_destroy(module->skgwin);
     }
 
@@ -227,6 +246,10 @@ static void gtk_sat_module_destroy(GtkWidget * widget)
         g_free(module->grid);
         module->grid = NULL;
     }
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module destroy end name=%s",
+                     module->name ? module->name : "(unnamed)");
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }

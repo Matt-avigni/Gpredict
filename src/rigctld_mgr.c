@@ -38,7 +38,13 @@
 #endif
 
 #define RIGCTLD_LOG_MAX_LEN 4096
+#define RIGCTLD_LOG_MAX_LINES 64
 #define RIGCTLD_MODEL_IC9700 3081
+
+typedef struct {
+    gchar *prefix;
+    gchar *line;
+} RigctldReplayLine;
 
 struct _RigctldMgr {
     GSubprocess *proc;
@@ -47,6 +53,7 @@ struct _RigctldMgr {
     GThread     *exit_thread;
     GMutex       log_lock;
     GString     *log;
+    GQueue      *replay_lines;
     FILE        *log_file;
     gchar       *log_path;
     RigctldMgrLogFunc log_cb;
@@ -63,6 +70,28 @@ typedef struct {
     GDataInputStream *stream;
     const gchar *prefix;
 } RigctldLogReader;
+
+static RigctldReplayLine *rigctld_replay_line_new(const gchar *prefix,
+                                                  const gchar *line)
+{
+    RigctldReplayLine *entry = g_new0(RigctldReplayLine, 1);
+
+    entry->prefix = g_strdup(prefix ? prefix : "");
+    entry->line = g_strdup(line ? line : "");
+    return entry;
+}
+
+static void rigctld_replay_line_free(gpointer data)
+{
+    RigctldReplayLine *entry = data;
+
+    if (entry == NULL)
+        return;
+
+    g_free(entry->prefix);
+    g_free(entry->line);
+    g_free(entry);
+}
 
 #ifndef __APPLE__
 static gchar *rigctld_mgr_find_bundled_rigctld(void)
@@ -318,6 +347,10 @@ static gpointer rigctld_mgr_wait_thread(gpointer data)
     mgr->exit_signal = sig;
     g_mutex_unlock(&mgr->log_lock);
 
+    sat_log_forensic((sig != 0 || status != 0) ?
+                     SAT_LOG_LEVEL_WARN : SAT_LOG_LEVEL_INFO,
+                     "rigctld: exited status=%d signal=%d",
+                     status, sig);
     rigctld_mgr_emit_exit_if_ready(mgr);
     return NULL;
 }
@@ -345,6 +378,26 @@ static void rigctld_mgr_log_append(RigctldMgr *mgr, const gchar *data,
     g_mutex_unlock(&mgr->log_lock);
 }
 
+static void rigctld_mgr_store_replay_line(RigctldMgr *mgr,
+                                          const gchar *prefix,
+                                          const gchar *line)
+{
+    RigctldReplayLine *entry = NULL;
+
+    if (mgr == NULL)
+        return;
+
+    entry = rigctld_replay_line_new(prefix, line);
+
+    g_mutex_lock(&mgr->log_lock);
+    if (mgr->replay_lines == NULL)
+        mgr->replay_lines = g_queue_new();
+    g_queue_push_tail(mgr->replay_lines, entry);
+    while (g_queue_get_length(mgr->replay_lines) > RIGCTLD_LOG_MAX_LINES)
+        rigctld_replay_line_free(g_queue_pop_head(mgr->replay_lines));
+    g_mutex_unlock(&mgr->log_lock);
+}
+
 static void rigctld_mgr_log_to_file(RigctldMgr *mgr,
                                     const gchar *prefix,
                                     const gchar *line)
@@ -364,6 +417,74 @@ static void rigctld_mgr_log_to_file(RigctldMgr *mgr,
     g_mutex_unlock(&mgr->log_lock);
 }
 
+static void rigctld_mgr_record_line(RigctldMgr *mgr,
+                                    const gchar *prefix,
+                                    const gchar *line)
+{
+    sat_log_level_t level =
+        (prefix != NULL && g_str_has_suffix(prefix, ":err")) ?
+        SAT_LOG_LEVEL_ERROR : SAT_LOG_LEVEL_INFO;
+
+    if (mgr == NULL)
+        return;
+
+    if (line != NULL && *line != '\0')
+    {
+        rigctld_mgr_log_append(mgr, line, strlen(line));
+        rigctld_mgr_log_append(mgr, "\n", 1);
+    }
+    else
+    {
+        rigctld_mgr_log_append(mgr, "\n", 1);
+    }
+
+    rigctld_mgr_store_replay_line(mgr, prefix, line);
+    rigctld_mgr_log_to_file(mgr, prefix, line);
+    sat_log_forensic(level, "%s: %s",
+                     prefix ? prefix : "rigctld",
+                     (line && *line) ? line : "");
+    rigctld_mgr_emit_log(mgr, prefix ? prefix : "rigctld",
+                         line ? line : "");
+}
+
+static void rigctld_mgr_replay_buffered_logs(RigctldMgr *mgr)
+{
+    RigctldMgrLogFunc cb = NULL;
+    gpointer user_data = NULL;
+    GPtrArray *copies = NULL;
+
+    if (mgr == NULL)
+        return;
+
+    copies = g_ptr_array_new_with_free_func(rigctld_replay_line_free);
+
+    g_mutex_lock(&mgr->log_lock);
+    cb = mgr->log_cb;
+    user_data = mgr->log_cb_data;
+    if (cb != NULL && mgr->replay_lines != NULL)
+    {
+        for (GList *iter = mgr->replay_lines->head; iter != NULL; iter = iter->next)
+        {
+            RigctldReplayLine *entry = iter->data;
+            g_ptr_array_add(copies,
+                            rigctld_replay_line_new(entry->prefix,
+                                                    entry->line));
+        }
+    }
+    g_mutex_unlock(&mgr->log_lock);
+
+    if (cb != NULL)
+    {
+        for (guint i = 0; i < copies->len; i++)
+        {
+            RigctldReplayLine *entry = g_ptr_array_index(copies, i);
+            cb(mgr, entry->prefix, entry->line, user_data);
+        }
+    }
+
+    g_ptr_array_free(copies, TRUE);
+}
+
 static gpointer rigctld_mgr_read_stream(gpointer data)
 {
     RigctldLogReader *reader = data;
@@ -378,18 +499,9 @@ static gpointer rigctld_mgr_read_stream(gpointer data)
                                                  NULL, &error)) != NULL)
     {
         if (length > 0)
-        {
-            rigctld_mgr_log_append(reader->mgr, line, length);
-            rigctld_mgr_log_append(reader->mgr, "\n", 1);
-            rigctld_mgr_log_to_file(reader->mgr, reader->prefix, line);
-            rigctld_mgr_emit_log(reader->mgr, reader->prefix, line);
-        }
+            rigctld_mgr_record_line(reader->mgr, reader->prefix, line);
         else
-        {
-            rigctld_mgr_log_append(reader->mgr, "\n", 1);
-            rigctld_mgr_log_to_file(reader->mgr, reader->prefix, "");
-            rigctld_mgr_emit_log(reader->mgr, reader->prefix, "");
-        }
+            rigctld_mgr_record_line(reader->mgr, reader->prefix, "");
         g_free(line);
     }
 
@@ -397,10 +509,7 @@ static gpointer rigctld_mgr_read_stream(gpointer data)
     {
         gchar *msg = g_strdup_printf("rigctld log read failed: %s",
                                      error->message);
-        rigctld_mgr_log_append(reader->mgr, msg, strlen(msg));
-        rigctld_mgr_log_append(reader->mgr, "\n", 1);
-        rigctld_mgr_log_to_file(reader->mgr, "rigctld:err", msg);
-        rigctld_mgr_emit_log(reader->mgr, "rigctld:err", msg);
+        rigctld_mgr_record_line(reader->mgr, "rigctld:err", msg);
         g_free(msg);
         g_clear_error(&error);
     }
@@ -892,12 +1001,9 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
         cmdline = g_strjoinv(" ", (gchar **) argv->pdata);
         if (cmdline_out)
             *cmdline_out = g_strdup(cmdline);
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("rigctld spawn argv: %s"),
-                    cmdline ? cmdline : "(null)");
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rigctld spawn final argv: %s",
-                    cmdline ? cmdline : "(null)");
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "rigctld spawn argv: %s",
+                         cmdline ? cmdline : "(null)");
     }
 
     launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_DEV_NULL |
@@ -935,14 +1041,14 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
             }
         }
 
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rigctld spawn detail: path=%s argv=%s "
-                    "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
-                    path ? path : "(null)",
-                    cmdline ? cmdline : "(null)",
-                    (dyld_final && *dyld_final) ? dyld_final : "(unset)",
-                    (fallback_final && *fallback_final) ? fallback_final
-                                                       : "(unset)");
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "rigctld spawn detail: path=%s argv=%s "
+                         "DYLD_LIBRARY_PATH=%s DYLD_FALLBACK_LIBRARY_PATH=%s",
+                         path ? path : "(null)",
+                         cmdline ? cmdline : "(null)",
+                         (dyld_final && *dyld_final) ? dyld_final : "(unset)",
+                         (fallback_final && *fallback_final) ? fallback_final
+                                                            : "(unset)");
 
         g_free(dyld_updated);
         g_free(fallback_updated);
@@ -967,6 +1073,7 @@ RigctldMgr *rigctld_mgr_spawn(const radio_conf_t *conf,
     mgr->proc = proc;
     g_mutex_init(&mgr->log_lock);
     mgr->log = g_string_new(NULL);
+    mgr->replay_lines = g_queue_new();
     mgr->log_file = NULL;
     mgr->log_path = NULL;
     mgr->proc_exited = FALSE;
@@ -1100,6 +1207,7 @@ void rigctld_mgr_set_log_callback(RigctldMgr *mgr,
     mgr->log_cb_data = user_data;
     g_mutex_unlock(&mgr->log_lock);
 
+    rigctld_mgr_replay_buffered_logs(mgr);
     rigctld_mgr_emit_exit_if_ready(mgr);
 }
 
@@ -1197,6 +1305,8 @@ void rigctld_mgr_terminate(RigctldMgr **mgr_ptr)
     g_mutex_clear(&mgr->log_lock);
     if (mgr->log)
         g_string_free(mgr->log, TRUE);
+    if (mgr->replay_lines)
+        g_queue_free_full(mgr->replay_lines, rigctld_replay_line_free);
     g_free(mgr);
     *mgr_ptr = NULL;
 }

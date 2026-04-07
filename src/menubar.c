@@ -466,6 +466,7 @@ static void menubar_message_log(GtkWidget * widget, gpointer data)
     (void)widget;
     (void)data;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "menu action: open runtime log browser");
     sat_log_browser_open();
 }
 
@@ -474,6 +475,7 @@ static void menubar_app_exit_cb(GtkWidget * widget, gpointer data)
     (void)widget;
     (void)data;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "menu action: app exit");
     gtk_widget_destroy(app);
 }
 
@@ -482,6 +484,7 @@ static void menubar_pref_cb(GtkWidget * widget, gpointer data)
     (void)widget;
     (void)data;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "menu action: open preferences");
     sat_pref_run();
 }
 
@@ -797,6 +800,8 @@ static void menubar_help_cb(GtkWidget * widget, gpointer data)
 
     (void)widget;
     (void)data;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "menu action: open help");
 
     dialog = gtk_message_dialog_new(GTK_WINDOW(app),
                                     GTK_DIALOG_MODAL |

@@ -31,6 +31,11 @@
 
 #define ROTCTLD_LOG_MAX_LINES 50
 
+typedef struct {
+    gchar *prefix;
+    gchar *line;
+} RotctldReplayLine;
+
 static gchar *rotctld_mgr_argv_to_shell_string(const gchar * const *argv)
 {
     GString *buf = NULL;
@@ -60,6 +65,7 @@ struct _RotctldMgr {
     GMutex       log_lock;
     GQueue      *stdout_lines;
     GQueue      *stderr_lines;
+    GQueue      *replay_lines;
     RotctldMgrLogFunc log_cb;
     gpointer     log_cb_data;
     gboolean     proc_exited;
@@ -80,6 +86,28 @@ typedef struct {
     RotctldMgr  *mgr;
     GMainLoop   *loop;
 } RotctldMgrWaitCtx;
+
+static RotctldReplayLine *rotctld_replay_line_new(const gchar *prefix,
+                                                  const gchar *line)
+{
+    RotctldReplayLine *entry = g_new0(RotctldReplayLine, 1);
+
+    entry->prefix = g_strdup(prefix ? prefix : "");
+    entry->line = g_strdup(line ? line : "");
+    return entry;
+}
+
+static void rotctld_replay_line_free(gpointer data)
+{
+    RotctldReplayLine *entry = data;
+
+    if (entry == NULL)
+        return;
+
+    g_free(entry->prefix);
+    g_free(entry->line);
+    g_free(entry);
+}
 
 static gchar *rotctld_mgr_preferred_hamlib_libdir(void)
 {
@@ -584,6 +612,23 @@ static void rotctld_mgr_store_line(GQueue *queue, const gchar *line)
         g_free(g_queue_pop_head(queue));
 }
 
+static void rotctld_mgr_store_replay_line(RotctldMgr *mgr,
+                                          const gchar *prefix,
+                                          const gchar *line)
+{
+    RotctldReplayLine *entry = NULL;
+
+    if (mgr == NULL)
+        return;
+
+    entry = rotctld_replay_line_new(prefix, line);
+    if (mgr->replay_lines == NULL)
+        mgr->replay_lines = g_queue_new();
+    g_queue_push_tail(mgr->replay_lines, entry);
+    while (g_queue_get_length(mgr->replay_lines) > ROTCTLD_LOG_MAX_LINES)
+        rotctld_replay_line_free(g_queue_pop_head(mgr->replay_lines));
+}
+
 static void rotctld_mgr_emit_log(RotctldMgr *mgr, const gchar *prefix,
                                  const gchar *line)
 {
@@ -600,6 +645,68 @@ static void rotctld_mgr_emit_log(RotctldMgr *mgr, const gchar *prefix,
 
     if (cb)
         cb(mgr, prefix, line, data);
+}
+
+static void rotctld_mgr_record_line(RotctldMgr *mgr,
+                                    GQueue *queue,
+                                    const gchar *prefix,
+                                    const gchar *line)
+{
+    sat_log_level_t level =
+        (prefix != NULL && g_str_has_suffix(prefix, ":err")) ?
+        SAT_LOG_LEVEL_ERROR : SAT_LOG_LEVEL_INFO;
+
+    if (mgr == NULL)
+        return;
+
+    g_mutex_lock(&mgr->log_lock);
+    rotctld_mgr_store_line(queue, line);
+    rotctld_mgr_store_replay_line(mgr, prefix, line);
+    g_mutex_unlock(&mgr->log_lock);
+
+    sat_log_forensic(level, "%s: %s",
+                     prefix ? prefix : "rotctld",
+                     (line && *line) ? line : "");
+    rotctld_mgr_emit_log(mgr, prefix ? prefix : "rotctld",
+                         line ? line : "");
+}
+
+static void rotctld_mgr_replay_buffered_logs(RotctldMgr *mgr)
+{
+    RotctldMgrLogFunc cb = NULL;
+    gpointer user_data = NULL;
+    GPtrArray *copies = NULL;
+
+    if (mgr == NULL)
+        return;
+
+    copies = g_ptr_array_new_with_free_func(rotctld_replay_line_free);
+
+    g_mutex_lock(&mgr->log_lock);
+    cb = mgr->log_cb;
+    user_data = mgr->log_cb_data;
+    if (cb != NULL && mgr->replay_lines != NULL)
+    {
+        for (GList *iter = mgr->replay_lines->head; iter != NULL; iter = iter->next)
+        {
+            RotctldReplayLine *entry = iter->data;
+            g_ptr_array_add(copies,
+                            rotctld_replay_line_new(entry->prefix,
+                                                    entry->line));
+        }
+    }
+    g_mutex_unlock(&mgr->log_lock);
+
+    if (cb != NULL)
+    {
+        for (guint i = 0; i < copies->len; i++)
+        {
+            RotctldReplayLine *entry = g_ptr_array_index(copies, i);
+            cb(mgr, entry->prefix, entry->line, user_data);
+        }
+    }
+
+    g_ptr_array_free(copies, TRUE);
 }
 
 static void rotctld_mgr_emit_exit_if_ready(RotctldMgr *mgr)
@@ -674,6 +781,10 @@ static void rotctld_mgr_wait_cb(GObject *source, GAsyncResult *res,
     mgr->exit_signal = sig;
     g_mutex_unlock(&mgr->log_lock);
 
+    sat_log_forensic((sig != 0 || status != 0) ?
+                     SAT_LOG_LEVEL_WARN : SAT_LOG_LEVEL_INFO,
+                     "rotctld: exited status=%d signal=%d",
+                     status, sig);
     rotctld_mgr_emit_exit_if_ready(mgr);
 
     if (ctx->loop)
@@ -719,20 +830,18 @@ static gpointer rotctld_mgr_read_stream(gpointer data)
                                                  NULL, &error)) != NULL)
     {
         if (length > 0)
-        {
-            g_mutex_lock(&reader->mgr->log_lock);
-            rotctld_mgr_store_line(reader->queue, line);
-            g_mutex_unlock(&reader->mgr->log_lock);
-            rotctld_mgr_emit_log(reader->mgr, reader->prefix, line);
-        }
+            rotctld_mgr_record_line(reader->mgr, reader->queue,
+                                    reader->prefix, line);
         g_free(line);
     }
 
     if (error != NULL)
     {
-        sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                    "rotctld_mgr: log read failed: %s",
-                    error->message);
+        gchar *msg = g_strdup_printf("rotctld_mgr: log read failed: %s",
+                                     error->message);
+        rotctld_mgr_record_line(reader->mgr, reader->mgr->stderr_lines,
+                                "rotctld:err", msg);
+        g_free(msg);
         g_clear_error(&error);
     }
 
@@ -810,17 +919,17 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
             gchar *cmdline =
                 rotctld_mgr_argv_to_shell_string(
                     (const gchar * const *) argv->pdata);
-            sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "rotctld_mgr: spawn detail: path=%s argv=%s "
-                        "PATH=%s DYLD_LIBRARY_PATH=%s "
-                        "DYLD_FALLBACK_LIBRARY_PATH=%s",
-                        path ? path : "(null)",
-                        cmdline ? cmdline : "(null)",
-                        (path_existing && *path_existing) ? path_existing
-                                                          : "(unset)",
-                        (dyld_final && *dyld_final) ? dyld_final : "(unset)",
-                        (fallback_final && *fallback_final) ? fallback_final
-                                                           : "(unset)");
+            sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                             "rotctld_mgr: spawn detail: path=%s argv=%s "
+                             "PATH=%s DYLD_LIBRARY_PATH=%s "
+                             "DYLD_FALLBACK_LIBRARY_PATH=%s",
+                             path ? path : "(null)",
+                             cmdline ? cmdline : "(null)",
+                             (path_existing && *path_existing) ? path_existing
+                                                               : "(unset)",
+                             (dyld_final && *dyld_final) ? dyld_final : "(unset)",
+                             (fallback_final && *fallback_final) ? fallback_final
+                                                                : "(unset)");
             g_free(cmdline);
         }
 
@@ -838,10 +947,10 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
         gchar *cmdline =
             rotctld_mgr_argv_to_shell_string(
                 (const gchar * const *) argv->pdata);
-        sat_log_log(SAT_LOG_LEVEL_ERROR,
-                    "rotctld_mgr: spawn failed: %s (argv=%s)",
-                    error ? error->message : "unknown error",
-                    cmdline ? cmdline : "(null)");
+        sat_log_forensic(SAT_LOG_LEVEL_ERROR,
+                         "rotctld_mgr: spawn failed: %s (argv=%s)",
+                         error ? error->message : "unknown error",
+                         cmdline ? cmdline : "(null)");
         g_free(cmdline);
         if (error_out)
             *error_out = g_strdup(error ? error->message
@@ -851,10 +960,10 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
         return NULL;
     }
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "rotctld_mgr: spawn success pid=%s path=%s",
-                g_subprocess_get_identifier(proc),
-                path ? path : "(null)");
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctld_mgr: spawn success pid=%s path=%s",
+                     g_subprocess_get_identifier(proc),
+                     path ? path : "(null)");
 
     mgr = g_new0(RotctldMgr, 1);
     mgr->proc = proc;
@@ -862,6 +971,7 @@ static RotctldMgr *rotctld_mgr_spawn_internal(GPtrArray *argv,
     g_mutex_init(&mgr->log_lock);
     mgr->stdout_lines = g_queue_new();
     mgr->stderr_lines = g_queue_new();
+    mgr->replay_lines = g_queue_new();
     mgr->proc_exited = FALSE;
     mgr->exit_ready = FALSE;
     mgr->exit_reported = FALSE;
@@ -922,9 +1032,9 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
     if (path == NULL)
         return NULL;
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "rotctld_mgr: resolved rotctld path=%s source=%s",
-                path, source ? source : "(unknown)");
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctld_mgr: resolved rotctld path=%s source=%s",
+                     path, source ? source : "(unknown)");
     rotctld_mgr_log_version(path);
 
     argv_copy = g_ptr_array_new_with_free_func(g_free);
@@ -937,9 +1047,9 @@ RotctldMgr *rotctld_mgr_spawn_argv(gchar **argv, gchar **error_out)
         gchar *cmdline =
             rotctld_mgr_argv_to_shell_string(
                 (const gchar * const *) argv_copy->pdata);
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("rotctld_mgr: spawn argv: %s"),
-                    cmdline ? cmdline : "(null)");
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "rotctld_mgr: spawn argv: %s",
+                         cmdline ? cmdline : "(null)");
         g_free(cmdline);
     }
 
@@ -987,9 +1097,9 @@ RotctldMgr *rotctld_mgr_spawn_timeout(const gchar *host, gint port, gint model,
     if (path == NULL)
         return NULL;
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "rotctld_mgr: resolved rotctld path=%s source=%s",
-                path, source ? source : "(unknown)");
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctld_mgr: resolved rotctld path=%s source=%s",
+                     path, source ? source : "(unknown)");
     rotctld_mgr_log_version(path);
 
     argv = g_ptr_array_new_with_free_func(g_free);
@@ -1009,9 +1119,9 @@ RotctldMgr *rotctld_mgr_spawn_timeout(const gchar *host, gint port, gint model,
         const gchar *bind_host = rotctld_mgr_bind_host(host);
         if (host && *host && g_strcmp0(host, bind_host) != 0)
         {
-            sat_log_log(SAT_LOG_LEVEL_DEBUG,
-                        "rotctld_mgr: host %s treated as local; binding to %s",
-                        host, bind_host);
+            sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                             "rotctld_mgr: host %s treated as local; binding to %s",
+                             host, bind_host);
         }
         g_ptr_array_add(argv, g_strdup("-T"));
         g_ptr_array_add(argv, g_strdup(bind_host));
@@ -1025,9 +1135,9 @@ RotctldMgr *rotctld_mgr_spawn_timeout(const gchar *host, gint port, gint model,
         gchar *cmdline =
             rotctld_mgr_argv_to_shell_string(
                 (const gchar * const *) argv->pdata);
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    _("rotctld_mgr: spawn argv: %s"),
-                    cmdline ? cmdline : "(null)");
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "rotctld_mgr: spawn argv: %s",
+                         cmdline ? cmdline : "(null)");
         g_free(cmdline);
     }
 
@@ -1129,6 +1239,7 @@ void rotctld_mgr_set_log_callback(RotctldMgr *mgr,
     mgr->log_cb_data = user_data;
     g_mutex_unlock(&mgr->log_lock);
 
+    rotctld_mgr_replay_buffered_logs(mgr);
     rotctld_mgr_emit_exit_if_ready(mgr);
 }
 
@@ -1194,6 +1305,11 @@ void rotctld_mgr_terminate(RotctldMgr **mgr_ptr)
     {
         g_queue_free_full(mgr->stderr_lines, g_free);
         mgr->stderr_lines = NULL;
+    }
+    if (mgr->replay_lines)
+    {
+        g_queue_free_full(mgr->replay_lines, rotctld_replay_line_free);
+        mgr->replay_lines = NULL;
     }
 
     g_free(mgr);

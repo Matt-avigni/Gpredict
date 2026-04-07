@@ -481,11 +481,11 @@ static void rig_session_set_state(GtkRigCtrl *ctrl, RigSession *session,
 
     if (session->state != state || reason != NULL)
     {
-        sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "rig session (%s) state=%s reason=%s",
-                    session->label ? session->label : "rig",
-                    rig_session_state_name(state),
-                    reason ? reason : "(none)");
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "rig session (%s) state=%s reason=%s",
+                         session->label ? session->label : "rig",
+                         rig_session_state_name(state),
+                         reason ? reason : "(none)");
         if (ctrl != NULL)
         {
             rig_term_log(ctrl, "gpredict",
@@ -1007,6 +1007,15 @@ void gtk_rig_ctrl_request_close(GtkRigCtrl *ctrl)
 {
     if (!IS_GTK_RIG_CTRL(ctrl) || ctrl->destroying)
         return;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctrl request_close begin ctrl=%p engaged=%d opening=%d opening2=%d sock=%d sock2=%d",
+                     (void *) ctrl,
+                     ctrl->engaged ? 1 : 0,
+                     ctrl->opening ? 1 : 0,
+                     ctrl->opening2 ? 1 : 0,
+                     ctrl->sock,
+                     ctrl->sock2);
 
     ctrl->rigctl_thread_exit_requested = TRUE;
 
@@ -3693,6 +3702,15 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
 {
     GtkRigCtrl     *ctrl = GTK_RIG_CTRL(widget);
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctrl destroy begin ctrl=%p sock=%d sock2=%d open_task=%p close_pending_id=%u thread=%p",
+                     (void *) ctrl,
+                     ctrl->sock,
+                     ctrl->sock2,
+                     (void *) ctrl->open_task,
+                     ctrl->close_pending_id,
+                     (void *) ctrl->rigctl_thread);
+
     ctrl->destroying = TRUE;
     ctrl->rigctl_thread_exit_requested = TRUE;
     rigctrl_cancel_open_task(ctrl);
@@ -3798,6 +3816,10 @@ static void gtk_rig_ctrl_destroy(GtkWidget * widget)
         free_transponders(ctrl->trsplist);
         ctrl->trsplist = NULL;
     }
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctrl destroy end ctrl=%p",
+                     (void *) ctrl);
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }
@@ -12773,14 +12795,18 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
 {
     RigctldClient *client = rigctld_client_for_socket(ctrl, sock);
     RigCaps *caps = NULL;
+    RigCaps *failed_caps = NULL;
     gint64 freq_probe = 0;
     gboolean freq_ok = FALSE;
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
+    gboolean main_sub = FALSE;
     gchar reason_buf[128] = { 0 };
 
     if (ctrl == NULL || session == NULL || conf == NULL)
         return FALSE;
+
+    main_sub = is_full_duplex_main_sub_configured(conf);
 
     if (client == NULL)
     {
@@ -12800,12 +12826,28 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
         if (reason_buf[0] != '\0')
             reason = reason_buf;
 
+        failed_caps = rigctld_client_get_caps_snapshot(client);
+        if (main_sub &&
+            failed_caps != NULL &&
+            rig_strategy_supports_explicit_vfo(failed_caps->strategy))
+        {
+            rig_session_apply_caps(session, failed_caps);
+            rigctld_client_caps_snapshot_free(failed_caps);
+            failed_caps = NULL;
+            rig_session_set_state(ctrl, session, RIG_SESSION_READY,
+                                  "probe degraded; preserving explicit VFO strategy=%s",
+                                  rig_strategy_name(session->strategy));
+            return TRUE;
+        }
+        rigctld_client_caps_snapshot_free(failed_caps);
+        failed_caps = NULL;
+
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "%s: rigctld probe failed (%s); attempting minimal fallback",
                     __func__,
                     reason ? reason : "unknown");
 
-        if (is_full_duplex_main_sub_configured(conf))
+        if (main_sub)
         {
             session->strategy = RIG_STRATEGY_PLAIN_FREQ;
             session->strategy_logged = FALSE;
@@ -12856,7 +12898,7 @@ static gboolean rig_session_probe_and_configure(GtkRigCtrl *ctrl,
     caps = rigctld_client_get_caps_snapshot(client);
     if (caps == NULL)
     {
-        if (is_full_duplex_main_sub_configured(conf))
+        if (main_sub)
         {
             session->strategy = RIG_STRATEGY_PLAIN_FREQ;
             session->strategy_logged = FALSE;
@@ -14923,11 +14965,18 @@ static gboolean rigctrl_close_idle(gpointer data)
 {
     RigctrlDeferredActionInfo *info = data;
     GtkRigCtrl *ctrl = info ? GTK_RIG_CTRL(info->ctrl) : NULL;
+    gboolean stale = FALSE;
 
     if (ctrl != NULL)
     {
+        stale = rigctrl_generation_stale(ctrl, info ? info->generation : 0);
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "rigctrl close_idle ctrl=%p generation=%u stale=%d",
+                         (void *) ctrl,
+                         info ? info->generation : 0,
+                         stale ? 1 : 0);
         ctrl->close_pending_id = 0;
-        if (!rigctrl_generation_stale(ctrl, info ? info->generation : 0))
+        if (!stale)
             rigctrl_close_internal(ctrl);
         g_object_unref(ctrl);
     }
@@ -14942,6 +14991,12 @@ static void rigctrl_request_close(GtkRigCtrl *ctrl)
 
     if (ctrl == NULL)
         return;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctrl request_close dispatch ctrl=%p main_thread=%d close_pending_id=%u",
+                     (void *) ctrl,
+                     rigctrl_on_main_thread(ctrl) ? 1 : 0,
+                     ctrl->close_pending_id);
 
     if (rigctrl_on_main_thread(ctrl))
     {
@@ -14982,6 +15037,15 @@ static void rigctrl_close_internal(GtkRigCtrl * data)
 
     if (ctrl == NULL)
         return;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctrl close_internal begin ctrl=%p destroying=%d sock=%d sock2=%d spawned=%d spawned2=%d",
+                     (void *) ctrl,
+                     ctrl->destroying ? 1 : 0,
+                     ctrl->sock,
+                     ctrl->sock2,
+                     rigctld_spawned_by_us(ctrl, FALSE) ? 1 : 0,
+                     rigctld_spawned_by_us(ctrl, TRUE) ? 1 : 0);
 
     /* Stop timers before touching sockets to avoid re-entrant callbacks. */
     remove_timer(ctrl);
@@ -15034,6 +15098,11 @@ static void rigctrl_close_internal(GtkRigCtrl * data)
 
     rigctrl_set_conn_state(ctrl, FALSE, RIGCTRL_CONN_DISCONNECTED, "closed");
     rigctrl_set_conn_state(ctrl, TRUE, RIGCTRL_CONN_DISCONNECTED, "closed");
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctrl close_internal end ctrl=%p sock=%d sock2=%d",
+                     (void *) ctrl,
+                     ctrl->sock,
+                     ctrl->sock2);
 }
 
 static void rigctrl_close_socket_internal(GtkRigCtrl *ctrl, gboolean secondary)
@@ -15157,9 +15226,10 @@ static gboolean rigctrl_open_internal(GtkRigCtrl *data,
                     _("%s: opening receiver rig %s:%d"), __func__,
                     ctrl->conf ? ctrl->conf->host : "(null)",
                     ctrl->conf ? ctrl->conf->port : 0);
-        g_printerr("%s: opening receiver rig %s:%d\n", __func__,
-                   ctrl->conf ? ctrl->conf->host : "(null)",
-                   ctrl->conf ? ctrl->conf->port : 0);
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "%s: opening receiver rig %s:%d", __func__,
+                         ctrl->conf ? ctrl->conf->host : "(null)",
+                         ctrl->conf ? ctrl->conf->port : 0);
 
         {
             gboolean error_reported = FALSE;
@@ -15351,9 +15421,10 @@ open_receiver_retry:
                     _("%s: opening uplink rig %s:%d"), __func__,
                     ctrl->conf2 ? ctrl->conf2->host : "(null)",
                     ctrl->conf2 ? ctrl->conf2->port : 0);
-        g_printerr("%s: opening uplink rig %s:%d\n", __func__,
-                   ctrl->conf2 ? ctrl->conf2->host : "(null)",
-                   ctrl->conf2 ? ctrl->conf2->port : 0);
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "%s: opening uplink rig %s:%d", __func__,
+                         ctrl->conf2 ? ctrl->conf2->host : "(null)",
+                         ctrl->conf2 ? ctrl->conf2->port : 0);
 
         {
             gboolean error_reported = FALSE;

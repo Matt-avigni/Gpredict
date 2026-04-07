@@ -157,11 +157,11 @@ gpredict_LDADD = @PACKAGE_LIBS@
 check_PROGRAMS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
     azel-mapping-test safety-window-test hamlib-mock-test \
-    payload-profile-test ui-status-test time-tools-test
+    payload-profile-test ui-status-test time-tools-test sat-log-test
 TESTS = rotor-cmd-map-test rig-mode-dispatch-test \
     rotctld-parse-test rigctld-io-test \
     azel-mapping-test safety-window-test hamlib-mock-test \
-    payload-profile-test ui-status-test time-tools-test
+    payload-profile-test ui-status-test time-tools-test sat-log-test
 
 rotor_cmd_map_test_SOURCES = \
     rotor-cmd-map-test.c \
@@ -210,7 +210,12 @@ hamlib_mock_test_SOURCES = \
     hamlib_transport.h \
     rotctld-parse.c \
     rotctld-parse.h \
-    sat-log-stub.c \
+    sat-log.c \
+    sat-log.h \
+    sat-log-test-stub.c \
+    compat.c \
+    compat.h \
+    sat-cfg.h \
     radio-conf.h \
     radio-conf-stub.c
 hamlib_mock_test_LDADD = @PACKAGE_LIBS@
@@ -236,3 +241,13 @@ time_tools_test_SOURCES = \
     sgpsdp/sgp_time.c \
     sgpsdp/sgp4sdp4.h
 time_tools_test_LDADD = @PACKAGE_LIBS@
+
+sat_log_test_SOURCES = \
+    sat-log-test.c \
+    sat-log-test-stub.c \
+    sat-log.c \
+    sat-log.h \
+    sat-cfg.h \
+    compat.c \
+    compat.h
+sat_log_test_LDADD = @PACKAGE_LIBS@

@@ -53,6 +53,25 @@ static const RigQuirkEntry rig_quirks[] = {
     { NULL, 0 }
 };
 
+static const gchar *rigctld_client_state_name(rigctld_client_state_t state)
+{
+    switch (state)
+    {
+    case RIGCTLD_CLIENT_STOPPED:
+        return "STOPPED";
+    case RIGCTLD_CLIENT_CONNECTING:
+        return "CONNECTING";
+    case RIGCTLD_CLIENT_PROBING:
+        return "PROBING";
+    case RIGCTLD_CLIENT_READY:
+        return "READY";
+    case RIGCTLD_CLIENT_DEGRADED:
+        return "DEGRADED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 void rigctld_client_set_log_level(rig_log_level_t level)
 {
     if (level < RIG_LOG_QUIET)
@@ -92,6 +111,50 @@ static gchar *rigctld_client_dup_trimmed(const gchar *text)
     g_strchomp(copy);
     g_strstrip(copy);
     return copy;
+}
+
+static void rigctld_client_forensic_line(RigctldClient *client,
+                                         const gchar *prefix,
+                                         const gchar *line)
+{
+    gchar *label = NULL;
+    gchar *msg = NULL;
+
+    if (client == NULL || prefix == NULL || line == NULL || *line == '\0')
+        return;
+
+    g_rec_mutex_lock(rigctld_client_meta_lock(client));
+    label = g_strdup(client->label ? client->label : "rig");
+    g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+
+    msg = g_strdup_printf("[%s] %s", label ? label : "rig", line);
+    sat_log_forensic(g_str_has_suffix(prefix, ":err") ?
+                     SAT_LOG_LEVEL_ERROR : SAT_LOG_LEVEL_INFO,
+                     "%s: %s", prefix, msg);
+    g_free(msg);
+    g_free(label);
+}
+
+static void rigctld_client_forensic_lines(RigctldClient *client,
+                                          const gchar *prefix,
+                                          const gchar *text)
+{
+    gchar **lines = NULL;
+
+    if (client == NULL || prefix == NULL || text == NULL || *text == '\0')
+        return;
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *trimmed = g_strdup(lines[i]);
+
+        g_strstrip(trimmed);
+        if (*trimmed != '\0')
+            rigctld_client_forensic_line(client, prefix, trimmed);
+        g_free(trimmed);
+    }
+    g_strfreev(lines);
 }
 
 static void rigctld_client_emit_log_line(RigctldClient *client,
@@ -1177,6 +1240,7 @@ static void rigctld_client_set_state(RigctldClient *client,
 {
     va_list args;
     gchar *reason = NULL;
+    gchar *label = NULL;
 
     if (client == NULL)
         return;
@@ -1189,10 +1253,18 @@ static void rigctld_client_set_state(RigctldClient *client,
     }
 
     g_rec_mutex_lock(rigctld_client_meta_lock(client));
+    label = g_strdup(client->label ? client->label : "rig");
     client->state = state;
     g_free(client->state_reason);
     client->state_reason = reason;
     g_rec_mutex_unlock(rigctld_client_meta_lock(client));
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rigctld client (%s) state=%s reason=%s",
+                     label ? label : "rig",
+                     rigctld_client_state_name(state),
+                     reason ? reason : "(none)");
+    g_free(label);
 }
 
 RigctldClient *rigctld_client_new(const gchar *label)
@@ -1234,6 +1306,9 @@ static gboolean rigctld_client_request(RigctldClient *client,
     if (client == NULL || client->transport == NULL || cmd == NULL)
         return FALSE;
 
+    if (wire_log)
+        rigctld_client_forensic_lines(client, "gpredict:tx", cmd);
+
     if (wire_log && rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
         rigctld_client_emit_log_lines(client, "gpredict:tx", cmd);
 
@@ -1253,6 +1328,20 @@ static gboolean rigctld_client_request(RigctldClient *client,
 
     if (!ok)
     {
+        if (wire_log)
+        {
+            gchar *trim_cmd = rigctld_client_dup_trimmed(cmd);
+
+            err = local.err ? local.err : EIO;
+            sat_log_forensic(SAT_LOG_LEVEL_ERROR,
+                             "gpredict:err: [%s] request failed cmd=%s err=%d (%s)",
+                             client->label ? client->label : "rig",
+                             (trim_cmd && *trim_cmd) ? trim_cmd : "(empty)",
+                             err,
+                             g_strerror(err));
+            g_free(trim_cmd);
+        }
+
         if (wire_log && rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
         {
             gchar *trim_cmd = rigctld_client_dup_trimmed(cmd);
@@ -1268,11 +1357,29 @@ static gboolean rigctld_client_request(RigctldClient *client,
         return FALSE;
     }
 
+    if (wire_log && reply != NULL && reply_len > 0 && reply[0] != '\0')
+        rigctld_client_forensic_lines(client, "gpredict:rx", reply);
+
     if (wire_log &&
         rigctld_client_get_log_level() >= RIG_LOG_VERBOSE &&
         reply != NULL && reply_len > 0 && reply[0] != '\0')
     {
         rigctld_client_emit_log_lines(client, "gpredict:rx", reply);
+    }
+
+    if (wire_log && local.saw_done &&
+        (reply == NULL || g_strrstr(reply, "done") == NULL))
+    {
+        rigctld_client_forensic_line(client, "gpredict:rx", "done");
+    }
+
+    if (wire_log && local.saw_rprt &&
+        (reply == NULL || g_strrstr(reply, "RPRT") == NULL))
+    {
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "gpredict:rx: [%s] RPRT %d",
+                         client->label ? client->label : "rig",
+                         local.rprt_code);
     }
 
     if (wire_log && rigctld_client_get_log_level() >= RIG_LOG_VERBOSE)
@@ -1503,6 +1610,8 @@ gboolean rigctld_client_probe(RigctldClient *client,
     gboolean vfo_select_ok = FALSE;
     gboolean vfo_opt_args_ok = FALSE;
     gboolean vfo_opt_set = FALSE;
+    gboolean force_main_sub = FALSE;
+    gboolean selection_only_main_sub_ok = FALSE;
     gint select_attempts = 1;
     gulong select_settle_us = 0;
     GHashTable *vfo_selectable = NULL;
@@ -1577,6 +1686,7 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     client->caps.prefer_main_sub_tokens =
         (conf != NULL && conf->radio_mode == RADIO_MODE_FULL_DUPLEX_MAIN_SUB);
+    force_main_sub = ((client->caps.quirks & RIG_QUIRK_FORCE_MAIN_SUB) != 0);
     select_attempts = client->caps.prefer_main_sub_tokens ?
         RIGCTLD_MAIN_SUB_FRAGILE_SELECT_ATTEMPTS : 1;
     select_settle_us = client->caps.prefer_main_sub_tokens ?
@@ -1642,6 +1752,59 @@ gboolean rigctld_client_probe(RigctldClient *client,
                 g_usleep(select_settle_us);
             }
         }
+
+        if (force_main_sub)
+        {
+            const gchar *main_token =
+                rigctld_client_find_vfo_token_in_table(VFO_MAIN,
+                                                       vfo_selectable);
+            const gchar *sub_token =
+                rigctld_client_find_vfo_token_in_table(VFO_SUB,
+                                                       vfo_selectable);
+
+            if (main_token == NULL || sub_token == NULL)
+            {
+                for (gint round = 0;
+                     round < RIGCTLD_MAIN_SUB_HANDSHAKE_ROUNDS &&
+                     (main_token == NULL || sub_token == NULL);
+                     round++)
+                {
+                    if (main_token == NULL)
+                    {
+                        main_token =
+                            rigctld_client_probe_select_token(client,
+                                                              main_candidates_strict,
+                                                              vfo_selectable,
+                                                              timeout_ms,
+                                                              select_attempts,
+                                                              select_settle_us,
+                                                              TRUE,
+                                                              FALSE,
+                                                              TRUE);
+                    }
+                    if (sub_token == NULL)
+                    {
+                        sub_token =
+                            rigctld_client_probe_select_token(client,
+                                                              sub_candidates_strict,
+                                                              vfo_selectable,
+                                                              timeout_ms,
+                                                              select_attempts,
+                                                              select_settle_us,
+                                                              TRUE,
+                                                              FALSE,
+                                                              TRUE);
+                    }
+                }
+
+                if (main_token != NULL && sub_token != NULL)
+                {
+                    sat_log_log(SAT_LOG_LEVEL_INFO,
+                                "rigctld probe: accepting selection-only Main/Sub fallback main=%s sub=%s",
+                                main_token, sub_token);
+                }
+            }
+        }
     }
     else
     {
@@ -1679,12 +1842,14 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
     if (client->caps.prefer_main_sub_tokens)
     {
-        const gchar *main_token =
+        const gchar *main_working =
             rigctld_client_find_vfo_token_in_table(VFO_MAIN,
                                                    client->caps.vfo_working);
-        const gchar *sub_token =
+        const gchar *sub_working =
             rigctld_client_find_vfo_token_in_table(VFO_SUB,
                                                    client->caps.vfo_working);
+        const gchar *main_token = main_working;
+        const gchar *sub_token = sub_working;
 
         if (main_token == NULL)
             main_token = rigctld_client_find_vfo_token_in_table(VFO_MAIN,
@@ -1702,37 +1867,20 @@ gboolean rigctld_client_probe(RigctldClient *client,
 
         if (main_token != NULL && sub_token != NULL)
         {
-            if (!g_hash_table_contains(client->caps.vfo_working, main_token))
-            {
-                g_hash_table_replace(client->caps.vfo_working,
-                                     g_strdup(main_token),
-                                     GINT_TO_POINTER(1));
-            }
-            if (!g_hash_table_contains(client->caps.vfo_working, sub_token))
-            {
-                g_hash_table_replace(client->caps.vfo_working,
-                                     g_strdup(sub_token),
-                                     GINT_TO_POINTER(1));
-            }
-
-            g_free(client->caps.vfo_token_main);
-            client->caps.vfo_token_main = g_strdup(main_token);
-            g_free(client->caps.vfo_token_sub);
-            client->caps.vfo_token_sub = g_strdup(sub_token);
             if (client->caps.default_vfo_token == NULL)
                 client->caps.default_vfo_token = g_strdup(main_token);
 
-            /* Some IC-9700/rigctld paths accept VFO selection but stall on
-               immediate per-VFO frequency readback during probe. Once both
-               sides are proven by selection plus current-VFO identity, keep
-               the simpler SELECT_VFO strategy. */
-            vfo_select_ok = TRUE;
+            vfo_select_ok = (main_working != NULL && sub_working != NULL);
+            selection_only_main_sub_ok =
+                (!vfo_select_ok &&
+                 main_token != NULL && sub_token != NULL);
         }
         else
         {
             /* Shared Main/Sub control is only usable when both sides resolve
                to a real token. */
             vfo_select_ok = FALSE;
+            selection_only_main_sub_ok = FALSE;
         }
     }
 
@@ -1841,6 +1989,37 @@ gboolean rigctld_client_probe(RigctldClient *client,
            both sides already prove selectable. The failing logs are on the
            tokenized F <vfo> <freq> path, so do not promote that strategy. */
         vfo_opt_args_ok = FALSE;
+    }
+
+    if (!vfo_select_ok &&
+        selection_only_main_sub_ok &&
+        !vfo_opt_args_ok &&
+        client->caps.vfo_token_main != NULL &&
+        client->caps.vfo_token_sub != NULL)
+    {
+        vfo_select_ok = TRUE;
+        if (!g_hash_table_contains(client->caps.vfo_working,
+                                   client->caps.vfo_token_main))
+        {
+            g_hash_table_replace(client->caps.vfo_working,
+                                 g_strdup(client->caps.vfo_token_main),
+                                 GINT_TO_POINTER(1));
+        }
+        if (!g_hash_table_contains(client->caps.vfo_working,
+                                   client->caps.vfo_token_sub))
+        {
+            g_hash_table_replace(client->caps.vfo_working,
+                                 g_strdup(client->caps.vfo_token_sub),
+                                 GINT_TO_POINTER(1));
+        }
+        if (client->caps.default_vfo_token == NULL)
+            client->caps.default_vfo_token =
+                g_strdup(client->caps.vfo_token_main);
+
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "rigctld probe: falling back to selection-only Main/Sub strategy main=%s sub=%s",
+                    client->caps.vfo_token_main,
+                    client->caps.vfo_token_sub);
     }
 
     if (vfo_opt_args_ok)

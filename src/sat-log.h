@@ -40,7 +40,12 @@ typedef enum {
 void            sat_log_init(void);
 void            sat_log_close(void);
 void            sat_log_log(sat_log_level_t level, const char *fmt, ...);
+void            sat_log_forensic(sat_log_level_t level, const char *fmt, ...);
 void            sat_log_set_visible(gboolean visible);
 void            sat_log_set_level(sat_log_level_t level);
+gchar          *sat_log_get_dir_path(void);
+gchar          *sat_log_get_current_path(void);
+gchar          *sat_log_get_latest_path(void);
+void            sat_log_write_fatal_signal(int sig, const char *detail);
 
 #endif

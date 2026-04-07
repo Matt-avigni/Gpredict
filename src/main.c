@@ -92,7 +92,9 @@ static gint     gpredict_app_delete(GtkWidget *, GdkEvent *, gpointer);
 static void     gpredict_app_destroy(GtkWidget *, gpointer);
 static gboolean gpredict_app_config(GtkWidget *, GdkEventConfigure *,
                                     gpointer);
-static void     gpredict_sig_handler(int sig);
+static void     gpredict_term_sig_handler(int sig);
+static void     gpredict_fatal_sig_handler(int sig);
+static void     gpredict_install_signal_handlers(void);
 static gboolean tle_mon_task(gpointer data);
 static void     tle_mon_stop(void);
 static gpointer update_tle_thread(gpointer data);
@@ -115,6 +117,8 @@ int main(int argc, char *argv[])
     bind_textdomain_codeset(PACKAGE, "UTF-8");
     textdomain(PACKAGE);
 #endif
+    sat_log_init();
+    gpredict_install_signal_handlers();
     gtk_init(&argc, &argv);
     {
         gchar *datadir = get_data_dir();
@@ -147,9 +151,10 @@ int main(int argc, char *argv[])
     if (!g_option_context_parse(context, &argc, &argv, &err))
         g_print(_("Option parsing failed: %s\n"), err->message);
 
-    sat_log_init();
     sat_cfg_load();
     sat_log_set_level(sat_cfg_get_int(SAT_CFG_INT_LOG_LEVEL));
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main: runtime log level=%d",
+                     sat_cfg_get_int(SAT_CFG_INT_LOG_LEVEL));
 
     if (cleantle)
         clean_tle();
@@ -184,10 +189,14 @@ int main(int argc, char *argv[])
     InitWinSock2();
 
     gtk_main();
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main: gtk_main exited");
 
     g_option_context_free(context);
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main: sat_cfg_save begin");
     sat_cfg_save();
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main: sat_cfg_save end");
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main: sat_log_close begin");
     sat_log_close();
     sat_cfg_close();
 
@@ -294,9 +303,25 @@ static void gpredict_app_create(void)
     g_signal_connect(G_OBJECT(app), "destroy",
                      G_CALLBACK(gpredict_app_destroy), NULL);
 
-    signal(SIGTERM, gpredict_sig_handler);
-    signal(SIGINT, gpredict_sig_handler);
-    signal(SIGABRT, gpredict_sig_handler);
+    signal(SIGTERM, gpredict_term_sig_handler);
+    signal(SIGINT, gpredict_term_sig_handler);
+}
+
+static void gpredict_install_signal_handlers(void)
+{
+    signal(SIGABRT, gpredict_fatal_sig_handler);
+#ifdef SIGSEGV
+    signal(SIGSEGV, gpredict_fatal_sig_handler);
+#endif
+#ifdef SIGBUS
+    signal(SIGBUS, gpredict_fatal_sig_handler);
+#endif
+#ifdef SIGILL
+    signal(SIGILL, gpredict_fatal_sig_handler);
+#endif
+#ifdef SIGFPE
+    signal(SIGFPE, gpredict_fatal_sig_handler);
+#endif
 }
 
 /**
@@ -309,10 +334,18 @@ static void gpredict_app_create(void)
  * signals is received, the function sends an error message to logger and tries
  * to make a clean exit.
  */
-static void gpredict_sig_handler(int sig)
+static void gpredict_term_sig_handler(int sig)
 {
-    g_print("Received signal: %d\n", sig);
-    gtk_widget_destroy(app);
+    sat_log_forensic(SAT_LOG_LEVEL_WARN, "received signal: %d", sig);
+    if (app != NULL)
+        gtk_widget_destroy(app);
+}
+
+static void gpredict_fatal_sig_handler(int sig)
+{
+    sat_log_write_fatal_signal(sig, "fatal signal");
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 /**
@@ -333,8 +366,10 @@ static gint gpredict_app_delete(GtkWidget * widget, GdkEvent * event,
                                 gpointer data)
 {
     (void)widget;
-    (void)event;
     (void)data;
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "main window delete_event type=%d",
+                     event ? (gint) event->type : -1);
     return FALSE;
 }
 
@@ -353,11 +388,15 @@ static void gpredict_app_destroy(GtkWidget * widget, gpointer data)
     (void)widget;
     (void)data;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main window destroy begin");
+
     /* stop TLE monitoring task */
     tle_mon_stop();
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main window destroy tle monitor stopped");
 
     /* GUI timers are stopped automatically */
     mod_mgr_save_state();
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main window destroy module state saved");
 
     /* not good, have to use configure event instead (see API doc) */
     /*     gtk_window_get_size (GTK_WINDOW (app), &w, &h);
@@ -366,6 +405,7 @@ static void gpredict_app_destroy(GtkWidget * widget, gpointer data)
      */
 
     gtk_main_quit();
+    sat_log_forensic(SAT_LOG_LEVEL_INFO, "main window destroy gtk_main_quit requested");
 }
 
 /**

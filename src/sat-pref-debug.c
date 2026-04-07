@@ -203,7 +203,7 @@ GtkWidget      *sat_pref_debug_create(void)
 
     age = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(age),
-                                   _("Always delete"));
+                                   _("Never auto-delete"));
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(age), _("1 day"));
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(age), _("1 week"));
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(age), _("1 month"));
@@ -211,7 +211,7 @@ GtkWidget      *sat_pref_debug_create(void)
     g_signal_connect(G_OBJECT(age), "realize",
                      G_CALLBACK(gpredict_set_combo_tooltips),
                      _("Select how often gpredict should delete "
-                       "old log files."));
+                       "old log files. 'Never auto-delete' preserves previous forensic sessions."));
     g_signal_connect(G_OBJECT(age), "changed", G_CALLBACK(state_change_cb),
                      NULL);
     gtk_box_pack_start(GTK_BOX(hbox), age, FALSE, FALSE, 10);
@@ -226,11 +226,11 @@ GtkWidget      *sat_pref_debug_create(void)
     confdir = get_user_conf_dir();
     msg =
         g_strdup_printf(_
-                        ("Gpredict stores all run-time messages in the %s%slogs%s\n"
-                         "directory. The current log file is called gpredict.log and the file is\n"
-                         "always kept until the next execution, so that you can examine it in case\n"
-                         "of a failure. If old log files are kept, they are called gpredict-XYZ.log\n"
-                         "where XYZ is a unique timestamp."), confdir,
+                        ("Gpredict stores forensic run-time logs in the %s%slogs%s\n"
+                         "directory. Each session writes a new file named\n"
+                         "gpredict-YYYYMMDD-HHMMSS-pPID.log so logs survive relaunches and\n"
+                         "crash recovery. Older session logs are cleaned according to the\n"
+                         "retention setting below."), confdir,
                         G_DIR_SEPARATOR_S, G_DIR_SEPARATOR_S);
     label = gtk_label_new(msg);
     gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);

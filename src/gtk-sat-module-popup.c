@@ -911,6 +911,12 @@ static gint rotctrl_window_delete(GtkWidget *widget, GdkEvent *event, gpointer d
 
     (void)event;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module popup: rotator control delete_event module=%s window=%p ctrl=%p",
+                     module && module->name ? module->name : "(unnamed)",
+                     (void *) widget,
+                     module ? (void *) module->rotctrl : NULL);
+
     if (module == NULL || module->rotctrl == NULL ||
         !GTK_IS_ROT_CTRL(module->rotctrl))
     {
@@ -946,6 +952,12 @@ static gint rigctrl_window_delete(GtkWidget *widget, GdkEvent *event, gpointer d
     RigCtrlCloseState *state = NULL;
 
     (void)event;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module popup: radio control delete_event module=%s window=%p ctrl=%p",
+                     module && module->name ? module->name : "(unnamed)",
+                     (void *) widget,
+                     module ? (void *) module->rigctrl : NULL);
 
     if (module == NULL || module->rigctrl == NULL ||
         !IS_GTK_RIG_CTRL(module->rigctrl))
@@ -1078,6 +1090,11 @@ static void destroy_rigctrl(GtkWidget * window, gpointer data)
 
     (void)window;               /* avoid unused parameter compiler warning */
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module popup: radio control window destroyed module=%s window=%p ctrl=%p",
+                     module && module->name ? module->name : "(unnamed)",
+                     (void *) window,
+                     module ? (void *) module->rigctrl : NULL);
     module->rigctrlwin = NULL;
     module->rigctrl = NULL;
 }
@@ -1098,6 +1115,10 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
     if (module->rigctrlwin != NULL)
     {
         /* there is already a radio controller for this module */
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "module popup: present existing radio control module=%s window=%p",
+                         module->name ? module->name : "(unnamed)",
+                         (void *) module->rigctrlwin);
         gtk_window_present(GTK_WINDOW(module->rigctrlwin));
         return;
     }
@@ -1125,6 +1146,11 @@ static void rigctrl_cb(GtkWidget * menuitem, gpointer data)
 
     /* create a window */
     module->rigctrlwin = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module popup: create radio control module=%s window=%p ctrl=%p",
+                     module->name ? module->name : "(unnamed)",
+                     (void *) module->rigctrlwin,
+                     (void *) module->rigctrl);
     buff = g_strdup_printf(_("Gpredict Radio Control: %s"), module->name);
     gtk_window_set_title(GTK_WINDOW(module->rigctrlwin), buff);
     g_free(buff);
@@ -1171,6 +1197,11 @@ static void destroy_rotctrl(GtkWidget * window, gpointer data)
 
     (void)window;
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module popup: rotator control window destroyed module=%s window=%p ctrl=%p",
+                     module && module->name ? module->name : "(unnamed)",
+                     (void *) window,
+                     module ? (void *) module->rotctrl : NULL);
     module->rotctrlwin = NULL;
     module->rotctrl = NULL;
 }
@@ -1191,6 +1222,10 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
     if (module->rotctrlwin != NULL)
     {
         /* there is already a roto controller for this module */
+        sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                         "module popup: present existing rotator control module=%s window=%p",
+                         module->name ? module->name : "(unnamed)",
+                         (void *) module->rotctrlwin);
         gtk_window_present(GTK_WINDOW(module->rotctrlwin));
         return;
     }
@@ -1219,6 +1254,11 @@ static void rotctrl_cb(GtkWidget * menuitem, gpointer data)
 
     /* create a window */
     module->rotctrlwin = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "module popup: create rotator control module=%s window=%p ctrl=%p",
+                     module->name ? module->name : "(unnamed)",
+                     (void *) module->rotctrlwin,
+                     (void *) module->rotctrl);
     buff = g_strdup_printf(_("Gpredict Rotator Control: %s"), module->name);
     gtk_window_set_title(GTK_WINDOW(module->rotctrlwin), buff);
     g_free(buff);

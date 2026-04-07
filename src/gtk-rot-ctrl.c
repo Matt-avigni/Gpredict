@@ -2393,11 +2393,11 @@ static void rot_session_set_state(GtkRotCtrl *ctrl,
     from = rot_session_state_name(ctrl->session_state);
     to = rot_session_state_name(state);
 
-    sat_log_log(SAT_LOG_LEVEL_INFO,
-                "rotor_state %s->%s reason=%s quit=%s",
-                from, to,
-                reason ? reason : "none",
-                send_quit ? "yes" : "no");
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotor_state %s->%s reason=%s quit=%s",
+                     from, to,
+                     reason ? reason : "none",
+                     send_quit ? "yes" : "no");
     rot_term_log_verbose(ctrl, "gpredict:state",
                          "rotor_state %s->%s reason=%s quit=%s",
                          from, to,
@@ -10927,6 +10927,13 @@ void gtk_rot_ctrl_request_close(GtkRotCtrl *ctrl)
 {
     if (!GTK_IS_ROT_CTRL(ctrl))
         return;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctrl request_close begin ctrl=%p engaged=%d pending=%d thread=%p",
+                     (void *) ctrl,
+                     ctrl->engaged ? 1 : 0,
+                     ctrl->engage_pending ? 1 : 0,
+                     (void *) ctrl->client.thread);
 
     if (ctrl->LockBut != NULL &&
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctrl->LockBut)))
@@ -22294,6 +22301,14 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
 {
     GtkRotCtrl     *ctrl = GTK_ROT_CTRL(widget);
 
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctrl destroy begin ctrl=%p socket=%d thread=%p engaged=%d pending=%d",
+                     (void *) ctrl,
+                     ctrl->client.socket,
+                     (void *) ctrl->client.thread,
+                     ctrl->engaged ? 1 : 0,
+                     ctrl->engage_pending ? 1 : 0);
+
     /* stop timer */
     if (ctrl->timerid > 0) {
         g_source_remove(ctrl->timerid);
@@ -22400,6 +22415,10 @@ static void gtk_rot_ctrl_destroy(GtkWidget * widget)
     }
     ctrl->module = NULL;
     ctrl->module_sats = NULL;
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctrl destroy end ctrl=%p",
+                     (void *) ctrl);
 
     (*GTK_WIDGET_CLASS(parent_class)->destroy) (widget);
 }

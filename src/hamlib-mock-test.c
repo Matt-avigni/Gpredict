@@ -17,10 +17,12 @@
 
 #include <gio/gio.h>
 #include <glib.h>
+#include <glib/gstdio.h>
 
 #include "rigctld_client.h"
 #include "rotctld_client.h"
 #include "radio-conf.h"
+#include "sat-log.h"
 
 #define MOCK_CONNECT_RETRIES 20
 #define MOCK_CONNECT_DELAY_US 100000
@@ -35,19 +37,59 @@ static gchar *find_python(void)
 
 static guint16 pick_free_port(void)
 {
-    GSocketListener *listener = g_socket_listener_new();
+    GSocket *socket = NULL;
+    GInetAddress *inet = NULL;
+    GSocketAddress *bind_addr = NULL;
+    GSocketAddress *local_addr = NULL;
     GError *error = NULL;
     guint16 port = 0;
 
-    port = g_socket_listener_add_any_inet_port(listener, NULL, &error);
-    if (port == 0)
+    inet = g_inet_address_new_from_string("127.0.0.1");
+    bind_addr = g_inet_socket_address_new(inet, 0);
+    socket = g_socket_new(G_SOCKET_FAMILY_IPV4,
+                          G_SOCKET_TYPE_STREAM,
+                          G_SOCKET_PROTOCOL_TCP,
+                          &error);
+    if (socket == NULL)
+    {
+        g_printerr("failed to create port picker socket: %s\n",
+                   error ? error->message : "unknown");
+        g_clear_error(&error);
+        goto cleanup;
+    }
+
+    if (!g_socket_bind(socket, bind_addr, TRUE, &error))
+    {
+        g_printerr("failed to bind port picker socket: %s\n",
+                   error ? error->message : "unknown");
+        g_clear_error(&error);
+        goto cleanup;
+    }
+
+    local_addr = g_socket_get_local_address(socket, &error);
+    if (local_addr == NULL)
+    {
+        g_printerr("failed to inspect port picker socket: %s\n",
+                   error ? error->message : "unknown");
+        g_clear_error(&error);
+        goto cleanup;
+    }
+
+    if (G_IS_INET_SOCKET_ADDRESS(local_addr))
+        port = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(local_addr));
+
+cleanup:
+    if (port == 0 && error != NULL)
     {
         g_printerr("failed to pick free port: %s\n",
-                   error ? error->message : "unknown");
+                   error->message);
         g_clear_error(&error);
     }
 
-    g_object_unref(listener);
+    g_clear_object(&local_addr);
+    g_clear_object(&bind_addr);
+    g_clear_object(&inet);
+    g_clear_object(&socket);
     return port;
 }
 
@@ -64,6 +106,49 @@ static gboolean command_matches_any_token(const gchar *line,
     }
 
     return FALSE;
+}
+
+static gchar *read_text_file(const gchar *path)
+{
+    gchar *contents = NULL;
+
+    if (path == NULL)
+        return NULL;
+
+    if (!g_file_get_contents(path, &contents, NULL, NULL))
+        return NULL;
+
+    return contents;
+}
+
+static void remove_tree(const gchar *path)
+{
+    GDir *dir = NULL;
+    const gchar *name = NULL;
+
+    if (path == NULL || !g_file_test(path, G_FILE_TEST_EXISTS))
+        return;
+
+    if (!g_file_test(path, G_FILE_TEST_IS_DIR))
+    {
+        g_remove(path);
+        return;
+    }
+
+    dir = g_dir_open(path, 0, NULL);
+    if (dir == NULL)
+        return;
+
+    while ((name = g_dir_read_name(dir)) != NULL)
+    {
+        gchar *child = g_build_filename(path, name, NULL);
+
+        remove_tree(child);
+        g_free(child);
+    }
+
+    g_dir_close(dir);
+    g_rmdir(path);
 }
 
 static GSubprocess *spawn_rigctld_mock(const gchar *python,
@@ -577,6 +662,8 @@ int main(void)
     gchar *python = NULL;
     gchar *rig_script = NULL;
     gchar *rot_script = NULL;
+    gchar *log_root = NULL;
+    gchar *log_path = NULL;
     guint16 rig_port = 0;
     guint16 rig_port_select = 0;
     guint16 rig_port_reject = 0;
@@ -640,6 +727,31 @@ int main(void)
         g_free(rig_script);
         g_free(rot_script);
         return 77;
+    }
+
+    log_root = g_dir_make_tmp("gpredict-hamlib-log-XXXXXX", &error);
+    if (log_root == NULL)
+    {
+        g_printerr("failed to create temp log root: %s\n",
+                   error ? error->message : "unknown");
+        g_clear_error(&error);
+        ok = FALSE;
+        goto cleanup;
+    }
+    if (!g_setenv("XDG_CONFIG_HOME", log_root, TRUE))
+    {
+        g_printerr("failed to set XDG_CONFIG_HOME for log test\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    sat_log_init();
+    sat_log_set_level(SAT_LOG_LEVEL_ERROR);
+    log_path = sat_log_get_current_path();
+    if (log_path == NULL)
+    {
+        g_printerr("failed to initialize forensic session log\n");
+        ok = FALSE;
+        goto cleanup;
     }
 
     rig_port = pick_free_port();
@@ -858,6 +970,27 @@ int main(void)
         rigctld_client_caps_snapshot_free(missing_sub_caps);
         ok = FALSE;
         goto cleanup;
+    }
+    else
+    {
+        rigctld_client_state_t state = RIGCTLD_CLIENT_STOPPED;
+        gchar reason[128] = { 0 };
+
+        rigctld_client_get_status(rig_missing_sub, &state,
+                                  reason, sizeof(reason));
+        if (reason[0] == '\0')
+        {
+            g_printerr("rigctld missing-sub probe failure should keep a non-empty reason\n");
+            ok = FALSE;
+            goto cleanup;
+        }
+        if (state != RIGCTLD_CLIENT_DEGRADED)
+        {
+            g_printerr("rigctld missing-sub probe failure should leave client DEGRADED (got=%d)\n",
+                       (gint) state);
+            ok = FALSE;
+            goto cleanup;
+        }
     }
     if (!connect_rigctld_with_retry(rig_select_only, "127.0.0.1",
                                     rig_port_select_only))
@@ -1444,6 +1577,14 @@ int main(void)
         g_strfreev(lines);
     }
 
+    rigctld_client_set_log_level(RIG_LOG_QUIET);
+    if (!rigctld_client_get_freq(rig, VFO_MAIN, &freq))
+    {
+        g_printerr("rigctld get freq failed with quiet logging enabled\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+
     if (!connect_rotctld_with_retry(rot, "127.0.0.1", rot_port))
     {
         g_printerr("failed to connect to rotctld mock\n");
@@ -1725,6 +1866,24 @@ int main(void)
             ok = FALSE;
             goto cleanup;
         }
+        {
+            rotctld_client_state_t state = ROTCTLD_CLIENT_STOPPED;
+            gchar reason[128] = { 0 };
+
+            rotctld_client_get_status(rot_fail, &state, reason, sizeof(reason));
+            if (reason[0] == '\0')
+            {
+                g_printerr("rotctld failure-mode handshake should keep a non-empty reason\n");
+                ok = FALSE;
+                goto cleanup;
+            }
+            if (state == ROTCTLD_CLIENT_READY)
+            {
+                g_printerr("rotctld failure-mode handshake should not report READY state\n");
+                ok = FALSE;
+                goto cleanup;
+            }
+        }
     }
     {
         HamlibResponseInfo info = { 0 };
@@ -1885,6 +2044,23 @@ cleanup:
     rotctld_client_free(&rot_fail);
     rotctld_client_free(&rot_split);
     rotctld_client_free(&rot_drop);
+    sat_log_close();
+    if (ok && log_path != NULL)
+    {
+        gchar *log_text = read_text_file(log_path);
+
+        if (log_text == NULL ||
+            g_strrstr(log_text, "gpredict:tx: [mock-rig] f") == NULL ||
+            g_strrstr(log_text, "gpredict:rx: [mock-rig] 145800000") == NULL ||
+            g_strrstr(log_text, "gpredict:tx: [mock-rot] p") == NULL ||
+            g_strrstr(log_text, "gpredict:rx: [mock-rot] 0.0") == NULL)
+        {
+            g_printerr("forensic session log missing expected rig/rot wire output with verbose UI logging disabled\n");
+            ok = FALSE;
+        }
+
+        g_free(log_text);
+    }
 
     if (rig_proc != NULL && ok &&
         !g_subprocess_wait_check(rig_proc, NULL, &error))
@@ -2026,6 +2202,10 @@ cleanup:
         g_ptr_array_free(rig_probe_log.lines, TRUE);
     if (rig_select_log.lines != NULL)
         g_ptr_array_free(rig_select_log.lines, TRUE);
+    if (ok && log_root != NULL)
+        remove_tree(log_root);
+    g_free(log_path);
+    g_free(log_root);
     g_free(python);
     g_free(rig_script);
     g_free(rot_script);

@@ -223,7 +223,7 @@ static int read_debug_file(const gchar * filename)
  */
 static void load_debug_file(GtkWidget * parent)
 {
-    gchar          *confdir;
+    gchar          *confdir = NULL;
     gchar          *filename;
     gchar          *title;
     gint            error;      /* error code returned by by read_debug_file */
@@ -460,7 +460,7 @@ void sat_log_browser_open(void)
 {
     GtkWidget      *hbox;
     gchar          *fname;
-    gchar          *confdir;
+    gchar          *confdir = NULL;
     gchar          *title;
     gint            error;      /* error code returned by by read_debug_file */
 
@@ -501,10 +501,13 @@ void sat_log_browser_open(void)
 
         gtk_widget_show_all(window);
 
-        /* read gpredict.log by default */
-        confdir = get_user_conf_dir();
-        fname = g_strconcat(confdir, G_DIR_SEPARATOR_S,
-                            "logs", G_DIR_SEPARATOR_S, "gpredict.log", NULL);
+        fname = sat_log_get_latest_path();
+        if (fname == NULL)
+        {
+            confdir = get_user_conf_dir();
+            fname = g_strconcat(confdir, G_DIR_SEPARATOR_S,
+                                "logs", G_DIR_SEPARATOR_S, "gpredict.log", NULL);
+        }
 
         error = read_debug_file(fname);
 

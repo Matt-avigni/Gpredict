@@ -2,11 +2,11 @@
    gpredict 2.3.326-4a74-dirty: src/test-suite.log
 =====================================================
 
-# TOTAL: 10
-# PASS:  8
+# TOTAL: 2
+# PASS:  1
 # SKIP:  0
 # XFAIL: 0
-# FAIL:  2
+# FAIL:  1
 # XPASS: 0
 # ERROR: 0
 
@@ -14,50 +14,8 @@ System information (uname -a): Darwin 24.6.0 Darwin Kernel Version 24.6.0: Mon J
 
 .. contents:: :depth: 2
 
-FAIL: rigctld-io-test
-=====================
-
-FAIL rigctld-io-test (exit status: 17)
-
 FAIL: hamlib-mock-test
 ======================
 
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
-failed to pick free port: Error binding to address [::]:0: Operation not permitted
 FAIL hamlib-mock-test (exit status: 1)
 

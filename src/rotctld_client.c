@@ -44,6 +44,53 @@ struct _RotctldClient {
     RotCaps                 caps;
 };
 
+static const gchar *rotctld_client_state_name(rotctld_client_state_t state)
+{
+    switch (state)
+    {
+    case ROTCTLD_CLIENT_STOPPED:
+        return "STOPPED";
+    case ROTCTLD_CLIENT_CONNECTING:
+        return "CONNECTING";
+    case ROTCTLD_CLIENT_PROBING:
+        return "PROBING";
+    case ROTCTLD_CLIENT_READY:
+        return "READY";
+    case ROTCTLD_CLIENT_DEGRADED:
+        return "DEGRADED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void rotctld_client_emit_wire_lines(RotctldClient *client,
+                                           sat_log_level_t level,
+                                           const gchar *prefix,
+                                           const gchar *text)
+{
+    gchar **lines = NULL;
+
+    if (client == NULL || prefix == NULL || text == NULL || *text == '\0')
+        return;
+
+    lines = g_strsplit(text, "\n", -1);
+    for (gint i = 0; lines[i] != NULL; i++)
+    {
+        gchar *trimmed = g_strdup(lines[i]);
+
+        g_strstrip(trimmed);
+        if (*trimmed != '\0')
+            sat_log_forensic(level,
+                             "%s: [%s] %s",
+                             prefix,
+                             client->label ? client->label : "rot",
+                             trimmed);
+        g_free(trimmed);
+    }
+
+    g_strfreev(lines);
+}
+
 static GMutex *rotctld_client_meta_mutex(const RotctldClient *client)
 {
     return (GMutex *)&client->meta_mutex;
@@ -712,6 +759,8 @@ static gboolean rotctld_client_exchange(RotctldClient *client,
         send_cmd = cmd;
     }
 
+    rotctld_client_emit_wire_lines(client, SAT_LOG_LEVEL_INFO,
+                                   "gpredict:tx", send_cmd);
     ok = hamlib_transport_request(client->transport,
                                   send_cmd,
                                   mode,
@@ -740,6 +789,10 @@ static gboolean rotctld_client_exchange(RotctldClient *client,
         sat_log_log(SAT_LOG_LEVEL_WARN,
                     "rotctld exchange failed cmd=%s err=%d",
                     cmd, local.err);
+        sat_log_forensic(SAT_LOG_LEVEL_ERROR,
+                         "rotctld exchange failed [%s] cmd=%s err=%d",
+                         client->label ? client->label : "rot",
+                         cmd, local.err);
         return FALSE;
     }
 
@@ -757,6 +810,8 @@ static gboolean rotctld_client_exchange(RotctldClient *client,
 
     if (out && out_len > 0)
     {
+        rotctld_client_emit_wire_lines(client, SAT_LOG_LEVEL_INFO,
+                                       "gpredict:rx", out);
         sat_log_log(SAT_LOG_LEVEL_DEBUG,
                     "rotctld exchange ok cmd=%s lines=%u rprt=%d code=%d",
                     cmd,
@@ -854,6 +909,13 @@ static void rotctld_client_log_failure(RotctldClient *client,
                 cmd ? cmd : "(null)",
                 bytes,
                 snippet ? snippet : "(null)");
+    sat_log_forensic(SAT_LOG_LEVEL_ERROR,
+                     "%s [%s]: cmd='%s' bytes=%" G_GSIZE_FORMAT " reply=%s",
+                     label ? label : "rotctld failure",
+                     (client && client->label) ? client->label : "rot",
+                     cmd ? cmd : "(null)",
+                     bytes,
+                     snippet ? snippet : "(null)");
 
     g_free(snippet);
 }
@@ -1046,6 +1108,7 @@ static void rotctld_client_set_state(RotctldClient *client,
 {
     va_list args;
     gchar *reason = NULL;
+    gchar *label = NULL;
 
     if (client == NULL)
         return;
@@ -1058,10 +1121,18 @@ static void rotctld_client_set_state(RotctldClient *client,
     }
 
     g_mutex_lock(rotctld_client_meta_mutex(client));
+    label = g_strdup(client->label ? client->label : "rot");
     client->state = state;
     g_free(client->state_reason);
     client->state_reason = reason;
     g_mutex_unlock(rotctld_client_meta_mutex(client));
+
+    sat_log_forensic(SAT_LOG_LEVEL_INFO,
+                     "rotctld client (%s) state=%s reason=%s",
+                     label ? label : "rot",
+                     rotctld_client_state_name(state),
+                     reason ? reason : "(none)");
+    g_free(label);
 }
 
 RotctldClient *rotctld_client_new(const gchar *label)
