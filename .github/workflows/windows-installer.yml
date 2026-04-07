@@ -34,6 +34,7 @@ jobs:
           install: >-
             autoconf
             automake-wrapper
+            git
             intltool
             libtool
             make
@@ -50,6 +51,16 @@ jobs:
             mingw-w64-ucrt-x86_64-hicolor-icon-theme
             mingw-w64-ucrt-x86_64-ntldd
             mingw-w64-ucrt-x86_64-nsis
+
+      - name: Verify MSYS2 build tools
+        run: |
+          set -euo pipefail
+          for tool in bash git autoreconf pkg-config gcc make ntldd makensis; do
+            command -v "$tool"
+          done
+          git --version
+          gcc --version | head -n 1
+          makensis -VERSION
 
       - name: Clone pinned Hamlib fork
         run: |
