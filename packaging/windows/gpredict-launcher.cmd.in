@@ -2,6 +2,7 @@
 setlocal
 set "APPDIR=%~dp0"
 
+if exist "%APPDIR%gpredict-env.cmd" call "%APPDIR%gpredict-env.cmd"
 if exist "%APPDIR%curl-ca-bundle.crt" set "CURL_CA_BUNDLE=%APPDIR%curl-ca-bundle.crt"
 set "GTK_DATA_PREFIX=%APPDIR%"
 set "GTK_EXE_PREFIX=%APPDIR%"
@@ -10,6 +11,7 @@ set "GIO_MODULE_DIR=%APPDIR%lib\gio\modules"
 set "GSETTINGS_SCHEMA_DIR=%APPDIR%share\glib-2.0\schemas"
 set "GDK_PIXBUF_MODULEDIR=%APPDIR%lib\@GDK_PIXBUF_SUBDIR@\loaders"
 set "GDK_PIXBUF_MODULE_FILE=%APPDIR%lib\@GDK_PIXBUF_SUBDIR@\loaders.cache"
+if defined GPREDICT_HAMLIB_DIR set "PATH=%GPREDICT_HAMLIB_DIR%;%PATH%"
 set "PATH=%APPDIR%;%APPDIR%lib\gio\modules;%PATH%"
 
 "%APPDIR%gpredict.exe" %*

@@ -24,7 +24,7 @@ jobs:
 
       - name: Export pinned Hamlib source
         shell: bash
-        run: cat packaging/windows/hamlib-source.env >> "$GITHUB_ENV"
+        run: grep -E '^[A-Z_][A-Z0-9_]*=' packaging/windows/hamlib-source.env >> "$GITHUB_ENV"
 
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
