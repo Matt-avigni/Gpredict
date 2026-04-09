@@ -986,6 +986,7 @@ static gboolean rotctld_autodetect_is_tty(const gchar *candidate);
 static gboolean rotctld_autodetect_is_cu(const gchar *candidate);
 static gchar   *rotctld_autodetect_tty_equivalent(const gchar *candidate);
 static gchar   *rotctld_autodetect_cu_equivalent(const gchar *candidate);
+static gchar   *rotctld_autodetect_preferred_device(const gchar *candidate);
 static gchar   *rotctld_autodetect_candidate_key(const gchar *candidate);
 static gboolean rotctld_autodetect_prefer_cu(const rotor_conf_t *conf,
                                              const gchar *cached);
@@ -15592,7 +15593,6 @@ static gchar *rotctld_autodetect_device(GtkRotCtrl *ctrl)
     gboolean prefer_cu = FALSE;
     gchar *filtered_list = NULL;
     gchar *preferred_current = NULL;
-    const gchar *lookup_current = NULL;
 
     if (ctrl && ctrl->conf)
     {
@@ -15625,16 +15625,13 @@ static gchar *rotctld_autodetect_device(GtkRotCtrl *ctrl)
 
     if (current && rotctld_list_contains(list, current))
     {
-        lookup_current = current;
-#ifdef __APPLE__
-        if (rotctld_autodetect_is_tty(current))
-        {
-            preferred_current = rotctld_autodetect_cu_equivalent(current);
-            if (preferred_current && rotctld_list_contains(list, preferred_current))
-                lookup_current = preferred_current;
-        }
-#endif
-        picked = g_strdup(lookup_current);
+        preferred_current = rotctld_autodetect_preferred_device(current);
+        if (preferred_current &&
+            (rotctld_list_contains(list, preferred_current) ||
+             g_strcmp0(preferred_current, current) != 0))
+            picked = g_strdup(preferred_current);
+        else
+            picked = g_strdup(current);
     }
     else if (list != NULL)
         picked = g_strdup(list->data);
@@ -15888,7 +15885,13 @@ static gchar *rotctld_resolve_device(GtkRotCtrl *ctrl,
         return g_strdup(manual);
 
     if (selected && *selected)
+    {
+        gchar *preferred = rotctld_autodetect_preferred_device(selected);
+
+        if (preferred != NULL)
+            return preferred;
         return g_strdup(selected);
+    }
 
     return NULL;
 }
@@ -16536,6 +16539,29 @@ static gchar *rotctld_autodetect_cu_equivalent(const gchar *candidate)
     (void)candidate;
     return NULL;
 #endif
+}
+
+static gchar *rotctld_autodetect_preferred_device(const gchar *candidate)
+{
+#ifdef __APPLE__
+    gchar *preferred = NULL;
+
+    if (candidate == NULL || *candidate == '\0')
+        return NULL;
+
+    if (!rotctld_autodetect_is_tty(candidate))
+        return g_strdup(candidate);
+
+    preferred = rotctld_autodetect_cu_equivalent(candidate);
+    if (preferred != NULL && g_file_test(preferred, G_FILE_TEST_EXISTS))
+        return preferred;
+
+    g_free(preferred);
+#else
+    (void)candidate;
+#endif
+
+    return candidate ? g_strdup(candidate) : NULL;
 }
 
 static gchar *rotctld_autodetect_candidate_key(const gchar *candidate)
@@ -17242,32 +17268,47 @@ static void rotctld_autodetect_apply_success(GtkRotCtrl *ctrl,
     gint pid = -1;
     gint64 now_us = g_get_monotonic_time();
     gdouble total_ms = 0.0;
+    gchar *preferred_device = NULL;
+    const gchar *selected_device = NULL;
 
     if (ctrl == NULL || state == NULL || state->autodetect_device == NULL)
         return;
+
+    preferred_device =
+        rotctld_autodetect_preferred_device(state->autodetect_device);
+    selected_device = (preferred_device && *preferred_device)
+                      ? preferred_device
+                      : state->autodetect_device;
+    if (preferred_device &&
+        g_strcmp0(preferred_device, state->autodetect_device) != 0)
+    {
+        g_free(state->autodetect_device);
+        state->autodetect_device = g_strdup(preferred_device);
+        selected_device = state->autodetect_device;
+    }
 
     if (state->autodetect_baud > 0)
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "%s: autodetect selected device %s (validated) baud=%d port=%d",
                     __func__,
-                    state->autodetect_device,
+                    selected_device,
                     state->autodetect_baud,
                     state->autodetect_port);
     else
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "%s: autodetect selected device %s (validated) port=%d",
-                    __func__, state->autodetect_device,
+                    __func__, selected_device,
                     state->autodetect_port);
     if (state->autodetect_baud > 0)
         rot_term_log(ctrl, "gpredict:rx",
                      "autodetect: selected %s (validated) baud=%d port=%d",
-                     state->autodetect_device,
+                     selected_device,
                      state->autodetect_baud,
                      state->autodetect_port);
     else
         rot_term_log(ctrl, "gpredict:rx",
                      "autodetect: selected %s (validated) port=%d",
-                     state->autodetect_device,
+                     selected_device,
                      state->autodetect_port);
 
     if (state->autodetect_start_us > 0)
@@ -17292,27 +17333,29 @@ static void rotctld_autodetect_apply_success(GtkRotCtrl *ctrl,
     sat_log_log(SAT_LOG_LEVEL_DEBUG,
                 "autodetect select pid=%d dev=%s reason=selected state=%s",
                 pid,
-                state->autodetect_device ? state->autodetect_device : "(null)",
+                selected_device ? selected_device : "(null)",
                 rotctld_autodetect_state_name(state->autodetect_state));
     rot_term_log_verbose(ctrl, "gpredict:rx",
                          "autodetect select pid=%d dev=%s reason=selected",
                          pid,
-                         state->autodetect_device ? state->autodetect_device : "(null)");
+                         selected_device ? selected_device : "(null)");
 
     if (ctrl->conf && ctrl->conf->device_autopick)
     {
         g_free(ctrl->conf->device);
-        ctrl->conf->device = g_strdup(state->autodetect_device);
+        ctrl->conf->device = g_strdup(selected_device);
     }
     if (ctrl->conf)
     {
         g_free(ctrl->conf->last_good_device);
-        ctrl->conf->last_good_device = g_strdup(state->autodetect_device);
+        ctrl->conf->last_good_device = g_strdup(selected_device);
         ctrl->conf->last_good_baud = state->autodetect_baud;
     }
     if (ctrl->conf && ctrl->conf->baud <= 0 &&
         state->autodetect_baud > 0)
         ctrl->conf->baud = state->autodetect_baud;
+
+    g_free(preferred_device);
 }
 
 static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
@@ -17320,6 +17363,8 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
     guint skipped = 0;
     const gchar *cached = NULL;
     const gchar *last_good = NULL;
+    gchar *preferred_cached = NULL;
+    gchar *preferred_last_good = NULL;
     gboolean prefer_cu = FALSE;
     gchar *filtered_list = NULL;
     gint64 now_us = g_get_monotonic_time();
@@ -17368,6 +17413,13 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
         else
             cached = ctrl->conf->device;
     }
+
+    preferred_cached = rotctld_autodetect_preferred_device(cached);
+    if (preferred_cached && *preferred_cached)
+        cached = preferred_cached;
+    preferred_last_good = rotctld_autodetect_preferred_device(last_good);
+    if (preferred_last_good && *preferred_last_good)
+        last_good = preferred_last_good;
 
     prefer_cu = rotctld_autodetect_prefer_cu(ctrl ? ctrl->conf : NULL, cached);
     full_list =
@@ -17443,6 +17495,9 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
         sat_log_log(SAT_LOG_LEVEL_INFO,
                     "rotor probe: enumerated devices: (none)");
     }
+
+    g_free(preferred_cached);
+    g_free(preferred_last_good);
 }
 
 static gboolean rotctld_autodetect_has_more(const RotctldProbeState *state)
