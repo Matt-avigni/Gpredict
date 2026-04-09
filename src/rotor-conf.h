@@ -51,6 +51,11 @@ typedef enum {
     ROT_PROTOCOL_OTHER = 3
 } rot_protocol_t;
 
+typedef enum {
+    ROT_NO_ENCODER_OUTPUT_TIME = 0,
+    ROT_NO_ENCODER_OUTPUT_DEGREE = 1
+} rot_no_encoder_output_mode_t;
+
 /** \brief Rotator configuration. */
 typedef struct {
     gchar          *name;       /*!< Configuration file name, less .rot */
@@ -96,6 +101,7 @@ typedef struct {
     gint            rotor_stale_park_ms; /*!< Park/disconnect threshold for stale position */
     gint            rotor_stale_resume_ms; /*!< Fresh period required to resume after hold */
     gboolean        disable_pos_feedback_checks; /*!< Disable position/encoder feedback checks */
+    rot_no_encoder_output_mode_t no_encoder_output_mode; /*!< No-encoder output trigger mode */
     gchar          *last_good_device; /*!< Last validated serial device */
     gint            last_good_baud; /*!< Last validated baud rate */
 } rotor_conf_t;

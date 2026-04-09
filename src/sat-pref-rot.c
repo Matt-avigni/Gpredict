@@ -89,6 +89,8 @@ static void rot_pref_store_set(GtkListStore *store,
                        ROT_LIST_COL_PRETRACK_MIN_EL, conf->pretrack_min_el,
                        ROT_LIST_COL_DISABLE_POS_FEEDBACK,
                        conf->disable_pos_feedback_checks,
+                       ROT_LIST_COL_NO_ENCODER_OUTPUT_MODE,
+                       conf->no_encoder_output_mode,
                        ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, conf->el_overtravel_enable,
                        ROT_LIST_COL_EL_MIN_DEG, conf->el_min_deg,
                        ROT_LIST_COL_EL_MAX_DEG, conf->el_max_deg,
@@ -189,6 +191,7 @@ static void add_cb(GtkWidget * button, gpointer data)
         .pretrack_immediate = TRUE,
         .pretrack_min_el = 1.0,
         .disable_pos_feedback_checks = FALSE,
+        .no_encoder_output_mode = ROT_NO_ENCODER_OUTPUT_TIME,
         .last_good_device = NULL,
         .last_good_baud = 0,
     };
@@ -295,6 +298,7 @@ static void edit_cb(GtkWidget * button, gpointer data)
         .pretrack_immediate = TRUE,
         .pretrack_min_el = 1.0,
         .disable_pos_feedback_checks = FALSE,
+        .no_encoder_output_mode = ROT_NO_ENCODER_OUTPUT_TIME,
         .last_good_device = NULL,
         .last_good_baud = 0,
     };
@@ -346,6 +350,8 @@ static void edit_cb(GtkWidget * button, gpointer data)
                        ROT_LIST_COL_PRETRACK_MIN_EL, &conf->pretrack_min_el,
                        ROT_LIST_COL_DISABLE_POS_FEEDBACK,
                        &conf->disable_pos_feedback_checks,
+                       ROT_LIST_COL_NO_ENCODER_OUTPUT_MODE,
+                       &conf->no_encoder_output_mode,
                        ROT_LIST_COL_LAST_GOOD_DEVICE, &conf->last_good_device,
                        ROT_LIST_COL_LAST_GOOD_BAUD, &conf->last_good_baud,
                        -1);
@@ -464,6 +470,7 @@ static GtkTreeModel *create_and_fill_model(void)
                                    G_TYPE_BOOLEAN,      // Pretrack immediate
                                    G_TYPE_DOUBLE,       // Pretrack min el
                                    G_TYPE_BOOLEAN,      // Disable pos feedback
+                                   G_TYPE_INT,          // No-encoder output mode
                                    G_TYPE_BOOLEAN,      // Elevation overtravel enable
                                    G_TYPE_DOUBLE,       // Elevation overtravel min
                                    G_TYPE_DOUBLE,       // Elevation overtravel max
@@ -538,6 +545,8 @@ static GtkTreeModel *create_and_fill_model(void)
                                        conf.pretrack_min_el,
                                        ROT_LIST_COL_DISABLE_POS_FEEDBACK,
                                        conf.disable_pos_feedback_checks,
+                                       ROT_LIST_COL_NO_ENCODER_OUTPUT_MODE,
+                                       conf.no_encoder_output_mode,
                                        ROT_LIST_COL_HAMLIB_MODEL, conf.hamlib_model,
                                        ROT_LIST_COL_LAST_GOOD_DEVICE, conf.last_good_device,
                                        ROT_LIST_COL_LAST_GOOD_BAUD, conf.last_good_baud,
@@ -869,6 +878,7 @@ void sat_pref_rot_ok(void)
         .pretrack_immediate = TRUE,
         .pretrack_min_el = 1.0,
         .disable_pos_feedback_checks = FALSE,
+        .no_encoder_output_mode = ROT_NO_ENCODER_OUTPUT_TIME,
         .last_good_device = NULL,
         .last_good_baud = 0,
     };
@@ -970,6 +980,8 @@ void sat_pref_rot_ok(void)
                                &conf.pretrack_min_el,
                                ROT_LIST_COL_DISABLE_POS_FEEDBACK,
                                &conf.disable_pos_feedback_checks,
+                               ROT_LIST_COL_NO_ENCODER_OUTPUT_MODE,
+                               &conf.no_encoder_output_mode,
                                ROT_LIST_COL_HAMLIB_MODEL, &conf.hamlib_model,
                                ROT_LIST_COL_LAST_GOOD_DEVICE,
                                &conf.last_good_device,

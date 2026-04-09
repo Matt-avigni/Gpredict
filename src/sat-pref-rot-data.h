@@ -69,6 +69,7 @@ typedef enum {
     ROT_LIST_COL_PRETRACK_IMMEDIATE, /*!< Enter pretrack immediately on Track. */
     ROT_LIST_COL_PRETRACK_MIN_EL, /*!< Pretrack elevation in degrees. */
     ROT_LIST_COL_DISABLE_POS_FEEDBACK, /*!< Disable feedback checks. */
+    ROT_LIST_COL_NO_ENCODER_OUTPUT_MODE, /*!< No-encoder output trigger mode. */
     ROT_LIST_COL_EL_OVERTRAVEL_ENABLE, /*!< Enable custom elevation overtravel clamp. */
     ROT_LIST_COL_EL_MIN_DEG,   /*!< Overtravel minimum elevation in degrees. */
     ROT_LIST_COL_EL_MAX_DEG,   /*!< Overtravel maximum elevation in degrees. */

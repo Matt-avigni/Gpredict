@@ -116,6 +116,7 @@
 #define ROT_PLAN_EL_WEIGHT 1.0
 #define ROT_PLAN_NEAR_LIMIT_MARGIN 2.0
 #define ROT_PLAN_NEAR_LIMIT_PENALTY 5.0
+#define ROT_PLAN_ZENITH_FLIP_MARGIN_DEG 2.0
 #define ROT_PRETRACK_LOOKAHEAD_SEC 7200.0
 #define ROT_PRETRACK_REACQUIRE_SEC 2.0
 #define ROT_PRETRACK_WINDOW_SEC 300.0
@@ -492,6 +493,7 @@ struct _GtkRotCtrl {
     GtkWidget      *aoslos_banner;
     GtkWidget      *DevSel, *LockBut, *MonitorCheckBox;
     GtkWidget      *track, *freeze, *cycle_spin, *thld_spin;
+    GtkWidget      *cycle_row, *threshold_row;
     GtkWidget      *plot;
     GtkWidget      *status_label_widget;
     GtkWidget      *status_indicator_widget;
@@ -918,6 +920,9 @@ static double   rotctrl_az_abs_error(double measured_abs,
                                      gboolean span_extended);
 static gboolean rotctrl_get_pos_valid(GtkRotCtrl *ctrl, gint64 *last_pos_us);
 static gboolean rotctrl_no_encoder_mode(const GtkRotCtrl *ctrl);
+static rot_no_encoder_output_mode_t
+rotctrl_no_encoder_output_mode(const GtkRotCtrl *ctrl);
+static void rotctrl_update_no_encoder_interval_widgets(GtkRotCtrl *ctrl);
 static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
                                    gint64 window_us,
                                    gint64 *last_pos_us);
@@ -1020,6 +1025,11 @@ static gdouble  ang_delta_deg(gdouble a, gdouble b);
 static gboolean rotctrl_samples_cross_endstop(const GArray *samples,
                                               const rotor_conf_t *conf,
                                               gdouble min_el);
+static gboolean rotctrl_samples_reach_zenith_flip_band(const GtkRotCtrl *ctrl,
+                                                       const GArray *samples,
+                                                       gdouble min_el,
+                                                       gdouble *peak_el_out,
+                                                       gdouble *trigger_el_out);
 static gdouble  rot_clamp_az_abs(gdouble az, gdouble min, gdouble max,
                                  gboolean *clamped_out);
 static void     rot_transform_update(GtkRotCtrl *ctrl);
@@ -4175,11 +4185,14 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
     gboolean have_normal = FALSE;
     gboolean have_flip = FALSE;
     gboolean crosses_endstop = FALSE;
+    gboolean zenith_flip_candidate = FALSE;
     rot_plan_result_t *chosen = NULL;
     GArray *normal_samples = NULL;
     GArray *flip_samples = NULL;
     gdouble t0, t1;
     gdouble az_min, az_max;
+    gdouble zenith_peak_el = 0.0;
+    gdouble zenith_trigger_el = 0.0;
     rot_plan_input_t in = { 0 };
 
     rot_plan_reset(&ctrl->trajectory_plan);
@@ -4226,11 +4239,28 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
     rot_term_log(ctrl, "gpredict",
                  "trajectory crosses_endstop=%d",
                  crosses_endstop ? 1 : 0);
+    zenith_flip_candidate =
+        rotctrl_samples_reach_zenith_flip_band(ctrl,
+                                               normal_samples,
+                                               ctrl->conf->minel,
+                                               &zenith_peak_el,
+                                               &zenith_trigger_el);
+    if (zenith_flip_candidate)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "trajectory zenith_flip_candidate=1 peak_el=%.2f trigger_el=%.2f",
+                    zenith_peak_el,
+                    zenith_trigger_el);
+        rot_term_log(ctrl, "gpredict",
+                     "trajectory zenith_flip_candidate=1 peak_el=%.2f trigger_el=%.2f",
+                     zenith_peak_el,
+                     zenith_trigger_el);
+    }
     in.samples = normal_samples;
     have_normal = rot_plan_build(&in, &normal);
 
     flip_allowed = (ctrl->conf->maxel >= 180.0);
-    if (flip_allowed && crosses_endstop) {
+    if (flip_allowed && (crosses_endstop || zenith_flip_candidate)) {
         flip_samples = rot_build_samples(ctrl, ctrl->pass,
                                          ROT_PLAN_MODE_FLIP, t0, t1);
         in.samples = flip_samples;
@@ -4238,6 +4268,8 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
     }
 
     if (crosses_endstop && have_flip)
+        chosen = &flip;
+    else if (zenith_flip_candidate && have_flip)
         chosen = &flip;
     else if (have_normal)
         chosen = &normal;
@@ -4281,17 +4313,23 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
 
         if (ctrl->trajectory_plan.status == ROT_PLAN_STATUS_FULL_TRACK) {
             sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "%s: selected %s plan strategy=%d (full track)",
-                        __func__,
-                        ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
-                        ctrl->trajectory_plan.strategy);
-        } else {
-            sat_log_log(SAT_LOG_LEVEL_WARN,
-                        "%s: selected %s plan strategy=%d (%s)",
+                        "%s: selected %s plan strategy=%d (full track)%s",
                         __func__,
                         ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
                         ctrl->trajectory_plan.strategy,
-                        ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "partial tracking");
+                        (zenith_flip_candidate && chosen == &flip && !crosses_endstop)
+                            ? " zenith_candidate=1"
+                            : "");
+        } else {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "%s: selected %s plan strategy=%d (%s)%s",
+                        __func__,
+                        ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
+                        ctrl->trajectory_plan.strategy,
+                        ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "partial tracking",
+                        (zenith_flip_candidate && chosen == &flip && !crosses_endstop)
+                            ? " zenith_candidate=1"
+                            : "");
         }
     } else {
         ctrl->trajectory_plan.valid = FALSE;
@@ -4590,6 +4628,54 @@ static gboolean rotctrl_samples_cross_endstop(const GArray *samples,
     }
 
     return FALSE;
+}
+
+static gboolean rotctrl_samples_reach_zenith_flip_band(const GtkRotCtrl *ctrl,
+                                                       const GArray *samples,
+                                                       gdouble min_el,
+                                                       gdouble *peak_el_out,
+                                                       gdouble *trigger_el_out)
+{
+    gdouble peak_el = -G_MAXDOUBLE;
+    gdouble trigger_el = 0.0;
+
+    if (peak_el_out)
+        *peak_el_out = 0.0;
+    if (trigger_el_out)
+        *trigger_el_out = 0.0;
+
+    if (ctrl == NULL || ctrl->conf == NULL || samples == NULL || samples->len == 0)
+        return FALSE;
+
+    if (!ctrl->transform.zenith_guard_enable || ctrl->conf->maxel < 180.0 ||
+        ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        return FALSE;
+
+    trigger_el = ctrl->transform.zenith_guard_el_deg + ROT_PLAN_ZENITH_FLIP_MARGIN_DEG;
+    if (trigger_el > ctrl->conf->maxel)
+        trigger_el = ctrl->conf->maxel;
+
+    for (guint i = 0; i < samples->len; i++)
+    {
+        rot_plan_sample_t sample =
+            g_array_index(samples, rot_plan_sample_t, i);
+
+        if (!isfinite(sample.el) || sample.el < (min_el - ROT_BELOW_HORIZON_MARGIN_DEG))
+            continue;
+
+        if (sample.el > peak_el)
+            peak_el = sample.el;
+    }
+
+    if (!isfinite(peak_el) || peak_el <= -G_MAXDOUBLE / 2.0)
+        return FALSE;
+
+    if (peak_el_out)
+        *peak_el_out = peak_el;
+    if (trigger_el_out)
+        *trigger_el_out = trigger_el;
+
+    return peak_el >= (trigger_el - 1e-6);
 }
 
 static void G_GNUC_UNUSED rotctrl_apply_inverted_el(const rotor_conf_t *conf,
@@ -5504,6 +5590,42 @@ static gboolean rotctrl_no_encoder_mode(const GtkRotCtrl *ctrl)
     return (ctrl != NULL &&
             ctrl->conf != NULL &&
             ctrl->conf->disable_pos_feedback_checks);
+}
+
+static rot_no_encoder_output_mode_t
+rotctrl_no_encoder_output_mode(const GtkRotCtrl *ctrl)
+{
+    if (ctrl == NULL || ctrl->conf == NULL)
+        return ROT_NO_ENCODER_OUTPUT_TIME;
+
+    if (ctrl->conf->no_encoder_output_mode == ROT_NO_ENCODER_OUTPUT_DEGREE)
+        return ROT_NO_ENCODER_OUTPUT_DEGREE;
+
+    return ROT_NO_ENCODER_OUTPUT_TIME;
+}
+
+static void rotctrl_update_no_encoder_interval_widgets(GtkRotCtrl *ctrl)
+{
+    gboolean no_encoder = FALSE;
+    gboolean cycle_sensitive = TRUE;
+    gboolean threshold_sensitive = TRUE;
+
+    if (ctrl == NULL)
+        return;
+
+    no_encoder = rotctrl_no_encoder_mode(ctrl);
+    if (no_encoder)
+    {
+        if (rotctrl_no_encoder_output_mode(ctrl) == ROT_NO_ENCODER_OUTPUT_DEGREE)
+            cycle_sensitive = FALSE;
+        else
+            threshold_sensitive = FALSE;
+    }
+
+    if (ctrl->cycle_row)
+        gtk_widget_set_sensitive(ctrl->cycle_row, cycle_sensitive);
+    if (ctrl->threshold_row)
+        gtk_widget_set_sensitive(ctrl->threshold_row, threshold_sensitive);
 }
 
 static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
@@ -11417,6 +11539,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
     gboolean cal_force_send = FALSE;
     gboolean park_active = FALSE;
     gboolean no_encoder = rotctrl_no_encoder_mode(ctrl);
+    rot_no_encoder_output_mode_t no_encoder_output_mode =
+        rotctrl_no_encoder_output_mode(ctrl);
 
     pos_recent = rotctrl_pos_recent(ctrl,
                                     (gint64)rotctrl_stale_ms(ctrl) * 1000,
@@ -14023,12 +14147,42 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             have_target &&
             reason != ROT_CMD_REASON_RANGE)
         {
-            send_ok = TRUE;
-            gate = ROT_CMD_ACTION_SEND;
-            reason = ctrl->setpoint_valid ? ROT_CMD_REASON_RESEND
-                                          : ROT_CMD_REASON_INITIAL;
-            resend_due = TRUE;
-            min_step_exceeded = TRUE;
+            if (no_encoder_output_mode == ROT_NO_ENCODER_OUTPUT_TIME)
+            {
+                send_ok = TRUE;
+                gate = ROT_CMD_ACTION_SEND;
+                reason = ctrl->setpoint_valid ? ROT_CMD_REASON_RESEND
+                                              : ROT_CMD_REASON_INITIAL;
+                resend_due = TRUE;
+                min_step_exceeded = TRUE;
+            }
+            else
+            {
+                gboolean should_send =
+                    force_send ||
+                    resend_due ||
+                    !ctrl->setpoint_valid ||
+                    min_step_exceeded;
+
+                send_ok = should_send;
+                gate = should_send ? ROT_CMD_ACTION_SEND
+                                   : ROT_CMD_ACTION_SUPPRESS;
+                if (should_send)
+                {
+                    if (force_send)
+                        reason = ROT_CMD_REASON_FORCE;
+                    else if (resend_due)
+                        reason = ROT_CMD_REASON_RESEND;
+                    else if (!ctrl->setpoint_valid)
+                        reason = ROT_CMD_REASON_INITIAL;
+                    else
+                        reason = ROT_CMD_REASON_TARGET_CHANGE;
+                }
+                else
+                {
+                    reason = ROT_CMD_REASON_MIN_STEP;
+                }
+            }
         }
 
         g_mutex_lock(&ctrl->client.mutex);
@@ -15310,6 +15464,7 @@ static void rot_selected_cb(GtkComboBox * box, gpointer data)
                                   ctrl->conf->cycle);
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ctrl->thld_spin),
                                   ctrl->conf->threshold);
+        rotctrl_update_no_encoder_interval_widgets(ctrl);
 
         rotctrl_update_geometry_widgets(ctrl);
 
@@ -20952,6 +21107,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     /* cycle period */
     cycle_row = gtk_grid_new();
+    ctrl->cycle_row = cycle_row;
     gtk_grid_set_column_spacing(GTK_GRID(cycle_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(cycle_row), 5);
     gtk_widget_set_halign(cycle_row, GTK_ALIGN_START);
@@ -20986,6 +21142,7 @@ static GtkWidget *create_conf_widgets(GtkRotCtrl * ctrl)
 
     /* Tolerance */
     threshold_row = gtk_grid_new();
+    ctrl->threshold_row = threshold_row;
     gtk_grid_set_column_spacing(GTK_GRID(threshold_row), 5);
     gtk_grid_set_row_spacing(GTK_GRID(threshold_row), 5);
     gtk_widget_set_halign(threshold_row, GTK_ALIGN_START);
@@ -22207,6 +22364,8 @@ static void gtk_rot_ctrl_init(GtkRotCtrl * ctrl,
     ctrl->delay = 300;      /* default: 300 ms control cycle */
     ctrl->timerid = 0;
     ctrl->threshold = 1.0;  /* default: 1 degree error tolerance */
+    ctrl->cycle_row = NULL;
+    ctrl->threshold_row = NULL;
     ctrl->errcnt = 0;
     ctrl->cycle_perf_warned = FALSE;
     ctrl->conf = NULL;

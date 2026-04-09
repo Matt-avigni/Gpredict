@@ -71,6 +71,8 @@ typedef struct {
     GtkWidget *el_max_deg_label;
     GtkWidget *axismode;
     GtkWidget *disable_pos_feedback;
+    GtkWidget *no_encoder_output_mode;
+    GtkWidget *no_encoder_output_mode_label;
     gboolean device_scan_in_progress;
     gboolean ui_updating;
     guint pending_ui_refresh_id;
@@ -105,6 +107,28 @@ static void device_refresh_cb(GtkButton *button, gpointer data);
 static void device_autopick_toggled_cb(GtkToggleButton *toggle, gpointer data);
 static void aztype_changed_cb(GtkComboBox *box, gpointer data);
 static void rot_pref_schedule_device_combo_refresh(RotPrefUi *ui);
+static void rot_pref_update_no_encoder_ui_state(RotPrefUi *ui);
+
+static const gchar *rot_no_encoder_output_mode_id(rot_no_encoder_output_mode_t mode)
+{
+    switch (mode)
+    {
+    case ROT_NO_ENCODER_OUTPUT_DEGREE:
+        return "degree";
+
+    case ROT_NO_ENCODER_OUTPUT_TIME:
+    default:
+        return "time";
+    }
+}
+
+static rot_no_encoder_output_mode_t rot_no_encoder_output_mode_from_id(const gchar *id)
+{
+    if (g_strcmp0(id, "degree") == 0)
+        return ROT_NO_ENCODER_OUTPUT_DEGREE;
+
+    return ROT_NO_ENCODER_OUTPUT_TIME;
+}
 
 static void rot_pref_ui_begin_update(RotPrefUi *ui, const gchar *reason)
 {
@@ -387,6 +411,21 @@ static void rot_pref_update_device_ui_state(RotPrefUi *ui)
     if (ui->device_manual_revealer)
         gtk_revealer_set_reveal_child(
             GTK_REVEALER(ui->device_manual_revealer), show_manual);
+}
+
+static void rot_pref_update_no_encoder_ui_state(RotPrefUi *ui)
+{
+    gboolean enabled = FALSE;
+
+    if (ui == NULL)
+        return;
+
+    enabled = rot_pref_no_encoder_enabled(ui);
+
+    if (ui->no_encoder_output_mode)
+        gtk_widget_set_sensitive(ui->no_encoder_output_mode, enabled);
+    if (ui->no_encoder_output_mode_label)
+        gtk_widget_set_sensitive(ui->no_encoder_output_mode_label, enabled);
 }
 
 static const gchar *rot_protocol_id(rot_protocol_t protocol)
@@ -1026,6 +1065,12 @@ static void update_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     if (ui->disable_pos_feedback)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback),
                                      conf->disable_pos_feedback_checks);
+    if (ui->no_encoder_output_mode)
+        rot_pref_combo_set_active_id(
+            GTK_COMBO_BOX(ui->no_encoder_output_mode),
+            rot_no_encoder_output_mode_id(conf->no_encoder_output_mode),
+            G_CALLBACK(rot_pref_on_field_changed));
+    rot_pref_update_no_encoder_ui_state(ui);
 
     rot_pref_ui_end_update(ui, "update_widgets");
     rot_pref_update_ok_button(ui);
@@ -1074,6 +1119,12 @@ static void clear_widgets(RotPrefUi *ui)
     if (ui->disable_pos_feedback)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback),
                                      FALSE);
+    if (ui->no_encoder_output_mode)
+        rot_pref_combo_set_active_id(
+            GTK_COMBO_BOX(ui->no_encoder_output_mode),
+            rot_no_encoder_output_mode_id(ROT_NO_ENCODER_OUTPUT_TIME),
+            G_CALLBACK(rot_pref_on_field_changed));
+    rot_pref_update_no_encoder_ui_state(ui);
 
     rot_pref_ui_end_update(ui, "clear_widgets");
     rot_pref_update_ok_button(ui);
@@ -1170,6 +1221,7 @@ static void disable_pos_feedback_toggled_cb(GtkToggleButton *button, gpointer da
         return;
 
     rot_pref_update_device_ui_state(ui);
+    rot_pref_update_no_encoder_ui_state(ui);
     rot_pref_on_field_changed(GTK_WIDGET(button), data);
 }
 
@@ -1640,6 +1692,28 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     g_signal_connect(ui->disable_pos_feedback, "toggled",
                      G_CALLBACK(disable_pos_feedback_toggled_cb), ui);
 
+    ui->no_encoder_output_mode_label = gtk_label_new(_(" Output mode"));
+    g_object_set(ui->no_encoder_output_mode_label,
+                 "xalign", 1.0, "yalign", 0.5, NULL);
+    gtk_grid_attach(GTK_GRID(table), ui->no_encoder_output_mode_label, 0, 21, 1, 1);
+
+    ui->no_encoder_output_mode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->no_encoder_output_mode),
+                              "time",
+                              _("Time interval"));
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ui->no_encoder_output_mode),
+                              "degree",
+                              _("Degree interval"));
+    gtk_widget_set_tooltip_text(
+        ui->no_encoder_output_mode,
+        _("Time interval sends commands every control cycle. "
+          "Degree interval sends a new command when azimuth or elevation "
+          "changes by at least the configured threshold from the last command."));
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(ui->no_encoder_output_mode), "time");
+    gtk_grid_attach(GTK_GRID(table), ui->no_encoder_output_mode, 1, 21, 3, 1);
+    g_signal_connect(ui->no_encoder_output_mode, "changed",
+                     G_CALLBACK(rot_pref_on_field_changed), ui);
+
 
     if (conf->name != NULL)
         update_widgets(ui, conf);
@@ -1647,6 +1721,7 @@ static GtkWidget *create_editor_widgets(RotPrefUi *ui, rotor_conf_t * conf)
     {
         rot_pref_scan_devices_async(ui, NULL, FALSE);
         rot_pref_update_device_ui_state(ui);
+        rot_pref_update_no_encoder_ui_state(ui);
     }
 
     update_el_limits_sensitivity(ui);
@@ -1787,6 +1862,11 @@ static gboolean apply_changes(RotPrefUi *ui, rotor_conf_t * conf)
     if (ui->disable_pos_feedback)
         conf->disable_pos_feedback_checks =
             gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->disable_pos_feedback));
+    conf->no_encoder_output_mode = ROT_NO_ENCODER_OUTPUT_TIME;
+    if (ui->no_encoder_output_mode)
+        conf->no_encoder_output_mode =
+            rot_no_encoder_output_mode_from_id(
+                gtk_combo_box_get_active_id(GTK_COMBO_BOX(ui->no_encoder_output_mode)));
 
     /* axis inversion */
 

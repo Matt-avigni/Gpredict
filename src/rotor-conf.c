@@ -78,6 +78,7 @@
 #define KEY_STALE_PARK_MS "StaleParkMs"
 #define KEY_STALE_RESUME_MS "StaleResumeMs"
 #define KEY_DISABLE_POS_FEEDBACK "DisablePosFeedbackChecks"
+#define KEY_NO_ENCODER_OUTPUT_MODE "NoEncoderOutputMode"
 #define KEY_LAST_GOOD_DEVICE "LastGoodDevice"
 #define KEY_LAST_GOOD_BAUD "LastGoodBaud"
 
@@ -101,6 +102,7 @@
 #define DEFAULT_ANGLE_EPSILON_DEG 1.5
 #define DEFAULT_ELEV_FLOOR_DEG 1.0
 #define DEFAULT_DISABLE_POS_FEEDBACK FALSE
+#define DEFAULT_NO_ENCODER_OUTPUT_MODE ROT_NO_ENCODER_OUTPUT_TIME
 #define DEFAULT_MIN_EL -5.0
 #define DEFAULT_MAX_EL 185.0
 #define DEFAULT_EL_OVERTRAVEL_ENABLE FALSE
@@ -540,6 +542,29 @@ gboolean rotor_conf_read(rotor_conf_t * conf)
             g_clear_error(&error);
             conf->disable_pos_feedback_checks = DEFAULT_DISABLE_POS_FEEDBACK;
         }
+    }
+
+    conf->no_encoder_output_mode = DEFAULT_NO_ENCODER_OUTPUT_MODE;
+    if (g_key_file_has_key(cfg, GROUP, KEY_NO_ENCODER_OUTPUT_MODE, NULL))
+    {
+        conf->no_encoder_output_mode =
+            g_key_file_get_integer(cfg, GROUP, KEY_NO_ENCODER_OUTPUT_MODE, &error);
+        if (error != NULL)
+        {
+            sat_log_log(SAT_LOG_LEVEL_INFO,
+                        _("%s: NoEncoderOutputMode not defined for %s. Assuming time interval."),
+                        __func__, conf->name);
+            g_clear_error(&error);
+            conf->no_encoder_output_mode = DEFAULT_NO_ENCODER_OUTPUT_MODE;
+        }
+    }
+    if (conf->no_encoder_output_mode != ROT_NO_ENCODER_OUTPUT_TIME &&
+        conf->no_encoder_output_mode != ROT_NO_ENCODER_OUTPUT_DEGREE)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    _("%s: Invalid NoEncoderOutputMode for %s. Assuming time interval."),
+                    __func__, conf->name);
+        conf->no_encoder_output_mode = DEFAULT_NO_ENCODER_OUTPUT_MODE;
     }
 
     conf->rotor_stale_debounce_count = DEFAULT_STALE_DEBOUNCE;
@@ -1064,6 +1089,12 @@ void rotor_conf_save(rotor_conf_t * conf)
     else
         g_key_file_set_boolean(cfg, GROUP, KEY_DISABLE_POS_FEEDBACK,
                                conf->disable_pos_feedback_checks);
+
+    if (conf->no_encoder_output_mode == DEFAULT_NO_ENCODER_OUTPUT_MODE)
+        g_key_file_remove_key(cfg, GROUP, KEY_NO_ENCODER_OUTPUT_MODE, NULL);
+    else
+        g_key_file_set_integer(cfg, GROUP, KEY_NO_ENCODER_OUTPUT_MODE,
+                               conf->no_encoder_output_mode);
 
     if (fabs(conf->rotor_angle_epsilon_deg - DEFAULT_ANGLE_EPSILON_DEG) < 1e-6)
         g_key_file_remove_key(cfg, GROUP, KEY_ANGLE_EPSILON, NULL);
