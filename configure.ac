@@ -134,6 +134,14 @@ PACKAGE_LIBS="$PACKAGE_LIBS $HAMLIB_LIBS"
 AC_SUBST(PACKAGE_CFLAGS)
 AC_SUBST(PACKAGE_LIBS)
 
+GPREDICT_EXE_LDFLAGS=
+case "$host_os" in
+    mingw*|msys*)
+        GPREDICT_EXE_LDFLAGS="-mwindows"
+        ;;
+esac
+AC_SUBST(GPREDICT_EXE_LDFLAGS)
+
 # Add the languages which your application supports here.
 # Note that other progs only have ALL_LINGUAS and AM_GLIB_GNU_GETTEXT
 ALL_LINGUAS="cs da de el en_GB en_US es fi fr id it lt ru th uk"

@@ -191,6 +191,7 @@ stage_runtime_layout() {
     copy_dir_contents "$MINGW_PREFIX/share/glib-2.0" "$APP_DIR/share/glib-2.0"
     copy_dir_contents "$MINGW_PREFIX/share/icons/Adwaita" "$APP_DIR/share/icons/Adwaita"
     copy_dir_contents "$MINGW_PREFIX/share/icons/hicolor" "$APP_DIR/share/icons/hicolor"
+    copy_dir_contents "$MINGW_PREFIX/share/mime" "$APP_DIR/share/mime"
     copy_dir_contents "$MINGW_PREFIX/share/themes" "$APP_DIR/share/themes"
 
     mkdir -p "$APP_DIR/lib/$pixbuf_subdir"
@@ -203,6 +204,8 @@ stage_runtime_layout() {
     copy_optional_file "$MINGW_PREFIX/bin/gspawn-win64-helper.exe" "$APP_DIR/gspawn-win64-helper.exe"
     copy_optional_file "$MINGW_PREFIX/bin/gspawn-win64-helper-console.exe" \
         "$APP_DIR/gspawn-win64-helper-console.exe"
+    copy_optional_file "$MINGW_PREFIX/bin/gdk-pixbuf-query-loaders.exe" \
+        "$APP_DIR/gdk-pixbuf-query-loaders.exe"
 
     if [[ -f "$MINGW_PREFIX/bin/curl-ca-bundle.crt" ]]; then
         copy_optional_file "$MINGW_PREFIX/bin/curl-ca-bundle.crt" "$APP_DIR/curl-ca-bundle.crt"

@@ -58,7 +58,7 @@ InstallDirRegKey HKLM "Software\Gpredict" "InstallDir"
 !insertmacro MUI_LANGUAGE "English"
 
 Function LaunchGpredict
-  ExecShell "" "$INSTDIR\gpredict.vbs"
+  ExecShell "" "$INSTDIR\gpredict.exe"
 FunctionEnd
 
 Section "Gpredict" SecMain
@@ -71,7 +71,7 @@ Section "Gpredict" SecMain
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\Gpredict"
-  CreateShortcut "$SMPROGRAMS\Gpredict\Gpredict.lnk" "$INSTDIR\gpredict.vbs" "" "$INSTDIR\gpredict.exe" 0
+  CreateShortcut "$SMPROGRAMS\Gpredict\Gpredict.lnk" "$INSTDIR\gpredict.exe"
   CreateShortcut "$SMPROGRAMS\Gpredict\Uninstall Gpredict.lnk" "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKLM "Software\Gpredict" "InstallDir" "$INSTDIR"

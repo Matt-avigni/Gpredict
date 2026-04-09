@@ -103,6 +103,12 @@ static void     clean_trsp(void);
 
 static void     InitWinSock2(void);
 static void     CloseWinSock2(void);
+#ifdef G_OS_WIN32
+static void     gpredict_windows_init_runtime(void);
+static void     gpredict_windows_refresh_pixbuf_cache(const gchar *prefix,
+                                                      const gchar *module_dir,
+                                                      const gchar *cache_file);
+#endif
 
 
 int main(int argc, char *argv[])
@@ -111,9 +117,23 @@ int main(int argc, char *argv[])
     GOptionContext *context;
     guint           error = 0;
 
+#ifdef G_OS_WIN32
+    gpredict_windows_init_runtime();
+#endif
 
 #ifdef ENABLE_NLS
+#ifdef G_OS_WIN32
+    {
+        gchar *prefix = g_win32_get_package_installation_directory_of_module(NULL);
+        gchar *locale_dir = g_build_filename(prefix, "share", "locale", NULL);
+
+        bindtextdomain(PACKAGE, locale_dir);
+        g_free(locale_dir);
+        g_free(prefix);
+    }
+#else
     bindtextdomain(PACKAGE, PACKAGE_LOCALE_DIR);
+#endif
     bind_textdomain_codeset(PACKAGE, "UTF-8");
     textdomain(PACKAGE);
 #endif
@@ -248,6 +268,152 @@ static void CloseWinSock2(void)
     return;
 #endif
 }
+
+#ifdef G_OS_WIN32
+static void gpredict_windows_setenv_if_unset(const gchar *name, const gchar *value)
+{
+    if (value != NULL && *value != '\0' && g_getenv(name) == NULL)
+        g_setenv(name, value, TRUE);
+}
+
+static void gpredict_windows_refresh_pixbuf_cache(const gchar *prefix,
+                                                  const gchar *module_dir,
+                                                  const gchar *cache_file)
+{
+    GDir           *dir = NULL;
+    GPtrArray      *argv = NULL;
+    const gchar    *name = NULL;
+    gchar          *query = NULL;
+    gchar          *stdout_buf = NULL;
+    gchar          *stderr_buf = NULL;
+    GError         *error = NULL;
+    gint            status = 0;
+
+    query = g_build_filename(prefix, "gdk-pixbuf-query-loaders.exe", NULL);
+    if (!g_file_test(query, G_FILE_TEST_EXISTS))
+        goto cleanup;
+
+    dir = g_dir_open(module_dir, 0, NULL);
+    if (dir == NULL)
+        goto cleanup;
+
+    argv = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(argv, g_strdup(query));
+
+    while ((name = g_dir_read_name(dir)) != NULL)
+    {
+        if (!g_str_has_suffix(name, ".dll"))
+            continue;
+        g_ptr_array_add(argv, g_build_filename(module_dir, name, NULL));
+    }
+
+    if (argv->len <= 1)
+        goto cleanup;
+
+    g_ptr_array_add(argv, NULL);
+
+    if (!g_spawn_sync(NULL, (gchar **) argv->pdata, NULL, 0, NULL, NULL,
+                      &stdout_buf, &stderr_buf, &status, &error))
+    {
+        g_clear_error(&error);
+        goto cleanup;
+    }
+
+    if (status == 0 && stdout_buf != NULL && *stdout_buf != '\0')
+        g_file_set_contents(cache_file, stdout_buf, -1, NULL);
+
+cleanup:
+    if (dir != NULL)
+        g_dir_close(dir);
+    if (argv != NULL)
+        g_ptr_array_free(argv, TRUE);
+    g_free(query);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+}
+
+static void gpredict_windows_init_runtime(void)
+{
+    GDir           *pixbuf_versions = NULL;
+    const gchar    *version_name = NULL;
+    gchar          *prefix = NULL;
+    gchar          *share_dir = NULL;
+    gchar          *gio_module_dir = NULL;
+    gchar          *schema_dir = NULL;
+    gchar          *mime_dir = NULL;
+    gchar          *pixbuf_root = NULL;
+    gchar          *pixbuf_module_dir = NULL;
+    gchar          *pixbuf_cache_file = NULL;
+    gchar          *query_exe = NULL;
+    gchar          *ca_bundle = NULL;
+
+    prefix = g_win32_get_package_installation_directory_of_module(NULL);
+    if (prefix == NULL || *prefix == '\0')
+        goto cleanup;
+
+    share_dir = g_build_filename(prefix, "share", NULL);
+    gio_module_dir = g_build_filename(prefix, "lib", "gio", "modules", NULL);
+    schema_dir = g_build_filename(prefix, "share", "glib-2.0", "schemas", NULL);
+    mime_dir = g_build_filename(prefix, "share", "mime", NULL);
+
+    gpredict_windows_setenv_if_unset("GTK_DATA_PREFIX", prefix);
+    gpredict_windows_setenv_if_unset("GTK_EXE_PREFIX", prefix);
+    gpredict_windows_setenv_if_unset("XDG_DATA_DIRS", share_dir);
+    gpredict_windows_setenv_if_unset("GIO_MODULE_DIR", gio_module_dir);
+    gpredict_windows_setenv_if_unset("GSETTINGS_SCHEMA_DIR", schema_dir);
+
+    ca_bundle = g_build_filename(prefix, "curl-ca-bundle.crt", NULL);
+    if (g_file_test(ca_bundle, G_FILE_TEST_EXISTS))
+        gpredict_windows_setenv_if_unset("CURL_CA_BUNDLE", ca_bundle);
+
+    pixbuf_root = g_build_filename(prefix, "lib", "gdk-pixbuf-2.0", NULL);
+    pixbuf_versions = g_dir_open(pixbuf_root, 0, NULL);
+    if (pixbuf_versions == NULL)
+        goto cleanup;
+
+    while ((version_name = g_dir_read_name(pixbuf_versions)) != NULL)
+    {
+        gchar *candidate = g_build_filename(pixbuf_root, version_name, "loaders", NULL);
+        if (g_file_test(candidate, G_FILE_TEST_IS_DIR))
+        {
+            pixbuf_module_dir = candidate;
+            pixbuf_cache_file =
+                g_build_filename(pixbuf_root, version_name, "loaders.cache", NULL);
+            break;
+        }
+        g_free(candidate);
+    }
+
+    if (pixbuf_module_dir != NULL && pixbuf_cache_file != NULL)
+    {
+        query_exe = g_build_filename(prefix, "gdk-pixbuf-query-loaders.exe", NULL);
+        if (g_file_test(query_exe, G_FILE_TEST_EXISTS))
+            gpredict_windows_refresh_pixbuf_cache(prefix, pixbuf_module_dir,
+                                                  pixbuf_cache_file);
+
+        gpredict_windows_setenv_if_unset("GDK_PIXBUF_MODULEDIR", pixbuf_module_dir);
+        gpredict_windows_setenv_if_unset("GDK_PIXBUF_MODULE_FILE",
+                                         pixbuf_cache_file);
+    }
+
+    if (g_file_test(mime_dir, G_FILE_TEST_IS_DIR))
+        gpredict_windows_setenv_if_unset("XDG_DATA_DIRS", share_dir);
+
+cleanup:
+    if (pixbuf_versions != NULL)
+        g_dir_close(pixbuf_versions);
+    g_free(prefix);
+    g_free(share_dir);
+    g_free(gio_module_dir);
+    g_free(schema_dir);
+    g_free(mime_dir);
+    g_free(pixbuf_root);
+    g_free(pixbuf_module_dir);
+    g_free(pixbuf_cache_file);
+    g_free(query_exe);
+    g_free(ca_bundle);
+}
+#endif
 
 /**
  * Create main application window.

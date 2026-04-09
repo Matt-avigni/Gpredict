@@ -150,6 +150,7 @@ gpredict_SOURCES = \
     strnatcmp.c strnatcmp.h
 
 ##gpredict_LDADD = ./sgpsdp/libsgp4sdp4.a @PACKAGE_LIBS@
+gpredict_LDFLAGS = @GPREDICT_EXE_LDFLAGS@
 gpredict_LDADD = @PACKAGE_LIBS@
 
 ## $(INTLLIBS)
