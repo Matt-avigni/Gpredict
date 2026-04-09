@@ -147,7 +147,12 @@ static gboolean winsock_ensure_init(void)
 #define RIGCTRL_FREQ_PLACEHOLDER "--- Hz"
 #define RIGCTRL_FREQ_PLACEHOLDER_DIGIT "<span size='xx-large'>-</span>"
 #define RIGCTLD_AUTOSTART_MAX_RESTARTS 2
+#ifdef G_OS_WIN32
+/* Give Windows time to release the child process and COM handle before retry. */
+#define RIGCTLD_AUTOSTART_RETRY_DELAY_MS 600
+#else
 #define RIGCTLD_AUTOSTART_RETRY_DELAY_MS 150
+#endif
 #define RIGCTLD_MODEL_IC905 3090
 #define RIGCTLD_IC905_FALLBACK_TIMEOUT_MS 12000
 #define RIGCTRL_RECONNECT_BACKOFF_MIN_MS 5000

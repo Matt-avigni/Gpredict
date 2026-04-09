@@ -1301,8 +1301,11 @@ void rigctld_mgr_terminate(RigctldMgr **mgr_ptr)
                 rigctld_mgr_wait_exit(mgr, 1500);
             }
 #endif
-            if (!rigctld_mgr_proc_exited(mgr) && pid > 0)
+            if (!rigctld_mgr_proc_exited(mgr))
+            {
                 g_subprocess_force_exit(mgr->proc);
+                rigctld_mgr_wait_exit(mgr, 1500);
+            }
         }
 
         g_subprocess_wait(mgr->proc, NULL, NULL);
