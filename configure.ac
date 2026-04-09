@@ -135,12 +135,18 @@ AC_SUBST(PACKAGE_CFLAGS)
 AC_SUBST(PACKAGE_LIBS)
 
 GPREDICT_EXE_LDFLAGS=
+WINDRES=
+build_win32_resource=no
 case "$host_os" in
     mingw*|msys*)
         GPREDICT_EXE_LDFLAGS="-mwindows"
+        build_win32_resource=yes
         ;;
 esac
+AC_CHECK_TOOL([WINDRES], [windres], [:])
 AC_SUBST(GPREDICT_EXE_LDFLAGS)
+AC_SUBST(WINDRES)
+AM_CONDITIONAL([BUILD_WIN32_RESOURCE], [test "x$build_win32_resource" = "xyes"])
 
 # Add the languages which your application supports here.
 # Note that other progs only have ALL_LINGUAS and AM_GLIB_GNU_GETTEXT

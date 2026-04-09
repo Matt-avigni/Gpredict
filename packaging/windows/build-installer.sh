@@ -197,28 +197,19 @@ stage_runtime_layout() {
     mkdir -p "$APP_DIR/lib/$pixbuf_subdir"
     copy_dir_contents "$pixbuf_dir" "$APP_DIR/lib/$pixbuf_subdir/loaders"
     loader_cache="$APP_DIR/lib/$pixbuf_subdir/loaders.cache"
-    gdk-pixbuf-query-loaders "$APP_DIR"/lib/"$pixbuf_subdir"/loaders/*.dll | \
-        sed -E 's#^"[^"]*[\\/](.+\.dll)"$#"\1"#' \
-        > "$loader_cache"
+    pushd "$APP_DIR/lib/$pixbuf_subdir/loaders" >/dev/null
+    gdk-pixbuf-query-loaders *.dll > "$loader_cache"
+    popd >/dev/null
 
     copy_optional_file "$MINGW_PREFIX/bin/gspawn-win64-helper.exe" "$APP_DIR/gspawn-win64-helper.exe"
     copy_optional_file "$MINGW_PREFIX/bin/gspawn-win64-helper-console.exe" \
         "$APP_DIR/gspawn-win64-helper-console.exe"
-    copy_optional_file "$MINGW_PREFIX/bin/gdk-pixbuf-query-loaders.exe" \
-        "$APP_DIR/gdk-pixbuf-query-loaders.exe"
 
     if [[ -f "$MINGW_PREFIX/bin/curl-ca-bundle.crt" ]]; then
         copy_optional_file "$MINGW_PREFIX/bin/curl-ca-bundle.crt" "$APP_DIR/curl-ca-bundle.crt"
     elif [[ -f "$MINGW_PREFIX/ssl/certs/ca-bundle.crt" ]]; then
         copy_optional_file "$MINGW_PREFIX/ssl/certs/ca-bundle.crt" "$APP_DIR/curl-ca-bundle.crt"
     fi
-
-    sed "s#@GDK_PIXBUF_SUBDIR@#${pixbuf_subdir//\//\\\\}#g" \
-        "$REPO_ROOT/packaging/windows/gpredict-launcher.cmd.in" \
-        > "$APP_DIR/gpredict.cmd"
-    chmod 0755 "$APP_DIR/gpredict.cmd"
-    install -m 0644 "$REPO_ROOT/packaging/windows/gpredict-launcher.vbs.in" \
-        "$APP_DIR/gpredict.vbs"
 }
 
 build_hamlib() {

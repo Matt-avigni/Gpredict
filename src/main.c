@@ -105,9 +105,6 @@ static void     InitWinSock2(void);
 static void     CloseWinSock2(void);
 #ifdef G_OS_WIN32
 static void     gpredict_windows_init_runtime(void);
-static void     gpredict_windows_refresh_pixbuf_cache(const gchar *prefix,
-                                                      const gchar *module_dir,
-                                                      const gchar *cache_file);
 #endif
 
 
@@ -276,60 +273,36 @@ static void gpredict_windows_setenv_if_unset(const gchar *name, const gchar *val
         g_setenv(name, value, TRUE);
 }
 
-static void gpredict_windows_refresh_pixbuf_cache(const gchar *prefix,
-                                                  const gchar *module_dir,
-                                                  const gchar *cache_file)
+static void gpredict_windows_prepend_env_path(const gchar *name,
+                                              const gchar *value)
 {
-    GDir           *dir = NULL;
-    GPtrArray      *argv = NULL;
-    const gchar    *name = NULL;
-    gchar          *query = NULL;
-    gchar          *stdout_buf = NULL;
-    gchar          *stderr_buf = NULL;
-    GError         *error = NULL;
-    gint            status = 0;
+    const gchar *existing = g_getenv(name);
+    gchar **parts = NULL;
+    gchar *updated = NULL;
 
-    query = g_build_filename(prefix, "gdk-pixbuf-query-loaders.exe", NULL);
-    if (!g_file_test(query, G_FILE_TEST_EXISTS))
-        goto cleanup;
+    if (value == NULL || *value == '\0')
+        return;
 
-    dir = g_dir_open(module_dir, 0, NULL);
-    if (dir == NULL)
-        goto cleanup;
-
-    argv = g_ptr_array_new_with_free_func(g_free);
-    g_ptr_array_add(argv, g_strdup(query));
-
-    while ((name = g_dir_read_name(dir)) != NULL)
+    if (existing == NULL || *existing == '\0')
     {
-        if (!g_str_has_suffix(name, ".dll"))
-            continue;
-        g_ptr_array_add(argv, g_build_filename(module_dir, name, NULL));
+        g_setenv(name, value, TRUE);
+        return;
     }
 
-    if (argv->len <= 1)
-        goto cleanup;
-
-    g_ptr_array_add(argv, NULL);
-
-    if (!g_spawn_sync(NULL, (gchar **) argv->pdata, NULL, 0, NULL, NULL,
-                      &stdout_buf, &stderr_buf, &status, &error))
+    parts = g_strsplit(existing, G_SEARCHPATH_SEPARATOR_S, -1);
+    for (gint i = 0; parts != NULL && parts[i] != NULL; i++)
     {
-        g_clear_error(&error);
-        goto cleanup;
+        if (g_strcmp0(parts[i], value) == 0)
+        {
+            g_strfreev(parts);
+            return;
+        }
     }
+    g_strfreev(parts);
 
-    if (status == 0 && stdout_buf != NULL && *stdout_buf != '\0')
-        g_file_set_contents(cache_file, stdout_buf, -1, NULL);
-
-cleanup:
-    if (dir != NULL)
-        g_dir_close(dir);
-    if (argv != NULL)
-        g_ptr_array_free(argv, TRUE);
-    g_free(query);
-    g_free(stdout_buf);
-    g_free(stderr_buf);
+    updated = g_strdup_printf("%s%s%s", value, G_SEARCHPATH_SEPARATOR_S, existing);
+    g_setenv(name, updated, TRUE);
+    g_free(updated);
 }
 
 static void gpredict_windows_init_runtime(void)
@@ -344,8 +317,8 @@ static void gpredict_windows_init_runtime(void)
     gchar          *pixbuf_root = NULL;
     gchar          *pixbuf_module_dir = NULL;
     gchar          *pixbuf_cache_file = NULL;
-    gchar          *query_exe = NULL;
     gchar          *ca_bundle = NULL;
+    gchar          *hamlib_override = NULL;
 
     prefix = g_win32_get_package_installation_directory_of_module(NULL);
     if (prefix == NULL || *prefix == '\0')
@@ -358,9 +331,14 @@ static void gpredict_windows_init_runtime(void)
 
     gpredict_windows_setenv_if_unset("GTK_DATA_PREFIX", prefix);
     gpredict_windows_setenv_if_unset("GTK_EXE_PREFIX", prefix);
-    gpredict_windows_setenv_if_unset("XDG_DATA_DIRS", share_dir);
+    gpredict_windows_prepend_env_path("XDG_DATA_DIRS", share_dir);
     gpredict_windows_setenv_if_unset("GIO_MODULE_DIR", gio_module_dir);
     gpredict_windows_setenv_if_unset("GSETTINGS_SCHEMA_DIR", schema_dir);
+    gpredict_windows_prepend_env_path("PATH", prefix);
+
+    hamlib_override = g_strdup(g_getenv("GPREDICT_HAMLIB_DIR"));
+    if (hamlib_override != NULL && *hamlib_override != '\0')
+        gpredict_windows_prepend_env_path("PATH", hamlib_override);
 
     ca_bundle = g_build_filename(prefix, "curl-ca-bundle.crt", NULL);
     if (g_file_test(ca_bundle, G_FILE_TEST_EXISTS))
@@ -386,11 +364,6 @@ static void gpredict_windows_init_runtime(void)
 
     if (pixbuf_module_dir != NULL && pixbuf_cache_file != NULL)
     {
-        query_exe = g_build_filename(prefix, "gdk-pixbuf-query-loaders.exe", NULL);
-        if (g_file_test(query_exe, G_FILE_TEST_EXISTS))
-            gpredict_windows_refresh_pixbuf_cache(prefix, pixbuf_module_dir,
-                                                  pixbuf_cache_file);
-
         gpredict_windows_setenv_if_unset("GDK_PIXBUF_MODULEDIR", pixbuf_module_dir);
         gpredict_windows_setenv_if_unset("GDK_PIXBUF_MODULE_FILE",
                                          pixbuf_cache_file);
@@ -410,8 +383,8 @@ cleanup:
     g_free(pixbuf_root);
     g_free(pixbuf_module_dir);
     g_free(pixbuf_cache_file);
-    g_free(query_exe);
     g_free(ca_bundle);
+    g_free(hamlib_override);
 }
 #endif
 

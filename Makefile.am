@@ -24,8 +24,6 @@ EXTRA_DIST = \
 	intltool-update.in    \
 	packaging/windows/README.md \
 	packaging/windows/build-installer.sh \
-	packaging/windows/gpredict-launcher.cmd.in \
-	packaging/windows/gpredict-launcher.vbs.in \
 	packaging/windows/gpredict-windows-installer.nsi \
 	packaging/windows/hamlib-source.env \
 	packaging/windows/patches/0001-hamlib-fix-spid-windows-build.patch \

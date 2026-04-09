@@ -1,6 +1,6 @@
 Unicode True
 SetCompressor /SOLID lzma
-RequestExecutionLevel admin
+RequestExecutionLevel user
 ShowInstDetails show
 ShowUnInstDetails show
 
@@ -35,8 +35,8 @@ ShowUnInstDetails show
 Name "${APP_NAME} ${APP_VERSION}"
 OutFile "${OUT_FILE}"
 BrandingText "${APP_NAME} ${APP_VERSION}"
-InstallDir "$ProgramFiles64\Gpredict"
-InstallDirRegKey HKLM "Software\Gpredict" "InstallDir"
+InstallDir "$LocalAppData\Programs\Gpredict"
+InstallDirRegKey HKCU "Software\Gpredict" "InstallDir"
 
 !define MUI_ABORTWARNING
 !define MUI_ICON "${APP_ICON}"
@@ -62,6 +62,7 @@ Function LaunchGpredict
 FunctionEnd
 
 Section "Gpredict" SecMain
+  SetShellVarContext current
   ${If} ${RunningX64}
     SetRegView 64
   ${EndIf}
@@ -74,19 +75,20 @@ Section "Gpredict" SecMain
   CreateShortcut "$SMPROGRAMS\Gpredict\Gpredict.lnk" "$INSTDIR\gpredict.exe"
   CreateShortcut "$SMPROGRAMS\Gpredict\Uninstall Gpredict.lnk" "$INSTDIR\Uninstall.exe"
 
-  WriteRegStr HKLM "Software\Gpredict" "InstallDir" "$INSTDIR"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "DisplayName" "${APP_NAME}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "DisplayVersion" "${APP_VERSION}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "Publisher" "${PRODUCT_PUBLISHER}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "DisplayIcon" "$INSTDIR\gpredict.exe"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "URLInfoAbout" "${PRODUCT_URL}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "UninstallString" "$INSTDIR\Uninstall.exe"
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "NoModify" 1
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "NoRepair" 1
+  WriteRegStr HKCU "Software\Gpredict" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "DisplayName" "${APP_NAME}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "DisplayVersion" "${APP_VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "Publisher" "${PRODUCT_PUBLISHER}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "DisplayIcon" "$INSTDIR\gpredict.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "URLInfoAbout" "${PRODUCT_URL}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "UninstallString" "$INSTDIR\Uninstall.exe"
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "NoModify" 1
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict" "NoRepair" 1
 SectionEnd
 
 Section "Uninstall"
+  SetShellVarContext current
   ${If} ${RunningX64}
     SetRegView 64
   ${EndIf}
@@ -95,8 +97,8 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Gpredict\Uninstall Gpredict.lnk"
   RMDir "$SMPROGRAMS\Gpredict"
 
-  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict"
-  DeleteRegKey HKLM "Software\Gpredict"
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gpredict"
+  DeleteRegKey HKCU "Software\Gpredict"
 
   Delete "$INSTDIR\Uninstall.exe"
   RMDir /r "$INSTDIR"

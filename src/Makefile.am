@@ -151,7 +151,20 @@ gpredict_SOURCES = \
 
 ##gpredict_LDADD = ./sgpsdp/libsgp4sdp4.a @PACKAGE_LIBS@
 gpredict_LDFLAGS = @GPREDICT_EXE_LDFLAGS@
+if BUILD_WIN32_RESOURCE
+gpredict_win32_res = gpredict-win32-res.o
+CLEANFILES = $(gpredict_win32_res)
+gpredict_DEPENDENCIES = $(gpredict_win32_res)
+
+$(gpredict_win32_res): $(top_srcdir)/win32/gpredict.rc \
+	$(top_srcdir)/win32/resource.h \
+	$(top_srcdir)/win32/icons/gpredict-icon.ico
+	$(WINDRES) -I$(top_srcdir)/win32 -i $(top_srcdir)/win32/gpredict.rc -o $@
+
+gpredict_LDADD = $(gpredict_win32_res) @PACKAGE_LIBS@
+else
 gpredict_LDADD = @PACKAGE_LIBS@
+endif
 
 ## $(INTLLIBS)
 
