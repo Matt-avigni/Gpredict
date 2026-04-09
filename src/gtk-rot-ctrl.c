@@ -116,6 +116,7 @@
 #define ROT_PLAN_EL_WEIGHT 1.0
 #define ROT_PLAN_NEAR_LIMIT_MARGIN 2.0
 #define ROT_PLAN_NEAR_LIMIT_PENALTY 5.0
+#define ROT_PLAN_ZENITH_FLIP_MARGIN_DEG 2.0
 #define ROT_PRETRACK_LOOKAHEAD_SEC 7200.0
 #define ROT_PRETRACK_REACQUIRE_SEC 2.0
 #define ROT_PRETRACK_WINDOW_SEC 300.0
@@ -1020,6 +1021,11 @@ static gdouble  ang_delta_deg(gdouble a, gdouble b);
 static gboolean rotctrl_samples_cross_endstop(const GArray *samples,
                                               const rotor_conf_t *conf,
                                               gdouble min_el);
+static gboolean rotctrl_samples_reach_zenith_flip_band(const GtkRotCtrl *ctrl,
+                                                       const GArray *samples,
+                                                       gdouble min_el,
+                                                       gdouble *peak_el_out,
+                                                       gdouble *trigger_el_out);
 static gdouble  rot_clamp_az_abs(gdouble az, gdouble min, gdouble max,
                                  gboolean *clamped_out);
 static void     rot_transform_update(GtkRotCtrl *ctrl);
@@ -4175,11 +4181,14 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
     gboolean have_normal = FALSE;
     gboolean have_flip = FALSE;
     gboolean crosses_endstop = FALSE;
+    gboolean zenith_flip_candidate = FALSE;
     rot_plan_result_t *chosen = NULL;
     GArray *normal_samples = NULL;
     GArray *flip_samples = NULL;
     gdouble t0, t1;
     gdouble az_min, az_max;
+    gdouble zenith_peak_el = 0.0;
+    gdouble zenith_trigger_el = 0.0;
     rot_plan_input_t in = { 0 };
 
     rot_plan_reset(&ctrl->trajectory_plan);
@@ -4226,11 +4235,28 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
     rot_term_log(ctrl, "gpredict",
                  "trajectory crosses_endstop=%d",
                  crosses_endstop ? 1 : 0);
+    zenith_flip_candidate =
+        rotctrl_samples_reach_zenith_flip_band(ctrl,
+                                               normal_samples,
+                                               ctrl->conf->minel,
+                                               &zenith_peak_el,
+                                               &zenith_trigger_el);
+    if (zenith_flip_candidate)
+    {
+        sat_log_log(SAT_LOG_LEVEL_INFO,
+                    "trajectory zenith_flip_candidate=1 peak_el=%.2f trigger_el=%.2f",
+                    zenith_peak_el,
+                    zenith_trigger_el);
+        rot_term_log(ctrl, "gpredict",
+                     "trajectory zenith_flip_candidate=1 peak_el=%.2f trigger_el=%.2f",
+                     zenith_peak_el,
+                     zenith_trigger_el);
+    }
     in.samples = normal_samples;
     have_normal = rot_plan_build(&in, &normal);
 
     flip_allowed = (ctrl->conf->maxel >= 180.0);
-    if (flip_allowed && crosses_endstop) {
+    if (flip_allowed && (crosses_endstop || zenith_flip_candidate)) {
         flip_samples = rot_build_samples(ctrl, ctrl->pass,
                                          ROT_PLAN_MODE_FLIP, t0, t1);
         in.samples = flip_samples;
@@ -4238,6 +4264,8 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
     }
 
     if (crosses_endstop && have_flip)
+        chosen = &flip;
+    else if (zenith_flip_candidate && have_flip)
         chosen = &flip;
     else if (have_normal)
         chosen = &normal;
@@ -4281,17 +4309,23 @@ static gboolean rot_build_tracking_plan(GtkRotCtrl *ctrl)
 
         if (ctrl->trajectory_plan.status == ROT_PLAN_STATUS_FULL_TRACK) {
             sat_log_log(SAT_LOG_LEVEL_INFO,
-                        "%s: selected %s plan strategy=%d (full track)",
-                        __func__,
-                        ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
-                        ctrl->trajectory_plan.strategy);
-        } else {
-            sat_log_log(SAT_LOG_LEVEL_WARN,
-                        "%s: selected %s plan strategy=%d (%s)",
+                        "%s: selected %s plan strategy=%d (full track)%s",
                         __func__,
                         ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
                         ctrl->trajectory_plan.strategy,
-                        ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "partial tracking");
+                        (zenith_flip_candidate && chosen == &flip && !crosses_endstop)
+                            ? " zenith_candidate=1"
+                            : "");
+        } else {
+            sat_log_log(SAT_LOG_LEVEL_WARN,
+                        "%s: selected %s plan strategy=%d (%s)%s",
+                        __func__,
+                        ctrl->trajectory_plan.mode == ROT_PLAN_MODE_FLIP ? "FLIP" : "NORMAL",
+                        ctrl->trajectory_plan.strategy,
+                        ctrl->trajectory_plan.reason ? ctrl->trajectory_plan.reason : "partial tracking",
+                        (zenith_flip_candidate && chosen == &flip && !crosses_endstop)
+                            ? " zenith_candidate=1"
+                            : "");
         }
     } else {
         ctrl->trajectory_plan.valid = FALSE;
@@ -4590,6 +4624,54 @@ static gboolean rotctrl_samples_cross_endstop(const GArray *samples,
     }
 
     return FALSE;
+}
+
+static gboolean rotctrl_samples_reach_zenith_flip_band(const GtkRotCtrl *ctrl,
+                                                       const GArray *samples,
+                                                       gdouble min_el,
+                                                       gdouble *peak_el_out,
+                                                       gdouble *trigger_el_out)
+{
+    gdouble peak_el = -G_MAXDOUBLE;
+    gdouble trigger_el = 0.0;
+
+    if (peak_el_out)
+        *peak_el_out = 0.0;
+    if (trigger_el_out)
+        *trigger_el_out = 0.0;
+
+    if (ctrl == NULL || ctrl->conf == NULL || samples == NULL || samples->len == 0)
+        return FALSE;
+
+    if (!ctrl->transform.zenith_guard_enable || ctrl->conf->maxel < 180.0 ||
+        ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        return FALSE;
+
+    trigger_el = ctrl->transform.zenith_guard_el_deg + ROT_PLAN_ZENITH_FLIP_MARGIN_DEG;
+    if (trigger_el > ctrl->conf->maxel)
+        trigger_el = ctrl->conf->maxel;
+
+    for (guint i = 0; i < samples->len; i++)
+    {
+        rot_plan_sample_t sample =
+            g_array_index(samples, rot_plan_sample_t, i);
+
+        if (!isfinite(sample.el) || sample.el < (min_el - ROT_BELOW_HORIZON_MARGIN_DEG))
+            continue;
+
+        if (sample.el > peak_el)
+            peak_el = sample.el;
+    }
+
+    if (!isfinite(peak_el) || peak_el <= -G_MAXDOUBLE / 2.0)
+        return FALSE;
+
+    if (peak_el_out)
+        *peak_el_out = peak_el;
+    if (trigger_el_out)
+        *trigger_el_out = trigger_el;
+
+    return peak_el >= (trigger_el - 1e-6);
 }
 
 static void G_GNUC_UNUSED rotctrl_apply_inverted_el(const rotor_conf_t *conf,

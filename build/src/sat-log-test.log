@@ -1,0 +1,3 @@
+2026/04/09 11:07:41|3|sat_log_cleanup_dir: retention disabled; preserving previous session logs
+sat-log-test: OK
+PASS sat-log-test (exit status: 0)

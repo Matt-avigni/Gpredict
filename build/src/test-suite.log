@@ -1,0 +1,27 @@
+======================================================
+   gpredict 2.3.361-77886-dirty: src/test-suite.log
+======================================================
+
+# TOTAL: 11
+# PASS:  9
+# SKIP:  1
+# XFAIL: 0
+# FAIL:  1
+# XPASS: 0
+# ERROR: 0
+
+System information (uname -a): Darwin 24.6.0 Darwin Kernel Version 24.6.0: Mon Jan 19 22:00:55 PST 2026; root:xnu-11417.140.69.708.3~1/RELEASE_ARM64_T6000
+
+.. contents:: :depth: 2
+
+FAIL: rigctld-io-test
+=====================
+
+FAIL rigctld-io-test (exit status: 17)
+
+SKIP: hamlib-mock-test
+======================
+
+mock scripts not found; skipping mock tests
+SKIP hamlib-mock-test (exit status: 77)
+
