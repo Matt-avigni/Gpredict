@@ -119,12 +119,14 @@ void about_dialog_create(void)
                                  "http://gpredict.oz9aec.net/");
     gtk_about_dialog_set_license_type(GTK_ABOUT_DIALOG(dialog),
                                       GTK_LICENSE_GPL_2_0);
-    iconfile = logo_file_name("gpredict_icon_color.svg");
+    iconfile = app_logo_file_name();
     icon = gdk_pixbuf_new_from_file_at_size(iconfile, 128, 128, NULL);
-    gtk_about_dialog_set_logo(GTK_ABOUT_DIALOG(dialog), icon);
+    if (icon != NULL)
+        gtk_about_dialog_set_logo(GTK_ABOUT_DIALOG(dialog), icon);
     gtk_window_set_icon_from_file(GTK_WINDOW(dialog), iconfile, NULL);
     g_free(iconfile);
-    g_object_unref(icon);
+    if (icon != NULL)
+        g_object_unref(icon);
     gtk_about_dialog_set_authors(GTK_ABOUT_DIALOG(dialog), authors);
     gtk_about_dialog_set_translator_credits(GTK_ABOUT_DIALOG(dialog),
                                             _("translator-credits"));

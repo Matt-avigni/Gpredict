@@ -65,13 +65,14 @@ jobs:
             mingw-w64-ucrt-x86_64-gsettings-desktop-schemas
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-hicolor-icon-theme
+            mingw-w64-ucrt-x86_64-shared-mime-info
             mingw-w64-ucrt-x86_64-ntldd
             mingw-w64-ucrt-x86_64-nsis
 
       - name: Verify MSYS2 build tools
         run: |
           set -euo pipefail
-          for tool in bash git autoreconf pkg-config gcc make ntldd makensis zip glib-compile-schemas gdk-pixbuf-query-loaders nproc; do
+          for tool in bash git autoreconf pkg-config gcc make ntldd makensis zip glib-compile-schemas gdk-pixbuf-query-loaders update-mime-database nproc; do
             command -v "$tool"
           done
           git --version

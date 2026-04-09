@@ -210,6 +210,10 @@ stage_runtime_layout() {
     elif [[ -f "$MINGW_PREFIX/ssl/certs/ca-bundle.crt" ]]; then
         copy_optional_file "$MINGW_PREFIX/ssl/certs/ca-bundle.crt" "$APP_DIR/curl-ca-bundle.crt"
     fi
+
+    if [[ -d "$APP_DIR/share/mime" ]] && command -v update-mime-database >/dev/null; then
+        update-mime-database "$APP_DIR/share/mime"
+    fi
 }
 
 build_hamlib() {

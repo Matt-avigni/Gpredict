@@ -650,7 +650,7 @@ static void create_module_window(GtkWidget * module)
     g_signal_connect(G_OBJECT(GTK_SAT_MODULE(module)->win), "configure_event",
                      G_CALLBACK(module_window_config_cb), module);
 
-    icon = logo_file_name("gpredict_icon_color.svg");
+    icon = app_logo_file_name();
     if (g_file_test(icon, G_FILE_TEST_EXISTS))
     {
         gtk_window_set_icon_from_file(GTK_WINDOW(GTK_SAT_MODULE(module)->win),

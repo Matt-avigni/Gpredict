@@ -24,7 +24,9 @@
 #include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
+#include <stdio.h>
 #ifdef G_OS_WIN32
 #include <winsock2.h>
 #endif
@@ -104,7 +106,11 @@ static void     clean_trsp(void);
 static void     InitWinSock2(void);
 static void     CloseWinSock2(void);
 #ifdef G_OS_WIN32
+static void     gpredict_windows_bootstrap_log(const gchar *format, ...);
 static void     gpredict_windows_init_runtime(void);
+#else
+#define gpredict_windows_bootstrap_log(...) ((void)0)
+#define gpredict_windows_init_runtime() ((void)0)
 #endif
 
 
@@ -115,7 +121,9 @@ int main(int argc, char *argv[])
     guint           error = 0;
 
 #ifdef G_OS_WIN32
+    gpredict_windows_bootstrap_log("startup: entering main");
     gpredict_windows_init_runtime();
+    gpredict_windows_bootstrap_log("startup: runtime initialized");
 #endif
 
 #ifdef ENABLE_NLS
@@ -136,7 +144,13 @@ int main(int argc, char *argv[])
 #endif
     sat_log_init();
     gpredict_install_signal_handlers();
-    gtk_init(&argc, &argv);
+    gpredict_windows_bootstrap_log("startup: before gtk_init");
+    if (!gtk_init_check(&argc, &argv))
+    {
+        gpredict_windows_bootstrap_log("startup: gtk_init_check failed");
+        return 1;
+    }
+    gpredict_windows_bootstrap_log("startup: after gtk_init");
     {
         gchar *datadir = get_data_dir();
         gchar *prefix = NULL;
@@ -193,8 +207,11 @@ int main(int argc, char *argv[])
     }
 
     /* create application */
+    gpredict_windows_bootstrap_log("startup: before gpredict_app_create");
     gpredict_app_create();
+    gpredict_windows_bootstrap_log("startup: after gpredict_app_create");
     gtk_widget_show_all(app);
+    gpredict_windows_bootstrap_log("startup: after gtk_widget_show_all");
     if (fullscreen)
 		gtk_window_fullscreen(GTK_WINDOW(app));
 
@@ -267,6 +284,39 @@ static void CloseWinSock2(void)
 }
 
 #ifdef G_OS_WIN32
+static void gpredict_windows_bootstrap_log(const gchar *format, ...)
+{
+    gchar *log_dir = NULL;
+    gchar *log_file = NULL;
+    FILE  *fp = NULL;
+    va_list args;
+
+    {
+        const gchar *local_appdata = g_getenv("LOCALAPPDATA");
+        if (local_appdata != NULL && *local_appdata != '\0')
+            log_dir = g_build_filename(local_appdata, "Gpredict", "logs", NULL);
+        else
+            log_dir = g_build_filename(g_get_user_config_dir(), "Gpredict", "logs", NULL);
+    }
+    if (g_mkdir_with_parents(log_dir, 0700) != 0)
+        goto cleanup;
+
+    log_file = g_build_filename(log_dir, "bootstrap.log", NULL);
+    fp = g_fopen(log_file, "a");
+    if (fp == NULL)
+        goto cleanup;
+
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+    fputc('\n', fp);
+    fclose(fp);
+
+cleanup:
+    g_free(log_dir);
+    g_free(log_file);
+}
+
 static void gpredict_windows_setenv_if_unset(const gchar *name, const gchar *value)
 {
     if (value != NULL && *value != '\0' && g_getenv(name) == NULL)
@@ -323,6 +373,7 @@ static void gpredict_windows_init_runtime(void)
     prefix = g_win32_get_package_installation_directory_of_module(NULL);
     if (prefix == NULL || *prefix == '\0')
         goto cleanup;
+    gpredict_windows_bootstrap_log("runtime: prefix=%s", prefix);
 
     share_dir = g_build_filename(prefix, "share", NULL);
     gio_module_dir = g_build_filename(prefix, "lib", "gio", "modules", NULL);
@@ -343,6 +394,8 @@ static void gpredict_windows_init_runtime(void)
     ca_bundle = g_build_filename(prefix, "curl-ca-bundle.crt", NULL);
     if (g_file_test(ca_bundle, G_FILE_TEST_EXISTS))
         gpredict_windows_setenv_if_unset("CURL_CA_BUNDLE", ca_bundle);
+    gpredict_windows_bootstrap_log("runtime: mime_dir=%s exists=%d", mime_dir,
+                                   g_file_test(mime_dir, G_FILE_TEST_IS_DIR));
 
     pixbuf_root = g_build_filename(prefix, "lib", "gdk-pixbuf-2.0", NULL);
     pixbuf_versions = g_dir_open(pixbuf_root, 0, NULL);
@@ -367,6 +420,12 @@ static void gpredict_windows_init_runtime(void)
         gpredict_windows_setenv_if_unset("GDK_PIXBUF_MODULEDIR", pixbuf_module_dir);
         gpredict_windows_setenv_if_unset("GDK_PIXBUF_MODULE_FILE",
                                          pixbuf_cache_file);
+        gpredict_windows_bootstrap_log("runtime: pixbuf_module_dir=%s exists=%d",
+                                       pixbuf_module_dir,
+                                       g_file_test(pixbuf_module_dir, G_FILE_TEST_IS_DIR));
+        gpredict_windows_bootstrap_log("runtime: pixbuf_cache_file=%s exists=%d",
+                                       pixbuf_cache_file,
+                                       g_file_test(pixbuf_cache_file, G_FILE_TEST_EXISTS));
     }
 
     if (g_file_test(mime_dir, G_FILE_TEST_IS_DIR))
@@ -402,10 +461,11 @@ static void gpredict_app_create(void)
 {
     gchar          *title;
     gchar          *icon;
+    GError         *icon_error = NULL;
 
     /* create window title and file name for window icon  */
     title = g_strdup(_("Gpredict"));
-    icon = logo_file_name("gpredict_icon_color.svg");
+    icon = app_logo_file_name();
 
     /* create window, add title and icon, restore size and position */
     app = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -429,7 +489,19 @@ static void gpredict_app_create(void)
 
     gtk_container_add(GTK_CONTAINER(app), gui_create(app));
     if (g_file_test(icon, G_FILE_TEST_EXISTS))
-        gtk_window_set_icon_from_file(GTK_WINDOW(app), icon, NULL);
+    {
+        if (!gtk_window_set_icon_from_file(GTK_WINDOW(app), icon, &icon_error))
+        {
+            gpredict_windows_bootstrap_log("startup: failed to load window icon %s: %s",
+                                           icon,
+                                           icon_error != NULL ? icon_error->message : "unknown error");
+            g_clear_error(&icon_error);
+        }
+    }
+    else
+    {
+        gpredict_windows_bootstrap_log("startup: missing window icon %s", icon);
+    }
 
     g_free(title);
     g_free(icon);

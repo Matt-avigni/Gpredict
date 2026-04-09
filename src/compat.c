@@ -30,6 +30,11 @@
 #include <locale.h>
 #include "compat.h"
 
+#ifdef G_OS_WIN32
+static gchar   *get_windows_pkgdata_dir(void);
+static gchar   *get_windows_pixmaps_dir(void);
+#endif
+
 /**
  * Get data directory.
  *
@@ -46,13 +51,9 @@ gchar          *get_data_dir(void)
     dir = g_strconcat(data_dir ? data_dir : PACKAGE_DATA_DIR, G_DIR_SEPARATOR_S, "data", NULL);
 #else
 #ifdef G_OS_WIN32
-    gchar          *buff =
-        g_win32_get_package_installation_directory_of_module(NULL);
-
-    dir = g_strconcat(buff, G_DIR_SEPARATOR_S,
-                      "share", G_DIR_SEPARATOR_S, "gpredict",
-                      G_DIR_SEPARATOR_S, "data", NULL);
-    g_free(buff);
+    gchar          *pkgdata_dir = get_windows_pkgdata_dir();
+    dir = g_build_filename(pkgdata_dir, "data", NULL);
+    g_free(pkgdata_dir);
 #endif
 #endif
 
@@ -93,14 +94,9 @@ gchar          *get_maps_dir(void)
     dir = g_strconcat(PACKAGE_PIXMAPS_DIR, G_DIR_SEPARATOR_S, "maps", NULL);
 #else
 #ifdef G_OS_WIN32
-    gchar          *buff =
-        g_win32_get_package_installation_directory_of_module(NULL);
-
-    dir = g_strconcat(buff, G_DIR_SEPARATOR_S, "share", G_DIR_SEPARATOR_S,
-                      /* FIXME */
-                      "gpredict", G_DIR_SEPARATOR_S, "pixmaps",
-                      G_DIR_SEPARATOR_S, "maps", NULL);
-    g_free(buff);
+    gchar          *pixmaps_dir = get_windows_pixmaps_dir();
+    dir = g_build_filename(pixmaps_dir, "maps", NULL);
+    g_free(pixmaps_dir);
 #endif
 #endif
 
@@ -141,14 +137,9 @@ gchar          *get_logo_dir(void)
     dir = g_strconcat(PACKAGE_PIXMAPS_DIR, G_DIR_SEPARATOR_S, "logos", NULL);
 #else
 #ifdef G_OS_WIN32
-    gchar          *buff =
-        g_win32_get_package_installation_directory_of_module(NULL);
-
-    dir = g_strconcat(buff, G_DIR_SEPARATOR_S,
-                      "share", G_DIR_SEPARATOR_S,
-                      "gpredict", G_DIR_SEPARATOR_S, "pixmaps",
-                      G_DIR_SEPARATOR_S, "logos", NULL);
-    g_free(buff);
+    gchar          *pixmaps_dir = get_windows_pixmaps_dir();
+    dir = g_build_filename(pixmaps_dir, "logos", NULL);
+    g_free(pixmaps_dir);
 #endif
 #endif
 
@@ -170,14 +161,9 @@ gchar          *get_icon_dir(void)
     dir = g_strconcat(PACKAGE_PIXMAPS_DIR, G_DIR_SEPARATOR_S, "icons", NULL);
 #else
 #ifdef G_OS_WIN32
-    gchar          *buff =
-        g_win32_get_package_installation_directory_of_module(NULL);
-
-    dir = g_strconcat(buff, G_DIR_SEPARATOR_S,
-                      "share", G_DIR_SEPARATOR_S,
-                      "gpredict", G_DIR_SEPARATOR_S, "pixmaps",
-                      G_DIR_SEPARATOR_S, "icons", NULL);
-    g_free(buff);
+    gchar          *pixmaps_dir = get_windows_pixmaps_dir();
+    dir = g_build_filename(pixmaps_dir, "icons", NULL);
+    g_free(pixmaps_dir);
 #endif
 #endif
 
@@ -201,6 +187,15 @@ gchar          *logo_file_name(const gchar * logo)
     g_free(buff);
 
     return filename;
+}
+
+gchar          *app_logo_file_name(void)
+{
+#ifdef G_OS_WIN32
+    return logo_file_name("gpredict_icon_color.png");
+#else
+    return logo_file_name("gpredict_icon_color.svg");
+#endif
 }
 
 /**
@@ -270,6 +265,32 @@ gchar          *get_user_conf_dir(void)
 
     return dir;
 }
+
+#ifdef G_OS_WIN32
+static gchar   *get_windows_pkgdata_dir(void)
+{
+    gchar          *prefix;
+    gchar          *dir;
+
+    prefix = g_win32_get_package_installation_directory_of_module(NULL);
+    dir = g_build_filename(prefix, "share", "gpredict", NULL);
+    g_free(prefix);
+
+    return dir;
+}
+
+static gchar   *get_windows_pixmaps_dir(void)
+{
+    gchar          *prefix;
+    gchar          *dir;
+
+    prefix = g_win32_get_package_installation_directory_of_module(NULL);
+    dir = g_build_filename(prefix, "share", "pixmaps", "gpredict", NULL);
+    g_free(prefix);
+
+    return dir;
+}
+#endif
 
 /** Get USER_CONF_DIR/modules */
 gchar          *get_modules_dir(void)
