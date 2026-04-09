@@ -1003,6 +1003,9 @@ static GSList  *rotctld_autodetect_prefer_device(GSList *list,
 static GSList  *rotctld_autodetect_limit_list(GSList *list, guint limit);
 static GSList  *rotctld_autodetect_remove_key(GSList *list,
                                               const gchar *key);
+static gint     rotctld_autodetect_baud_candidate(const RotctldProbeState *state,
+                                                  const rotor_conf_t *conf,
+                                                  guint ordinal);
 static gboolean rotctld_autodetect_has_next_baud(const RotctldProbeState *state,
                                                  const rotor_conf_t *conf);
 static gboolean rotctld_autodetect_next_baud(RotctldProbeState *state,
@@ -16950,47 +16953,82 @@ static GSList *rotctld_autodetect_remove_key(GSList *list,
     return out;
 }
 
+static gint rotctld_autodetect_baud_candidate(const RotctldProbeState *state,
+                                              const rotor_conf_t *conf,
+                                              guint ordinal)
+{
+    static const gint baud_list[] = { 9600, 4800, 19200, 38400 };
+    gint preferred = 0;
+    guint count = 0;
+
+    if (state == NULL || conf == NULL)
+        return 0;
+
+    if (state->last_good_exclusive)
+    {
+        if (state->last_good_baud > 0)
+            preferred = state->last_good_baud;
+        else if (conf->baud > 0)
+            preferred = conf->baud;
+        else
+            preferred = rot_protocol_default_baud(conf->protocol);
+
+        return ordinal == 0 ? preferred : 0;
+    }
+
+    if (conf->last_good_baud > 0 &&
+        conf->last_good_device &&
+        state->autodetect_device &&
+        g_strcmp0(state->autodetect_device, conf->last_good_device) == 0)
+        preferred = conf->last_good_baud;
+    else if (conf->baud > 0)
+        preferred = conf->baud;
+    else
+        preferred = rot_protocol_default_baud(conf->protocol);
+
+    if (preferred > 0)
+    {
+        if (ordinal == count)
+            return preferred;
+        count++;
+    }
+
+    for (guint i = 0; i < G_N_ELEMENTS(baud_list); i++)
+    {
+        if (baud_list[i] == preferred)
+            continue;
+        if (ordinal == count)
+            return baud_list[i];
+        count++;
+    }
+
+    return 0;
+}
+
 static gboolean rotctld_autodetect_has_next_baud(const RotctldProbeState *state,
                                                  const rotor_conf_t *conf)
 {
-    static const gint baud_list[] = { 9600, 4800, 19200, 38400 };
-
-    if (state == NULL || conf == NULL)
-        return FALSE;
-
-    if (state->last_good_exclusive)
-        return FALSE;
-
-    if (conf->baud > 0)
-        return state->autodetect_baud_index == 0;
-
-    return state->autodetect_baud_index < (gint) G_N_ELEMENTS(baud_list);
+    return rotctld_autodetect_baud_candidate(state,
+                                             conf,
+                                             state ? state->autodetect_baud_index : 0) > 0;
 }
 
 static gboolean rotctld_autodetect_next_baud(RotctldProbeState *state,
                                              const rotor_conf_t *conf)
 {
-    static const gint baud_list[] = { 9600, 4800, 19200, 38400 };
+    gint baud = 0;
 
     if (state == NULL || conf == NULL)
         return FALSE;
 
-    if (state->last_good_exclusive)
+    baud = rotctld_autodetect_baud_candidate(state,
+                                             conf,
+                                             state->autodetect_baud_index);
+    if (baud <= 0)
         return FALSE;
 
-    if (conf->baud > 0)
-    {
-        if (state->autodetect_baud_index > 0)
-            return FALSE;
-        state->autodetect_baud = conf->baud;
-        state->autodetect_baud_index = 1;
-        return TRUE;
-    }
-
-    if (state->autodetect_baud_index >= G_N_ELEMENTS(baud_list))
-        return FALSE;
-
-    state->autodetect_baud = baud_list[state->autodetect_baud_index++];
+    state->autodetect_baud = baud;
+    state->autodetect_baud_index++;
     return TRUE;
 }
 
@@ -17002,27 +17040,6 @@ static void rotctld_autodetect_reset_baud(RotctldProbeState *state,
 
     state->autodetect_baud_index = 0;
     state->autodetect_baud = 0;
-    if (state->last_good_exclusive)
-    {
-        if (state->last_good_baud > 0)
-            state->autodetect_baud = state->last_good_baud;
-        else if (conf && conf->baud > 0)
-            state->autodetect_baud = conf->baud;
-        else if (conf)
-            state->autodetect_baud = rot_protocol_default_baud(conf->protocol);
-        state->autodetect_baud_index = 1;
-        return;
-    }
-    if (conf && conf->baud <= 0 &&
-        conf->last_good_baud > 0 &&
-        conf->last_good_device &&
-        state->autodetect_device &&
-        g_strcmp0(state->autodetect_device, conf->last_good_device) == 0)
-    {
-        state->autodetect_baud = conf->last_good_baud;
-        state->autodetect_baud_index = 1;
-        return;
-    }
     (void)rotctld_autodetect_next_baud(state, conf);
 }
 
@@ -19083,6 +19100,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             state->autodetect_port_free_deadline_us = 0;
             state->autodetect_generation++;
             state->non_rotctld_count = 0;
+            rotctld_autodetect_reset_validation(state);
             state->autodetect_settle_until_us =
                 now_us + ((gint64) ROTCTLD_AUTODETECT_COOLDOWN_MS * 1000);
 
