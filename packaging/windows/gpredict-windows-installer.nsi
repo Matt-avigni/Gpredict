@@ -41,7 +41,7 @@ InstallDirRegKey HKLM "Software\Gpredict" "InstallDir"
 !define MUI_ABORTWARNING
 !define MUI_ICON "${APP_ICON}"
 !define MUI_UNICON "${APP_ICON}"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\gpredict.cmd"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchGpredict
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Gpredict"
 
 !insertmacro MUI_PAGE_WELCOME
@@ -57,6 +57,10 @@ InstallDirRegKey HKLM "Software\Gpredict" "InstallDir"
 
 !insertmacro MUI_LANGUAGE "English"
 
+Function LaunchGpredict
+  ExecShell "" "$INSTDIR\gpredict.vbs"
+FunctionEnd
+
 Section "Gpredict" SecMain
   ${If} ${RunningX64}
     SetRegView 64
@@ -67,7 +71,7 @@ Section "Gpredict" SecMain
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\Gpredict"
-  CreateShortcut "$SMPROGRAMS\Gpredict\Gpredict.lnk" "$INSTDIR\gpredict.cmd"
+  CreateShortcut "$SMPROGRAMS\Gpredict\Gpredict.lnk" "$INSTDIR\gpredict.vbs" "" "$INSTDIR\gpredict.exe" 0
   CreateShortcut "$SMPROGRAMS\Gpredict\Uninstall Gpredict.lnk" "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKLM "Software\Gpredict" "InstallDir" "$INSTDIR"

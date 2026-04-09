@@ -54,7 +54,7 @@ Build under an MSYS2 `UCRT64` shell with these packages installed:
 Then:
 
 ```bash
-git clone --depth 1 --branch Dev https://github.com/Matt-avigni/Hamlib.git hamlib-src
+git clone --depth 1 --branch Dev https://github.com/matteo-avigni/Hamlib.git hamlib-src
 git -C hamlib-src checkout 0e27135a1bb2f4d709e7f2dc9ead4c6e2467f88e
 packaging/windows/build-installer.sh
 ```

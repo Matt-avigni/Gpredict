@@ -10,6 +10,29 @@ die() {
     exit 1
 }
 
+detect_app_version() {
+    local version
+
+    if [[ -n "${GPREDICT_APP_VERSION:-}" ]]; then
+        printf '%s\n' "$GPREDICT_APP_VERSION"
+        return 0
+    fi
+
+    version="$("$REPO_ROOT/git-version-gen" "$REPO_ROOT/.tarball-version")"
+    case "$version" in
+        UNKNOWN*|*-dirty)
+            if version="$(git -C "$REPO_ROOT" describe --tags --always --match='v*' HEAD 2>/dev/null)"; then
+                version="${version#v}"
+                version="${version%-dirty}"
+            else
+                version="git-$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+            fi
+            ;;
+    esac
+
+    printf '%s\n' "$version"
+}
+
 require_dir() {
     local dir="$1"
 
@@ -151,6 +174,7 @@ copy_hamlib_binaries() {
 
 stage_runtime_layout() {
     local pixbuf_dir pixbuf_subdir
+    local loader_cache
 
     pixbuf_dir="$(find "$MINGW_PREFIX/lib/gdk-pixbuf-2.0" -type d -name loaders | head -n 1)"
     [[ -n "$pixbuf_dir" ]] || die "failed to locate gdk-pixbuf loaders under $MINGW_PREFIX"
@@ -171,8 +195,10 @@ stage_runtime_layout() {
 
     mkdir -p "$APP_DIR/lib/$pixbuf_subdir"
     copy_dir_contents "$pixbuf_dir" "$APP_DIR/lib/$pixbuf_subdir/loaders"
-    install -m 0644 "$REPO_ROOT/win32/loaders.cache" \
-        "$APP_DIR/lib/$pixbuf_subdir/loaders.cache"
+    loader_cache="$APP_DIR/lib/$pixbuf_subdir/loaders.cache"
+    gdk-pixbuf-query-loaders "$APP_DIR"/lib/"$pixbuf_subdir"/loaders/*.dll | \
+        sed -E 's#^"[^"]*[\\/](.+\.dll)"$#"\1"#' \
+        > "$loader_cache"
 
     copy_optional_file "$MINGW_PREFIX/bin/gspawn-win64-helper.exe" "$APP_DIR/gspawn-win64-helper.exe"
     copy_optional_file "$MINGW_PREFIX/bin/gspawn-win64-helper-console.exe" \
@@ -188,6 +214,8 @@ stage_runtime_layout() {
         "$REPO_ROOT/packaging/windows/gpredict-launcher.cmd.in" \
         > "$APP_DIR/gpredict.cmd"
     chmod 0755 "$APP_DIR/gpredict.cmd"
+    install -m 0644 "$REPO_ROOT/packaging/windows/gpredict-launcher.vbs.in" \
+        "$APP_DIR/gpredict.vbs"
 }
 
 build_hamlib() {
@@ -293,7 +321,7 @@ GPREDICT_BUILD_DIR="$BUILD_ROOT/gpredict-build"
 STAGE_ROOT="$BUILD_ROOT/stage"
 APP_DIR="$STAGE_ROOT/Gpredict"
 ARTIFACT_DIR="$BUILD_ROOT/artifacts"
-APP_VERSION="$("$REPO_ROOT/git-version-gen" "$REPO_ROOT/.tarball-version")"
+APP_VERSION="$(detect_app_version)"
 APP_VERSION_SAFE="$(printf '%s' "$APP_VERSION" | tr '/:' '--')"
 INSTALLER_NAME="gpredict-${APP_VERSION_SAFE}-windows-x86_64-setup.exe"
 PORTABLE_ARCHIVE="gpredict-${APP_VERSION_SAFE}-windows-x86_64-portable.zip"
