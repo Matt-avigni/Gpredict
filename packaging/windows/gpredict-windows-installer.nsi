@@ -58,7 +58,7 @@ InstallDirRegKey HKLM "Software\Gpredict" "InstallDir"
 !insertmacro MUI_LANGUAGE "English"
 
 Function LaunchGpredict
-  ExecShell "" "$INSTDIR\gpredict.exe"
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\gpredict.exe"'
 FunctionEnd
 
 Section "Gpredict" SecMain
