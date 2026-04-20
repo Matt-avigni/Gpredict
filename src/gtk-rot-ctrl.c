@@ -925,6 +925,11 @@ static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
 static gboolean rotctrl_session_ready(GtkRotCtrl *ctrl,
                                       gboolean pos_recent);
 static gboolean rotctrl_manual_override_active(GtkRotCtrl *ctrl);
+static gboolean rotctrl_compute_target_display(GtkRotCtrl *ctrl,
+                                               gdouble target_az360,
+                                               gdouble target_el,
+                                               gdouble *user_az_out,
+                                               gdouble *user_el_out);
 static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl);
 static gboolean G_GNUC_UNUSED rotctrl_wait_for_baseline(GtkRotCtrl *ctrl);
 static void     rotctrl_update_safety(GtkRotCtrl *ctrl,
@@ -6898,11 +6903,69 @@ static gboolean rotctrl_predict_at(GtkRotCtrl *ctrl,
     return TRUE;
 }
 
-static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
+static gboolean rotctrl_compute_target_display(GtkRotCtrl *ctrl,
+                                               gdouble target_az360,
+                                               gdouble target_el,
+                                               gdouble *user_az_out,
+                                               gdouble *user_el_out)
 {
     RotTargetOut xform = { 0 };
     rot_plan_mode_t tracking_mode = ROT_PLAN_MODE_NORMAL;
     rot_ui_mode_t ui_mode = ROT_UI_360;
+    gdouble display_az360 = 0.0;
+    gdouble display_el = 0.0;
+
+    if (ctrl == NULL || !isfinite(target_az360) || !isfinite(target_el))
+        return FALSE;
+
+    display_az360 = rot_norm360(target_az360);
+    display_el = target_el;
+
+    if (ctrl->conf != NULL)
+    {
+        ui_mode = (ctrl->conf->aztype == ROT_AZ_TYPE_180)
+                  ? ROT_UI_NORTH_CENTERED
+                  : ROT_UI_360;
+        tracking_mode = rot_plan_matches_pass(ctrl)
+                        ? ctrl->trajectory_plan.mode
+                        : (ctrl->flipped ? ROT_PLAN_MODE_FLIP
+                                         : ROT_PLAN_MODE_NORMAL);
+        if (ctrl->conf->maxel < 180.0)
+            tracking_mode = ROT_PLAN_MODE_NORMAL;
+
+        if (tracking_mode == ROT_PLAN_MODE_FLIP && ctrl->conf->maxel >= 180.0)
+        {
+            display_az360 = rot_norm360(display_az360 + 180.0);
+            display_el = 180.0 - display_el;
+        }
+
+        if (ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+            display_el = ctrl->conf->minel;
+
+        if (!gp_rot_transform_target(ctrl,
+                                     display_az360,
+                                     display_el,
+                                     -1.0,
+                                     &xform))
+            return FALSE;
+
+        display_az360 = xform.az_after_southzero;
+        display_el = xform.el_after_southzero;
+        display_az360 = rotctrl_clamp_user_az_interval(
+            ctrl, rot_az360_to_ui(display_az360, ui_mode));
+        display_el = CLAMP(display_el, ctrl->conf->minel, ctrl->conf->maxel);
+    }
+
+    if (user_az_out)
+        *user_az_out = display_az360;
+    if (user_el_out)
+        *user_el_out = display_el;
+
+    return isfinite(display_az360) && isfinite(display_el);
+}
+
+static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
+{
     gdouble target_az360 = 0.0;
     gdouble target_el = 0.0;
     gdouble preview_az = 0.0;
@@ -6921,16 +6984,7 @@ static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
     if (ctrl->have_user_command || rotctrl_manual_override_active(ctrl))
         return FALSE;
 
-    ui_mode = (ctrl->conf->aztype == ROT_AZ_TYPE_180)
-              ? ROT_UI_NORTH_CENTERED
-              : ROT_UI_360;
     elev_floor = ctrl->conf->minel;
-    tracking_mode = rot_plan_matches_pass(ctrl)
-                    ? ctrl->trajectory_plan.mode
-                    : (ctrl->flipped ? ROT_PLAN_MODE_FLIP
-                                     : ROT_PLAN_MODE_NORMAL);
-    if (ctrl->conf->maxel < 180.0)
-        tracking_mode = ROT_PLAN_MODE_NORMAL;
 
     if (ctrl->pretrack_enabled &&
         isfinite(ctrl->target->el) &&
@@ -6949,22 +7003,13 @@ static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
         return FALSE;
     }
 
-    if (tracking_mode == ROT_PLAN_MODE_FLIP && ctrl->conf->maxel >= 180.0)
-    {
-        target_az360 = rot_norm360(target_az360 + 180.0);
-        target_el = 180.0 - target_el;
-    }
-
-    if (ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
-        target_el = ctrl->conf->minel;
-
-    if (!gp_rot_transform_target(ctrl, target_az360, target_el, -1.0, &xform))
+    if (!rotctrl_compute_target_display(ctrl,
+                                        target_az360,
+                                        target_el,
+                                        &preview_az,
+                                        &preview_el))
         return FALSE;
 
-    preview_az = rot_az360_to_ui(xform.az_after_southzero, ui_mode);
-    preview_el = xform.el_after_southzero;
-    preview_az = rotctrl_clamp_user_az_interval(ctrl, preview_az);
-    preview_el = CLAMP(preview_el, ctrl->conf->minel, ctrl->conf->maxel);
     cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
     cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
     az_delta = (ctrl->conf->aztype == ROT_AZ_TYPE_480)
@@ -10982,6 +11027,8 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
 {
     gchar          *buff;
     gboolean        target_valid = FALSE;
+    gdouble         target_display_az = 0.0;
+    gdouble         target_display_el = 0.0;
 
     ctrl->t = t;
     if (ctrl->target)
@@ -11005,10 +11052,20 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
         }
 
         /* update target displays */
-        buff = g_strdup_printf(FMTSTR, ctrl->target->az);
+        if (!rotctrl_compute_target_display(ctrl,
+                                            ctrl->target->az,
+                                            ctrl->target->el,
+                                            &target_display_az,
+                                            &target_display_el))
+        {
+            target_display_az = ctrl->target->az;
+            target_display_el = ctrl->target->el;
+        }
+
+        buff = g_strdup_printf(FMTSTR, target_display_az);
         gtk_label_set_text(GTK_LABEL(ctrl->AzSat), buff);
         g_free(buff);
-        buff = g_strdup_printf(FMTSTR, ctrl->target->el);
+        buff = g_strdup_printf(FMTSTR, target_display_el);
         gtk_label_set_text(GTK_LABEL(ctrl->ElSat), buff);
         g_free(buff);
 
