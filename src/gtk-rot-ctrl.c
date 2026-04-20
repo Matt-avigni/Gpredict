@@ -6950,23 +6950,33 @@ static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
         return FALSE;
     }
 
-    if (!from_pretrack_plan &&
-        tracking_mode == ROT_PLAN_MODE_FLIP &&
-        ctrl->conf->maxel >= 180.0)
+    if (from_pretrack_plan)
     {
-        target_az360 = rot_norm360(target_az360 + 180.0);
-        target_el = 180.0 - target_el;
+        preview_az = rotctrl_clamp_user_az_interval(
+            ctrl, rot_az360_to_ui(rot_norm360(target_az360), ui_mode));
+        preview_el = CLAMP(target_el, ctrl->conf->minel, ctrl->conf->maxel);
     }
+    else
+    {
+        if (tracking_mode == ROT_PLAN_MODE_FLIP &&
+            ctrl->conf->maxel >= 180.0)
+        {
+            target_az360 = rot_norm360(target_az360 + 180.0);
+            target_el = 180.0 - target_el;
+        }
 
-    if (ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
-        target_el = ctrl->conf->minel;
+        if (ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+            target_el = ctrl->conf->minel;
 
-    if (!gp_rot_transform_target(ctrl, target_az360, target_el, -1.0, &xform))
-        return FALSE;
+        if (!gp_rot_transform_target(ctrl, target_az360, target_el, -1.0, &xform))
+            return FALSE;
 
-    preview_az = rotctrl_clamp_user_az_interval(
-        ctrl, rot_az360_to_ui(xform.az360_final, ui_mode));
-    preview_el = CLAMP(xform.el_final, ctrl->conf->minel, ctrl->conf->maxel);
+        preview_az = rotctrl_clamp_user_az_interval(
+            ctrl, rot_az360_to_ui(xform.az_after_southzero, ui_mode));
+        preview_el = CLAMP(xform.el_after_southzero,
+                           ctrl->conf->minel,
+                           ctrl->conf->maxel);
+    }
     cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
     cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
     az_delta = (ctrl->conf->aztype == ROT_AZ_TYPE_480)
