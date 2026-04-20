@@ -925,6 +925,7 @@ static gboolean rotctrl_pos_recent(GtkRotCtrl *ctrl,
 static gboolean rotctrl_session_ready(GtkRotCtrl *ctrl,
                                       gboolean pos_recent);
 static gboolean rotctrl_manual_override_active(GtkRotCtrl *ctrl);
+static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl);
 static gboolean G_GNUC_UNUSED rotctrl_wait_for_baseline(GtkRotCtrl *ctrl);
 static void     rotctrl_update_safety(GtkRotCtrl *ctrl,
                                       gboolean caps_valid,
@@ -6897,6 +6898,96 @@ static gboolean rotctrl_predict_at(GtkRotCtrl *ctrl,
     return TRUE;
 }
 
+static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
+{
+    RotTargetOut xform = { 0 };
+    rot_plan_mode_t tracking_mode = ROT_PLAN_MODE_NORMAL;
+    rot_ui_mode_t ui_mode = ROT_UI_360;
+    gdouble target_az360 = 0.0;
+    gdouble target_el = 0.0;
+    gdouble preview_az = 0.0;
+    gdouble preview_el = 0.0;
+    gdouble elev_floor = ROTCTRL_DEFAULT_MIN_EL;
+    gdouble cur_az = 0.0;
+    gdouble cur_el = 0.0;
+    gdouble az_delta = 0.0;
+    gboolean changed = FALSE;
+
+    if (ctrl == NULL || ctrl->engaged || ctrl->tracking ||
+        ctrl->conf == NULL || ctrl->target == NULL || ctrl->qth == NULL ||
+        ctrl->AzSet == NULL || ctrl->ElSet == NULL)
+        return FALSE;
+
+    if (ctrl->have_user_command || rotctrl_manual_override_active(ctrl))
+        return FALSE;
+
+    ui_mode = (ctrl->conf->aztype == ROT_AZ_TYPE_180)
+              ? ROT_UI_NORTH_CENTERED
+              : ROT_UI_360;
+    elev_floor = ctrl->conf->minel;
+    tracking_mode = rot_plan_matches_pass(ctrl)
+                    ? ctrl->trajectory_plan.mode
+                    : (ctrl->flipped ? ROT_PLAN_MODE_FLIP
+                                     : ROT_PLAN_MODE_NORMAL);
+    if (ctrl->conf->maxel < 180.0)
+        tracking_mode = ROT_PLAN_MODE_NORMAL;
+
+    if (ctrl->pretrack_enabled &&
+        isfinite(ctrl->target->el) &&
+        ctrl->target->el < elev_floor &&
+        rotctrl_find_pretrack_cmd(ctrl, ctrl->t, elev_floor,
+                                  &target_az360, &target_el, NULL))
+    {
+        /* use pretrack target */
+    }
+    else if (!rotctrl_predict_at(ctrl,
+                                 ctrl->t + (ROT_TRACK_LOOKAHEAD_SEC / secday),
+                                 &target_az360,
+                                 &target_el) &&
+             !rotctrl_predict_at(ctrl, ctrl->t, &target_az360, &target_el))
+    {
+        return FALSE;
+    }
+
+    if (tracking_mode == ROT_PLAN_MODE_FLIP && ctrl->conf->maxel >= 180.0)
+    {
+        target_az360 = rot_norm360(target_az360 + 180.0);
+        target_el = 180.0 - target_el;
+    }
+
+    if (ctrl->conf->axis_mode == ROT_AXIS_MODE_AZ_ONLY)
+        target_el = ctrl->conf->minel;
+
+    if (!gp_rot_transform_target(ctrl, target_az360, target_el, -1.0, &xform))
+        return FALSE;
+
+    preview_az = rot_az360_to_ui(xform.az_after_southzero, ui_mode);
+    preview_el = xform.el_after_southzero;
+    cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
+    cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
+    az_delta = (ctrl->conf->aztype == ROT_AZ_TYPE_480)
+               ? fabs(cur_az - preview_az)
+               : fabs(shortest_az_delta(cur_az, preview_az));
+
+    if (az_delta >= 0.05 || fabs(cur_el - preview_el) >= 0.05)
+    {
+        gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), preview_az);
+        gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), preview_el);
+        changed = TRUE;
+    }
+
+    if (changed)
+    {
+        rotctrl_set_ctrl_pos_on_plots(ctrl,
+                                      azel_normalize_az_0_360(
+                                          rot_ui_to_az360(preview_az, ui_mode)),
+                                      preview_el);
+        rotctrl_queue_draw_plots(ctrl);
+    }
+
+    return changed;
+}
+
 static gboolean rotctrl_pretrack_target_values_valid(gdouble az,
                                                      gdouble el,
                                                      gdouble target_time,
@@ -10931,6 +11022,7 @@ void gtk_rot_ctrl_update(GtkRotCtrl * ctrl, gdouble t)
         update_count_down(ctrl, t);
         update_aoslos_banner(ctrl, t);
         rotctrl_update_detached_labels(ctrl);
+        (void)rotctrl_update_disconnected_target_preview(ctrl);
 
         if (ctrl->tracking &&
             ctrl->tracking_session_los > 0.0 &&
@@ -20663,6 +20755,11 @@ static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
 
     ctrl->target = selected;
     (void)rotctrl_sync_sat_copy_from_module(ctrl, ctrl->target);
+    if (!ctrl->engaged && !ctrl->tracking)
+    {
+        ctrl->have_user_command = FALSE;
+        ctrl->manual_edit_until_us = 0;
+    }
     rotctrl_cancel_pending_motion(ctrl,
                                   ctrl->engaged && ctrl->tracking,
                                   "target_change");
@@ -20719,6 +20816,7 @@ static gboolean rotctrl_apply_sat_selection(GtkRotCtrl *ctrl,
     update_count_down(ctrl, ctrl->t);
     update_aoslos_banner(ctrl, ctrl->t);
     rotctrl_update_detached_labels(ctrl);
+    (void)rotctrl_update_disconnected_target_preview(ctrl);
     rotctrl_queue_draw_plots(ctrl);
 
     sat_log_log(SAT_LOG_LEVEL_INFO,
