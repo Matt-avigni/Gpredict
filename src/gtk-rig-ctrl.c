@@ -828,6 +828,10 @@ static void     rigctrl_update_doppler(GtkRigCtrl *ctrl);
 static void     rigctrl_update_last_target(GtkRigCtrl *ctrl,
                                            gboolean downlink,
                                            gint64 target_hz);
+static gint64   rigctrl_compute_preview_target(GtkRigCtrl *ctrl,
+                                               gboolean downlink,
+                                               gdouble lo,
+                                               gboolean *target_ok_out);
 static gint64   rigctrl_compute_target(GtkRigCtrl *ctrl,
                                        gboolean downlink,
                                        gdouble lo,
@@ -3215,6 +3219,7 @@ static void rigctrl_update_freq_display(GtkRigCtrl *ctrl)
     const radio_conf_t *up_conf;
     gboolean down_ok;
     gboolean up_ok;
+    gboolean target_ok;
     gint64 target_hz;
 
     if (ctrl == NULL)
@@ -3228,10 +3233,10 @@ static void rigctrl_update_freq_display(GtkRigCtrl *ctrl)
     /* Show the computed target even when no rig readback is available. */
     if (!down_ok && ctrl->RigFreqDown != NULL && down_conf != NULL)
     {
-        target_hz = rigctrl_compute_target(ctrl, TRUE,
-                                           rigctrl_lo_for_role(ctrl, TRUE),
-                                           FALSE, NULL, NULL, NULL);
-        if (target_hz > 0)
+        target_hz = rigctrl_compute_preview_target(ctrl, TRUE,
+                                                   rigctrl_lo_for_role(ctrl, TRUE),
+                                                   &target_ok);
+        if (target_hz > 0 && target_ok)
         {
             rigctrl_update_last_target(ctrl, TRUE, target_hz);
             rigctrl_set_freq_knob_value(ctrl, FALSE, (gdouble)target_hz);
@@ -3240,10 +3245,10 @@ static void rigctrl_update_freq_display(GtkRigCtrl *ctrl)
 
     if (!up_ok && ctrl->RigFreqUp != NULL && up_conf != NULL)
     {
-        target_hz = rigctrl_compute_target(ctrl, FALSE,
-                                           rigctrl_lo_for_role(ctrl, FALSE),
-                                           FALSE, NULL, NULL, NULL);
-        if (target_hz > 0)
+        target_hz = rigctrl_compute_preview_target(ctrl, FALSE,
+                                                   rigctrl_lo_for_role(ctrl, FALSE),
+                                                   &target_ok);
+        if (target_hz > 0 && target_ok)
         {
             rigctrl_update_last_target(ctrl, FALSE, target_hz);
             rigctrl_set_freq_knob_value(ctrl, TRUE, (gdouble)target_hz);
@@ -5404,6 +5409,42 @@ static gint64 rigctrl_compute_target_tx(GtkRigCtrl *ctrl,
     rigctrl_log_calc(ctrl, FALSE, menu_hz, doppler, target_rig, doppler_enabled);
 
     return target_rig;
+}
+
+static gint64 rigctrl_compute_preview_target(GtkRigCtrl *ctrl,
+                                             gboolean downlink,
+                                             gdouble lo,
+                                             gboolean *target_ok_out)
+{
+    gdouble base_rig_f = 0.0;
+    gint64 menu_hz = 0;
+    gint64 base_rig = 0;
+    gint64 doppler = 0;
+    gint64 target_rig = 0;
+
+    if (target_ok_out)
+        *target_ok_out = FALSE;
+
+    if (ctrl == NULL)
+        return 0;
+
+    menu_hz = downlink
+                  ? ((ctrl->menu_rx_hz > 0)
+                         ? ctrl->menu_rx_hz
+                         : rigctrl_get_user_base_freq(ctrl, TRUE))
+                  : ((ctrl->menu_tx_hz > 0)
+                         ? ctrl->menu_tx_hz
+                         : rigctrl_get_user_base_freq(ctrl, FALSE));
+    if (menu_hz <= 0)
+        return 0;
+
+    doppler = rigctrl_get_cached_doppler(ctrl, downlink);
+    base_rig_f = (gdouble)menu_hz - lo;
+    base_rig = rigctrl_round_hz(base_rig_f);
+    target_rig = base_rig + doppler;
+
+    return rigctrl_adjust_target(ctrl, downlink, menu_hz,
+                                 doppler, target_rig, target_ok_out);
 }
 
 static gint64 rigctrl_compute_target(GtkRigCtrl *ctrl,
