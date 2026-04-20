@@ -6963,6 +6963,8 @@ static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
 
     preview_az = rot_az360_to_ui(xform.az_after_southzero, ui_mode);
     preview_el = xform.el_after_southzero;
+    preview_az = rotctrl_clamp_user_az_interval(ctrl, preview_az);
+    preview_el = CLAMP(preview_el, ctrl->conf->minel, ctrl->conf->maxel);
     cur_az = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->AzSet));
     cur_el = gtk_rot_knob_get_value(GTK_ROT_KNOB(ctrl->ElSet));
     az_delta = (ctrl->conf->aztype == ROT_AZ_TYPE_480)
@@ -6974,15 +6976,6 @@ static gboolean rotctrl_update_disconnected_target_preview(GtkRotCtrl *ctrl)
         gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->AzSet), preview_az);
         gtk_rot_knob_set_value(GTK_ROT_KNOB(ctrl->ElSet), preview_el);
         changed = TRUE;
-    }
-
-    if (changed)
-    {
-        rotctrl_set_ctrl_pos_on_plots(ctrl,
-                                      azel_normalize_az_0_360(
-                                          rot_ui_to_az360(preview_az, ui_mode)),
-                                      preview_el);
-        rotctrl_queue_draw_plots(ctrl);
     }
 
     return changed;
