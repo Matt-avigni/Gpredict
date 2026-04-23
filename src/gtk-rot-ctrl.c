@@ -970,6 +970,10 @@ static void     rotctld_autodetect_transition(GtkRotCtrl *ctrl,
                                               rotctld_autodetect_state_t next,
                                               const gchar *reason);
 static void     rotctld_autodetect_reset_validation(RotctldProbeState *state);
+static gboolean rotctld_autodetect_accept_positionless(const RotctldProbeState *state,
+                                                       rotctld_pos_result_t res,
+                                                       gint rprt,
+                                                       gboolean dump_ok);
 static void     rotctld_autodetect_apply_success(GtkRotCtrl *ctrl,
                                                  RotctldProbeState *state);
 static gboolean rotctld_autodetect_is_candidate(const gchar *candidate);
@@ -993,6 +997,7 @@ static GSList  *rotctld_autodetect_prefer_device(GSList *list,
 static GSList  *rotctld_autodetect_limit_list(GSList *list, guint limit);
 static GSList  *rotctld_autodetect_remove_key(GSList *list,
                                               const gchar *key);
+static gboolean rotctld_autodetect_has_more(const RotctldProbeState *state);
 static gboolean rotctld_autodetect_has_next_baud(const RotctldProbeState *state,
                                                  const rotor_conf_t *conf);
 static gboolean rotctld_autodetect_next_baud(RotctldProbeState *state,
@@ -8152,6 +8157,7 @@ struct RotctldProbeState {
     gboolean     validate_dump_ok;
     gboolean     validate_pos_ok;
     gboolean     validate_timeout;
+    gboolean     autodetect_positionless;
     gint         validate_timeout_ms;
     gint         validate_retries;
     gint         validate_retry_delay_ms;
@@ -17251,6 +17257,7 @@ static void rotctld_autodetect_reset_validation(RotctldProbeState *state)
     state->validate_dump_ok = FALSE;
     state->validate_pos_ok = FALSE;
     state->validate_timeout = FALSE;
+    state->autodetect_positionless = FALSE;
     g_mutex_unlock(&state->validate_mutex);
 }
 
@@ -17260,32 +17267,39 @@ static void rotctld_autodetect_apply_success(GtkRotCtrl *ctrl,
     gint pid = -1;
     gint64 now_us = g_get_monotonic_time();
     gdouble total_ms = 0.0;
+    const gchar *mode = NULL;
 
     if (ctrl == NULL || state == NULL || state->autodetect_device == NULL)
         return;
 
+    mode = state->autodetect_positionless ? "position pending" : "validated";
+
     if (state->autodetect_baud > 0)
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "%s: autodetect selected device %s (validated) baud=%d port=%d",
+                    "%s: autodetect selected device %s (%s) baud=%d port=%d",
                     __func__,
                     state->autodetect_device,
+                    mode,
                     state->autodetect_baud,
                     state->autodetect_port);
     else
         sat_log_log(SAT_LOG_LEVEL_INFO,
-                    "%s: autodetect selected device %s (validated) port=%d",
+                    "%s: autodetect selected device %s (%s) port=%d",
                     __func__, state->autodetect_device,
+                    mode,
                     state->autodetect_port);
     if (state->autodetect_baud > 0)
         rot_term_log(ctrl, "gpredict:rx",
-                     "autodetect: selected %s (validated) baud=%d port=%d",
+                     "autodetect: selected %s (%s) baud=%d port=%d",
                      state->autodetect_device,
+                     mode,
                      state->autodetect_baud,
                      state->autodetect_port);
     else
         rot_term_log(ctrl, "gpredict:rx",
-                     "autodetect: selected %s (validated) port=%d",
+                     "autodetect: selected %s (%s) port=%d",
                      state->autodetect_device,
+                     mode,
                      state->autodetect_port);
 
     if (state->autodetect_start_us > 0)
@@ -17354,6 +17368,7 @@ static void rotctld_autodetect_init(RotctldProbeState *state, GtkRotCtrl *ctrl)
     state->best_baud = 0;
     state->scanning_child_pid = -1;
     state->scanning_child_validated = FALSE;
+    state->autodetect_positionless = FALSE;
     state->autodetect_start_us = now_us;
     state->autodetect_candidate_start_us = 0;
     state->last_good_exclusive = FALSE;
@@ -18005,6 +18020,7 @@ typedef struct {
     gint               retries;
     gint               retry_delay_ms;
     gint               settle_ms;
+    gboolean           identity_ok;
 } RotctldAutodetectWorker;
 
 static rotctld_pos_result_t
@@ -18140,6 +18156,34 @@ static gboolean rotctld_autodetect_worker_done_cb(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+static gboolean
+rotctld_autodetect_accept_positionless(const RotctldProbeState *state,
+                                       rotctld_pos_result_t res,
+                                       gint rprt,
+                                       gboolean dump_ok)
+{
+    gboolean exact_last_good = FALSE;
+    gboolean only_candidate = FALSE;
+
+    if (state == NULL || !dump_ok || res != ROTCTLD_POS_RPRT_ERR)
+        return FALSE;
+
+    if (rprt != -5 && rprt != -6 && rprt != -8)
+        return FALSE;
+
+    exact_last_good =
+        state->last_good_device != NULL &&
+        state->autodetect_device != NULL &&
+        g_strcmp0(state->last_good_device, state->autodetect_device) == 0;
+    only_candidate =
+        !state->autodetect_limited &&
+        state->autodetect_count <= 1 &&
+        state->autodetect_list_full == NULL &&
+        !rotctld_autodetect_has_more(state);
+
+    return exact_last_good || only_candidate;
+}
+
 static gpointer rotctld_autodetect_validate_thread(gpointer data)
 {
     RotctldAutodetectWorker *worker = data;
@@ -18186,6 +18230,10 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
 
     if (worker->settle_ms > 0)
         g_usleep((gulong) worker->settle_ms * 1000);
+
+    dump_ok = worker->identity_ok;
+    if (dump_ok)
+        score += 2;
 
     {
         gchar pos_reply[512];
@@ -18357,7 +18405,7 @@ static gpointer rotctld_autodetect_validate_thread(gpointer data)
                     (long long) elapsed_ms);
     }
 
-    if (pos_ok)
+    if (pos_ok && !dump_ok)
     {
         memset(&info, 0, sizeof(info));
         dump_state[0] = '\0';
@@ -18792,6 +18840,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             worker->timeout_ms = validate_timeout_ms;
             worker->retries = state->validate_retries;
             worker->retry_delay_ms = state->validate_retry_delay_ms;
+            worker->identity_ok = TRUE;
             worker->settle_ms =
                 rotctld_autodetect_get_ms("GPREDICT_ROT_AUTODETECT_TCP_SETTLE_MS",
                                           ROTCTLD_AUTODETECT_TCP_SETTLE_MS,
@@ -18808,6 +18857,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             state->validate_dump_ok = FALSE;
             state->validate_pos_ok = FALSE;
             state->validate_timeout = FALSE;
+            state->autodetect_positionless = FALSE;
             state->validate_thread =
                 g_thread_new("rotctld-autodetect",
                              rotctld_autodetect_validate_thread,
@@ -18828,6 +18878,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             gboolean pos_ok = FALSE;
             gboolean dump_ok = FALSE;
             gboolean saw_timeout = FALSE;
+            gboolean positionless_ok = FALSE;
             gint score = 0;
 
             g_mutex_lock(&state->validate_mutex);
@@ -18840,7 +18891,10 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
             saw_timeout = state->validate_timeout;
             g_mutex_unlock(&state->validate_mutex);
 
-            if (pos_ok)
+            positionless_ok =
+                rotctld_autodetect_accept_positionless(state, res, rprt, dump_ok);
+
+            if (pos_ok || positionless_ok)
             {
                 gint64 now_us = g_get_monotonic_time();
                 gdouble elapsed_ms = 0.0;
@@ -18855,7 +18909,7 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                 state->best_score = score;
 
                 sat_log_log(SAT_LOG_LEVEL_INFO,
-                            "autodetect[%llu:%llu] validated score=%d dump_ok=%d pos_ok=%d timeout=%d time=%.1fms",
+                            "autodetect[%llu:%llu] accepted score=%d dump_ok=%d pos_ok=%d timeout=%d time=%.1fms",
                             (unsigned long long) state->generation,
                             (unsigned long long) state->autodetect_generation,
                             score,
@@ -18863,44 +18917,58 @@ static rotctld_autodetect_step_t rotctld_autodetect_step(GtkRotCtrl *ctrl,
                             pos_ok ? 1 : 0,
                             saw_timeout ? 1 : 0,
                             elapsed_ms);
+                if (pos_ok)
+                    rot_term_log(ctrl, "gpredict:rx",
+                                 "autodetect: candidate ok: %s baud=%d port=%d (%.0fms)",
+                                 state->autodetect_device,
+                                 state->autodetect_baud,
+                                 state->autodetect_port,
+                                 elapsed_ms);
+                else
+                    rot_term_log(ctrl, "gpredict:rx",
+                                 "autodetect: candidate accepted without initial position: %s baud=%d port=%d (rprt=%d, %.0fms)",
+                                 state->autodetect_device,
+                                 state->autodetect_baud,
+                                 state->autodetect_port,
+                                 rprt,
+                                 elapsed_ms);
                 rot_term_log(ctrl, "gpredict:rx",
-                             "autodetect: candidate ok: %s baud=%d port=%d (%.0fms)",
+                             "rotor probe: device=%s %s",
                              state->autodetect_device,
-                             state->autodetect_baud,
-                             state->autodetect_port,
-                             elapsed_ms);
-                rot_term_log(ctrl, "gpredict:rx",
-                             "rotor probe: device=%s SUCCESS",
-                             state->autodetect_device);
+                             pos_ok ? "SUCCESS" : "POSITION_PENDING");
                 sat_log_log(SAT_LOG_LEVEL_INFO,
-                            "rotor probe: device=%s SUCCESS",
-                            state->autodetect_device);
+                            "rotor probe: device=%s %s",
+                            state->autodetect_device,
+                            pos_ok ? "SUCCESS" : "POSITION_PENDING");
 
                 if (state->scanning_child_pid > 0)
                     pid = state->scanning_child_pid;
                 else if (ctrl->rotctld_mgr)
                     pid = rotctld_mgr_pid(ctrl->rotctld_mgr);
                 rot_term_log(ctrl, "gpredict:rx",
-                             "autodetect: VALIDATE_IO OK -> SUCCESS selected pid=%d dev=%s baud=%d port=%d",
+                             "autodetect: VALIDATE_IO %s -> SUCCESS selected pid=%d dev=%s baud=%d port=%d",
+                             pos_ok ? "OK" : "POSITION_PENDING",
                              pid,
                              state->autodetect_device ? state->autodetect_device : "(null)",
                              state->autodetect_baud,
                              state->autodetect_port);
                 sat_log_log(SAT_LOG_LEVEL_INFO,
-                            "autodetect[%llu:%llu] VALIDATE_IO OK -> SUCCESS selected pid=%d dev=%s baud=%d port=%d",
+                            "autodetect[%llu:%llu] VALIDATE_IO %s -> SUCCESS selected pid=%d dev=%s baud=%d port=%d",
                             (unsigned long long) state->generation,
                             (unsigned long long) state->autodetect_generation,
+                            pos_ok ? "OK" : "POSITION_PENDING",
                             pid,
                             state->autodetect_device ? state->autodetect_device : "(null)",
                             state->autodetect_baud,
                             state->autodetect_port);
 
                 state->scanning_child_validated = TRUE;
+                state->autodetect_positionless = !pos_ok;
                 g_free(reason);
                 /* Bugfix: validated candidates are terminal; do not score/FAIL_NEXT/replace. */
                 rotctld_autodetect_transition(ctrl, state,
                                               ROTCTLD_AUTODETECT_SUCCESS,
-                                              "validated");
+                                              pos_ok ? "validated" : "position_pending");
                 return ROTCTLD_AUTODETECT_STEP_CONTINUE;
             }
 
@@ -20058,6 +20126,7 @@ static rotctld_ensure_result_t rotctld_ensure_running(GtkRotCtrl *ctrl)
     state->validate_dump_ok = FALSE;
     state->validate_pos_ok = FALSE;
     state->validate_timeout = FALSE;
+    state->autodetect_positionless = FALSE;
     state->validate_timeout_ms = ROTCTLD_AUTODETECT_VALIDATE_TIMEOUT_MS;
     state->validate_retries = ROTCTLD_AUTODETECT_VALIDATE_RETRIES;
     state->validate_retry_delay_ms = ROTCTLD_AUTODETECT_VALIDATE_RETRY_DELAY_MS;
