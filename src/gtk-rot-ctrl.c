@@ -14225,20 +14225,6 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             }
         }
 
-        if (no_encoder &&
-            ctrl->tracking &&
-            allow_send &&
-            have_target &&
-            reason != ROT_CMD_REASON_RANGE)
-        {
-            send_ok = TRUE;
-            gate = ROT_CMD_ACTION_SEND;
-            reason = ctrl->setpoint_valid ? ROT_CMD_REASON_RESEND
-                                          : ROT_CMD_REASON_INITIAL;
-            resend_due = TRUE;
-            min_step_exceeded = TRUE;
-        }
-
         g_mutex_lock(&ctrl->client.mutex);
         ctrl->client.stall_since_us = stall_since_us;
         g_mutex_unlock(&ctrl->client.mutex);
@@ -14331,6 +14317,8 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
         {
             const gchar *mode_name =
                 (desired_state == ROT_TARGET_STATE_PRETRACK) ? "PRETRACK" : "TRACKING";
+            const gchar *plan_mode_name =
+                rotctrl_tracking_mode_name(tracking_mode);
             const gchar *action = rot_cmd_action_name(gate);
             const gchar *range_reason =
                 (reason == ROT_CMD_REASON_RANGE)
@@ -14338,11 +14326,12 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
                     : "none";
 
             rot_term_log_verbose(ctrl, "gpredict:tx",
-                                 "rot_cmd_gate: mode=%s desired_user=(%.2f,%.2f) setpoint_user=(%.2f,%.2f) "
+                                 "rot_cmd_gate: mode=%s plan=%s desired_user=(%.2f,%.2f) setpoint_user=(%.2f,%.2f) "
                                  "last_cmd_user=(%.2f,%.2f) desired_backend=(%.2f,%.2f) setpoint_backend=(%.2f,%.2f) "
                                  "in_flight=%d stale_hold=%d pos_fresh=%d last_good_age_ms=%lld "
                                  "delta_user=(%.2f,%.2f) delta_backend=(%.2f,%.2f) action=%s reason=%s range=%s",
                                  mode_name,
+                                 plan_mode_name,
                                  desired_user_az, desired_user_el,
                                  setpoint_user_az, setpoint_user_el,
                                  last_cmd_user_az_log, last_cmd_user_el_log,
@@ -14479,10 +14468,11 @@ static gboolean rot_ctrl_timeout_cb(gpointer data)
             rot_log_rate_limited(ctrl, &ctrl->send_log_rate, 1000000,
                                  SAT_LOG_LEVEL_INFO, "gpredict:tx",
                                  "send target az_pred=%.2f az_user=%.2f az_backend=%.2f "
-                                 "el_pred=%.2f el_backend=%.2f state=%s reason=%s",
+                                 "el_pred=%.2f el_backend=%.2f state=%s mode=%s reason=%s",
                                  log_az_pred, log_az_user, cmdaz,
                                  log_el_pred, cmdel,
                                  rot_target_state_name(ctrl->target_state),
+                                 rotctrl_tracking_mode_name(tracking_mode),
                                  rot_cmd_reason_name(reason));
         }
 
@@ -20492,12 +20482,18 @@ static void rotctrl_cancel_pending_motion(GtkRotCtrl *ctrl,
                                           gboolean request_stop,
                                           const gchar *reason)
 {
+    gboolean send_stop = request_stop;
+
     if (ctrl == NULL)
         return;
 
+    if (send_stop && rotctrl_no_encoder_mode(ctrl) &&
+        (g_strcmp0(reason, "track_off") == 0 ||
+         g_strcmp0(reason, "pass_over") == 0))
+        send_stop = FALSE;
+
     g_mutex_lock(&ctrl->client.mutex);
-    if (request_stop)
-        ctrl->client.stop_pending = TRUE;
+    ctrl->client.stop_pending = send_stop;
     ctrl->client.new_trg = FALSE;
     ctrl->client.force_pending = FALSE;
     ctrl->client.desired_valid = FALSE;
@@ -20512,7 +20508,7 @@ static void rotctrl_cancel_pending_motion(GtkRotCtrl *ctrl,
     if (ctrl->verbose_logging)
         rot_term_log_verbose(ctrl, "gpredict:state",
                              "cleared pending rotor motion stop=%d reason=%s",
-                             request_stop ? 1 : 0,
+                             send_stop ? 1 : 0,
                              reason ? reason : "(none)");
 }
 

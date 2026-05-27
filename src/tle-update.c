@@ -178,8 +178,6 @@ void tle_update_from_files(const gchar * dir, const gchar * filter,
                      */
                     while (g_main_context_iteration(NULL, FALSE));
 
-                    /* give user a chance to follow progress */
-                    g_usleep(G_USEC_PER_SEC / 100);
                 }
 
                 /* now, do read the fresh data */
@@ -635,7 +633,8 @@ void tle_update_from_network(gboolean silent,
             {
 
                 /* complete download corresponds to 50% */
-                fraction = start + (0.5 - start) * i / (1.0 * numfiles);
+                fraction = start + (0.5 - start) * (i + 1) /
+                    (1.0 * numfiles);
                 gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progress),
                                               fraction);
 
