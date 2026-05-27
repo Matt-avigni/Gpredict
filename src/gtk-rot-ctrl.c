@@ -8668,6 +8668,7 @@ static rot_set_result_t rotctrl_send_position(GtkRotCtrl *ctrl,
     gint            rprt_code = 0;
     HamlibResponseInfo info = { 0 };
     gboolean ok = FALSE;
+    gboolean no_feedback_send = FALSE;
     const gchar *cmd_name = use_setpos ? "set_position" : "move";
 
     if (use_setpos && ctrl != NULL && ctrl->tracking_active)
@@ -8707,14 +8708,28 @@ static rot_set_result_t rotctrl_send_position(GtkRotCtrl *ctrl,
     rot_term_log_verbose(ctrl, "gpredict:tx",
                          "%s send=(%s, %s)",
                          cmd_name, send_az_str, send_el_str);
-    
-    ok = rotctld_client_set_position_checked(ctrl->client.client,
-                                             az_send,
-                                             el_send,
-                                             &rprt_code,
-                                             &info,
-                                             buffback,
-                                             sizeof(buffback));
+
+    no_feedback_send = rotctrl_no_encoder_mode(ctrl) && !use_setpos;
+    if (no_feedback_send)
+    {
+        ok = rotctld_client_set_position_no_feedback(ctrl->client.client,
+                                                     az_send,
+                                                     el_send,
+                                                     &rprt_code,
+                                                     &info,
+                                                     buffback,
+                                                     sizeof(buffback));
+    }
+    else
+    {
+        ok = rotctld_client_set_position_checked(ctrl->client.client,
+                                                 az_send,
+                                                 el_send,
+                                                 &rprt_code,
+                                                 &info,
+                                                 buffback,
+                                                 sizeof(buffback));
+    }
 
     rot_term_log_verbose(ctrl, "gpredict:rx",
                          "%s reply=%s", cmd_name, buffback);
@@ -8722,6 +8737,7 @@ static rot_set_result_t rotctrl_send_position(GtkRotCtrl *ctrl,
     /* Interpret reply:
      *  - RPRT 0                → success.
      *  - RPRT -5/-6            → backend I/O issue (rotctld stays up).
+     *  - No encoder mode       → timeout/no feedback is accepted as sent.
      *  - Other RPRT non-zero   → rejected.
      *  - Otherwise             → treat as rejected.
      */
@@ -8733,6 +8749,18 @@ static rot_set_result_t rotctrl_send_position(GtkRotCtrl *ctrl,
 
     if (ok)
         return ROT_SET_OK;
+
+    if (no_feedback_send &&
+        info.saw_rprt &&
+        (rprt_code == -5 || rprt_code == -6 || rprt_code == -8))
+    {
+        rot_term_log_verbose(ctrl, "gpredict:warn",
+                             "%s no-encoder feedback error ignored: %s (RPRT %d)",
+                             cmd_name,
+                             rot_rprt_error_string(rprt_code),
+                             rprt_code);
+        return ROT_SET_OK;
+    }
 
     if (info.used_multiline)
     {

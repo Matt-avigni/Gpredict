@@ -110,6 +110,13 @@ gboolean              rotctld_client_set_position_checked(RotctldClient *client,
                                                           HamlibResponseInfo *info_out,
                                                           gchar *reply_out,
                                                           gsize reply_len);
+gboolean              rotctld_client_set_position_no_feedback(RotctldClient *client,
+                                                              gdouble az,
+                                                              gdouble el,
+                                                              gint *rprt_code_out,
+                                                              HamlibResponseInfo *info_out,
+                                                              gchar *reply_out,
+                                                              gsize reply_len);
 gboolean              rotctld_client_set_pos_ex(RotctldClient *client,
                                                 gdouble az,
                                                 gdouble el,

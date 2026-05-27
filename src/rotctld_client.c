@@ -21,6 +21,7 @@
 #define ROTCTLD_GETPOS_RETRIES 2
 #define ROTCTLD_GETPOS_RETRY_DELAY_MS 50
 #define ROTCTLD_SETPOS_TIMEOUT_MS 1500
+#define ROTCTLD_SETPOS_NO_FEEDBACK_TIMEOUT_MS 50
 #define ROTCTLD_SETPOS_RETRIES 1
 #define ROTCTLD_SETPOS_RETRY_DELAY_MS 100
 #define ROTCTLD_SETPOS_LOG_THROTTLE_US 1000000
@@ -2198,6 +2199,116 @@ gboolean rotctld_client_set_position_checked(RotctldClient *client,
                                      info_out,
                                      reply_out,
                                      reply_len);
+}
+
+gboolean rotctld_client_set_position_no_feedback(RotctldClient *client,
+                                                 gdouble az,
+                                                 gdouble el,
+                                                 gint *rprt_code_out,
+                                                 HamlibResponseInfo *info_out,
+                                                 gchar *reply_out,
+                                                 gsize reply_len)
+{
+    gchar cmd[96];
+    gchar azbuf[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar elbuf[G_ASCII_DTOSTR_BUF_SIZE];
+    gchar reply_local[128];
+    gchar *reply = reply_local;
+    gsize reply_cap = sizeof(reply_local);
+    HamlibResponseInfo local = { 0 };
+    gboolean ok = FALSE;
+    gint parsed_rprt = 0;
+
+    if (rprt_code_out)
+        *rprt_code_out = 0;
+    if (info_out)
+        memset(info_out, 0, sizeof(*info_out));
+
+    if (reply_out && reply_len > 0)
+    {
+        reply = reply_out;
+        reply_cap = reply_len;
+    }
+
+    if (reply && reply_cap > 0)
+        reply[0] = '\0';
+
+    if (client == NULL || client->transport == NULL ||
+        !hamlib_transport_is_ready(client->transport))
+        return FALSE;
+
+    g_ascii_formatd(azbuf, sizeof(azbuf), "%.2f", az);
+    g_ascii_formatd(elbuf, sizeof(elbuf), "%.2f", el);
+    g_warn_if_fail(strchr(azbuf, ',') == NULL && strchr(elbuf, ',') == NULL);
+    g_snprintf(cmd, sizeof(cmd), "P %s %s\n", azbuf, elbuf);
+
+    rotctld_client_emit_wire_lines(client, SAT_LOG_LEVEL_INFO,
+                                   "gpredict:tx", cmd);
+    ok = hamlib_transport_request(client->transport,
+                                  cmd,
+                                  HAMLIB_READ_SINGLE,
+                                  HAMLIB_TERM_RPRT,
+                                  ROTCTLD_SETPOS_NO_FEEDBACK_TIMEOUT_MS,
+                                  10,
+                                  0,
+                                  0,
+                                  reply,
+                                  reply_cap,
+                                  &local);
+
+    if (info_out)
+        *info_out = local;
+
+    if (ok)
+    {
+        if (reply && reply_cap > 0)
+            rotctld_client_emit_wire_lines(client, SAT_LOG_LEVEL_INFO,
+                                           "gpredict:rx", reply);
+
+        if (local.saw_rprt)
+        {
+            if (rprt_code_out)
+                *rprt_code_out = local.rprt_code;
+            rotctld_client_note_valid_reply(client);
+            return local.rprt_code == 0;
+        }
+
+        if (rotctld_client_reply_is_ok(reply))
+        {
+            rotctld_client_note_valid_reply(client);
+            return TRUE;
+        }
+
+        if (rotctld_client_line_parse_rprt(reply, &parsed_rprt))
+        {
+            local.saw_rprt = TRUE;
+            local.rprt_code = parsed_rprt;
+            if (info_out)
+                *info_out = local;
+            if (rprt_code_out)
+                *rprt_code_out = parsed_rprt;
+            rotctld_client_note_valid_reply(client);
+            return parsed_rprt == 0;
+        }
+
+        return TRUE;
+    }
+
+    if (local.err == EAGAIN ||
+        local.err == EWOULDBLOCK ||
+        local.err == ETIMEDOUT)
+    {
+        return TRUE;
+    }
+
+    if (rotctld_client_err_is_disconnect(local.err))
+    {
+        hamlib_transport_close(client->transport);
+        rotctld_client_set_state(client, ROTCTLD_CLIENT_DEGRADED,
+                                 "transport lost");
+    }
+
+    return FALSE;
 }
 
 gboolean rotctld_client_set_pos(RotctldClient *client,
